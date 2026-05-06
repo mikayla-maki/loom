@@ -97,7 +97,7 @@ body
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "provider-agent"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -195,7 +195,7 @@ s = "../skills/shout"
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "skill-provider-agent"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -303,7 +303,7 @@ body
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "manifest-provider-agent"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -388,7 +388,7 @@ body`,
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "n"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -449,7 +449,7 @@ body`,
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "audit-prov"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]

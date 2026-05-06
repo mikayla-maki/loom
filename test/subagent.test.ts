@@ -30,7 +30,7 @@ async function buildSubagentFixture(opts: {
     path.join(helperDir, "agent.toml"),
     `[agent]
 name = "helper"
-identity_inline = "child"
+system_prompt = "child"
 [harness]
 provider = "test"
 echo = true
@@ -74,7 +74,7 @@ body
     path.join(parentDir, "agent.toml"),
     `[agent]
 name = "parent"
-identity_inline = "parent"
+system_prompt = "parent"
 [harness]
 provider = "test"
 [session]
@@ -230,7 +230,7 @@ body
         path.join(parentDir, "agent.toml"),
         `[agent]
 name = "p"
-identity_inline = "p"
+system_prompt = "p"
 [harness]
 provider = "test"
 [session]

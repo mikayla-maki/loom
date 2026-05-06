@@ -22,7 +22,7 @@ describe("GlassDaemon — Unix socket transport", () => {
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "daemon-agent"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 echo = true
@@ -61,7 +61,7 @@ secrets = []
           path.join(a2, "agent.toml"),
           `[agent]
 name = "second"
-identity_inline = "y"
+system_prompt = "y"
 [harness]
 provider = "test"
 [session]
@@ -99,7 +99,7 @@ secrets = []
         path.join(childDir, "agent.toml"),
         `[agent]
 name = "child"
-identity_inline = "c"
+system_prompt = "c"
 [harness]
 provider = "test"
 echo = true

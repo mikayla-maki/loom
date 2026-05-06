@@ -44,7 +44,7 @@ body
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "self"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]

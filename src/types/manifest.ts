@@ -22,9 +22,15 @@ export interface AgentManifest {
   agent: {
     name: string;
     description?: string;
-    /** Either a path (relative to manifest) or already-loaded inline content. */
-    identity?: string;
-    identityInline?: string;
+    /**
+     * `[agent].system_prompt` — the static, manifest-owned portion of the
+     * system prompt the runtime assembles each turn.
+     *
+     * Stored verbatim. The resolver decides whether it's a path or inline:
+     *   - path-like (`./`, `../`, `/`, `~/` prefix) → read from disk
+     *   - anything else → used as the literal text
+     */
+    systemPrompt?: string;
   };
   harness: {
     provider: string;

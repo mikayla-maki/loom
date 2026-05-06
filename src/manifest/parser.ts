@@ -42,9 +42,17 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
     throw new ManifestError(`agent.toml at ${abs} is missing required [agent].name`);
   }
 
-  if (agent.identity != null && agent.identity_inline != null) {
+  // [agent].system_prompt — single field, accepts either a path-like value
+  // or a literal string. The two-field `identity` / `identity_inline` shape
+  // was retired in favour of this one.
+  if (agent.identity != null || agent.identity_inline != null) {
     throw new ManifestError(
-      `agent.toml at ${abs}: choose either [agent].identity or [agent].identity_inline, not both`,
+      `agent.toml at ${abs}: [agent].identity / [agent].identity_inline have been replaced by [agent].system_prompt (path or inline string)`,
+    );
+  }
+  if (agent.system_prompt != null && typeof agent.system_prompt !== "string") {
+    throw new ManifestError(
+      `agent.toml at ${abs}: [agent].system_prompt must be a string (got ${typeof agent.system_prompt})`,
     );
   }
 
@@ -98,9 +106,8 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
     agent: {
       name: agent.name,
       ...(typeof agent.description === "string" ? { description: agent.description } : {}),
-      ...(typeof agent.identity === "string" ? { identity: agent.identity } : {}),
-      ...(typeof agent.identity_inline === "string"
-        ? { identityInline: agent.identity_inline }
+      ...(typeof agent.system_prompt === "string"
+        ? { systemPrompt: agent.system_prompt }
         : {}),
     },
     harness: { ...(harness as Record<string, unknown>), provider: harness.provider as string },

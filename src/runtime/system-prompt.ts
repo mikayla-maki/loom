@@ -4,7 +4,7 @@
  * Glass owns the system prompt. Each turn, the runtime composes a single
  * string from three sources:
  *   1. Runtime-owned (structural): the skill/tool catalog
- *   2. Manifest-owned (semantic): [agent].identity content
+ *   2. Manifest-owned (semantic): [agent].system_prompt content
  *   3. Per-turn (dynamic): current date and any other context Glass injects
  *
  * Harness extensions consume the final string via runtime.systemPrompt().
@@ -15,7 +15,8 @@
 import type { SkillDescriptor, ToolDescriptor } from "../types/interfaces.js";
 
 export interface SystemPromptInputs {
-  identity: string;
+  /** The resolved [agent].system_prompt content (manifest-owned core). */
+  core: string;
   skills: SkillDescriptor[];
   tools: ToolDescriptor[];
   /** Per-turn context (e.g. now, agent name, agent description). */
@@ -27,12 +28,12 @@ export interface SystemPromptInputs {
 export function assembleSystemPrompt(inputs: SystemPromptInputs): string {
   const parts: string[] = [];
 
-  // 1. Identity (semantic, manifest-owned).
-  if (inputs.identity.trim().length > 0) {
-    parts.push("# Identity\n\n" + inputs.identity.trim());
+  // 1. Manifest-owned core ([agent].system_prompt).
+  if (inputs.core.trim().length > 0) {
+    parts.push(inputs.core.trim());
   } else {
     parts.push(
-      `# Identity\n\nYou are ${inputs.agentName}${
+      `You are ${inputs.agentName}${
         inputs.agentDescription ? ` — ${inputs.agentDescription}` : ""
       }.`,
     );

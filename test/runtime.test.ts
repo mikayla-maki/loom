@@ -196,7 +196,7 @@ body`,
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "iso"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -251,9 +251,9 @@ e = "../skills/envskill"
 });
 
 describe("system prompt assembly", () => {
-  it("includes identity, skills, and a Context block", () => {
+  it("includes the manifest-owned core, skills, and a Context block", () => {
     const text = assembleSystemPrompt({
-      identity: "I am a helpful assistant.",
+      core: "I am a helpful assistant.",
       skills: [
         {
           name: "greeter",
@@ -269,7 +269,6 @@ describe("system prompt assembly", () => {
       agentName: "tester",
       now: new Date("2026-01-01T00:00:00Z"),
     });
-    expect(text).toContain("# Identity");
     expect(text).toContain("I am a helpful assistant.");
     expect(text).toContain("# Available Skills");
     expect(text).toContain("greet, uppercase");

@@ -130,7 +130,7 @@ describe("ACP over spawned `glass acp serve` (subprocess, real stdio)", () => {
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "acp-sample"
-identity = "./identity.md"
+system_prompt = "./identity.md"
 [harness]
 provider = "test"
 echo = true

@@ -154,7 +154,7 @@ Use search_skills to list candidates; use add_skill to load one.
     : "network = []";
   const agentToml = `[agent]
 name = "discoverer"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -565,7 +565,7 @@ body
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "acp-discoverer"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "script-add-skill"
 [session]
@@ -648,7 +648,7 @@ body
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "ax"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "script-add-skill-2"
 [session]

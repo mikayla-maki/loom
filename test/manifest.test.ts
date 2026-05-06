@@ -35,7 +35,7 @@ describe("agent.toml parser", () => {
     }
   });
 
-  it("rejects identity + identity_inline together", async () => {
+  it("rejects the legacy identity / identity_inline fields with a migration message", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-bad-"));
     try {
       const p = path.join(dir, "agent.toml");
@@ -44,7 +44,6 @@ describe("agent.toml parser", () => {
         `[agent]
 name = "x"
 identity = "./i.md"
-identity_inline = "y"
 [harness]
 provider = "test"
 [session]
@@ -55,7 +54,59 @@ filesystem = []
 `,
         "utf8",
       );
-      await expect(parseAgentManifest(p)).rejects.toThrow(/identity/);
+      await expect(parseAgentManifest(p)).rejects.toThrow(/system_prompt/);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("system_prompt accepts an inline string (no path prefix)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-inline-sp-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "x"
+system_prompt = "You are a friendly demo agent."
+[harness]
+provider = "test"
+[session]
+provider = "memory"
+[sandbox]
+filesystem = []
+[skills]
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(m.agent.systemPrompt).toBe("You are a friendly demo agent.");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("system_prompt accepts a path-like string", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-path-sp-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "x"
+system_prompt = "./prompt.md"
+[harness]
+provider = "test"
+[session]
+provider = "memory"
+[sandbox]
+filesystem = []
+[skills]
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(m.agent.systemPrompt).toBe("./prompt.md");
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

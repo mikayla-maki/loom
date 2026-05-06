@@ -31,7 +31,8 @@ import type { UpdateSink } from "./update-sink.js";
 export interface RuntimeImplOptions {
   session: Session;
   state: AgentState;
-  identity: string;
+  /** Resolved value of [agent].system_prompt. */
+  systemPromptCore: string;
   updateSink: UpdateSink;
   agentName: string;
   agentDescription?: string;
@@ -84,7 +85,7 @@ export class RuntimeImpl implements Runtime {
     const skills = this.listSkills();
     const tools = this.listTools();
     const prompt = assembleSystemPrompt({
-      identity: this.opts.identity,
+      core: this.opts.systemPromptCore,
       skills,
       tools,
       agentName: this.opts.agentName,
@@ -96,8 +97,8 @@ export class RuntimeImpl implements Runtime {
     return prompt;
   }
 
-  identity(): string {
-    return this.opts.identity;
+  systemPromptCore(): string {
+    return this.opts.systemPromptCore;
   }
 
   listSkills(): SkillDescriptor[] {

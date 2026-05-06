@@ -37,7 +37,7 @@ describe("FileSession", () => {
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "persist"
-identity = "./identity.md"
+system_prompt = "./identity.md"
 [harness]
 provider = "test"
 [session]

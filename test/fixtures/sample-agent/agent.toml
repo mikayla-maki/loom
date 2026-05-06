@@ -1,7 +1,7 @@
 [agent]
 name = "sample-agent"
 description = "An end-to-end Glass v0 demo agent. Greets the user and shouts."
-identity = "./identity.md"
+system_prompt = "./identity.md"
 
 [harness]
 provider = "test"

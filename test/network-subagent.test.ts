@@ -51,7 +51,7 @@ describe("network-located subagents (acp+unix:// over the daemon)", () => {
         path.join(childDir, "agent.toml"),
         `[agent]
 name = "child"
-identity_inline = "c"
+system_prompt = "c"
 [harness]
 provider = "test"
 echo = true
@@ -103,7 +103,7 @@ body
         path.join(parentDir, "agent.toml"),
         `[agent]
 name = "parent"
-identity_inline = "p"
+system_prompt = "p"
 [harness]
 provider = "test"
 [session]
@@ -176,7 +176,7 @@ r = "../skills/remote-skill"
         path.join(childSrc, "agent.toml"),
         `[agent]
 name = "helper-agent"
-identity_inline = "h"
+system_prompt = "h"
 [harness]
 provider = "test"
 echo = true
@@ -214,7 +214,7 @@ body
         path.join(parentDir, "agent.toml"),
         `[agent]
 name = "p2"
-identity_inline = "p2"
+system_prompt = "p2"
 [harness]
 provider = "test"
 [session]

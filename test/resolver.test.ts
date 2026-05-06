@@ -14,7 +14,7 @@ describe("resolveAgent", () => {
     expect(r.skills).toHaveLength(1);
     expect(r.skills[0]?.manifest.name).toBe("greeter");
     expect(r.tools.map((t) => t.manifest.tool.name).sort()).toEqual(["greet", "uppercase"]);
-    expect(r.identity).toMatch(/Sample Agent/);
+    expect(r.systemPrompt).toMatch(/Sample Agent/);
     expect(r.requiredSecrets.has("sample_user_name")).toBe(true);
     expect(r.pathAdditions).toHaveLength(2);
   });
@@ -61,7 +61,7 @@ body`,
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "snoopy"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -124,7 +124,7 @@ body`,
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "n"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -141,6 +141,63 @@ w = "../skills/wrong"
       await expect(resolveAgent(path.join(agentDir, "agent.toml"))).rejects.toThrow(
         ManifestError,
       );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves [agent].system_prompt as inline string when not path-like", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-sp-inline-"));
+    try {
+      const agentDir = path.join(dir, "agent");
+      await fs.mkdir(agentDir, { recursive: true });
+      await fs.writeFile(
+        path.join(agentDir, "agent.toml"),
+        `[agent]
+name = "inline-sp"
+system_prompt = "Be concise. Use only tools provided."
+[harness]
+provider = "test"
+[session]
+provider = "memory"
+[sandbox]
+filesystem = []
+network = []
+secrets = []
+[skills]
+`,
+      );
+      const r = await resolveAgent(path.join(agentDir, "agent.toml"));
+      expect(r.systemPrompt).toBe("Be concise. Use only tools provided.");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves [agent].system_prompt as a file when path-like", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-sp-path-"));
+    try {
+      const agentDir = path.join(dir, "agent");
+      await fs.mkdir(agentDir, { recursive: true });
+      await fs.writeFile(path.join(agentDir, "core.md"), "# Core\n\nbe brief\n");
+      await fs.writeFile(
+        path.join(agentDir, "agent.toml"),
+        `[agent]
+name = "path-sp"
+system_prompt = "./core.md"
+[harness]
+provider = "test"
+[session]
+provider = "memory"
+[sandbox]
+filesystem = []
+network = []
+secrets = []
+[skills]
+`,
+      );
+      const r = await resolveAgent(path.join(agentDir, "agent.toml"));
+      expect(r.systemPrompt).toMatch(/be brief/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
@@ -168,7 +225,7 @@ body`,
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "x"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]

@@ -98,7 +98,7 @@ process.stdout.write(String(i.text ?? "").toUpperCase());
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "bare-name-test"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]
@@ -178,7 +178,7 @@ shadowed`,
           path.join(agentDir, "agent.toml"),
           `[agent]
 name = "x"
-identity_inline = "x"
+system_prompt = "x"
 [harness]
 provider = "test"
 [session]

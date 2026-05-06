@@ -109,7 +109,9 @@ export type ResolvedSubagent =
 
 export interface ResolvedAgent {
   manifest: AgentManifest;
-  identity: string;
+  /** The resolved system-prompt-core string — the literal value the runtime
+   *  will splice into the assembled system prompt as the agent's identity. */
+  systemPrompt: string;
   skills: ResolvedSkill[];
   /** All tools, flattened, deduped by name (last writer wins). */
   tools: ResolvedTool[];
@@ -131,8 +133,8 @@ export async function resolveAgent(
     ...(options.registry ? { registry: options.registry } : {}),
   };
 
-  // Resolve identity content.
-  const identity = await resolveIdentity(manifest, baseDir);
+  // Resolve the manifest's system_prompt content (path or inline).
+  const systemPrompt = await resolveSystemPrompt(manifest, baseDir);
 
   const providers = options.providers ?? [];
 
@@ -263,7 +265,7 @@ export async function resolveAgent(
 
   return {
     manifest,
-    identity,
+    systemPrompt,
     skills,
     tools,
     requiredSecrets,
@@ -290,22 +292,44 @@ async function firstNonNull<T extends object, R>(
   return null;
 }
 
-async function resolveIdentity(manifest: AgentManifest, baseDir: string): Promise<string> {
-  if (manifest.agent.identityInline !== undefined) {
-    return manifest.agent.identityInline;
-  }
-  if (manifest.agent.identity !== undefined) {
-    const p = path.resolve(baseDir, manifest.agent.identity);
+async function resolveSystemPrompt(
+  manifest: AgentManifest,
+  baseDir: string,
+): Promise<string> {
+  const v = manifest.agent.systemPrompt;
+  if (v === undefined || v === "") return "";
+  if (looksLikePath(v)) {
+    const p = path.resolve(baseDir.replace(/^~(?=\/)/, process.env.HOME ?? "~"), expandHome(v));
     try {
       return await fs.readFile(p, "utf8");
     } catch (e) {
       throw new ResolutionError(
-        `Failed to read [agent].identity file at ${p}: ${(e as Error).message}`,
+        `Failed to read [agent].system_prompt file at ${p}: ${(e as Error).message}`,
         { cause: e },
       );
     }
   }
-  return "";
+  // Inline literal — used verbatim. (TOML triple-quoted multiline strings
+  // also flow through here naturally.)
+  return v;
+}
+
+/**
+ * Heuristic: a `[agent].system_prompt` value is treated as a path iff it
+ * starts with `./`, `../`, `/`, or `~/`. Bare strings (no path prefix) are
+ * treated as inline content. This matches how the rest of the resolver
+ * decides path-vs-name for skills and tools.
+ */
+function looksLikePath(s: string): boolean {
+  return s.startsWith("./") || s.startsWith("../") || s.startsWith("/") || s.startsWith("~/");
+}
+
+function expandHome(s: string): string {
+  if (s.startsWith("~/")) {
+    const home = process.env.HOME ?? "";
+    return home + s.slice(1);
+  }
+  return s;
 }
 
 async function resolveSkillPath(

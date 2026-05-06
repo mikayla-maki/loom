@@ -110,7 +110,7 @@ export class RunningAgentImpl implements RunningAgent {
     const runtime: Runtime = new RuntimeImpl({
       session: this.session,
       state: this.state,
-      identity: this.resolved.identity,
+      systemPromptCore: this.resolved.systemPrompt,
       updateSink: this.updateSink,
       agentName: this.resolved.manifest.agent.name,
       ...(this.resolved.manifest.agent.description

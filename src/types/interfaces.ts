@@ -95,8 +95,13 @@ export interface Runtime {
   /** The fully-assembled system prompt (default path). */
   systemPrompt(): string;
 
-  /** Just the resolved [agent].identity content. */
-  identity(): string;
+  /**
+   * Just the manifest-owned core (the `[agent].system_prompt` field after
+   * path resolution) — exposed so a Harness extension that needs to roll
+   * its own assembly (provider-specific formatting, prompt-caching tricks)
+   * can read components separately and reuse `listSkills()` / `listTools()`.
+   */
+  systemPromptCore(): string;
 
   /** All skills (manifest + session-contributed) with their tool names. */
   listSkills(): SkillDescriptor[];
