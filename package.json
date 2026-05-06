@@ -1,0 +1,55 @@
+{
+  "name": "glass",
+  "version": "0.1.0",
+  "description": "Glass — A manifest-driven agent meta-harness",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./acp": {
+      "import": "./dist/acp/index.js",
+      "types": "./dist/acp/index.d.ts"
+    },
+    "./extensions": {
+      "import": "./dist/extensions/index.js",
+      "types": "./dist/extensions/index.d.ts"
+    }
+  },
+  "bin": {
+    "glass": "./dist/cli/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "agent",
+    "llm",
+    "harness",
+    "acp",
+    "skills"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "ajv": "^8.17.1",
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

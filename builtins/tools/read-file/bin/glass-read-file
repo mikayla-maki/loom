@@ -1,0 +1,14 @@
+#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const input = JSON.parse(readFileSync(0, "utf8"));
+if (typeof input.path !== "string" || !input.path) {
+  console.error("read_file: 'path' is required");
+  process.exit(2);
+}
+try {
+  const text = readFileSync(input.path, "utf8");
+  process.stdout.write(text);
+} catch (e) {
+  console.error(`read_file: ${e.message}`);
+  process.exit(1);
+}

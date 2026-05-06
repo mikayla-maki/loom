@@ -1,0 +1,21 @@
+[agent]
+name = "sample-agent"
+description = "An end-to-end Glass v0 demo agent. Greets the user and shouts."
+identity = "./identity.md"
+
+[harness]
+provider = "test"
+# Configured in tests; CLI runs with an empty script (one greeting + stop).
+
+[session]
+provider = "file"
+path = "./session.jsonl"
+
+[sandbox]
+filesystem = ["./"]
+network = []
+secrets = ["sample_user_name"]
+subagent = []
+
+[skills]
+greeter = "../skills/greeter"

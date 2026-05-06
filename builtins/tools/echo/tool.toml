@@ -1,0 +1,18 @@
+[tool]
+name = "echo"
+description = "Return the provided text. Useful for tests and trivial responses."
+
+[tool.schema]
+type = "object"
+required = ["text"]
+properties.text.type = "string"
+
+[tool.invocation]
+command = "glass-echo"
+
+[tool.secrets]
+required = []
+
+[tool.capabilities]
+filesystem = []
+network = []

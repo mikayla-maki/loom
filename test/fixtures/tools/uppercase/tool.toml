@@ -1,0 +1,18 @@
+[tool]
+name = "uppercase"
+description = "Uppercase a string."
+
+[tool.schema]
+type = "object"
+required = ["text"]
+properties.text.type = "string"
+
+[tool.invocation]
+command = "sample-uppercase"
+
+[tool.secrets]
+required = []
+
+[tool.capabilities]
+filesystem = []
+network = []

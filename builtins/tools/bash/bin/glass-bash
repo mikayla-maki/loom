@@ -1,0 +1,52 @@
+#!/usr/bin/env node
+/**
+ * Glass builtin: bash
+ *
+ * Reads JSON `{ command, cwd?, timeout_ms? }` on stdin, runs it via /bin/bash -c,
+ * and writes stdout. On non-zero exit, writes the combined stderr+stdout to
+ * stderr and exits with the child's exit code.
+ */
+
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+const raw = readFileSync(0, "utf8");
+let input;
+try {
+  input = JSON.parse(raw);
+} catch (e) {
+  console.error(`bash: invalid JSON input: ${e.message}`);
+  process.exit(2);
+}
+const command = input.command;
+if (typeof command !== "string" || !command) {
+  console.error("bash: 'command' is required");
+  process.exit(2);
+}
+const cwd = typeof input.cwd === "string" ? input.cwd : process.cwd();
+const timeout = typeof input.timeout_ms === "number" ? input.timeout_ms : 30000;
+
+const child = spawn("/bin/bash", ["-c", command], {
+  cwd,
+  stdio: ["ignore", "pipe", "pipe"],
+});
+
+let stdout = "";
+let stderr = "";
+child.stdout.on("data", (b) => (stdout += b.toString("utf8")));
+child.stderr.on("data", (b) => (stderr += b.toString("utf8")));
+
+const t = setTimeout(() => {
+  child.kill("SIGKILL");
+}, timeout);
+
+child.on("close", (code, signal) => {
+  clearTimeout(t);
+  if (code === 0) {
+    process.stdout.write(stdout);
+    process.exit(0);
+  } else {
+    process.stderr.write(`exit ${code ?? signal}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`);
+    process.exit(code ?? 1);
+  }
+});

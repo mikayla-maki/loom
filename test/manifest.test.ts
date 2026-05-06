@@ -1,0 +1,173 @@
+import { describe, expect, it } from "vitest";
+import * as path from "node:path";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+
+import {
+  parseAgentManifest,
+  parseSkillManifest,
+  parseToolManifest,
+  parseSubagentsFile,
+} from "../src/manifest/parser.js";
+import { ManifestError } from "../src/errors.js";
+
+const FIXTURES = path.resolve("test/fixtures");
+
+describe("agent.toml parser", () => {
+  it("parses the sample agent.toml", async () => {
+    const m = await parseAgentManifest(path.join(FIXTURES, "sample-agent/agent.toml"));
+    expect(m.agent.name).toBe("sample-agent");
+    expect(m.harness.provider).toBe("test");
+    expect(m.session.provider).toBe("file");
+    expect(m.sandbox.filesystem).toEqual(["./"]);
+    expect(m.sandbox.secrets).toEqual(["sample_user_name"]);
+    expect(m.skills).toMatchObject({ greeter: "../skills/greeter" });
+  });
+
+  it("rejects manifests missing required sections", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-bad-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(p, '[agent]\nname = "x"\n[harness]\nprovider = "test"\n', "utf8");
+      await expect(parseAgentManifest(p)).rejects.toThrow(ManifestError);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects identity + identity_inline together", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-bad-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "x"
+identity = "./i.md"
+identity_inline = "y"
+[harness]
+provider = "test"
+[session]
+provider = "memory"
+[sandbox]
+filesystem = []
+[skills]
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(/identity/);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("tool.toml parser", () => {
+  it("parses a complete tool manifest including capabilities", async () => {
+    const t = await parseToolManifest(path.join(FIXTURES, "tools/whoami"));
+    expect(t.tool.name).toBe("greet");
+    expect(t.tool.invocation.command).toBe("sample-greet");
+    expect(t.tool.secrets.required).toEqual(["sample_user_name"]);
+    expect(t.tool.capabilities.secrets).toEqual(["sample_user_name"]);
+    expect(t.shipsBinary).toBe(true);
+    expect(t.binDir).toBe(path.join(FIXTURES, "tools/whoami", "bin"));
+  });
+
+  it("flags shipsBinary false when no bin/ exists", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-tool-"));
+    try {
+      await fs.writeFile(
+        path.join(dir, "tool.toml"),
+        `[tool]
+name = "noop"
+description = "noop"
+[tool.schema]
+type = "object"
+[tool.invocation]
+command = "echo"
+[tool.secrets]
+required = []
+[tool.capabilities]
+filesystem = []
+network = []
+`,
+        "utf8",
+      );
+      const t = await parseToolManifest(dir);
+      expect(t.shipsBinary).toBe(false);
+      expect(t.binDir).toBeUndefined();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("SKILL.md parser", () => {
+  it("parses the greeter skill", async () => {
+    const s = await parseSkillManifest(path.join(FIXTURES, "skills/greeter"));
+    expect(s.name).toBe("greeter");
+    expect(s.description).toMatch(/greet/i);
+    expect(s.requires).toEqual({
+      greet: "../../tools/whoami",
+      uppercase: "../../tools/uppercase",
+    });
+    expect(s.body).toMatch(/Greeter/);
+  });
+
+  it("supports inline subagents mapping", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-skill-"));
+    try {
+      await fs.writeFile(
+        path.join(dir, "SKILL.md"),
+        `---
+name: rich
+description: A skill with subagents
+requires: {}
+subagents:
+  helper: ../helper/agent.toml
+  remote: acp://example.com:1234/foo
+  registry: my-helper
+---
+body
+`,
+        "utf8",
+      );
+      const s = await parseSkillManifest(dir);
+      expect(s.subagents?.helper).toEqual({ kind: "path", path: "../helper/agent.toml" });
+      expect(s.subagents?.remote).toEqual({ kind: "acp", url: "acp://example.com:1234/foo" });
+      expect(s.subagents?.registry).toEqual({ kind: "registry", name: "my-helper" });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("supports subagents declared as a path to subagents.toml", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-skill-"));
+    try {
+      await fs.writeFile(
+        path.join(dir, "SKILL.md"),
+        `---
+name: with-subagents-file
+description: stuff
+requires: {}
+subagents: ./subagents.toml
+---
+body`,
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(dir, "subagents.toml"),
+        `compactor = "./compactor/agent.toml"\nremote = "acp://x:1/y"\n`,
+        "utf8",
+      );
+      const s = await parseSkillManifest(dir);
+      expect(s.subagents?.__file__).toEqual({ kind: "path", path: "./subagents.toml" });
+
+      const file = await parseSubagentsFile(path.join(dir, "subagents.toml"));
+      expect(file.compactor).toEqual({ kind: "path", path: "./compactor/agent.toml" });
+      expect(file.remote).toEqual({ kind: "acp", url: "acp://x:1/y" });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});

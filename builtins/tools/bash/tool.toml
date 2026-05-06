@@ -1,0 +1,23 @@
+[tool]
+name = "bash"
+description = "Execute a bash command. Returns stdout (or stderr on failure)."
+
+[tool.schema]
+type = "object"
+required = ["command"]
+properties.command.type = "string"
+properties.command.description = "The bash command to run."
+properties.cwd.type = "string"
+properties.cwd.description = "Optional working directory."
+properties.timeout_ms.type = "number"
+properties.timeout_ms.description = "Optional timeout in milliseconds (default 30000)."
+
+[tool.invocation]
+command = "glass-bash"
+
+[tool.secrets]
+required = []
+
+[tool.capabilities]
+filesystem = ["./"]
+network = []
