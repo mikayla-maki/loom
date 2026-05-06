@@ -37,6 +37,12 @@ export interface AgentManifest {
   sandbox: Capabilities;
   /** Map of skill name → path (relative or registry name). */
   skills: Record<string, string>;
+  /**
+   * Map of extension-name → config for *Provider* extensions. Providers
+   * dynamically contribute tools/skills at boot — for example, an MCP
+   * extension that exposes MCP-server tools as Glass tools.
+   */
+  providers: Record<string, Record<string, unknown>>;
 }
 
 /** Parsed `tool.toml` declaration. */

@@ -24,10 +24,13 @@ export {
 export {
   registerHarness,
   registerSession,
+  registerProvider,
   getHarnessFactory,
   getSessionFactory,
+  getProviderFactory,
   listHarnesses,
   listSessions,
+  listProviders,
   testHarnessFactory,
   anthropicHarnessFactory,
   openaiHarnessFactory,

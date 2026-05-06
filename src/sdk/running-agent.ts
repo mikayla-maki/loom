@@ -11,7 +11,7 @@
  */
 
 import type { SessionUpdate, StopReason } from "../types/acp.js";
-import type { Harness, Runtime, Session } from "../types/interfaces.js";
+import type { Harness, Provider, Runtime, Session } from "../types/interfaces.js";
 
 import { RuntimeImpl } from "../runtime/runtime.js";
 import type { ToolTable } from "../runtime/tool-table.js";
@@ -38,6 +38,7 @@ interface RunningAgentImplOptions {
   toolTable: ToolTable;
   skills: SkillManifest[];
   updateSink: UpdateSink;
+  providers?: Provider[];
   now?: () => Date;
 }
 
@@ -50,6 +51,7 @@ export class RunningAgentImpl implements RunningAgent {
   private readonly toolTable: ToolTable;
   private readonly skills: SkillManifest[];
   private readonly updateSink: UpdateSink;
+  private readonly providers: Provider[];
   private readonly now: (() => Date) | undefined;
 
   private currentAbortCtl: AbortController | null = null;
@@ -63,6 +65,7 @@ export class RunningAgentImpl implements RunningAgent {
     this.toolTable = opts.toolTable;
     this.skills = opts.skills;
     this.updateSink = opts.updateSink;
+    this.providers = opts.providers ?? [];
     this.secretNames = Object.keys(opts.secrets);
     this.now = opts.now;
   }
@@ -124,5 +127,10 @@ export class RunningAgentImpl implements RunningAgent {
     await this.cancel();
     this.updateSink.close();
     if (this.session.close) await this.session.close();
+    for (const p of this.providers) {
+      if (p.close) {
+        await p.close().catch(() => undefined);
+      }
+    }
   }
 }

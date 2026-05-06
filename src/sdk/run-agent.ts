@@ -8,10 +8,17 @@
  */
 
 import * as path from "node:path";
+// path is used below.
 
-import { getHarnessFactory, getSessionFactory } from "../extensions/index.js";
+import {
+  getHarnessFactory,
+  getProviderFactory,
+  getSessionFactory,
+} from "../extensions/index.js";
 import { resolveAgent, type ResolveOptions, type ResolvedAgent } from "../manifest/resolver.js";
+import { parseAgentManifest } from "../manifest/parser.js";
 import { LocalRegistry } from "../registry/registry.js";
+import type { Provider } from "../types/interfaces.js";
 import { RuntimeImpl } from "../runtime/runtime.js";
 import { ProcessTool, ToolTable } from "../runtime/tool-table.js";
 import { SpawnSubagentTool, SubagentRegistry } from "../runtime/subagent.js";
@@ -32,7 +39,7 @@ import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 export const GLASS_VERSION = "0.1.0";
 
 export interface RunAgentOptions {
-  /** Resolver options (registry, custom builtins). */
+  /** Resolver options (registry, custom builtins, providers). */
   resolve?: ResolveOptions;
   /** Custom secrets store. Defaults to env + optional secrets file in manifest dir. */
   secrets?: SecretsStore;
@@ -46,6 +53,11 @@ export interface RunAgentOptions {
   harnessConfigOverride?: Record<string, unknown>;
   /** Override the session config inline (without changing the factory). */
   sessionConfigOverride?: Record<string, unknown>;
+  /**
+   * Programmatic provider overrides — appended to whatever the manifest's
+   * [providers] table declares. Useful for tests and embedding.
+   */
+  providers?: Provider[];
   /** For testing: deterministic 'now' used in system-prompt assembly. */
   now?: () => Date;
   /** Per-tool execution timeout in ms (passed through to ProcessTool). */
@@ -62,6 +74,32 @@ export async function runAgent(
   if (!resolveOptions.registry) {
     const lr = new LocalRegistry();
     resolveOptions.registry = lr.lookup;
+  }
+
+  // Boot providers from the manifest's [providers] table BEFORE resolution
+  // so they get a chance to claim tool/skill names. Pre-parse the manifest
+  // here just to inspect [providers] and [agent].name; resolveAgent re-parses
+  // the manifest internally, which is cheap.
+  const preManifest = await parseAgentManifest(manifestPath);
+  const providerEntries = Object.entries(preManifest.providers ?? {});
+  const bootedProviders: Provider[] = [];
+  if (providerEntries.length > 0) {
+    const providerCtx = {
+      manifestDir: path.dirname(preManifest.manifestPath),
+      agentName: preManifest.agent.name,
+      glassVersion: GLASS_VERSION,
+    };
+    for (const [name, config] of providerEntries) {
+      const factory = getProviderFactory(name);
+      const inst = await factory.create(config, providerCtx);
+      bootedProviders.push(inst);
+    }
+  }
+  // Manifest-declared providers are tried first, then any extra ones the
+  // caller passed programmatically (tests, embedding).
+  const allProviders = [...bootedProviders, ...(options.providers ?? [])];
+  if (allProviders.length > 0) {
+    resolveOptions.providers = [...(resolveOptions.providers ?? []), ...allProviders];
   }
 
   const resolved = await resolveAgent(manifestPath, resolveOptions);
@@ -102,22 +140,17 @@ export async function runAgent(
     resolved.manifest.sandbox,
   );
 
-  // Tools — process-backed for declared tools, plus an in-process
-  // spawn_subagent if the skill graph reaches any subagents.
+  // Tools — provider-supplied tools win over ProcessTool construction; for
+  // any tool without a pre-built impl, fall back to spawning a subprocess.
   const processTools: Tool[] = resolved.tools
-    // The user can't ship a tool literally named spawn_subagent — we own
-    // that name. If a process-backed builtin is also named spawn_subagent
-    // (which is true for the bundled builtin), we replace it with the
-    // in-process one because it's strictly better (no cold start, no
-    // env-var registry, real capability check).
     .filter((rt) => rt.manifest.tool.name !== "spawn_subagent")
-    .map(
-      (rt) =>
-        new ProcessTool(rt.manifest, {
-          extraPath: resolved.pathAdditions,
-          ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
-        }),
-    );
+    .map((rt) => {
+      if (rt.tool) return rt.tool;
+      return new ProcessTool(rt.manifest, {
+        extraPath: resolved.pathAdditions,
+        ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
+      });
+    });
   const tools: Tool[] = [...processTools];
   const hasProcessSpawn = resolved.tools.some((rt) => rt.manifest.tool.name === "spawn_subagent");
   if (hasProcessSpawn || subagentEntries.length > 0) {
@@ -168,6 +201,7 @@ export async function runAgent(
     toolTable,
     skills: allSkills,
     updateSink,
+    providers: allProviders,
     ...(options.now ? { now: options.now } : {}),
   });
 }

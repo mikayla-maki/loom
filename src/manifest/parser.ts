@@ -74,6 +74,25 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
     skills[k] = v;
   }
 
+  // [providers] — pluggable resolvers (e.g. mcp). Each entry is keyed by the
+  // extension's bare-name; value is an arbitrary config table.
+  const providersRaw = raw.providers ?? {};
+  if (typeof providersRaw !== "object" || Array.isArray(providersRaw)) {
+    throw new ManifestError(`agent.toml at ${abs}: [providers] must be a table`);
+  }
+  const providers: Record<string, Record<string, unknown>> = {};
+  for (const [k, v] of Object.entries(providersRaw as Record<string, unknown>)) {
+    if (v === null || v === undefined) {
+      providers[k] = {};
+    } else if (typeof v !== "object" || Array.isArray(v)) {
+      throw new ManifestError(
+        `agent.toml at ${abs}: [providers].${k} must be a table, got ${typeof v}`,
+      );
+    } else {
+      providers[k] = v as Record<string, unknown>;
+    }
+  }
+
   const manifest: AgentManifest = {
     manifestPath: abs,
     agent: {
@@ -88,6 +107,7 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
     session: { ...(session as Record<string, unknown>), provider: session.provider as string },
     sandbox,
     skills,
+    providers,
   };
   return manifest;
 }

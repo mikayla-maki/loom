@@ -147,3 +147,58 @@ export interface ExtensionContext {
   /** Glass version. */
   glassVersion: string;
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Provider — a pluggable resolver for tools and/or skills.
+//
+// The resolver consults provider instances *before* falling back to the
+// LocalRegistry / builtins. This is how a future MCP extension would
+// surface MCP-server tools as Glass tools without anything ever existing
+// on disk: at boot the provider connects to the server(s), and resolveTool
+// returns a synthetic ToolManifest plus a pre-built Tool that proxies to
+// the MCP server.
+//
+// Providers can also resolve skills (and skills can come bundled with
+// already-instantiated tools — useful when the provider's tools share a
+// connection or auth scope).
+// ────────────────────────────────────────────────────────────────────────────
+
+import type { ToolManifest } from "./manifest.js";
+
+/** Result of provider resolution — either a path on disk, or a synthetic in-memory bundle. */
+export type ProviderToolResolution =
+  | { kind: "path"; path: string }
+  | { kind: "synthetic"; manifest: ToolManifest; tool: Tool };
+
+export type ProviderSkillResolution =
+  | { kind: "path"; path: string }
+  | {
+      kind: "synthetic";
+      manifest: SkillManifest;
+      /** Map of model-facing tool name → resolved tool. */
+      tools: Map<string, { manifest: ToolManifest; tool: Tool }>;
+    };
+
+export interface Provider {
+  /** Optional: resolve a tool by model-facing name. Return null to pass. */
+  resolveTool?(
+    name: string,
+  ): Promise<ProviderToolResolution | null> | ProviderToolResolution | null;
+
+  /** Optional: resolve a skill by name. Return null to pass. */
+  resolveSkill?(
+    name: string,
+  ): Promise<ProviderSkillResolution | null> | ProviderSkillResolution | null;
+
+  /** Optional: enumerate all currently-available tools/skills (for audit / listing). */
+  list?(): Promise<{ skills?: string[]; tools?: string[] }> | { skills?: string[]; tools?: string[] };
+
+  /** Optional cleanup. Called when the agent closes. */
+  close?(): Promise<void>;
+}
+
+export interface ProviderFactory {
+  /** Bare-name the runtime resolves to find this extension. */
+  readonly name: string;
+  create(config: Record<string, unknown>, ctx: ExtensionContext): Promise<Provider> | Provider;
+}

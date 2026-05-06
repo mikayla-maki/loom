@@ -60,17 +60,37 @@ export type RegistryLookup = (kind: "skill" | "tool" | "agent", name: string) =>
   | null
   | Promise<string | null>;
 
+import type {
+  Provider,
+  ProviderSkillResolution,
+  ProviderToolResolution,
+  Tool as ToolImpl,
+} from "../types/interfaces.js";
+
 export interface ResolveOptions {
   /** Optional registry lookup; bare names try this before failing. */
   registry?: RegistryLookup;
   /** Override builtins directory (used by tests). */
   builtinsDir?: string;
+  /**
+   * Pluggable resolver chain. Each Provider may claim a tool or skill name
+   * before the resolver falls back to local path / registry / builtin. This
+   * is the extension point an MCP-style extension would implement to expose
+   * MCP-server tools as Glass tools.
+   */
+  providers?: Provider[];
 }
 
 export interface ResolvedTool {
   manifest: ToolManifest;
   /** The skill that pulled this tool in (used for v1 broker token scoping). */
   introducedBy: string;
+  /**
+   * Pre-built Tool implementation, supplied by a Provider. When present,
+   * runAgent uses this instead of constructing a ProcessTool. This is how
+   * non-process tools (MCP servers, HTTP-backed tools, etc.) plug in.
+   */
+  tool?: ToolImpl;
 }
 
 export interface ResolvedSkill {
@@ -114,25 +134,79 @@ export async function resolveAgent(
   // Resolve identity content.
   const identity = await resolveIdentity(manifest, baseDir);
 
+  const providers = options.providers ?? [];
+
   // Resolve each skill.
   const skills: ResolvedSkill[] = [];
   for (const [skillName, skillRef] of Object.entries(manifest.skills)) {
-    const skillDir = await resolveSkillPath(skillRef, baseDir, opts);
-    const skillManifest = await parseSkillManifest(skillDir);
-    if (skillManifest.name !== skillName) {
-      // Soft warning shape: allow rename but expose under manifest key.
-      // We use the skill's manifest name as canonical.
+    let skillManifest: SkillManifest;
+    let providerSuppliedTools: Map<string, { manifest: ToolManifest; tool: ToolImpl }> | undefined;
+
+    // 1. Provider chain claims this skill name (only for non-path-like refs).
+    if (!isPathLike(skillRef)) {
+      const claim = await firstNonNull(providers, (p) =>
+        p.resolveSkill ? Promise.resolve(p.resolveSkill(skillRef)) : Promise.resolve(null),
+      );
+      if (claim) {
+        if (claim.kind === "synthetic") {
+          skillManifest = claim.manifest;
+          providerSuppliedTools = claim.tools;
+        } else {
+          skillManifest = await parseSkillManifest(claim.path);
+        }
+      } else {
+        const skillDir = await resolveSkillPath(skillRef, baseDir, opts);
+        skillManifest = await parseSkillManifest(skillDir);
+      }
+    } else {
+      const skillDir = await resolveSkillPath(skillRef, baseDir, opts);
+      skillManifest = await parseSkillManifest(skillDir);
     }
+
+    void skillName; // skill key is informational; the skill's own name is canonical
+
     const skillTools: ResolvedTool[] = [];
     for (const [toolModelName, toolRef] of Object.entries(skillManifest.requires)) {
-      const toolDir = await resolveToolPath(toolRef, skillManifest.skillDir, opts, toolModelName);
-      const toolManifest = await parseToolManifest(toolDir);
-      // The model-facing name in the skill MUST equal the tool's declared name.
-      if (toolManifest.tool.name !== toolModelName) {
-        throw new ManifestError(
-          `Skill ${skillManifest.name} requires tool '${toolModelName}' but ${toolManifest.manifestPath} declares name '${toolManifest.tool.name}'`,
+      // 1. Tool came pre-built with the synthetic skill.
+      const supplied = providerSuppliedTools?.get(toolModelName);
+      if (supplied) {
+        validateToolName(skillManifest.name, toolModelName, supplied.manifest);
+        skillTools.push({
+          manifest: supplied.manifest,
+          introducedBy: skillManifest.name,
+          tool: supplied.tool,
+        });
+        continue;
+      }
+
+      // 2. Provider chain claims this tool by reference name (non-path-like).
+      let providerTool: ProviderToolResolution | null = null;
+      if (!isPathLike(toolRef) && toolRef !== "builtin" && !toolRef.startsWith("builtin:")) {
+        providerTool = await firstNonNull(providers, (p) =>
+          p.resolveTool ? Promise.resolve(p.resolveTool(toolRef)) : Promise.resolve(null),
         );
       }
+      if (providerTool) {
+        if (providerTool.kind === "synthetic") {
+          validateToolName(skillManifest.name, toolModelName, providerTool.manifest);
+          skillTools.push({
+            manifest: providerTool.manifest,
+            introducedBy: skillManifest.name,
+            tool: providerTool.tool,
+          });
+          continue;
+        } else {
+          const toolManifest = await parseToolManifest(providerTool.path);
+          validateToolName(skillManifest.name, toolModelName, toolManifest);
+          skillTools.push({ manifest: toolManifest, introducedBy: skillManifest.name });
+          continue;
+        }
+      }
+
+      // 3. Path / registry / builtin (existing behaviour).
+      const toolDir = await resolveToolPath(toolRef, skillManifest.skillDir, opts, toolModelName);
+      const toolManifest = await parseToolManifest(toolDir);
+      validateToolName(skillManifest.name, toolModelName, toolManifest);
       skillTools.push({ manifest: toolManifest, introducedBy: skillManifest.name });
     }
 
@@ -195,6 +269,25 @@ export async function resolveAgent(
     requiredSecrets,
     pathAdditions,
   };
+}
+
+function validateToolName(skillName: string, expected: string, m: ToolManifest): void {
+  if (m.tool.name !== expected) {
+    throw new ManifestError(
+      `Skill ${skillName} requires tool '${expected}' but ${m.manifestPath} declares name '${m.tool.name}'`,
+    );
+  }
+}
+
+async function firstNonNull<T extends object, R>(
+  arr: T[],
+  fn: (t: T) => Promise<R | null | undefined>,
+): Promise<R | null> {
+  for (const item of arr) {
+    const v = await fn(item);
+    if (v !== null && v !== undefined) return v as R;
+  }
+  return null;
 }
 
 async function resolveIdentity(manifest: AgentManifest, baseDir: string): Promise<string> {
