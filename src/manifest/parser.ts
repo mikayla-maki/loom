@@ -101,6 +101,26 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
     }
   }
 
+  // [extensions] — npm packages to dynamic-import at boot. Keys are package
+  // names (which may be scoped). Values are arbitrary config tables passed
+  // to the package's register() function.
+  const extensionsRaw = raw.extensions ?? {};
+  if (typeof extensionsRaw !== "object" || Array.isArray(extensionsRaw)) {
+    throw new ManifestError(`agent.toml at ${abs}: [extensions] must be a table`);
+  }
+  const extensions: Record<string, Record<string, unknown>> = {};
+  for (const [k, v] of Object.entries(extensionsRaw as Record<string, unknown>)) {
+    if (v === null || v === undefined) {
+      extensions[k] = {};
+    } else if (typeof v !== "object" || Array.isArray(v)) {
+      throw new ManifestError(
+        `agent.toml at ${abs}: [extensions]."${k}" must be a table, got ${typeof v}`,
+      );
+    } else {
+      extensions[k] = v as Record<string, unknown>;
+    }
+  }
+
   const manifest: AgentManifest = {
     manifestPath: abs,
     agent: {
@@ -115,6 +135,7 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
     sandbox,
     skills,
     providers,
+    extensions,
   };
   return manifest;
 }

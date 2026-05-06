@@ -15,6 +15,7 @@ import {
   getProviderFactory,
   getSessionFactory,
 } from "../extensions/index.js";
+import { loadExtensionPackage, type LoadOptions } from "../extensions/loader.js";
 import { resolveAgent, type ResolveOptions, type ResolvedAgent } from "../manifest/resolver.js";
 import { parseAgentManifest } from "../manifest/parser.js";
 import { LocalRegistry } from "../registry/registry.js";
@@ -69,6 +70,12 @@ export interface RunAgentOptions {
    * such requests fail closed.
    */
   permissionHandler?: PermissionHandler;
+  /**
+   * Override the search paths used to resolve `[extensions]` package names.
+   * In test contexts this typically points at a fixtures directory that
+   * looks like a node_modules tree.
+   */
+  extensionLoadOptions?: LoadOptions;
   /** For testing: deterministic 'now' used in system-prompt assembly. */
   now?: () => Date;
   /** Per-tool execution timeout in ms (passed through to ProcessTool). */
@@ -92,6 +99,28 @@ export async function runAgent(
   // here just to inspect [providers] and [agent].name; resolveAgent re-parses
   // the manifest internally, which is cheap.
   const preManifest = await parseAgentManifest(manifestPath);
+
+  // Activate npm-installed Glass extension packages BEFORE we resolve
+  // anything else. Each listed package's register() may install harness /
+  // session / provider factories (named, activated through manifest tables)
+  // OR call api.addProvider(...) to auto-activate provider instances for
+  // this agent.
+  const extensionEntries = Object.entries(preManifest.extensions ?? {});
+  const extensionProviders: Provider[] = [];
+  for (const [pkgName, pkgConfig] of extensionEntries) {
+    const { addedProviders } = await loadExtensionPackage(
+      pkgName,
+      pkgConfig,
+      {
+        agentManifestDir: path.dirname(preManifest.manifestPath),
+        agentName: preManifest.agent.name,
+        glassVersion: GLASS_VERSION,
+      },
+      options.extensionLoadOptions ?? {},
+    );
+    extensionProviders.push(...addedProviders);
+  }
+
   const providerEntries = Object.entries(preManifest.providers ?? {});
   const bootedProviders: Provider[] = [];
   if (providerEntries.length > 0) {
@@ -106,9 +135,13 @@ export async function runAgent(
       bootedProviders.push(inst);
     }
   }
-  // Manifest-declared providers are tried first, then any extra ones the
-  // caller passed programmatically (tests, embedding).
-  const allProviders = [...bootedProviders, ...(options.providers ?? [])];
+  // Provider chain priority: extension-auto-added → manifest [providers] →
+  // programmatic options.providers. Earlier entries claim names first.
+  const allProviders = [
+    ...extensionProviders,
+    ...bootedProviders,
+    ...(options.providers ?? []),
+  ];
   if (allProviders.length > 0) {
     resolveOptions.providers = [...(resolveOptions.providers ?? []), ...allProviders];
   }

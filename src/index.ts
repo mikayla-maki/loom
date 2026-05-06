@@ -40,5 +40,17 @@ export {
 
 export type { TestHarnessConfig, TurnScript, TurnStep } from "./extensions/harness/test.js";
 
+export {
+  loadExtensionPackage,
+  locateExtensionPackage,
+  listInstalledExtensions,
+} from "./extensions/loader.js";
+export type {
+  GlassExtensionApi,
+  GlassExtensionModule,
+  ExtensionPackageInfo,
+  LoadOptions as ExtensionLoadOptions,
+} from "./extensions/loader.js";
+
 export { auditAgent } from "./audit/audit.js";
 export type { CapabilityTree } from "./audit/audit.js";

@@ -77,6 +77,60 @@ await agent.prompt("Hello, agent.");
 await agent.close();
 ```
 
+## Distributing extensions via npm / GitHub
+
+A Glass extension is a regular npm package with a `glass.extension` field in
+its `package.json` pointing at an entry that exports a `register()` function:
+
+```json
+{
+  "name": "mcp-glass-extension",
+  "type": "module",
+  "main": "./dist/index.js",
+  "glass": { "extension": "./dist/index.js" }
+}
+```
+
+```js
+// dist/index.js
+export function register(api) {
+  // Register a named factory the user activates via [providers]:
+  api.registerProvider({
+    name: "mcp",
+    create(config, ctx) { /* ... */ },
+  });
+
+  // OR auto-activate a Provider for the agent that listed this extension:
+  api.addProvider({
+    resolveTool(name) { /* ... */ },
+    async list() { return { tools: [...] }; },
+    async close() {},
+  });
+}
+```
+
+Activation is explicit (extensions run as the runtime trust class):
+
+```toml
+[extensions]
+"mcp-glass-extension" = { servers = ["filesystem"] }
+"@my-org/glass-foo"   = {}
+```
+
+Discovery walks `<manifest-dir>/node_modules` → `npm root -g` → `~/.glass/extensions`,
+so any of the following works:
+
+```sh
+npm install mcp-glass-extension                    # local
+npm install -g mcp-glass-extension                 # global
+npm install github:user/mcp-glass-extension        # any git ref
+npm install file:./local-path                      # local checkout
+```
+
+Once installed, `glass extensions list` shows packages that declared
+themselves as extensions (i.e. have a `glass.extension` field). Without an
+entry in `[extensions]`, packages are visible but inert.
+
 ## Design
 
 This implementation follows the v0 / v1 design documents (four resources,

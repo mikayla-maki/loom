@@ -49,6 +49,20 @@ export interface AgentManifest {
    * extension that exposes MCP-server tools as Glass tools.
    */
   providers: Record<string, Record<string, unknown>>;
+  /**
+   * Map of npm-package-name → config for Glass *extension packages*. At
+   * boot, each listed package is dynamic-imported and its register()
+   * function is called; the package decides what to install (harnesses,
+   * sessions, providers).
+   *
+   *   [extensions]
+   *   "mcp-glass-extension" = { servers = ["filesystem"] }
+   *   "@example/glass-foo" = {}
+   *
+   * Discovery scopes <manifestDir>/node_modules → npm global root →
+   * ~/.glass/extensions.
+   */
+  extensions: Record<string, Record<string, unknown>>;
 }
 
 /** Parsed `tool.toml` declaration. */

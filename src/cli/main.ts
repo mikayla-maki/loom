@@ -39,6 +39,8 @@ async function main(argv: string[]): Promise<number> {
       return await cmdInstall(argv.slice(1));
     case "list":
       return await cmdList(argv.slice(1));
+    case "extensions":
+      return await cmdExtensions(argv.slice(1));
     default:
       console.error(`Unknown subcommand: ${cmd}`);
       printHelp();
@@ -58,6 +60,8 @@ Usage:
   glass daemon [--socket <path>]          Run the broker daemon (v1).
   glass install <kind> <path> [--name N]  Install a skill/tool/agent into ~/.glass.
   glass list <kind>                       List installed skills/tools/agents.
+  glass extensions list                   List Glass extension npm packages on disk.
+  glass extensions info <name>            Show resolved metadata for an extension package.
 
 Where <kind> ∈ { skill | tool | agent }.
 
@@ -180,6 +184,46 @@ async function cmdAcp(args: string[]): Promise<number> {
   const agent = await runAgent(manifestPath);
   await serveOverStdio(agent);
   return 0;
+}
+
+async function cmdExtensions(args: string[]): Promise<number> {
+  const sub = args[0];
+  const { listInstalledExtensions, locateExtensionPackage } = await import(
+    "../extensions/loader.js"
+  );
+  if (sub === "list") {
+    const items = await listInstalledExtensions({});
+    if (items.length === 0) {
+      process.stdout.write(
+        "(no Glass extension packages found in node_modules, npm root -g, or ~/.glass/extensions)\n",
+      );
+      return 0;
+    }
+    for (const e of items) {
+      const head = e.version ? `${e.name}@${e.version}` : e.name;
+      process.stdout.write(`${head}\n`);
+      if (e.description) process.stdout.write(`  ${e.description}\n`);
+      process.stdout.write(`  ${e.entryPath}\n`);
+    }
+    return 0;
+  }
+  if (sub === "info") {
+    const name = args[1];
+    if (!name) {
+      console.error("usage: glass extensions info <name>");
+      return 2;
+    }
+    try {
+      const info = await locateExtensionPackage(name, { agentManifestDir: process.cwd() });
+      process.stdout.write(JSON.stringify(info, null, 2) + "\n");
+      return 0;
+    } catch (e) {
+      console.error((e as Error).message);
+      return 1;
+    }
+  }
+  console.error("usage: glass extensions <list|info> [name]");
+  return 2;
 }
 
 async function cmdInstall(args: string[]): Promise<number> {
