@@ -22,6 +22,7 @@ import { LocalRegistry } from "../registry/registry.js";
 import { AgentState } from "../runtime/agent-state.js";
 import { AddSkillTool, SearchSkillsTool, type SkillDiscoveryDeps } from "../runtime/skill-discovery.js";
 import { fileURLToPath } from "node:url";
+import * as fsSync from "node:fs";
 import type { Provider } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
 import { RuntimeImpl } from "../runtime/runtime.js";
@@ -295,9 +296,7 @@ function resolveBuiltinsDir(override: string | undefined): string {
   for (let i = 0; i < 5; i++) {
     const candidate = path.join(dir, "builtins");
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const sync = require("node:fs") as typeof import("node:fs");
-      if (sync.existsSync(candidate)) return candidate;
+      if (fsSync.existsSync(candidate)) return candidate;
     } catch {
       // ignore
     }

@@ -1,0 +1,73 @@
+#!/usr/bin/env node
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join, sep, relative, resolve } from "node:path";
+
+const input = JSON.parse(readFileSync(0, "utf8"));
+if (typeof input.pattern !== "string" || !input.pattern) {
+  console.error("find: 'pattern' is required");
+  process.exit(2);
+}
+const root = typeof input.root === "string" ? input.root : ".";
+const limit = typeof input.limit === "number" && input.limit > 0 ? input.limit : 200;
+
+// Compile a simple glob → RegExp. Supports * (single segment) and ** (any depth).
+function globToRegex(g) {
+  const parts = g.split("/");
+  let out = "^";
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (i > 0) out += "/";
+    if (p === "**") {
+      out += "(?:.*)";
+    } else {
+      let segment = "";
+      for (const ch of p) {
+        if (ch === "*") segment += "[^/]*";
+        else if (ch === "?") segment += "[^/]";
+        else if (/[.+^${}()|[\]\\]/.test(ch)) segment += "\\" + ch;
+        else segment += ch;
+      }
+      out += segment;
+    }
+  }
+  out += "$";
+  return new RegExp(out);
+}
+
+const re = globToRegex(input.pattern);
+const matches = [];
+const SKIP = new Set(["node_modules", ".git", "dist", ".cache", ".turbo"]);
+
+function walk(dir) {
+  if (matches.length >= limit) return;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (matches.length >= limit) return;
+    if (SKIP.has(e.name)) continue;
+    const abs = join(dir, e.name);
+    const rel = relative(root, abs).split(sep).join("/");
+    if (e.isDirectory()) {
+      walk(abs);
+    } else if (e.isFile() || e.isSymbolicLink()) {
+      if (re.test(rel)) matches.push(rel);
+    }
+  }
+}
+
+try {
+  const stat = statSync(resolve(root));
+  if (!stat.isDirectory()) {
+    console.error(`find: ${root} is not a directory`);
+    process.exit(1);
+  }
+  walk(resolve(root));
+  process.stdout.write(matches.join("\n"));
+} catch (e) {
+  console.error(`find: ${e.message}`);
+  process.exit(1);
+}

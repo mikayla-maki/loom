@@ -23,6 +23,8 @@ describe("GlassDaemon — Unix socket transport", () => {
         `[agent]
 name = "daemon-agent"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 echo = true
@@ -62,6 +64,8 @@ secrets = []
           `[agent]
 name = "second"
 system_prompt = "y"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -100,6 +104,8 @@ secrets = []
         `[agent]
 name = "child"
 system_prompt = "c"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 echo = true

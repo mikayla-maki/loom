@@ -31,6 +31,13 @@ export interface AgentManifest {
      *   - anything else → used as the literal text
      */
     systemPrompt?: string;
+    /**
+     * `[agent].remove_builtin_tools` — when true, suppress the auto-loaded
+     * `core` builtin skill (bash / read_file / write_file / find). The
+     * agent only sees the tools its manifest brings in via `[skills]`.
+     * Default: false.
+     */
+    removeBuiltinTools?: boolean;
   };
   harness: {
     provider: string;
@@ -98,6 +105,13 @@ export interface SkillManifest {
   requires: Record<string, string>;
   /** v1: subagents this skill may invoke (path / inline / acp:// / registry). */
   subagents?: Record<string, SubagentReference>;
+  /**
+   * If true, the runtime renders this skill's body as part of the manifest's
+   * core system prompt (rather than under `# Available Skills`), so the
+   * model treats its tools as always-on. The auto-loaded `core` builtin
+   * uses this to behave like ambient guidance, not an opt-in capability.
+   */
+  inlineInSystemPrompt?: boolean;
 }
 
 export type SubagentReference =

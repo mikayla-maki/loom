@@ -44,6 +44,8 @@ describe("agent.toml parser", () => {
         `[agent]
 name = "x"
 identity = "./i.md"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -69,6 +71,8 @@ filesystem = []
         `[agent]
 name = "x"
 system_prompt = "You are a friendly demo agent."
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -95,6 +99,8 @@ filesystem = []
         `[agent]
 name = "x"
 system_prompt = "./prompt.md"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

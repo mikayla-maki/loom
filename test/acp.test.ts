@@ -131,6 +131,8 @@ describe("ACP over spawned `glass acp serve` (subprocess, real stdio)", () => {
         `[agent]
 name = "acp-sample"
 system_prompt = "./identity.md"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 echo = true

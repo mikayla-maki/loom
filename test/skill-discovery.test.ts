@@ -155,6 +155,8 @@ Use search_skills to list candidates; use add_skill to load one.
   const agentToml = `[agent]
 name = "discoverer"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -566,6 +568,8 @@ body
         `[agent]
 name = "acp-discoverer"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "script-add-skill"
 [session]
@@ -649,6 +653,8 @@ body
         `[agent]
 name = "ax"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "script-add-skill-2"
 [session]

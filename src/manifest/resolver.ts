@@ -7,6 +7,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,10 +46,11 @@ function builtinsDir(): string {
 }
 
 function existsSyncSafe(p: string): boolean {
+  // node:fs's existsSync is the simplest way to do a sync existence check;
+  // we need it sync because builtinsDir() walks the directory tree at
+  // module load time and needs to return synchronously.
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const sync = require("node:fs") as typeof import("node:fs");
-    return sync.existsSync(p);
+    return existsSync(p);
   } catch {
     return false;
   }
@@ -138,8 +140,34 @@ export async function resolveAgent(
 
   const providers = options.providers ?? [];
 
-  // Resolve each skill.
+  // Resolve each skill. The auto-loaded `core` builtin (if not opted out)
+  // is always first so its tools are always available; subsequent skills
+  // can introduce more, but a manifest skill that names the same tools
+  // would collide with these (the resolver dedupes by tool name and last
+  // writer wins, so user-defined shadows are explicit).
   const skills: ResolvedSkill[] = [];
+  if (!manifest.agent.removeBuiltinTools) {
+    const coreDir = path.join(opts.builtinsDir ?? builtinsDir(), "skills", "core");
+    if (await isDir(coreDir)) {
+      const coreManifest = await parseSkillManifest(coreDir);
+      // Mark the core skill so the runtime renders its body inline rather
+      // than under '# Available Skills'.
+      coreManifest.inlineInSystemPrompt = true;
+      const coreTools: ResolvedTool[] = [];
+      for (const [toolModelName, toolRef] of Object.entries(coreManifest.requires)) {
+        const toolDir = await resolveToolPath(
+          toolRef,
+          coreManifest.skillDir,
+          opts,
+          toolModelName,
+        );
+        const toolManifest = await parseToolManifest(toolDir);
+        validateToolName(coreManifest.name, toolModelName, toolManifest);
+        coreTools.push({ manifest: toolManifest, introducedBy: coreManifest.name });
+      }
+      skills.push({ manifest: coreManifest, tools: coreTools, subagents: {} });
+    }
+  }
   for (const [skillName, skillRef] of Object.entries(manifest.skills)) {
     let skillManifest: SkillManifest;
     let providerSuppliedTools: Map<string, { manifest: ToolManifest; tool: ToolImpl }> | undefined;
@@ -228,8 +256,12 @@ export async function resolveAgent(
   }
   const tools = Array.from(flat.values());
 
-  // Validate capabilities.
+  // Validate capabilities. If the failure involves a tool introduced by the
+  // auto-loaded `core` skill, surface a hint about the opt-out flag.
   const required = unionCapabilities(tools.map((t) => t.manifest.tool.capabilities));
+  const coreTools = new Set(
+    tools.filter((t) => t.introducedBy === "core").map((t) => t.manifest.tool.name),
+  );
   // Subagents declared by skills bubble into required.subagent.
   const subagentNames = new Set<string>();
   for (const sk of skills) {
@@ -243,7 +275,19 @@ export async function resolveAgent(
       required.subagent = Array.from(new Set([...(cur ?? []), ...subagentNames]));
     }
   }
-  assertSubset(required, manifest.sandbox);
+  try {
+    assertSubset(required, manifest.sandbox);
+  } catch (e) {
+    if (coreTools.size > 0 && !manifest.agent.removeBuiltinTools) {
+      const original = (e as Error).message;
+      const wrapped = new Error(
+        `${original}\n\nHint: this includes capabilities required by the auto-loaded 'core' builtin skill (${[...coreTools].join(", ")}). Either widen [sandbox] to fit, or set [agent].remove_builtin_tools = true.`,
+      );
+      wrapped.name = (e as Error).name;
+      throw wrapped;
+    }
+    throw e;
+  }
 
   // Required secrets.
   const requiredSecrets = new Map<string, string[]>();

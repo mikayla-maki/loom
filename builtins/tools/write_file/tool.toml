@@ -1,0 +1,25 @@
+[tool]
+name = "write_file"
+description = "Write (or overwrite, or append to) a UTF-8 file on disk."
+
+[tool.schema]
+type = "object"
+required = ["path", "content"]
+properties.path.type = "string"
+properties.path.description = "File path to write."
+properties.content.type = "string"
+properties.content.description = "Full file contents."
+properties.append.type = "boolean"
+properties.append.description = "If true, append to the file instead of overwriting (default: false)."
+properties.create_dirs.type = "boolean"
+properties.create_dirs.description = "If true, create missing parent directories (default: false)."
+
+[tool.invocation]
+command = "glass-write-file"
+
+[tool.secrets]
+required = []
+
+[tool.capabilities]
+filesystem = ["./"]
+network = []

@@ -98,6 +98,8 @@ body
         `[agent]
 name = "provider-agent"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -196,6 +198,8 @@ s = "../skills/shout"
         `[agent]
 name = "skill-provider-agent"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -304,6 +308,8 @@ body
         `[agent]
 name = "manifest-provider-agent"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -389,6 +395,8 @@ body`,
         `[agent]
 name = "n"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -450,6 +458,8 @@ body`,
         `[agent]
 name = "audit-prov"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

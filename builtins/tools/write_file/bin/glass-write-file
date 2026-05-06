@@ -1,0 +1,27 @@
+#!/usr/bin/env node
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
+const input = JSON.parse(readFileSync(0, "utf8"));
+if (typeof input.path !== "string" || !input.path) {
+  console.error("write_file: 'path' is required");
+  process.exit(2);
+}
+if (typeof input.content !== "string") {
+  console.error("write_file: 'content' must be a string");
+  process.exit(2);
+}
+try {
+  if (input.create_dirs) {
+    mkdirSync(dirname(input.path), { recursive: true });
+  }
+  if (input.append) {
+    appendFileSync(input.path, input.content, "utf8");
+  } else {
+    writeFileSync(input.path, input.content, "utf8");
+  }
+  process.stdout.write(`wrote ${input.content.length} bytes to ${input.path}`);
+} catch (e) {
+  console.error(`write_file: ${e.message}`);
+  process.exit(1);
+}

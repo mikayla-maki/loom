@@ -51,6 +51,29 @@ npm test                 # 28+ tests covering parser, resolver, runtime, ACP, au
 node dist/cli/main.js help
 ```
 
+## Default capabilities (auto-loaded `core` skill)
+
+Every agent boots with a built-in `core` skill that brings four tools into
+scope: `bash`, `read_file`, `write_file`, and `find`. The skill's body is
+inlined into the system prompt — no `# Available Skills` entry, no "invoke
+the core skill" dance — so the model treats the file/shell tools as ambient
+capability.
+
+The agent's `[sandbox]` ceiling still applies: the four core tools all
+declare `filesystem = ["./"]`, so an agent with a tighter sandbox either
+widens it or opts out:
+
+```toml
+[agent]
+name = "minimal"
+system_prompt = "..."
+remove_builtin_tools = true     # opt out of bash/read_file/write_file/find
+```
+
+If `[sandbox]` doesn't fit the core tools and `remove_builtin_tools` is
+false, the resolver throws a `CapabilityError` whose message points at the
+opt-out flag.
+
 ## End-to-end demo (no LLM required)
 
 ```sh

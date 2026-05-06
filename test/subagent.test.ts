@@ -31,6 +31,8 @@ async function buildSubagentFixture(opts: {
     `[agent]
 name = "helper"
 system_prompt = "child"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 echo = true
@@ -75,6 +77,8 @@ body
     `[agent]
 name = "parent"
 system_prompt = "parent"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -231,6 +235,8 @@ body
         `[agent]
 name = "p"
 system_prompt = "p"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

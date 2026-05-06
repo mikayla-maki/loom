@@ -197,6 +197,8 @@ body`,
         `[agent]
 name = "iso"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

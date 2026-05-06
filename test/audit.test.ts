@@ -11,7 +11,14 @@ describe("auditAgent", () => {
   it("produces a static capability tree for the sample agent", async () => {
     const tree = await auditAgent(path.join(FIXTURES, "sample-agent/agent.toml"));
     expect(tree.name).toBe("sample-agent");
-    expect(tree.tools.map((t) => t.name).sort()).toEqual(["greet", "uppercase"]);
+    expect(tree.tools.map((t) => t.name).sort()).toEqual([
+      "bash",
+      "find",
+      "greet",
+      "read_file",
+      "uppercase",
+      "write_file",
+    ]);
     expect(tree.required.secrets).toEqual(["sample_user_name"]);
     expect(tree.subagents).toHaveLength(0);
     const printed = formatCapabilityTree(tree);
@@ -45,6 +52,8 @@ body
         `[agent]
 name = "self"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

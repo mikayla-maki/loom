@@ -1,0 +1,23 @@
+[tool]
+name = "find"
+description = "List files in the current tree matching a glob pattern. Use **/ for recursive descent."
+
+[tool.schema]
+type = "object"
+required = ["pattern"]
+properties.pattern.type = "string"
+properties.pattern.description = "Glob pattern (e.g. '**/*.ts', 'src/**/*.json'). Supports * and **."
+properties.root.type = "string"
+properties.root.description = "Root directory to walk (default: '.')."
+properties.limit.type = "number"
+properties.limit.description = "Max results to return (default: 200)."
+
+[tool.invocation]
+command = "glass-find"
+
+[tool.secrets]
+required = []
+
+[tool.capabilities]
+filesystem = ["./"]
+network = []

@@ -55,6 +55,14 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
       `agent.toml at ${abs}: [agent].system_prompt must be a string (got ${typeof agent.system_prompt})`,
     );
   }
+  if (
+    agent.remove_builtin_tools != null &&
+    typeof agent.remove_builtin_tools !== "boolean"
+  ) {
+    throw new ManifestError(
+      `agent.toml at ${abs}: [agent].remove_builtin_tools must be a boolean (got ${typeof agent.remove_builtin_tools})`,
+    );
+  }
 
   const harness = ensureObject(raw.harness, "[harness]", abs);
   if (typeof harness.provider !== "string" || !harness.provider) {
@@ -128,6 +136,9 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
       ...(typeof agent.description === "string" ? { description: agent.description } : {}),
       ...(typeof agent.system_prompt === "string"
         ? { systemPrompt: agent.system_prompt }
+        : {}),
+      ...(typeof agent.remove_builtin_tools === "boolean"
+        ? { removeBuiltinTools: agent.remove_builtin_tools }
         : {}),
     },
     harness: { ...(harness as Record<string, unknown>), provider: harness.provider as string },

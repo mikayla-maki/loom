@@ -38,6 +38,8 @@ describe("FileSession", () => {
         `[agent]
 name = "persist"
 system_prompt = "./identity.md"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

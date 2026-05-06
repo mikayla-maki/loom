@@ -9,14 +9,67 @@ import { CapabilityError, ManifestError } from "../src/errors.js";
 const FIXTURES = path.resolve("test/fixtures");
 
 describe("resolveAgent", () => {
-  it("resolves the sample agent end-to-end", async () => {
+  it("resolves the sample agent end-to-end (includes the auto-loaded 'core' builtin)", async () => {
     const r = await resolveAgent(path.join(FIXTURES, "sample-agent/agent.toml"));
-    expect(r.skills).toHaveLength(1);
-    expect(r.skills[0]?.manifest.name).toBe("greeter");
-    expect(r.tools.map((t) => t.manifest.tool.name).sort()).toEqual(["greet", "uppercase"]);
+    // 2 skills: the auto-loaded `core` (file/shell tools) + the manifest's `greeter`.
+    expect(r.skills).toHaveLength(2);
+    expect(r.skills.map((s) => s.manifest.name).sort()).toEqual(["core", "greeter"]);
+    expect(r.skills.find((s) => s.manifest.name === "core")?.manifest.inlineInSystemPrompt).toBe(
+      true,
+    );
+    // Tools include the manifest's pair plus the 4 core builtins.
+    expect(r.tools.map((t) => t.manifest.tool.name).sort()).toEqual([
+      "bash",
+      "find",
+      "greet",
+      "read_file",
+      "uppercase",
+      "write_file",
+    ]);
     expect(r.systemPrompt).toMatch(/Sample Agent/);
     expect(r.requiredSecrets.has("sample_user_name")).toBe(true);
-    expect(r.pathAdditions).toHaveLength(2);
+    // pathAdditions: 4 core tool bin dirs + 2 manifest tool bin dirs.
+    expect(r.pathAdditions).toHaveLength(6);
+  });
+
+  it("[agent].remove_builtin_tools = true suppresses the auto-loaded core skill", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-no-core-"));
+    try {
+      const fixturesRoot = path.resolve("test/fixtures");
+      const agentDir = path.join(dir, "agent");
+      await fs.mkdir(agentDir, { recursive: true });
+      await fs.cp(
+        path.join(fixturesRoot, "sample-agent", "identity.md"),
+        path.join(agentDir, "identity.md"),
+      );
+      await fs.writeFile(
+        path.join(agentDir, "agent.toml"),
+        `[agent]
+name = "no-core"
+system_prompt = "./identity.md"
+remove_builtin_tools = true
+
+[harness]
+provider = "test"
+
+[session]
+provider = "memory"
+
+[sandbox]
+filesystem = ["./"]
+secrets = ["sample_user_name"]
+
+[skills]
+greeter = "${path.join(fixturesRoot, "skills/greeter").replace(/\\/g, "/")}"
+`,
+      );
+      const r = await resolveAgent(path.join(agentDir, "agent.toml"));
+      expect(r.skills).toHaveLength(1);
+      expect(r.skills[0]?.manifest.name).toBe("greeter");
+      expect(r.tools.map((t) => t.manifest.tool.name).sort()).toEqual(["greet", "uppercase"]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("rejects when a tool needs a capability outside the ceiling", async () => {
@@ -62,6 +115,8 @@ body`,
         `[agent]
 name = "snoopy"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -125,6 +180,8 @@ body`,
         `[agent]
 name = "n"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -156,6 +213,8 @@ w = "../skills/wrong"
         `[agent]
 name = "inline-sp"
 system_prompt = "Be concise. Use only tools provided."
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -185,6 +244,8 @@ secrets = []
         `[agent]
 name = "path-sp"
 system_prompt = "./core.md"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -226,6 +287,8 @@ body`,
         `[agent]
 name = "x"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

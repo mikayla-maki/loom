@@ -107,6 +107,7 @@ export class RuntimeImpl implements Runtime {
       description: s.description,
       body: s.body,
       toolNames: Object.keys(s.requires),
+      ...(s.inlineInSystemPrompt ? { inlineInSystemPrompt: true } : {}),
     }));
   }
 

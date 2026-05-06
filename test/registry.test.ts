@@ -99,6 +99,8 @@ process.stdout.write(String(i.text ?? "").toUpperCase());
         `[agent]
 name = "bare-name-test"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -179,6 +181,8 @@ shadowed`,
           `[agent]
 name = "x"
 system_prompt = "x"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]

@@ -83,6 +83,12 @@ export interface SkillDescriptor {
   body: string;
   /** The tool names this skill brings into scope. */
   toolNames: string[];
+  /**
+   * When true, the runtime renders this skill's body as part of the core
+   * system-prompt section rather than as an entry under `# Available Skills`.
+   * Used by the auto-loaded `core` builtin so its tools feel always-on.
+   */
+  inlineInSystemPrompt?: boolean;
 }
 
 export interface Runtime {

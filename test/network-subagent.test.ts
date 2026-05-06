@@ -52,6 +52,8 @@ describe("network-located subagents (acp+unix:// over the daemon)", () => {
         `[agent]
 name = "child"
 system_prompt = "c"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 echo = true
@@ -104,6 +106,8 @@ body
         `[agent]
 name = "parent"
 system_prompt = "p"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
@@ -177,6 +181,8 @@ r = "../skills/remote-skill"
         `[agent]
 name = "helper-agent"
 system_prompt = "h"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 echo = true
@@ -215,6 +221,8 @@ body
         `[agent]
 name = "p2"
 system_prompt = "p2"
+remove_builtin_tools = true
+
 [harness]
 provider = "test"
 [session]
