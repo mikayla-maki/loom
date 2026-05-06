@@ -81,8 +81,10 @@ export interface ResolvedAgentManifest {
   skills: ResolvedSkill[];
   /** Flattened tools, deduped by name (last writer wins). */
   tools: ResolvedTool[];
-  /** Map of secret name → tools that need it (for boot-time prompting). */
+  /** Map of required-secret name → tools that need it (must resolve at boot). */
   requiredSecrets: Map<string, string[]>;
+  /** Map of optional-secret name → tools that want it (best-effort load). */
+  optionalSecrets: Map<string, string[]>;
   /** PATH additions from each tool's bin/ dir. */
   pathAdditions: string[];
 }
@@ -181,13 +183,22 @@ export async function resolveAgent(
     throw e;
   }
 
-  // ─── secrets index ──────────────────────────────────────────────────────
+  // ─── secrets index ────────────────────────────────────────────
   const requiredSecrets = new Map<string, string[]>();
+  const optionalSecrets = new Map<string, string[]>();
   for (const t of tools) {
     for (const s of t.manifest.secrets?.required ?? []) {
       const arr = requiredSecrets.get(s) ?? [];
       arr.push(t.manifest.name);
       requiredSecrets.set(s, arr);
+    }
+    for (const s of t.manifest.secrets?.optional ?? []) {
+      // Required wins if a name appears on both axes — a missing
+      // required-secret should still throw, regardless of optional decls.
+      if (requiredSecrets.has(s)) continue;
+      const arr = optionalSecrets.get(s) ?? [];
+      arr.push(t.manifest.name);
+      optionalSecrets.set(s, arr);
     }
   }
 
@@ -204,6 +215,7 @@ export async function resolveAgent(
     skills,
     tools,
     requiredSecrets,
+    optionalSecrets,
     pathAdditions,
   };
 }

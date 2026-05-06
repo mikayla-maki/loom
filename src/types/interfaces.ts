@@ -122,10 +122,11 @@ export interface Runtime {
   readonly abortSignal: AbortSignal;
 
   /**
-   * Request a capability decision from the SDK consumer. Returns the
-   * handler's reply, or `{ decision: "deny" }` if no handler is registered.
-   * Builtin tools that want to expand the agent's scope (e.g. `add_skill`)
-   * route their consent flow through this method.
+   * Ask the SDK consumer for user consent. Returns the handler's reply,
+   * or `{ decision: "deny" }` if no handler is registered. Available to
+   * any in-process tool that wants a "are you sure?" rail before a
+   * sensitive action; reaches the connected ACP client via
+   * `session/request_permission` when applicable.
    */
   requestPermission(
     req: import("./permissions.js").PermissionRequest,
@@ -145,24 +146,46 @@ export interface Harness {
   run(runtime: Runtime): Promise<StopReason>;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────
 // Extension factories.
-// ────────────────────────────────────────────────────────────────────────────
+//
+// Each factory may declare the secrets its product requires. The runtime
+// resolves the union of declared secrets at boot, then injects each
+// factory's per-component subset via the `secrets` arg of `create()`.
+// Implementations should *not* read `process.env` directly — the runtime
+// is responsible for sourcing values (env, OS keychain, config files, an
+// SDK-supplied store) and gating them through the manifest.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Secrets a factory's product needs at runtime. The closure of all
+ * declared `required` names is validated at boot; missing required
+ * secrets fail the run. `optional` names load best-effort.
+ */
+export interface SecretNeeds {
+  required?: string[];
+  optional?: string[];
+}
 
 export interface SessionFactory {
   /** Bare-name the runtime resolves to find this extension. */
   readonly name: string;
+  /** Secrets this session needs. Resolved at boot, injected at create(). */
+  readonly secrets?: SecretNeeds;
   create(
     config: Record<string, unknown>,
     ctx: ExtensionContext,
+    secrets: Record<string, string>,
   ): Promise<Session> | Session;
 }
 
 export interface HarnessFactory {
   readonly name: string;
+  readonly secrets?: SecretNeeds;
   create(
     config: Record<string, unknown>,
     ctx: ExtensionContext,
+    secrets: Record<string, string>,
   ): Promise<Harness> | Harness;
 }
 
@@ -235,8 +258,11 @@ export interface Provider {
 export interface ProviderFactory {
   /** Bare-name the runtime resolves to find this extension. */
   readonly name: string;
+  /** Secrets this provider needs. Resolved at boot, injected at create(). */
+  readonly secrets?: SecretNeeds;
   create(
     config: Record<string, unknown>,
     ctx: ExtensionContext,
+    secrets: Record<string, string>,
   ): Promise<Provider> | Provider;
 }

@@ -16,6 +16,7 @@ import { runAgent } from "../sdk/run-agent.js";
 import { TextRenderer } from "./renderer.js";
 import { auditAgent, formatCapabilityTree } from "../audit/audit.js";
 import { ttyPermissionHandler } from "./permissions.js";
+import { ttyMissingSecretHandler } from "./secret-prompt.js";
 
 async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
@@ -77,6 +78,7 @@ async function cmdRun(args: string[]): Promise<number> {
   }
   const agent = await runAgent(manifestPath, {
     permissionHandler: ttyPermissionHandler(),
+    onMissingSecret: ttyMissingSecretHandler(),
   });
   const renderer = new TextRenderer({
     useColors: !opts.flags["no-colors"],
@@ -138,6 +140,7 @@ async function cmdPrompt(args: string[]): Promise<number> {
   }
   const agent = await runAgent(manifestPath, {
     permissionHandler: ttyPermissionHandler(),
+    onMissingSecret: ttyMissingSecretHandler(),
   });
   const renderer = new TextRenderer({
     useColors: !opts.flags["no-colors"],

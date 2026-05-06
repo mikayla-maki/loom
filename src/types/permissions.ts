@@ -1,16 +1,17 @@
 /**
- * Permission system — runtime-mediated capability expansion.
+ * Permission system — runtime-mediated user-consent channel.
  *
- * Some operations (most notably `add_skill`) want to expand an agent's
- * declared `[sandbox]` ceiling at runtime. That breaks the static
- * "every scope sandboxed; tools punch out" model unless we add a
- * deliberate, user-mediated escape hatch.
+ * Some tools want to ask the user before taking a sensitive action. The
+ * canonical example is `add_skill` (now removed) wanting to expand the
+ * agent's `[sandbox]` ceiling, but the same channel applies to any tool
+ * that wants a "are you sure?" rail — destructive operations, network
+ * calls outside a normal envelope, etc.
  *
  * The hatch is a `PermissionHandler` registered by the SDK consumer (CLI,
- * ACP client, embedder). When the runtime needs more capability than the
- * agent's current ceiling permits, it builds a `PermissionRequest`, calls
- * the handler, and acts on the returned `PermissionDecision`. If no handler
- * is registered, the runtime fails closed — same end-state as today.
+ * ACP client, embedder). When a tool wants user consent, it calls through
+ * `Runtime.requestPermission`, the runtime invokes the handler, and the
+ * tool acts on the returned `PermissionDecision`. If no handler is
+ * registered, the runtime denies — the secure default.
  *
  * ACP carries the same shape as `session/request_permission` notifications
  * to the connected client.

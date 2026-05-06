@@ -68,6 +68,8 @@ export type { RegistryOptions } from "./registry/registry.js";
 export {
   EnvSecretsStore,
   FileSecretsStore,
+  XDGSecretsStore,
+  KeychainSecretsStore,
   StaticSecretsStore,
   ChainedSecretsStore,
   resolveSecrets,

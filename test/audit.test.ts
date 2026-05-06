@@ -32,6 +32,53 @@ describe("auditAgent", () => {
     expect(printed).toContain("uppercase");
   });
 
+  it("surfaces every declared secret with its requesters", async () => {
+    const spec: AgentManifest = {
+      name: "secret-surface",
+      systemPrompt: "p",
+      removeBuiltinTools: true,
+      // Anthropic harness declares ANTHROPIC_API_KEY required.
+      harness: { provider: "anthropic", model: "claude-3-haiku-20240307" },
+      sandbox: { filesystem: [], network: [], secrets: [] },
+      skills: {
+        s: {
+          description: "x",
+          requires: {
+            t1: {
+              description: "needs A required + SHARED required",
+              schema: { type: "object" },
+              invocation: { command: "echo" },
+              secrets: { required: ["A_TOKEN", "SHARED"] },
+            },
+            t2: {
+              description: "needs SHARED optional + B optional",
+              schema: { type: "object" },
+              invocation: { command: "echo" },
+              secrets: { optional: ["SHARED", "B_TOKEN"] },
+            },
+          },
+        },
+      },
+    };
+    const tree = await auditAgent(spec);
+    const byName = new Map(tree.secrets.map((s) => [s.name, s]));
+    expect(byName.get("ANTHROPIC_API_KEY")?.required).toBe(true);
+    expect(byName.get("ANTHROPIC_API_KEY")?.requestedBy).toEqual([
+      "harness:anthropic",
+    ]);
+    expect(byName.get("A_TOKEN")?.required).toBe(true);
+    // Required wins on conflict: SHARED is required because t1 wants it.
+    expect(byName.get("SHARED")?.required).toBe(true);
+    expect(byName.get("SHARED")?.requestedBy).toEqual(["tool:t1"]);
+    // B is optional-only.
+    expect(byName.get("B_TOKEN")?.required).toBe(false);
+
+    const printed = formatCapabilityTree(tree);
+    expect(printed).toContain("secrets:");
+    expect(printed).toContain("ANTHROPIC_API_KEY [required]");
+    expect(printed).toContain("B_TOKEN [optional]");
+  });
+
   it("audits an inline spec without touching the filesystem", async () => {
     const spec: AgentManifest = {
       name: "inline",

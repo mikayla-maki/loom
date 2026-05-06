@@ -71,7 +71,7 @@ export class FileSession implements Session {
 
 export const fileSessionFactory: SessionFactory = {
   name: "file",
-  create(config: Record<string, unknown>, ctx: ExtensionContext): Session {
+  create(config: Record<string, unknown>, ctx: ExtensionContext, _secrets: Record<string, string>): Session {
     const p = config.path;
     if (typeof p !== "string" || !p) {
       throw new ManifestError(`[session] provider 'file' requires config 'path'`);

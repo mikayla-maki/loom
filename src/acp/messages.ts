@@ -73,10 +73,10 @@ export interface SessionCancelParams {
 /**
  * `session/request_permission` — agent → client.
  *
- * Mirrors ACP's request-for-permission shape. The runtime calls this when
- * an in-process tool (e.g. add_skill) wants to expand the agent's declared
- * scope. Clients that don't implement the method MUST return an error,
- * which the runtime treats as a deny.
+ * Mirrors ACP's request-for-permission shape. The runtime forwards a
+ * tool's permission request to the connected client; the client returns
+ * a decision. Clients that don't implement the method MUST return an
+ * error, which the runtime treats as a deny.
  */
 export interface SessionRequestPermissionParams {
   sessionId: string;

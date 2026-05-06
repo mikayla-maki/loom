@@ -216,22 +216,11 @@ export class ProcessTool implements Tool {
       .filter(Boolean)
       .join(path.delimiter);
 
-    const requested = new Set([
-      ...(this.manifest.secrets?.required ?? []),
-      ...(this.manifest.secrets?.optional ?? []),
-    ]);
+    // The secrets bag passed in is already filtered by ToolTable to this
+    // tool's allowlist; just inject everything.
     for (const [name, value] of Object.entries(secrets)) {
-      if (!requested.has(name)) continue;
       base[name] = value;
       base[name.replace(/[.\-]/g, "_").toUpperCase()] = value;
-    }
-
-    // The builtin `secrets.get` is the one tool that may read any loaded
-    // secret on the model's behalf. Gated by tool-name match — users can't
-    // recreate it under a different name. The agent's [sandbox].secrets
-    // already bounds what's loaded.
-    if (this.manifest.name === "secrets.get") {
-      base.LOOM_SECRETS_JSON = JSON.stringify(secrets);
     }
 
     // Broker wiring: only inject when this tool is allowed to call the
@@ -247,21 +236,44 @@ export class ProcessTool implements Tool {
   }
 }
 
-/** Mutable name→Tool registry; the runtime executes through this. */
-export class ToolTable {
-  private readonly byName = new Map<string, Tool>();
-  private secrets: Record<string, string>;
+/**
+ * Tool registration entry. Each tool ships an `allowedSecrets` set of
+ * names — the union of `[tool.secrets].required` and `optional` from its
+ * manifest, or an empty set for privileged in-process builtins. The
+ * `ToolTable` filters the loaded secret bag through this set on every
+ * `execute()` call so a tool only ever sees the secrets it declared.
+ */
+export interface ToolEntry {
+  tool: Tool;
+  allowedSecrets: Set<string>;
+}
 
-  constructor(tools: Tool[], secrets: Record<string, string>) {
+/**
+ * Name→Tool registry; the runtime executes through this. The set of
+ * tools is fixed after construction except for `addTool()`, used by the
+ * SDK to register privileged in-process builtins (spawn_subagent,
+ * search_skills) that need a runtime-supplied dep that isn't available
+ * at manifest-resolution time. The secrets bag is fixed at construction.
+ */
+export class ToolTable {
+  private readonly byName = new Map<string, ToolEntry>();
+  private readonly secrets: Record<string, string>;
+
+  constructor(tools: Array<Tool | ToolEntry>, secrets: Record<string, string>) {
     this.secrets = secrets;
-    for (const t of tools) this.byName.set(t.name, t);
+    for (const t of tools) {
+      const entry = isToolEntry(t)
+        ? t
+        : { tool: t, allowedSecrets: new Set<string>() };
+      this.byName.set(entry.tool.name, entry);
+    }
   }
 
   list(): ToolDescriptor[] {
-    return [...this.byName.values()].map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
+    return [...this.byName.values()].map((e) => ({
+      name: e.tool.name,
+      description: e.tool.description,
+      inputSchema: e.tool.inputSchema,
     }));
   }
 
@@ -269,27 +281,31 @@ export class ToolTable {
     return this.byName.has(name);
   }
 
-  /** Returns false if a tool by this name already exists (no replacement). */
-  addTool(tool: Tool): boolean {
+  /**
+   * Register a tool. Two-arg form supplies an explicit allowlist; the
+   * one-arg form defaults to no secrets visible (privileged builtins).
+   * Returns false if a tool by this name already exists.
+   */
+  addTool(tool: Tool, allowedSecrets?: Set<string>): boolean {
     if (this.byName.has(tool.name)) return false;
-    this.byName.set(tool.name, tool);
+    this.byName.set(tool.name, {
+      tool,
+      allowedSecrets: allowedSecrets ?? new Set<string>(),
+    });
     return true;
   }
 
-  addSecrets(extra: Record<string, string>): void {
-    this.secrets = { ...this.secrets, ...extra };
-  }
-
   async execute(call: ToolCall): Promise<ToolResult> {
-    const t = this.byName.get(call.name);
-    if (!t) {
+    const entry = this.byName.get(call.name);
+    if (!entry) {
       return {
         content: `Unknown tool: ${call.name}. Available: ${[...this.byName.keys()].join(", ")}`,
         isError: true,
       };
     }
+    const filtered = filterSecrets(this.secrets, entry.allowedSecrets);
     try {
-      return await t.execute(call.input, this.secrets);
+      return await entry.tool.execute(call.input, filtered);
     } catch (e) {
       if (e instanceof ToolInputError || e instanceof ToolExecutionError) {
         return { content: (e as Error).message, isError: true };
@@ -297,4 +313,22 @@ export class ToolTable {
       throw e;
     }
   }
+}
+
+function isToolEntry(v: Tool | ToolEntry): v is ToolEntry {
+  return (
+    typeof v === "object" && v !== null && "tool" in v && "allowedSecrets" in v
+  );
+}
+
+function filterSecrets(
+  bag: Record<string, string>,
+  allow: Set<string>,
+): Record<string, string> {
+  if (allow.size === 0) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(bag)) {
+    if (allow.has(k)) out[k] = v;
+  }
+  return out;
 }

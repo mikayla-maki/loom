@@ -50,46 +50,52 @@ async function buildExtensionFixture(opts: {
     `// Synthetic Loom extension fixture.
 //
 // Two side-effects on register():
-//   1. Auto-activates a Provider instance that supplies 'fixture.echo'.
+//   1. Auto-activates a ProviderFactory that supplies 'fixture.echo'.
 //      This is the common case — listing the extension in [extensions]
-//      is enough; no [providers] entry needed.
+//      is enough.
 //   2. ALSO registers a named ProviderFactory (so a separate test can
 //      assert factories get registered).
 export function register(api) {
   const greeting = api.config && typeof api.config.greeting === "string" ? api.config.greeting : "hi";
-  const provider = {
-    resolveTool(name) {
-      if (name !== "fixture:echo") return null;
+  const factory = {
+    name: "fixture-provider",
+    create(_config, _ctx, _secrets) {
       return {
-        kind: "synthetic",
-        manifest: {
-          manifestPath: "synthetic://fixture.echo",
-          toolDir: "synthetic://fixture.echo",
-          name: "fixture.echo",
-          description: "Echo with greeting prefix",
-          schema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
-          invocation: { command: "(synthetic)", args: [] },
-          secrets: { required: [] },
-          capabilities: { filesystem: [], network: [] },
-          shipsBinary: false,
+        resolveTool(name) {
+          if (name !== "fixture:echo") return null;
+          return {
+            kind: "synthetic",
+            manifest: {
+              manifestPath: "synthetic://fixture.echo",
+              toolDir: "synthetic://fixture.echo",
+              name: "fixture.echo",
+              description: "Echo with greeting prefix",
+              schema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
+              invocation: { command: "(synthetic)", args: [] },
+              secrets: { required: [] },
+              capabilities: { filesystem: [], network: [] },
+              shipsBinary: false,
+            },
+            tool: {
+              name: "fixture.echo",
+              description: "Echo with greeting prefix",
+              inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
+              async execute(input) {
+                return { content: greeting + ": " + String((input || {}).text || "") };
+              },
+            },
+          };
         },
-        tool: {
-          name: "fixture.echo",
-          description: "Echo with greeting prefix",
-          inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
-          async execute(input) {
-            return { content: greeting + ": " + String((input || {}).text || "") };
-          },
-        },
+        resolveSkill() { return null; },
+        async list() { return { tools: ["fixture.echo"], skills: [] }; },
+        async close() { /* noop */ },
       };
     },
-    async list() { return { tools: ["fixture.echo"], skills: [] }; },
-    async close() { /* noop */ },
   };
-  api.addProvider(provider);
+  api.addProvider(factory);
   api.registerProvider({
     name: "${fullName}",
-    create() { return provider; },
+    create(_config, _ctx, _secrets) { return factory.create(_config, _ctx, _secrets); },
   });
 }
 `,

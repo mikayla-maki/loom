@@ -37,11 +37,11 @@ export interface LoomExtensionApi {
   registerSession(factory: SessionFactory): void;
   registerProvider(factory: ProviderFactory): void;
   /**
-   * Auto-activate a Provider instance for the current agent. Common case
-   * for "list this extension and you get its tools" — no [providers] entry
-   * required.
+   * Auto-activate a Provider for the current agent. Pass a `ProviderFactory`
+   * (NOT an already-built instance) so the runtime can resolve the
+   * factory's declared secrets at boot and inject them at `create()` time.
    */
-  addProvider(provider: Provider): void;
+  addProvider(factory: ProviderFactory): void;
   readonly agentName: string;
   readonly manifestDir: string;
   readonly loomVersion: string;
@@ -95,12 +95,17 @@ export async function loadExtensionPackage(
   config: Record<string, unknown>,
   loadCtx: { agentManifestDir: string; agentName: string; loomVersion: string },
   options: LoadOptions = {},
-): Promise<{ info: ExtensionPackageInfo; addedProviders: Provider[] }> {
+): Promise<{
+  info: ExtensionPackageInfo;
+  addedProviderFactories: ProviderFactory[];
+}> {
   const info = await locateExtensionPackage(name, loadCtx, options);
 
   let mod: LoomExtensionModule;
   try {
-    mod = (await import(pathToFileURL(info.entryPath).href)) as LoomExtensionModule;
+    mod = (await import(
+      pathToFileURL(info.entryPath).href
+    )) as LoomExtensionModule;
   } catch (e) {
     throw new LoomError(
       `Failed to import Loom extension '${name}' (${info.entryPath}): ${(e as Error).message}`,
@@ -115,25 +120,28 @@ export async function loadExtensionPackage(
     );
   }
 
-  const addedProviders: Provider[] = [];
+  const addedProviderFactories: ProviderFactory[] = [];
   await register({
     registerHarness,
     registerSession,
     registerProvider,
-    addProvider: (p) => addedProviders.push(p),
+    addProvider: (f) => addedProviderFactories.push(f),
     agentName: loadCtx.agentName,
     manifestDir: loadCtx.agentManifestDir,
     loomVersion: loadCtx.loomVersion,
     config,
   });
-  return { info, addedProviders };
+  return { info, addedProviderFactories };
 }
 
 export async function listInstalledExtensions(
   loadCtx: { agentManifestDir?: string } = {},
   options: LoadOptions = {},
 ): Promise<ExtensionPackageInfo[]> {
-  const roots = await collectSearchRoots(loadCtx.agentManifestDir ?? process.cwd(), options);
+  const roots = await collectSearchRoots(
+    loadCtx.agentManifestDir ?? process.cwd(),
+    options,
+  );
   const seen = new Set<string>();
   const out: ExtensionPackageInfo[] = [];
 
@@ -241,7 +249,10 @@ async function collectSearchRoots(
 
   roots.push(
     options.loomExtensionsDir ??
-      path.join(process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom"), "extensions"),
+      path.join(
+        process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom"),
+        "extensions",
+      ),
   );
 
   return [...new Set(roots.filter(Boolean))];

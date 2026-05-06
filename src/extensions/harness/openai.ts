@@ -21,11 +21,14 @@ import type {
   HarnessFactory,
   Runtime,
 } from "../../types/interfaces.js";
-import type { SessionUpdate, StopReason, ToolCallStatus } from "../../types/acp.js";
+import type {
+  SessionUpdate,
+  StopReason,
+  ToolCallStatus,
+} from "../../types/acp.js";
 
 interface OpenAIConfig {
   model?: string;
-  apiKey?: string;
   apiBase?: string;
   maxTokens?: number;
   maxTurnRequests?: number;
@@ -67,11 +70,17 @@ export class OpenAIHarness implements Harness {
     let requests = 0;
     while (true) {
       if (runtime.abortSignal.aborted) {
-        await runtime.update({ sessionUpdate: "stop", stopReason: "cancelled" });
+        await runtime.update({
+          sessionUpdate: "stop",
+          stopReason: "cancelled",
+        });
         return "cancelled";
       }
       if (requests >= this.maxTurnRequests) {
-        await runtime.update({ sessionUpdate: "stop", stopReason: "max_turn_requests" });
+        await runtime.update({
+          sessionUpdate: "stop",
+          stopReason: "max_turn_requests",
+        });
         return "max_turn_requests";
       }
       requests += 1;
@@ -96,7 +105,10 @@ export class OpenAIHarness implements Harness {
       } catch (e) {
         await runtime.update({
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `[openai error] ${(e as Error).message}` },
+          content: {
+            type: "text",
+            text: `[openai error] ${(e as Error).message}`,
+          },
         });
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
         return "error";
@@ -134,7 +146,10 @@ export class OpenAIHarness implements Harness {
       }
 
       if (choice.finish_reason === "length") {
-        await runtime.update({ sessionUpdate: "stop", stopReason: "max_tokens" });
+        await runtime.update({
+          sessionUpdate: "stop",
+          stopReason: "max_tokens",
+        });
         return "max_tokens";
       }
 
@@ -156,12 +171,19 @@ export class OpenAIHarness implements Harness {
             name: tc.function.name,
             input: parsedInput,
           });
-          const status: ToolCallStatus = result.isError ? "failed" : "completed";
+          const status: ToolCallStatus = result.isError
+            ? "failed"
+            : "completed";
           await runtime.update({
             sessionUpdate: "tool_call_update",
             toolCallId: tc.id,
             status,
-            content: [{ type: "content", content: { type: "text", text: result.content } }],
+            content: [
+              {
+                type: "content",
+                content: { type: "text", text: result.content },
+              },
+            ],
           });
         }),
       );
@@ -190,7 +212,10 @@ export class OpenAIHarness implements Harness {
               {
                 id: e.toolCallId,
                 type: "function",
-                function: { name: e.title, arguments: JSON.stringify(e.input ?? {}) },
+                function: {
+                  name: e.title,
+                  arguments: JSON.stringify(e.input ?? {}),
+                },
               },
             ],
           });
@@ -199,9 +224,17 @@ export class OpenAIHarness implements Harness {
         case "tool_call_update": {
           const text =
             (e.content ?? [])
-              .map((c) => (c.type === "content" && c.content.type === "text" ? c.content.text : ""))
+              .map((c) =>
+                c.type === "content" && c.content.type === "text"
+                  ? c.content.text
+                  : "",
+              )
               .join("") || "";
-          messages.push({ role: "tool", tool_call_id: e.toolCallId, content: text });
+          messages.push({
+            role: "tool",
+            tool_call_id: e.toolCallId,
+            content: text,
+          });
           break;
         }
         case "agent_thought_chunk":
@@ -244,14 +277,25 @@ export class OpenAIHarness implements Harness {
 
 export const openaiHarnessFactory: HarnessFactory = {
   name: "openai",
-  create(config: Record<string, unknown>, _ctx: ExtensionContext): Harness {
+  secrets: { required: ["OPENAI_API_KEY"] },
+  create(
+    config: Record<string, unknown>,
+    _ctx: ExtensionContext,
+    secrets: Record<string, string>,
+  ): Harness {
     const c = config as OpenAIConfig;
-    const model = c.model ?? "gpt-4o-mini";
-    const apiKey = c.apiKey ?? process.env.OPENAI_API_KEY ?? "";
+    const apiKey = secrets.OPENAI_API_KEY;
     if (!apiKey) {
-      throw new Error("OpenAI harness requires OPENAI_API_KEY env var or [harness].apiKey config");
+      throw new Error(
+        "OpenAI harness was instantiated without OPENAI_API_KEY in its secrets bundle",
+      );
     }
-    const apiBase = c.apiBase ?? "https://api.openai.com/v1";
-    return new OpenAIHarness(model, apiKey, apiBase, c.maxTokens, c.maxTurnRequests ?? 16);
+    return new OpenAIHarness(
+      c.model ?? "gpt-4o-mini",
+      apiKey,
+      c.apiBase ?? "https://api.openai.com/v1",
+      c.maxTokens,
+      c.maxTurnRequests ?? 16,
+    );
   },
 };

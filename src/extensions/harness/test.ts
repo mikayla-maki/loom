@@ -152,7 +152,7 @@ export class TestHarness implements Harness {
 
 export const testHarnessFactory: HarnessFactory = {
   name: "test",
-  create(config: Record<string, unknown>, _ctx: ExtensionContext): Harness {
+  create(config: Record<string, unknown>, _ctx: ExtensionContext, _secrets: Record<string, string>): Harness {
     return new TestHarness(config as TestHarnessConfig);
   },
 };

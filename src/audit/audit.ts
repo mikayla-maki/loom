@@ -8,11 +8,23 @@ import * as path from "node:path";
 
 import { resolveAgent, type ResolveOptions } from "../manifest/resolver.js";
 import { unionCapabilities } from "../manifest/capabilities.js";
+import { getHarnessFactory, getSessionFactory } from "../extensions/index.js";
 import type {
   AgentManifest,
   SandboxCeiling,
   ToolCapabilities,
 } from "../types/manifest.js";
+
+/**
+ * One declared secret name plus a human-readable list of who asked for
+ * it (`harness:anthropic`, `tool:bash`, etc.) and whether any requester
+ * marked it required.
+ */
+export interface SecretRequest {
+  name: string;
+  required: boolean;
+  requestedBy: string[];
+}
 
 export interface CapabilityTree {
   manifestPath: string;
@@ -24,6 +36,13 @@ export interface CapabilityTree {
     capabilities: ToolCapabilities;
     introducedBy: string;
   }>;
+  /**
+   * Every secret name a component of this agent declares it needs. Built
+   * from harness + session factory `secrets` and each tool's
+   * `[tool.secrets]`. Provider-factory secrets aren't included because
+   * audit doesn't load extensions — see the comment in `collectSecrets`.
+   */
+  secrets: SecretRequest[];
   subagents: Array<{
     skill: string;
     name: string;
@@ -61,6 +80,7 @@ async function auditOne(
       ceiling: {},
       required: {},
       tools: [],
+      secrets: [],
       subagents: [],
     };
   }
@@ -73,6 +93,7 @@ async function auditOne(
     introducedBy: t.introducedBy,
   }));
   const required = unionCapabilities(tools.map((t) => t.capabilities));
+  const secrets = collectSecrets(resolved.source, resolved.tools);
 
   const subagents: CapabilityTree["subagents"] = [];
   for (const skill of resolved.skills) {
@@ -113,8 +134,88 @@ async function auditOne(
     ceiling: resolved.sandbox,
     required,
     tools,
+    secrets,
     subagents,
   };
+}
+
+/**
+ * Roll up every secret name a component of this agent declares.
+ *
+ * Sources:
+ *   - harness factory's `secrets` (if `[harness]` references one by name)
+ *   - session factory's `secrets`
+ *   - every resolved tool's `[tool.secrets]`
+ *
+ * NOT included: extension-added provider factories. Audit doesn't load
+ * `[extensions]` packages — that's a side-effect surface and would
+ * make audit dynamic. The result is that an `audit` of a manifest
+ * with `[extensions.foo-mcp]` won't show foo-mcp's required tokens.
+ * `loom run` will still resolve them; `loom audit` is conservative.
+ */
+function collectSecrets(
+  manifest: AgentManifest,
+  tools: import("../manifest/resolver.js").ResolvedTool[],
+): SecretRequest[] {
+  const required = new Map<string, Set<string>>(); // name → requesters
+  const optional = new Map<string, Set<string>>();
+
+  const addNeeds = (
+    needs: { required?: string[]; optional?: string[] } | undefined,
+    by: string,
+  ): void => {
+    if (!needs) return;
+    for (const n of needs.required ?? []) {
+      const arr = required.get(n) ?? new Set<string>();
+      arr.add(by);
+      required.set(n, arr);
+    }
+    for (const n of needs.optional ?? []) {
+      const arr = optional.get(n) ?? new Set<string>();
+      arr.add(by);
+      optional.set(n, arr);
+    }
+  };
+
+  // Harness
+  if ("provider" in manifest.harness) {
+    try {
+      const f = getHarnessFactory(manifest.harness.provider);
+      addNeeds(f.secrets, `harness:${f.name}`);
+    } catch {
+      // Unknown harness provider — skip; resolveAgent already validated
+      // it for the run path. Audit shouldn't fail just because a
+      // hypothetical extension isn't loaded yet.
+    }
+  }
+
+  // Session
+  if (manifest.session && "provider" in manifest.session) {
+    try {
+      const f = getSessionFactory(manifest.session.provider);
+      addNeeds(f.secrets, `session:${f.name}`);
+    } catch {
+      // ditto
+    }
+  }
+
+  // Tools
+  for (const t of tools) {
+    addNeeds(t.manifest.secrets, `tool:${t.manifest.name}`);
+  }
+
+  // Required wins on conflict.
+  for (const k of required.keys()) optional.delete(k);
+
+  const out: SecretRequest[] = [];
+  for (const [name, by] of required) {
+    out.push({ name, required: true, requestedBy: [...by].sort() });
+  }
+  for (const [name, by] of optional) {
+    out.push({ name, required: false, requestedBy: [...by].sort() });
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
 }
 
 /** Pretty-print a CapabilityTree as a tree of strings (for CLI use). */
@@ -129,6 +230,15 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
     for (const t of tree.tools) {
       lines.push(
         `${pad}    - ${t.name} (from ${t.introducedBy}): ${formatToolCaps(t.capabilities)}`,
+      );
+    }
+  }
+  if (tree.secrets.length > 0) {
+    lines.push(`${pad}  secrets:`);
+    for (const s of tree.secrets) {
+      const tag = s.required ? "required" : "optional";
+      lines.push(
+        `${pad}    - ${s.name} [${tag}] (needed by ${s.requestedBy.join(", ")})`,
       );
     }
   }

@@ -18,7 +18,11 @@
  * turn ends with `end_turn`.
  */
 
-import type { SessionUpdate, StopReason, ToolCallStatus } from "../../types/acp.js";
+import type {
+  SessionUpdate,
+  StopReason,
+  ToolCallStatus,
+} from "../../types/acp.js";
 import type {
   ExtensionContext,
   Harness,
@@ -28,7 +32,6 @@ import type {
 
 interface AnthropicConfig {
   model?: string;
-  apiKey?: string;
   apiBase?: string;
   maxTokens?: number;
   maxTurnRequests?: number;
@@ -42,13 +45,23 @@ interface AnthropicMessage {
 type AnthropicContentBlock =
   | { type: "text"; text: string }
   | { type: "tool_use"; id: string; name: string; input: unknown }
-  | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+  | {
+      type: "tool_result";
+      tool_use_id: string;
+      content: string;
+      is_error?: boolean;
+    };
 
 interface AnthropicResponse {
   id: string;
   role: "assistant";
   content: AnthropicContentBlock[];
-  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | string;
+  stop_reason:
+    | "end_turn"
+    | "tool_use"
+    | "max_tokens"
+    | "stop_sequence"
+    | string;
 }
 
 export class AnthropicHarness implements Harness {
@@ -64,11 +77,17 @@ export class AnthropicHarness implements Harness {
     let requests = 0;
     while (true) {
       if (runtime.abortSignal.aborted) {
-        await runtime.update({ sessionUpdate: "stop", stopReason: "cancelled" });
+        await runtime.update({
+          sessionUpdate: "stop",
+          stopReason: "cancelled",
+        });
         return "cancelled";
       }
       if (requests >= this.maxTurnRequests) {
-        await runtime.update({ sessionUpdate: "stop", stopReason: "max_turn_requests" });
+        await runtime.update({
+          sessionUpdate: "stop",
+          stopReason: "max_turn_requests",
+        });
         return "max_turn_requests";
       }
       requests += 1;
@@ -83,11 +102,19 @@ export class AnthropicHarness implements Harness {
 
       let response: AnthropicResponse;
       try {
-        response = await this.callAPI(runtime.systemPrompt(), messages, tools, runtime.abortSignal);
+        response = await this.callAPI(
+          runtime.systemPrompt(),
+          messages,
+          tools,
+          runtime.abortSignal,
+        );
       } catch (e) {
         await runtime.update({
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `[anthropic error] ${(e as Error).message}` },
+          content: {
+            type: "text",
+            text: `[anthropic error] ${(e as Error).message}`,
+          },
         });
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
         return "error";
@@ -114,7 +141,10 @@ export class AnthropicHarness implements Harness {
       }
 
       if (response.stop_reason === "max_tokens") {
-        await runtime.update({ sessionUpdate: "stop", stopReason: "max_tokens" });
+        await runtime.update({
+          sessionUpdate: "stop",
+          stopReason: "max_tokens",
+        });
         return "max_tokens";
       }
 
@@ -131,12 +161,19 @@ export class AnthropicHarness implements Harness {
             name: tu.name,
             input: tu.input,
           });
-          const status: ToolCallStatus = result.isError ? "failed" : "completed";
+          const status: ToolCallStatus = result.isError
+            ? "failed"
+            : "completed";
           await runtime.update({
             sessionUpdate: "tool_call_update",
             toolCallId: tu.id,
             status,
-            content: [{ type: "content", content: { type: "text", text: result.content } }],
+            content: [
+              {
+                type: "content",
+                content: { type: "text", text: result.content },
+              },
+            ],
           });
         }),
       );
@@ -147,7 +184,10 @@ export class AnthropicHarness implements Harness {
   private eventsToMessages(events: SessionUpdate[]): AnthropicMessage[] {
     const messages: AnthropicMessage[] = [];
     let current: AnthropicMessage | null = null;
-    const pendingToolUseById = new Map<string, { name: string; input: unknown }>();
+    const pendingToolUseById = new Map<
+      string,
+      { name: string; input: unknown }
+    >();
 
     const push = (m: AnthropicMessage) => {
       if (current && current.role === m.role) {
@@ -162,13 +202,19 @@ export class AnthropicHarness implements Harness {
       switch (e.sessionUpdate) {
         case "user_message_chunk": {
           if (e.content.type === "text") {
-            push({ role: "user", content: [{ type: "text", text: e.content.text }] });
+            push({
+              role: "user",
+              content: [{ type: "text", text: e.content.text }],
+            });
           }
           break;
         }
         case "agent_message_chunk": {
           if (e.content.type === "text") {
-            push({ role: "assistant", content: [{ type: "text", text: e.content.text }] });
+            push({
+              role: "assistant",
+              content: [{ type: "text", text: e.content.text }],
+            });
           }
           break;
         }
@@ -176,11 +222,19 @@ export class AnthropicHarness implements Harness {
           // Thoughts are not sent back to the API in v0.
           break;
         case "tool_call": {
-          pendingToolUseById.set(e.toolCallId, { name: e.title, input: e.input });
+          pendingToolUseById.set(e.toolCallId, {
+            name: e.title,
+            input: e.input,
+          });
           push({
             role: "assistant",
             content: [
-              { type: "tool_use", id: e.toolCallId, name: e.title, input: e.input ?? {} },
+              {
+                type: "tool_use",
+                id: e.toolCallId,
+                name: e.title,
+                input: e.input ?? {},
+              },
             ],
           });
           break;
@@ -188,7 +242,11 @@ export class AnthropicHarness implements Harness {
         case "tool_call_update": {
           const text =
             (e.content ?? [])
-              .map((c) => (c.type === "content" && c.content.type === "text" ? c.content.text : ""))
+              .map((c) =>
+                c.type === "content" && c.content.type === "text"
+                  ? c.content.text
+                  : "",
+              )
               .join("") || "";
           push({
             role: "user",
@@ -245,23 +303,27 @@ export class AnthropicHarness implements Harness {
 
 export const anthropicHarnessFactory: HarnessFactory = {
   name: "anthropic",
-  create(config: Record<string, unknown>, _ctx: ExtensionContext): Harness {
+  secrets: { required: ["ANTHROPIC_API_KEY"] },
+  create(
+    config: Record<string, unknown>,
+    _ctx: ExtensionContext,
+    secrets: Record<string, string>,
+  ): Harness {
     const c = config as AnthropicConfig;
-    const model = c.model ?? "claude-3-5-sonnet-latest";
-    const apiKey = c.apiKey ?? process.env.ANTHROPIC_API_KEY ?? "";
+    const apiKey = secrets.ANTHROPIC_API_KEY;
     if (!apiKey) {
+      // Should never happen — the runtime validates required secrets
+      // before calling create(). Defensive guard for direct callers.
       throw new Error(
-        "Anthropic harness requires ANTHROPIC_API_KEY env var or [harness].apiKey config",
+        "Anthropic harness was instantiated without ANTHROPIC_API_KEY in its secrets bundle",
       );
     }
-    const apiBase = c.apiBase ?? "https://api.anthropic.com";
     return new AnthropicHarness(
-      model,
+      c.model ?? "claude-3-5-sonnet-latest",
       apiKey,
-      apiBase,
+      c.apiBase ?? "https://api.anthropic.com",
       c.maxTokens ?? 4096,
       c.maxTurnRequests ?? 16,
     );
   },
 };
-

@@ -30,7 +30,7 @@ This repository implements the **v0** + most of **v1** of the
 - **Process-backed tools** with strict env isolation: only declared secrets
   reach the tool; the parent's env is filtered to a system whitelist.
 - **Builtin tools:** `bash`, `echo`, `read_file`, `write_file`, `find`,
-  `secrets.get`, `spawn_subagent`, `search_skills`, `add_skill`.
+  `spawn_subagent`, `search_skills`.
 - **CLI:** `loom run`, `loom prompt`, `loom audit`, `loom acp serve`,
   `loom install`, `loom list`, `loom extensions`.
 - An end-to-end **sample agent** under `test/fixtures/sample-agent`.

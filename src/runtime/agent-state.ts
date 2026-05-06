@@ -1,47 +1,26 @@
 /**
- * AgentState — the mutable part of a running agent.
+ * AgentState — the runtime's read-only view of the agent's live skills,
+ * sandbox ceiling, and tool table.
  *
- * Owns the live skills list, capability ceiling, and tool table. Both
- * `RunningAgentImpl` and `RuntimeImpl` hold a reference to the same
- * `AgentState` instance, so that when an in-process tool such as `add_skill`
- * mutates state, the next turn's system prompt and tool catalog reflect it.
+ * Owned by `RunningAgentImpl`; the runtime instance per turn (`RuntimeImpl`)
+ * borrows the same reference for system-prompt assembly and tool dispatch.
  *
- * Mutation is exclusive: `addSkill` is the only entry point. It returns the
- * effective ceiling diff (caller uses this to decide whether a permission
- * prompt was actually needed).
+ * Historically this was mutable, because the deleted `add_skill` builtin
+ * grew the tool table and ceiling at runtime. With dynamic skill addition
+ * gone, it's a plain typed bag — no setters, no `addSkill`. To bring more
+ * skills into scope, run a fresh `runAgent()` with an updated manifest.
  */
 
-import type { SkillManifest, SandboxCeiling } from "../types/manifest.js";
-import type { Tool } from "../types/interfaces.js";
+import type { SandboxCeiling, SkillManifest } from "../types/manifest.js";
 
-import { unionCapabilities } from "../manifest/capabilities.js";
 import type { ToolTable } from "./tool-table.js";
-
-export interface AddSkillArgs {
-  skill: SkillManifest;
-  tools: Tool[];
-  /** Capabilities the new tools collectively require. */
-  required: SandboxCeiling;
-  /** Secrets to merge into the runtime secret store. */
-  secrets?: Record<string, string>;
-}
-
-export interface AddSkillOutcome {
-  added: true;
-  /** New tool names made visible to the model. */
-  newTools: string[];
-  /** Capabilities granted by this addition (post-expansion view). */
-  ceilingAfter: SandboxCeiling;
-  /** Whether the agent's ceiling actually had to grow. */
-  ceilingChanged: boolean;
-}
 
 export class AgentState {
   /** Read by RuntimeImpl every turn (when assembling the system prompt). */
-  readonly skills: SkillManifest[];
-  /** The currently-effective capability ceiling. Mutates as add_skill expands it. */
-  ceiling: SandboxCeiling;
-  /** Mutable name→Tool table the runtime executes against. */
+  readonly skills: readonly SkillManifest[];
+  /** The agent's effective sandbox ceiling. */
+  readonly ceiling: SandboxCeiling;
+  /** Name→Tool registry the runtime executes against. */
   readonly toolTable: ToolTable;
 
   constructor(opts: {
@@ -60,31 +39,4 @@ export class AgentState {
   hasTool(name: string): boolean {
     return this.toolTable.has(name);
   }
-
-  addSkill(args: AddSkillArgs): AddSkillOutcome {
-    const newTools: string[] = [];
-    for (const t of args.tools) {
-      if (this.toolTable.addTool(t)) newTools.push(t.name);
-    }
-    if (args.secrets) this.toolTable.addSecrets(args.secrets);
-
-    const before = this.ceiling;
-    const after = unionCapabilities([before, args.required]);
-    const ceilingChanged =
-      JSON.stringify(normalize(before)) !== JSON.stringify(normalize(after));
-    this.ceiling = after;
-
-    if (args.skill.name && !this.hasSkill(args.skill.name)) {
-      this.skills.push(args.skill);
-    }
-    return { added: true, newTools, ceilingAfter: after, ceilingChanged };
-  }
-}
-
-function normalize(c: SandboxCeiling): Record<string, unknown> {
-  return {
-    filesystem: [...(c.filesystem ?? [])].sort(),
-    network: [...(c.network ?? [])].sort(),
-    secrets: [...(c.secrets ?? [])].sort(),
-  };
 }

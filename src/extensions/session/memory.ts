@@ -35,7 +35,7 @@ export class MemorySession implements Session {
 
 export const memorySessionFactory: SessionFactory = {
   name: "memory",
-  create(config: Record<string, unknown>, _ctx: ExtensionContext): Session {
+  create(config: Record<string, unknown>, _ctx: ExtensionContext, _secrets: Record<string, string>): Session {
     const skills = (config.contributesSkills as SkillManifest[] | undefined) ?? [];
     return new MemorySession(skills);
   },
