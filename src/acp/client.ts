@@ -23,7 +23,7 @@ import {
 import type { SessionUpdate } from "../types/acp.js";
 
 export interface AcpClient {
-  newSession(manifestPath?: string): Promise<SessionNewResult>;
+  newSession(manifestPathOrName?: string, opts?: { byName?: boolean }): Promise<SessionNewResult>;
   prompt(params: SessionPromptParams): Promise<SessionPromptResult>;
   cancel(sessionId: string): Promise<void>;
   closeSession(sessionId: string): Promise<void>;
@@ -84,8 +84,14 @@ class JsonRpcClient implements AcpClient {
     });
   }
 
-  async newSession(manifestPath?: string): Promise<SessionNewResult> {
-    return this.call<SessionNewResult>(ACP_METHODS.sessionNew, { manifestPath });
+  async newSession(
+    manifestPathOrName?: string,
+    opts: { byName?: boolean } = {},
+  ): Promise<SessionNewResult> {
+    const params = opts.byName
+      ? { name: manifestPathOrName }
+      : { manifestPath: manifestPathOrName };
+    return this.call<SessionNewResult>(ACP_METHODS.sessionNew, params);
   }
 
   async prompt(params: SessionPromptParams): Promise<SessionPromptResult> {
@@ -190,24 +196,69 @@ export function connectUnix(socketPath: string): Promise<AcpClient> {
   });
 }
 
-export async function connectAcpUrl(url: string): Promise<AcpClient> {
+export interface ParsedAcpUrl {
+  scheme: "acp" | "acp+unix";
+  /** For acp+unix: the socket path (everything between scheme:// and the next '/' delimiter). */
+  socketPath?: string;
+  host?: string;
+  port?: number;
+  /** Path component (e.g. "/search") — used as the registry name on the remote daemon. */
+  agentName?: string;
+}
+
+/**
+ * Parse an ACP URL.
+ *
+ * Examples:
+ *   acp://192.168.1.5:8910/search       → { scheme: acp, host, port, agentName: 'search' }
+ *   acp+unix:///run/glass.sock          → { scheme: acp+unix, socketPath: '/run/glass.sock' }
+ *   acp+unix:///run/glass.sock:helper   → { scheme: acp+unix, socketPath: '/run/glass.sock', agentName: 'helper' }
+ *
+ * The acp+unix variant uses ':' as the socket-vs-name separator because Unix
+ * paths can contain '/'. Either or both halves may be omitted.
+ */
+export function parseAcpUrl(url: string): ParsedAcpUrl {
   if (url.startsWith("acp+unix://")) {
-    return connectUnix(url.slice("acp+unix://".length));
+    const tail = url.slice("acp+unix://".length);
+    const colon = tail.lastIndexOf(":");
+    if (colon > 0) {
+      return {
+        scheme: "acp+unix",
+        socketPath: tail.slice(0, colon),
+        agentName: tail.slice(colon + 1),
+      };
+    }
+    return { scheme: "acp+unix", socketPath: tail };
   }
   if (url.startsWith("acp://")) {
     const tail = url.slice("acp://".length);
-    const m = /^([^:]+):(\d+)/.exec(tail);
+    const m = /^([^:/]+):(\d+)(\/.*)?$/.exec(tail);
     if (!m) throw new Error(`invalid acp:// URL: ${url}`);
-    const host = m[1]!;
-    const port = parseInt(m[2]!, 10);
-    return new Promise<AcpClient>((resolve, reject) => {
-      const s = connect(port, host);
-      s.once("connect", () => {
-        const stream = ndjsonStream(s, s);
-        resolve(new JsonRpcClient(stream, () => s.destroy()));
-      });
-      s.once("error", reject);
-    });
+    const out: ParsedAcpUrl = { scheme: "acp", host: m[1]!, port: parseInt(m[2]!, 10) };
+    if (m[3]) out.agentName = m[3].replace(/^\//, "");
+    return out;
   }
   throw new Error(`unsupported ACP URL scheme: ${url}`);
+}
+
+export async function connectAcpUrl(url: string): Promise<AcpClient & { agentName?: string }> {
+  const parsed = parseAcpUrl(url);
+  if (parsed.scheme === "acp+unix") {
+    const c = (await connectUnix(parsed.socketPath!)) as AcpClient & { agentName?: string };
+    if (parsed.agentName) c.agentName = parsed.agentName;
+    return c;
+  }
+  // acp://
+  const host = parsed.host!;
+  const port = parsed.port!;
+  return await new Promise<AcpClient & { agentName?: string }>((resolve, reject) => {
+    const s = connect(port, host);
+    s.once("connect", () => {
+      const stream = ndjsonStream(s, s);
+      const c: AcpClient & { agentName?: string } = new JsonRpcClient(stream, () => s.destroy());
+      if (parsed.agentName) c.agentName = parsed.agentName;
+      resolve(c);
+    });
+    s.once("error", reject);
+  });
 }

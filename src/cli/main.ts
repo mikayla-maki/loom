@@ -34,6 +34,10 @@ async function main(argv: string[]): Promise<number> {
       return await cmdAcp(argv.slice(1));
     case "daemon":
       return await cmdDaemon(argv.slice(1));
+    case "install":
+      return await cmdInstall(argv.slice(1));
+    case "list":
+      return await cmdList(argv.slice(1));
     default:
       console.error(`Unknown subcommand: ${cmd}`);
       printHelp();
@@ -51,6 +55,10 @@ Usage:
   glass audit <agent.toml>                Print the static capability tree.
   glass acp serve <agent.toml>            Speak ACP over stdio.
   glass daemon [--socket <path>]          Run the broker daemon (v1).
+  glass install <kind> <path> [--name N]  Install a skill/tool/agent into ~/.glass.
+  glass list <kind>                       List installed skills/tools/agents.
+
+Where <kind> ∈ { skill | tool | agent }.
 
 Flags:
   --no-colors                             Disable ANSI colour output.
@@ -137,13 +145,18 @@ async function cmdPrompt(args: string[]): Promise<number> {
 }
 
 async function cmdAudit(args: string[]): Promise<number> {
-  const manifestPath = args[0];
+  const opts = parseFlags(args);
+  const manifestPath = opts._[0];
   if (!manifestPath) {
-    console.error("usage: glass audit <agent.toml>");
+    console.error("usage: glass audit <agent.toml> [--json]");
     return 2;
   }
   const tree = await auditAgent(manifestPath);
-  process.stdout.write(formatCapabilityTree(tree) + "\n");
+  if (opts.flags.json) {
+    process.stdout.write(JSON.stringify(tree, null, 2) + "\n");
+  } else {
+    process.stdout.write(formatCapabilityTree(tree) + "\n");
+  }
   return 0;
 }
 
@@ -161,6 +174,56 @@ async function cmdAcp(args: string[]): Promise<number> {
   const { serveOverStdio } = await import("../acp/server.js");
   const agent = await runAgent(manifestPath);
   await serveOverStdio(agent);
+  return 0;
+}
+
+async function cmdInstall(args: string[]): Promise<number> {
+  const opts = parseFlags(args);
+  const kind = opts._[0];
+  const src = opts._[1];
+  if (!kind || !src) {
+    console.error("usage: glass install <skill|tool|agent> <path> [--name <name>] [--symlink]");
+    return 2;
+  }
+  if (kind !== "skill" && kind !== "tool" && kind !== "agent") {
+    console.error(`unknown kind: ${kind}`);
+    return 2;
+  }
+  const { LocalRegistry } = await import("../registry/registry.js");
+  const reg = new LocalRegistry();
+  const dest = await reg.install(kind, src, {
+    ...(typeof opts.flags.name === "string" ? { name: opts.flags.name } : {}),
+    symlink: !!opts.flags.symlink,
+  });
+  process.stdout.write(`installed ${kind} → ${dest}\n`);
+  return 0;
+}
+
+async function cmdList(args: string[]): Promise<number> {
+  const kind = args[0];
+  if (kind !== "skill" && kind !== "tool" && kind !== "agent") {
+    console.error("usage: glass list <skill|tool|agent>");
+    return 2;
+  }
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  const home = process.env.GLASS_HOME ?? path.join(os.homedir(), ".glass");
+  const dir = path.join(home, kind === "skill" ? "skills" : kind === "tool" ? "tools" : "agents");
+  let entries: string[] = [];
+  try {
+    entries = (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory() || d.isSymbolicLink())
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    entries = [];
+  }
+  if (entries.length === 0) {
+    process.stdout.write(`(no installed ${kind}s under ${dir})\n`);
+    return 0;
+  }
+  for (const e of entries) process.stdout.write(`${e}\n`);
   return 0;
 }
 

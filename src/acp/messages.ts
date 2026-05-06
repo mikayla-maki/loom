@@ -56,7 +56,10 @@ export interface SessionUpdateNotification {
 }
 
 export interface SessionNewParams {
-  manifestPath: string;
+  /** Path to an agent.toml. Mutually exclusive with `name`. */
+  manifestPath?: string;
+  /** Registry name (~/.glass/agents/<name>). Mutually exclusive with `manifestPath`. */
+  name?: string;
 }
 export interface SessionNewResult {
   sessionId: string;

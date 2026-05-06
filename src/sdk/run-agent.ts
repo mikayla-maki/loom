@@ -11,8 +11,10 @@ import * as path from "node:path";
 
 import { getHarnessFactory, getSessionFactory } from "../extensions/index.js";
 import { resolveAgent, type ResolveOptions, type ResolvedAgent } from "../manifest/resolver.js";
+import { LocalRegistry } from "../registry/registry.js";
 import { RuntimeImpl } from "../runtime/runtime.js";
 import { ProcessTool, ToolTable } from "../runtime/tool-table.js";
+import { SpawnSubagentTool, SubagentRegistry } from "../runtime/subagent.js";
 import { UpdateSink } from "../runtime/update-sink.js";
 import {
   ChainedSecretsStore,
@@ -54,7 +56,15 @@ export async function runAgent(
   manifestPath: string,
   options: RunAgentOptions = {},
 ): Promise<RunningAgent> {
-  const resolved = await resolveAgent(manifestPath, options.resolve ?? {});
+  // Resolve options: if no registry was provided and a registry exists at
+  // $GLASS_HOME / ~/.glass, plumb it in so bare names resolve there.
+  const resolveOptions: ResolveOptions = { ...(options.resolve ?? {}) };
+  if (!resolveOptions.registry) {
+    const lr = new LocalRegistry();
+    resolveOptions.registry = lr.lookup;
+  }
+
+  const resolved = await resolveAgent(manifestPath, resolveOptions);
 
   // Secrets store (chained: explicit > env > optional file in manifest dir).
   const stores: SecretsStore[] = [];
@@ -78,14 +88,41 @@ export async function runAgent(
   const optional = await resolveSecrets(store, ceilingOnly, { allowMissing: true });
   const secrets: Record<string, string> = { ...required, ...optional };
 
-  // Tools (process-backed).
-  const tools: Tool[] = resolved.tools.map(
-    (rt) =>
-      new ProcessTool(rt.manifest, {
-        extraPath: resolved.pathAdditions,
-        ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
-      }),
+  // Build the subagent registry from each skill's declared subagents. The
+  // resolver already validated that the union sits inside the agent's
+  // [sandbox].subagent ceiling.
+  const subagentEntries: Array<{ name: string; ref: import("../manifest/resolver.js").ResolvedSubagent; skill: string }> = [];
+  for (const sk of resolved.skills) {
+    for (const [name, ref] of Object.entries(sk.subagents)) {
+      subagentEntries.push({ name, ref, skill: sk.manifest.name });
+    }
+  }
+  const subagentRegistry = new SubagentRegistry(
+    subagentEntries,
+    resolved.manifest.sandbox,
   );
+
+  // Tools — process-backed for declared tools, plus an in-process
+  // spawn_subagent if the skill graph reaches any subagents.
+  const processTools: Tool[] = resolved.tools
+    // The user can't ship a tool literally named spawn_subagent — we own
+    // that name. If a process-backed builtin is also named spawn_subagent
+    // (which is true for the bundled builtin), we replace it with the
+    // in-process one because it's strictly better (no cold start, no
+    // env-var registry, real capability check).
+    .filter((rt) => rt.manifest.tool.name !== "spawn_subagent")
+    .map(
+      (rt) =>
+        new ProcessTool(rt.manifest, {
+          extraPath: resolved.pathAdditions,
+          ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
+        }),
+    );
+  const tools: Tool[] = [...processTools];
+  const hasProcessSpawn = resolved.tools.some((rt) => rt.manifest.tool.name === "spawn_subagent");
+  if (hasProcessSpawn || subagentEntries.length > 0) {
+    tools.push(new SpawnSubagentTool(subagentRegistry, { runOptions: options.resolve ? { resolve: options.resolve } : {} }));
+  }
   const toolTable = new ToolTable(tools, secrets);
 
   // Extensions: factories.
