@@ -111,64 +111,6 @@ provider = "test"
     }
   });
 
-  it("rejects [agent].remove_builtin_tools with a migration message pointing at [tools]", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-rmbt-"));
-    try {
-      const p = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        p,
-        `[agent]
-name = "legacy"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-`,
-        "utf8",
-      );
-      await expect(parseAgentManifest(p)).rejects.toThrow(
-        /remove_builtin_tools is no longer supported.*\[tools\]/s,
-      );
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects the legacy identity / identity_inline fields with a migration message", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-bad-"));
-    try {
-      const p = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        p,
-        `[agent]
-name = "x"
-identity = "./i.md"
-[tools]
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-[skills]
-`,
-        "utf8",
-      );
-      await expect(parseAgentManifest(p)).rejects.toThrow(/system_prompt/);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
   it("system_prompt accepts an inline string (no path prefix)", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inline-sp-"));
     try {

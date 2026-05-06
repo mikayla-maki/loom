@@ -38,16 +38,6 @@ export async function parseAgentManifest(
       `agent.toml at ${abs} is missing required [agent].name`,
     );
   }
-  if (agent.identity != null || agent.identity_inline != null) {
-    throw new ManifestError(
-      `agent.toml at ${abs}: [agent].identity / [agent].identity_inline have been replaced by [agent].system_prompt (path or inline string)`,
-    );
-  }
-  if (agent.remove_builtin_tools != null) {
-    throw new ManifestError(
-      `agent.toml at ${abs}: [agent].remove_builtin_tools is no longer supported. Declare an explicit (possibly empty) [tools] table instead — absence of [tools] auto-loads the default builtin set; an empty [tools] table opts out entirely.`,
-    );
-  }
   const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
 
   const harness = ensureObject(raw.harness, "[harness]", abs);
@@ -80,11 +70,6 @@ export async function parseAgentManifest(
       ? undefined
       : parseStringValueTable(raw.tools, "[tools]", abs);
   const skills = parseStringValueTable(raw.skills, "[skills]", abs);
-  if (raw.providers !== undefined) {
-    throw new ManifestError(
-      `agent.toml at ${abs}: [providers] is no longer a separate table — list provider names under [extensions] instead. Each [extensions].<name> entry resolves to a registered provider factory or to an npm package with a 'loom.extension' field.`,
-    );
-  }
   const extensions = parseConfigTable(raw.extensions, "[extensions]", abs);
 
   return {
@@ -329,11 +314,6 @@ function parseSubagentEntry(
     if (typeof obj.name === "string")
       return { kind: "registry", name: obj.name };
     if (typeof obj.acp === "string") return { kind: "acp", url: obj.acp };
-    if ("inline" in obj) {
-      throw new ManifestError(
-        `subagent ${key} at ${manifestPath}: inline manifests are no longer supported. Use a path, a registry name, or an acp:// URL.`,
-      );
-    }
   }
   throw new ManifestError(
     `subagent ${key} at ${manifestPath}: expected string or { path | name | acp }`,
@@ -441,17 +421,12 @@ function parseConfigTable(
 }
 
 /**
- * Parse the agent's `[sandbox]` ceiling. Rejects `subagent` here —
- * subagent permissions live on each skill's `subagents` field; the agent
- * has no separate veto axis.
+ * Parse the agent's `[sandbox]` ceiling. The three axes are filesystem,
+ * network, and secrets; subagent permissions live on each skill's
+ * `subagents` field, not here.
  */
 function parseSandboxCeiling(v: unknown, where: string): SandboxCeiling {
   const obj = ensureObject(v, "[sandbox]", where);
-  if ("subagent" in obj) {
-    throw new ManifestError(
-      `agent.toml at ${where}: [sandbox].subagent is no longer supported. Subagent permissions live on each skill's \`subagents\` field; the agent's [sandbox] only constrains filesystem / network / secrets.`,
-    );
-  }
   const out: SandboxCeiling = {};
   if (obj.filesystem !== undefined) {
     out.filesystem = parseStringArray(
