@@ -1,14 +1,14 @@
 /**
- * Load Glass extension packages from npm-installed locations.
+ * Load Loom extension packages from npm-installed locations.
  *
- * Contract: a package is a Glass extension if its package.json contains a
- * `glass.extension` field pointing at an entry that exports `register(api)`:
+ * Contract: a package is a Loom extension if its package.json contains a
+ * `loom.extension` field pointing at an entry that exports `register(api)`:
  *
- *   { "name": "mcp-glass-extension",
- *     "glass": { "extension": "./dist/index.js" } }
+ *   { "name": "mcp-loom-extension",
+ *     "loom": { "extension": "./dist/index.js" } }
  *
  * Discovery walks <manifestDir>/node_modules → npm root -g →
- * ~/.glass/extensions. Activation is explicit (an `[extensions]` entry in
+ * ~/.loom/extensions. Activation is explicit (an `[extensions]` entry in
  * agent.toml) — extensions run as the runtime trust class.
  */
 
@@ -19,7 +19,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 
-import { GlassError } from "../errors.js";
+import { LoomError } from "../errors.js";
 import type {
   HarnessFactory,
   Provider,
@@ -31,7 +31,7 @@ import { registerHarness, registerProvider, registerSession } from "./index.js";
 
 const exec = promisify(execFile);
 
-export interface GlassExtensionApi {
+export interface LoomExtensionApi {
   /** Register a factory by name; the user activates it via the matching manifest table. */
   registerHarness(factory: HarnessFactory): void;
   registerSession(factory: SessionFactory): void;
@@ -44,14 +44,14 @@ export interface GlassExtensionApi {
   addProvider(provider: Provider): void;
   readonly agentName: string;
   readonly manifestDir: string;
-  readonly glassVersion: string;
+  readonly loomVersion: string;
   /** Per-extension config from `[extensions].<name>` in agent.toml. */
   readonly config: Record<string, unknown>;
 }
 
-type RegisterFn = (api: GlassExtensionApi) => void | Promise<void>;
+type RegisterFn = (api: LoomExtensionApi) => void | Promise<void>;
 
-export interface GlassExtensionModule {
+export interface LoomExtensionModule {
   register?: RegisterFn;
   default?: RegisterFn | { register?: RegisterFn };
 }
@@ -69,8 +69,8 @@ export interface LoadOptions {
   searchPaths?: string[];
   /** Override `npm root -g` lookup. */
   npmGlobalRoot?: string;
-  /** Override `~/.glass/extensions`. */
-  glassExtensionsDir?: string;
+  /** Override `~/.loom/extensions`. */
+  loomExtensionsDir?: string;
 }
 
 export async function locateExtensionPackage(
@@ -83,35 +83,35 @@ export async function locateExtensionPackage(
     const info = await tryLoadPackageJson(path.join(root, name), name);
     if (info) return info;
   }
-  throw new GlassError(
-    `Cannot find Glass extension package '${name}'. Searched: ${roots.join(", ")}. ` +
+  throw new LoomError(
+    `Cannot find Loom extension package '${name}'. Searched: ${roots.join(", ")}. ` +
       `Install via 'npm install ${name}' (locally), 'npm install -g ${name}' (globally), ` +
-      `or place under ~/.glass/extensions/${name}/.`,
+      `or place under ~/.loom/extensions/${name}/.`,
   );
 }
 
 export async function loadExtensionPackage(
   name: string,
   config: Record<string, unknown>,
-  loadCtx: { agentManifestDir: string; agentName: string; glassVersion: string },
+  loadCtx: { agentManifestDir: string; agentName: string; loomVersion: string },
   options: LoadOptions = {},
 ): Promise<{ info: ExtensionPackageInfo; addedProviders: Provider[] }> {
   const info = await locateExtensionPackage(name, loadCtx, options);
 
-  let mod: GlassExtensionModule;
+  let mod: LoomExtensionModule;
   try {
-    mod = (await import(pathToFileURL(info.entryPath).href)) as GlassExtensionModule;
+    mod = (await import(pathToFileURL(info.entryPath).href)) as LoomExtensionModule;
   } catch (e) {
-    throw new GlassError(
-      `Failed to import Glass extension '${name}' (${info.entryPath}): ${(e as Error).message}`,
+    throw new LoomError(
+      `Failed to import Loom extension '${name}' (${info.entryPath}): ${(e as Error).message}`,
       { cause: e },
     );
   }
 
   const register = pickRegisterFn(mod);
   if (!register) {
-    throw new GlassError(
-      `Glass extension '${name}' does not export a register() function (entry: ${info.entryPath})`,
+    throw new LoomError(
+      `Loom extension '${name}' does not export a register() function (entry: ${info.entryPath})`,
     );
   }
 
@@ -123,7 +123,7 @@ export async function loadExtensionPackage(
     addProvider: (p) => addedProviders.push(p),
     agentName: loadCtx.agentName,
     manifestDir: loadCtx.agentManifestDir,
-    glassVersion: loadCtx.glassVersion,
+    loomVersion: loadCtx.loomVersion,
     config,
   });
   return { info, addedProviders };
@@ -175,7 +175,7 @@ async function listPackageNames(root: string): Promise<string[]> {
   return out;
 }
 
-function pickRegisterFn(mod: GlassExtensionModule): RegisterFn | undefined {
+function pickRegisterFn(mod: LoomExtensionModule): RegisterFn | undefined {
   if (typeof mod.register === "function") return mod.register;
   const d = mod.default;
   if (typeof d === "function") return d;
@@ -197,15 +197,15 @@ async function tryLoadPackageJson(
     name?: string;
     version?: string;
     description?: string;
-    glass?: { extension?: string };
+    loom?: { extension?: string };
   };
   try {
     parsed = JSON.parse(raw);
   } catch {
     return null;
   }
-  if (!parsed.glass || typeof parsed.glass.extension !== "string") return null;
-  const entryAbs = path.resolve(packageDir, parsed.glass.extension);
+  if (!parsed.loom || typeof parsed.loom.extension !== "string") return null;
+  const entryAbs = path.resolve(packageDir, parsed.loom.extension);
   try {
     await fs.access(entryAbs);
   } catch {
@@ -240,8 +240,8 @@ async function collectSearchRoots(
   if (globalRoot) roots.push(globalRoot);
 
   roots.push(
-    options.glassExtensionsDir ??
-      path.join(process.env.GLASS_HOME ?? path.join(os.homedir(), ".glass"), "extensions"),
+    options.loomExtensionsDir ??
+      path.join(process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom"), "extensions"),
   );
 
   return [...new Set(roots.filter(Boolean))];

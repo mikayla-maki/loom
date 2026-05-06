@@ -1,5 +1,5 @@
 /**
- * Glass — public entry.
+ * Loom — public entry.
  */
 
 export * from "./types/index.js";
@@ -7,7 +7,13 @@ export * from "./sdk/index.js";
 export * as errors from "./errors.js";
 
 export { resolveAgent } from "./manifest/resolver.js";
-export type { ResolveOptions, ResolvedAgent, ResolvedSkill, ResolvedTool } from "./manifest/resolver.js";
+export type {
+  ResolveOptions,
+  ResolvedAgentManifest,
+  ResolvedSkill,
+  ResolvedTool,
+  ResolvedSubagent,
+} from "./manifest/resolver.js";
 
 export {
   parseAgentManifest,
@@ -16,10 +22,7 @@ export {
   parseSubagentsFile,
 } from "./manifest/parser.js";
 
-export {
-  unionCapabilities,
-  assertSubset,
-} from "./manifest/capabilities.js";
+export { unionCapabilities, assertSubset } from "./manifest/capabilities.js";
 
 export {
   registerHarness,
@@ -38,7 +41,11 @@ export {
   fileSessionFactory,
 } from "./extensions/index.js";
 
-export type { TestHarnessConfig, TurnScript, TurnStep } from "./extensions/harness/test.js";
+export type {
+  TestHarnessConfig,
+  TurnScript,
+  TurnStep,
+} from "./extensions/harness/test.js";
 
 export {
   loadExtensionPackage,
@@ -46,8 +53,8 @@ export {
   listInstalledExtensions,
 } from "./extensions/loader.js";
 export type {
-  GlassExtensionApi,
-  GlassExtensionModule,
+  LoomExtensionApi,
+  LoomExtensionModule,
   ExtensionPackageInfo,
   LoadOptions as ExtensionLoadOptions,
 } from "./extensions/loader.js";

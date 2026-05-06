@@ -8,7 +8,7 @@ required = ["text"]
 properties.text.type = "string"
 
 [tool.invocation]
-command = "glass-echo"
+command = "loom-echo"
 
 [tool.secrets]
 required = []

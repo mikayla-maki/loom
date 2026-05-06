@@ -4,97 +4,103 @@
  *
  * The runtime calls this before booting an agent. If it fails, the agent
  * does not start.
+ *
+ * Permissive-default model: an axis that is *absent* from the ceiling
+ * (i.e. `ceiling.filesystem === undefined`) means "no constraint on this
+ * axis" (`*`). An empty array means "explicitly nothing." Whole `[sandbox]`
+ * absent on the agent therefore means "all axes unconstrained." Subagents
+ * are no longer a sandbox axis at the agent level — each skill declares
+ * which subagents its tools may invoke; the auditor walks them transitively.
  */
 
 import { CapabilityError } from "../errors.js";
-import type { Capabilities } from "../types/manifest.js";
+import type { SandboxCeiling, ToolCapabilities } from "../types/manifest.js";
 
 export interface CapabilityField {
   /** Items in `required` not in `ceiling`, when literal-membership is used. */
   excess: string[];
 }
 
-/** The four capability axes Glass tracks at v0/v1. */
-export type CapabilityAxis = "filesystem" | "network" | "secrets" | "subagent";
+/** Capability axes the agent's `[sandbox]` controls. */
+export type CapabilityAxis = "filesystem" | "network" | "secrets";
 
-const AXES: CapabilityAxis[] = ["filesystem", "network", "secrets", "subagent"];
+const SANDBOX_AXES: CapabilityAxis[] = ["filesystem", "network", "secrets"];
 
 /**
- * Union all capabilities from a list of contributors (e.g. tools).
- *
- * For string-array axes we just merge & dedupe. The "*" wildcard on subagent
- * is preserved (means "any declared by skills").
+ * Union all sandbox-axis capabilities from a list of contributors (e.g.
+ * tools). For sandbox axes we merge & dedupe; the `subagent` field on
+ * tool capabilities is intentionally not unioned here — it lives on
+ * tools as a per-tool broker opt-in, not as an agent-wide ceiling.
  */
-export function unionCapabilities(parts: Array<Capabilities | undefined>): Capabilities {
-  const out: Capabilities = {};
+export function unionCapabilities(
+  parts: Array<ToolCapabilities | SandboxCeiling | undefined>,
+): SandboxCeiling {
+  const out: SandboxCeiling = {};
   for (const p of parts) {
     if (!p) continue;
-    for (const axis of AXES) {
-      const v = p[axis as keyof Capabilities];
+    for (const axis of SANDBOX_AXES) {
+      const v = (p as SandboxCeiling)[axis];
       if (v === undefined) continue;
-      if (v === "*") {
-        if (axis === "subagent") out.subagent = "*";
-        continue;
-      }
       const cur = out[axis];
-      if (cur === "*") continue;
-      const arr = (cur as string[] | undefined) ?? [];
-      const merged = new Set<string>(arr);
-      for (const x of v as string[]) merged.add(x);
-      if (axis === "subagent") out.subagent = Array.from(merged);
-      else if (axis === "filesystem") out.filesystem = Array.from(merged);
-      else if (axis === "network") out.network = Array.from(merged);
-      else if (axis === "secrets") out.secrets = Array.from(merged);
+      const merged = new Set<string>(cur ?? []);
+      for (const x of v) merged.add(x);
+      out[axis] = Array.from(merged);
     }
   }
   return out;
 }
 
 /**
- * Assert that `required` ⊆ `ceiling`.
+ * Assert that `required` ⊆ `ceiling` for the three sandbox axes.
  *
  * Rules per axis:
+ *  - **Absent ceiling axis** (`ceiling.<axis> === undefined`): unconstrained;
+ *    skip the check.
  *  - filesystem: each required path must be inside *some* ceiling path
  *    (path-prefix containment).
  *  - network: each required host must match a ceiling entry, where ceiling
  *    entries may be wildcards like `*.example.com`.
- *  - secrets, subagent: literal set membership.
- *
- * If `ceiling.subagent === "*"` the subagent axis is unrestricted.
+ *  - secrets: literal set membership.
  */
-export function assertSubset(required: Capabilities, ceiling: Capabilities): void {
+export function assertSubset(
+  required: SandboxCeiling,
+  ceiling: SandboxCeiling,
+): void {
   const violations: Record<string, string[]> = {};
 
   // filesystem
-  if (required.filesystem && required.filesystem.length > 0) {
-    const c = ceiling.filesystem ?? [];
-    const bad = required.filesystem.filter((req) => !pathContainedInAny(req, c));
+  if (
+    required.filesystem &&
+    required.filesystem.length > 0 &&
+    ceiling.filesystem !== undefined
+  ) {
+    const c = ceiling.filesystem;
+    const bad = required.filesystem.filter(
+      (req) => !pathContainedInAny(req, c),
+    );
     if (bad.length > 0) violations.filesystem = bad;
   }
 
   // network
-  if (required.network && required.network.length > 0) {
-    const c = ceiling.network ?? [];
+  if (
+    required.network &&
+    required.network.length > 0 &&
+    ceiling.network !== undefined
+  ) {
+    const c = ceiling.network;
     const bad = required.network.filter((req) => !hostMatchesAny(req, c));
     if (bad.length > 0) violations.network = bad;
   }
 
   // secrets
-  if (required.secrets && required.secrets.length > 0) {
-    const c = new Set(ceiling.secrets ?? []);
+  if (
+    required.secrets &&
+    required.secrets.length > 0 &&
+    ceiling.secrets !== undefined
+  ) {
+    const c = new Set(ceiling.secrets);
     const bad = required.secrets.filter((s) => !c.has(s));
     if (bad.length > 0) violations.secrets = bad;
-  }
-
-  // subagent
-  if (required.subagent && required.subagent !== "*") {
-    if (ceiling.subagent !== "*") {
-      const c = new Set(ceiling.subagent ?? []);
-      const bad = (required.subagent as string[]).filter((s) => !c.has(s));
-      if (bad.length > 0) violations.subagent = bad;
-    }
-  } else if (required.subagent === "*" && ceiling.subagent !== "*") {
-    violations.subagent = ["* (unrestricted) requires ceiling subagent = \"*\""];
   }
 
   if (Object.keys(violations).length > 0) {

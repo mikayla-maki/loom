@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 /**
- * Glass CLI — `glass <subcommand>`.
+ * Loom CLI — `loom <subcommand>`.
  *
  * Subcommands:
  *   run <agent.toml>           Drive the agent in a REPL loop.
  *   prompt <agent.toml> [text] One-shot: prompt with `text` (or stdin) and exit.
  *   audit <agent.toml>         Print the static capability tree.
  *   acp serve <agent.toml>     Speak ACP over stdio (peer can drive turns).
- *   daemon                     Run the broker daemon (v1).
  *
  * The CLI is intentionally minimal — the surface area is the SDK.
  */
@@ -33,8 +32,6 @@ async function main(argv: string[]): Promise<number> {
       return await cmdAudit(argv.slice(1));
     case "acp":
       return await cmdAcp(argv.slice(1));
-    case "daemon":
-      return await cmdDaemon(argv.slice(1));
     case "install":
       return await cmdInstall(argv.slice(1));
     case "list":
@@ -50,18 +47,17 @@ async function main(argv: string[]): Promise<number> {
 
 function printHelp(): void {
   process.stdout.write(
-    `glass — manifest-driven agent meta-harness
+    `loom — manifest-driven agent meta-harness
 
 Usage:
-  glass run <agent.toml>                  Start an interactive REPL.
-  glass prompt <agent.toml> [text]        One-shot prompt (stdin if [text] omitted).
-  glass audit <agent.toml>                Print the static capability tree.
-  glass acp serve <agent.toml>            Speak ACP over stdio.
-  glass daemon [--socket <path>]          Run the broker daemon (v1).
-  glass install <kind> <path> [--name N]  Install a skill/tool/agent into ~/.glass.
-  glass list <kind>                       List installed skills/tools/agents.
-  glass extensions list                   List Glass extension npm packages on disk.
-  glass extensions info <name>            Show resolved metadata for an extension package.
+  loom run <agent.toml>                  Start an interactive REPL.
+  loom prompt <agent.toml> [text]        One-shot prompt (stdin if [text] omitted).
+  loom audit <agent.toml>                Print the static capability tree.
+  loom acp serve <agent.toml>            Speak ACP over stdio.
+  loom install <kind> <path> [--name N]  Install a skill/tool/agent into ~/.loom.
+  loom list <kind>                       List installed skills/tools/agents.
+  loom extensions list                   List Loom extension npm packages on disk.
+  loom extensions info <name>            Show resolved metadata for an extension package.
 
 Where <kind> ∈ { skill | tool | agent }.
 
@@ -76,7 +72,7 @@ async function cmdRun(args: string[]): Promise<number> {
   const opts = parseFlags(args);
   const manifestPath = opts._[0];
   if (!manifestPath) {
-    console.error("usage: glass run <agent.toml>");
+    console.error("usage: loom run <agent.toml>");
     return 2;
   }
   const agent = await runAgent(manifestPath, {
@@ -93,8 +89,13 @@ async function cmdRun(args: string[]): Promise<number> {
     for await (const u of sub) renderer.render(u);
   })();
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  process.stdout.write(`\nglass: ready (${agent.resolved.manifest.agent.name}). type a message; ctrl-c to quit.\n`);
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  process.stdout.write(
+    `\nloom: ready (${agent.resolved.source.name}). type a message; ctrl-c to quit.\n`,
+  );
 
   const ask = () =>
     new Promise<string | null>((resolve) => {
@@ -124,13 +125,15 @@ async function cmdPrompt(args: string[]): Promise<number> {
   const opts = parseFlags(args);
   const manifestPath = opts._[0];
   if (!manifestPath) {
-    console.error("usage: glass prompt <agent.toml> [text]");
+    console.error("usage: loom prompt <agent.toml> [text]");
     return 2;
   }
   let text = opts._.slice(1).join(" ");
   if (!text) text = await readStdin();
   if (!text.trim()) {
-    console.error("error: no prompt text supplied (pipe via stdin or pass as arg)");
+    console.error(
+      "error: no prompt text supplied (pipe via stdin or pass as arg)",
+    );
     return 2;
   }
   const agent = await runAgent(manifestPath, {
@@ -157,7 +160,7 @@ async function cmdAudit(args: string[]): Promise<number> {
   const opts = parseFlags(args);
   const manifestPath = opts._[0];
   if (!manifestPath) {
-    console.error("usage: glass audit <agent.toml> [--json]");
+    console.error("usage: loom audit <agent.toml> [--json]");
     return 2;
   }
   const tree = await auditAgent(manifestPath);
@@ -172,12 +175,12 @@ async function cmdAudit(args: string[]): Promise<number> {
 async function cmdAcp(args: string[]): Promise<number> {
   const sub = args[0];
   if (sub !== "serve") {
-    console.error("usage: glass acp serve <agent.toml>");
+    console.error("usage: loom acp serve <agent.toml>");
     return 2;
   }
   const manifestPath = args[1];
   if (!manifestPath) {
-    console.error("usage: glass acp serve <agent.toml>");
+    console.error("usage: loom acp serve <agent.toml>");
     return 2;
   }
   const { serveOverStdio } = await import("../acp/server.js");
@@ -188,14 +191,13 @@ async function cmdAcp(args: string[]): Promise<number> {
 
 async function cmdExtensions(args: string[]): Promise<number> {
   const sub = args[0];
-  const { listInstalledExtensions, locateExtensionPackage } = await import(
-    "../extensions/loader.js"
-  );
+  const { listInstalledExtensions, locateExtensionPackage } =
+    await import("../extensions/loader.js");
   if (sub === "list") {
     const items = await listInstalledExtensions({});
     if (items.length === 0) {
       process.stdout.write(
-        "(no Glass extension packages found in node_modules, npm root -g, or ~/.glass/extensions)\n",
+        "(no Loom extension packages found in node_modules, npm root -g, or ~/.loom/extensions)\n",
       );
       return 0;
     }
@@ -210,11 +212,13 @@ async function cmdExtensions(args: string[]): Promise<number> {
   if (sub === "info") {
     const name = args[1];
     if (!name) {
-      console.error("usage: glass extensions info <name>");
+      console.error("usage: loom extensions info <name>");
       return 2;
     }
     try {
-      const info = await locateExtensionPackage(name, { agentManifestDir: process.cwd() });
+      const info = await locateExtensionPackage(name, {
+        agentManifestDir: process.cwd(),
+      });
       process.stdout.write(JSON.stringify(info, null, 2) + "\n");
       return 0;
     } catch (e) {
@@ -222,7 +226,7 @@ async function cmdExtensions(args: string[]): Promise<number> {
       return 1;
     }
   }
-  console.error("usage: glass extensions <list|info> [name]");
+  console.error("usage: loom extensions <list|info> [name]");
   return 2;
 }
 
@@ -231,7 +235,9 @@ async function cmdInstall(args: string[]): Promise<number> {
   const kind = opts._[0];
   const src = opts._[1];
   if (!kind || !src) {
-    console.error("usage: glass install <skill|tool|agent> <path> [--name <name>] [--symlink]");
+    console.error(
+      "usage: loom install <skill|tool|agent> <path> [--name <name>] [--symlink]",
+    );
     return 2;
   }
   if (kind !== "skill" && kind !== "tool" && kind !== "agent") {
@@ -251,14 +257,17 @@ async function cmdInstall(args: string[]): Promise<number> {
 async function cmdList(args: string[]): Promise<number> {
   const kind = args[0];
   if (kind !== "skill" && kind !== "tool" && kind !== "agent") {
-    console.error("usage: glass list <skill|tool|agent>");
+    console.error("usage: loom list <skill|tool|agent>");
     return 2;
   }
   const fs = await import("node:fs/promises");
   const path = await import("node:path");
   const os = await import("node:os");
-  const home = process.env.GLASS_HOME ?? path.join(os.homedir(), ".glass");
-  const dir = path.join(home, kind === "skill" ? "skills" : kind === "tool" ? "tools" : "agents");
+  const home = process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom");
+  const dir = path.join(
+    home,
+    kind === "skill" ? "skills" : kind === "tool" ? "tools" : "agents",
+  );
   let entries: string[] = [];
   try {
     entries = (await fs.readdir(dir, { withFileTypes: true }))
@@ -276,15 +285,10 @@ async function cmdList(args: string[]): Promise<number> {
   return 0;
 }
 
-async function cmdDaemon(args: string[]): Promise<number> {
-  const opts = parseFlags(args);
-  const socket = opts.flags.socket;
-  const { startDaemon } = await import("../daemon/server.js");
-  await startDaemon({ ...(typeof socket === "string" ? { socketPath: socket } : {}) });
-  return 0;
-}
-
-function parseFlags(args: string[]): { _: string[]; flags: Record<string, string | boolean> } {
+function parseFlags(args: string[]): {
+  _: string[];
+  flags: Record<string, string | boolean>;
+} {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < args.length; i++) {

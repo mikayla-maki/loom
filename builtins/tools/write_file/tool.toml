@@ -15,7 +15,7 @@ properties.create_dirs.type = "boolean"
 properties.create_dirs.description = "If true, create missing parent directories (default: false)."
 
 [tool.invocation]
-command = "glass-write-file"
+command = "loom-write-file"
 
 [tool.secrets]
 required = []

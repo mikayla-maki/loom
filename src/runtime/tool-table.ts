@@ -14,7 +14,12 @@ import * as path from "node:path";
 import Ajv from "ajv";
 
 import { ToolExecutionError, ToolInputError } from "../errors.js";
-import type { Tool, ToolCall, ToolDescriptor, ToolResult } from "../types/interfaces.js";
+import type {
+  Tool,
+  ToolCall,
+  ToolDescriptor,
+  ToolResult,
+} from "../types/interfaces.js";
 import type { ToolManifest } from "../types/manifest.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false, useDefaults: true });
@@ -39,6 +44,23 @@ const SYSTEM_ENV_WHITELIST = [
   "PWD",
 ] as const;
 
+/**
+ * Per-spawn broker binding. When set, ProcessTool injects
+ * LOOM_INVOKE_TOKEN + LOOM_INVOKE_SOCKET into the child's env, and the
+ * caller is responsible for revoking the token after the child exits.
+ *
+ * The function returns a fresh token (or `null` if no broker) and a
+ * matching revoke callback. Calling the broker once per execute() means
+ * each tool invocation gets a short-lived credential; long-running tool
+ * processes don't keep tokens alive across multiple calls.
+ */
+export interface BrokerBinding {
+  socketPath: string;
+  /** Mint a token bound to this tool's owning skill. */
+  mintToken(): string;
+  revokeToken(token: string): void;
+}
+
 export interface ProcessToolOptions {
   /** Extra env vars merged on top (useful for tests). */
   env?: Record<string, string>;
@@ -47,21 +69,23 @@ export interface ProcessToolOptions {
   extraPath?: string[];
   /** 0 = no timeout. */
   timeoutMs?: number;
+  /** Wire spawned children to a LoomServer broker for subagent invocation. */
+  broker?: BrokerBinding;
 }
 
 export class ProcessTool implements Tool {
   public readonly name: string;
   public readonly description: string;
-  public readonly inputSchema: ToolManifest["tool"]["schema"];
+  public readonly inputSchema: ToolManifest["schema"];
   private readonly validate: import("ajv").ValidateFunction;
 
   constructor(
     public readonly manifest: ToolManifest,
     private readonly options: ProcessToolOptions = {},
   ) {
-    this.name = manifest.tool.name;
-    this.description = manifest.tool.description;
-    this.inputSchema = manifest.tool.schema;
+    this.name = manifest.name ?? "";
+    this.description = manifest.description;
+    this.inputSchema = manifest.schema;
     try {
       this.validate = ajv.compile(this.inputSchema as object);
     } catch (e) {
@@ -72,48 +96,76 @@ export class ProcessTool implements Tool {
     }
   }
 
-  async execute(input: unknown, secrets: Record<string, string>): Promise<ToolResult> {
+  async execute(
+    input: unknown,
+    secrets: Record<string, string>,
+  ): Promise<ToolResult> {
     if (!this.validate(input)) {
       const errors = (this.validate.errors ?? [])
         .map((e) => `${e.instancePath || "/"} ${e.message ?? ""}`)
         .join("; ");
-      throw new ToolInputError(`Tool '${this.name}' input failed validation: ${errors}`);
+      throw new ToolInputError(
+        `Tool '${this.name}' input failed validation: ${errors}`,
+      );
     }
 
-    const env = this.buildEnv(secrets);
+    // Per-execution broker token. Minted just before spawn, revoked when
+    // the child exits (success or failure).
+    const broker = this.shouldWireBroker() ? this.options.broker : undefined;
+    const brokerToken = broker ? broker.mintToken() : null;
+
+    const env = this.buildEnv(secrets, broker, brokerToken);
     const cwd = this.options.cwd ?? this.manifest.toolDir;
-    const command = this.manifest.tool.invocation.command;
-    const args = this.manifest.tool.invocation.args ?? [];
+    const command = this.manifest.invocation.command;
+    const args = this.manifest.invocation.args ?? [];
     const timeout = this.options.timeoutMs ?? 0;
 
     return new Promise<ToolResult>((resolve, reject) => {
-      const child = spawn(command, args, { env, cwd, stdio: ["pipe", "pipe", "pipe"] });
+      const revokeIfMinted = () => {
+        if (broker && brokerToken) broker.revokeToken(brokerToken);
+      };
+      const child = spawn(command, args, {
+        env,
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
       let stdout = "";
       let stderr = "";
       let timedOut = false;
-      const timer = timeout > 0
-        ? setTimeout(() => {
-            timedOut = true;
-            child.kill("SIGKILL");
-          }, timeout)
-        : null;
+      const timer =
+        timeout > 0
+          ? setTimeout(() => {
+              timedOut = true;
+              child.kill("SIGKILL");
+            }, timeout)
+          : null;
 
       child.stdout.on("data", (b: Buffer) => (stdout += b.toString("utf8")));
       child.stderr.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
       child.on("error", (err) => {
         if (timer) clearTimeout(timer);
-        reject(new ToolExecutionError(
-          `Tool '${this.name}' failed to spawn: ${err.message}`,
-          this.name, null, stderr,
-        ));
+        revokeIfMinted();
+        reject(
+          new ToolExecutionError(
+            `Tool '${this.name}' failed to spawn: ${err.message}`,
+            this.name,
+            null,
+            stderr,
+          ),
+        );
       });
       child.on("close", (code) => {
         if (timer) clearTimeout(timer);
+        revokeIfMinted();
         if (timedOut) {
-          reject(new ToolExecutionError(
-            `Tool '${this.name}' timed out after ${timeout}ms`,
-            this.name, null, stderr,
-          ));
+          reject(
+            new ToolExecutionError(
+              `Tool '${this.name}' timed out after ${timeout}ms`,
+              this.name,
+              null,
+              stderr,
+            ),
+          );
           return;
         }
         if (code === 0) {
@@ -122,7 +174,10 @@ export class ProcessTool implements Tool {
           // Surface failure into the tool result instead of throwing — the
           // model needs to see what went wrong to adapt.
           resolve({
-            content: stderr || stdout || `tool '${this.name}' exited with code ${code}`,
+            content:
+              stderr ||
+              stdout ||
+              `tool '${this.name}' exited with code ${code}`,
             isError: true,
           });
         }
@@ -132,19 +187,38 @@ export class ProcessTool implements Tool {
     });
   }
 
-  private buildEnv(secrets: Record<string, string>): NodeJS.ProcessEnv {
+  /**
+   * Only wire the broker for tools that explicitly declare `subagent`
+   * capability. A tool with no subagent capability gets no token and
+   * (because LOOM_INVOKE_SOCKET is also unset) cannot reach the broker.
+   */
+  private shouldWireBroker(): boolean {
+    if (!this.options.broker) return false;
+    const sa = this.manifest.capabilities?.subagent;
+    if (sa === "*") return true;
+    return Array.isArray(sa) && sa.length > 0;
+  }
+
+  private buildEnv(
+    secrets: Record<string, string>,
+    broker: BrokerBinding | undefined,
+    brokerToken: string | null,
+  ): NodeJS.ProcessEnv {
     const base: NodeJS.ProcessEnv = {};
     for (const key of SYSTEM_ENV_WHITELIST) {
       const v = process.env[key];
       if (typeof v === "string") base[key] = v;
     }
-    base.PATH = [...(this.options.extraPath ?? []), process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"]
+    base.PATH = [
+      ...(this.options.extraPath ?? []),
+      process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    ]
       .filter(Boolean)
       .join(path.delimiter);
 
     const requested = new Set([
-      ...this.manifest.tool.secrets.required,
-      ...(this.manifest.tool.secrets.optional ?? []),
+      ...(this.manifest.secrets?.required ?? []),
+      ...(this.manifest.secrets?.optional ?? []),
     ]);
     for (const [name, value] of Object.entries(secrets)) {
       if (!requested.has(name)) continue;
@@ -156,12 +230,19 @@ export class ProcessTool implements Tool {
     // secret on the model's behalf. Gated by tool-name match — users can't
     // recreate it under a different name. The agent's [sandbox].secrets
     // already bounds what's loaded.
-    if (this.manifest.tool.name === "secrets.get") {
-      base.GLASS_SECRETS_JSON = JSON.stringify(secrets);
+    if (this.manifest.name === "secrets.get") {
+      base.LOOM_SECRETS_JSON = JSON.stringify(secrets);
+    }
+
+    // Broker wiring: only inject when this tool is allowed to call the
+    // broker (subagent capability declared) AND a broker is bound.
+    if (broker && brokerToken) {
+      base.LOOM_INVOKE_SOCKET = broker.socketPath;
+      base.LOOM_INVOKE_TOKEN = brokerToken;
     }
 
     if (this.options.env) Object.assign(base, this.options.env);
-    base.GLASS_TOOL_NAME = this.name;
+    base.LOOM_TOOL_NAME = this.name;
     return base;
   }
 }

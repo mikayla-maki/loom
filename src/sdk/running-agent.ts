@@ -11,20 +11,26 @@
  */
 
 import type { SessionUpdate, StopReason } from "../types/acp.js";
-import type { Harness, Provider, Runtime, Session } from "../types/interfaces.js";
+import type {
+  Harness,
+  Provider,
+  Runtime,
+  Session,
+} from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
 
 import { RuntimeImpl } from "../runtime/runtime.js";
 import type { AgentState } from "../runtime/agent-state.js";
 import type { UpdateSink } from "../runtime/update-sink.js";
-import type { ResolvedAgent } from "../manifest/resolver.js";
+import type { ResolvedAgentManifest } from "../manifest/resolver.js";
+import type { LoomServer } from "../server/server.js";
 
 export interface RunningAgent {
   prompt(text: string): Promise<StopReason>;
   cancel(): Promise<void>;
   updates(opts?: { capacity?: number }): AsyncIterableIterator<SessionUpdate>;
   readonly session: Session;
-  readonly resolved: ResolvedAgent;
+  readonly resolved: ResolvedAgentManifest;
   /** Resolved secret values (for diagnostics; never logged). */
   readonly secretNames: string[];
   /** Mutable runtime state — live tool table, skills list, ceiling. */
@@ -38,13 +44,15 @@ export interface RunningAgent {
 }
 
 interface RunningAgentImplOptions {
-  resolved: ResolvedAgent;
+  resolved: ResolvedAgentManifest;
   secrets: Record<string, string>;
   session: Session;
   harness: Harness;
   state: AgentState;
   updateSink: UpdateSink;
   providers?: Provider[];
+  /** Embed-mode broker server. Closed when the agent closes. */
+  server?: LoomServer;
   /**
    * Shared mutable holder for the active permission handler. Both this
    * RunningAgentImpl and the privileged in-process tools read through the
@@ -57,13 +65,14 @@ interface RunningAgentImplOptions {
 
 export class RunningAgentImpl implements RunningAgent {
   public readonly session: Session;
-  public readonly resolved: ResolvedAgent;
+  public readonly resolved: ResolvedAgentManifest;
   public readonly secretNames: string[];
 
   private readonly harness: Harness;
   private readonly state: AgentState;
   private readonly updateSink: UpdateSink;
   private readonly providers: Provider[];
+  private readonly server: LoomServer | undefined;
   private readonly permissionHolder: { current: PermissionHandler | null };
   private readonly now: (() => Date) | undefined;
 
@@ -78,6 +87,7 @@ export class RunningAgentImpl implements RunningAgent {
     this.state = opts.state;
     this.updateSink = opts.updateSink;
     this.providers = opts.providers ?? [];
+    this.server = opts.server;
     this.permissionHolder = opts.permissionHolder;
     this.secretNames = Object.keys(opts.secrets);
     this.now = opts.now;
@@ -112,9 +122,9 @@ export class RunningAgentImpl implements RunningAgent {
       state: this.state,
       systemPromptCore: this.resolved.systemPrompt,
       updateSink: this.updateSink,
-      agentName: this.resolved.manifest.agent.name,
-      ...(this.resolved.manifest.agent.description
-        ? { agentDescription: this.resolved.manifest.agent.description }
+      agentName: this.resolved.source.name,
+      ...(this.resolved.source.description
+        ? { agentDescription: this.resolved.source.description }
         : {}),
       abortSignal: ctl.signal,
       ...(this.permissionHolder.current
@@ -141,7 +151,9 @@ export class RunningAgentImpl implements RunningAgent {
     }
   }
 
-  updates(opts: { capacity?: number } = {}): AsyncIterableIterator<SessionUpdate> {
+  updates(
+    opts: { capacity?: number } = {},
+  ): AsyncIterableIterator<SessionUpdate> {
     return this.updateSink.subscribe(opts);
   }
 
@@ -152,9 +164,14 @@ export class RunningAgentImpl implements RunningAgent {
     this.updateSink.close();
     if (this.session.close) await this.session.close();
     for (const p of this.providers) {
-      if (p.close) {
-        await p.close().catch(() => undefined);
+      try {
+        await p.close();
+      } catch {
+        /* ignore cleanup errors */
       }
+    }
+    if (this.server) {
+      await this.server.close().catch(() => undefined);
     }
   }
 }

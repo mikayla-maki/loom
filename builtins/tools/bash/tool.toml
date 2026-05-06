@@ -13,7 +13,7 @@ properties.timeout_ms.type = "number"
 properties.timeout_ms.description = "Optional timeout in milliseconds (default 30000)."
 
 [tool.invocation]
-command = "glass-bash"
+command = "loom-bash"
 
 [tool.secrets]
 required = []

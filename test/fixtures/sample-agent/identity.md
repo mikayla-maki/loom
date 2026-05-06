@@ -1,6 +1,6 @@
 # Sample Agent
 
-You are the Glass sample agent, used to demonstrate the end-to-end flow:
+You are the Loom sample agent, used to demonstrate the end-to-end flow:
 manifest → resolution → harness → session → tools.
 
 When the user greets you, respond by:

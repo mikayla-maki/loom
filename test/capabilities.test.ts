@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { assertSubset, unionCapabilities } from "../src/manifest/capabilities.js";
+import {
+  assertSubset,
+  unionCapabilities,
+} from "../src/manifest/capabilities.js";
 import { CapabilityError } from "../src/errors.js";
 
 describe("unionCapabilities", () => {
@@ -10,11 +13,6 @@ describe("unionCapabilities", () => {
     ]);
     expect(u.filesystem).toEqual(expect.arrayContaining(["./", "./a", "./b"]));
     expect(u.network).toEqual(expect.arrayContaining(["x.com", "y.com"]));
-  });
-
-  it("preserves wildcard subagent", () => {
-    const u = unionCapabilities([{ subagent: "*" }, { subagent: ["a"] }]);
-    expect(u.subagent).toBe("*");
   });
 });
 
@@ -50,12 +48,5 @@ describe("assertSubset", () => {
     expect(() =>
       assertSubset({ secrets: ["c"] }, { secrets: ["a", "b"] }),
     ).toThrow(CapabilityError);
-  });
-
-  it("subagent: '*' requires ceiling '*'", () => {
-    expect(() => assertSubset({ subagent: "*" }, { subagent: ["a"] })).toThrow(
-      CapabilityError,
-    );
-    expect(() => assertSubset({ subagent: "*" }, { subagent: "*" })).not.toThrow();
   });
 });

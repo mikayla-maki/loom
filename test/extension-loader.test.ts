@@ -9,12 +9,12 @@ import {
   locateExtensionPackage,
 } from "../src/extensions/loader.js";
 import { runAgent } from "../src/sdk/run-agent.js";
-import { memorySessionFactory } from "../src/extensions/session/memory.js";
-import { GlassError } from "../src/errors.js";
+import { parseAgentManifest } from "../src/manifest/parser.js";
+import { LoomError } from "../src/errors.js";
 
 /**
  * Build a directory tree that looks like a node_modules folder, containing
- * a single Glass extension package. The package's `glass.extension` field
+ * a single Loom extension package. The package's `loom.extension` field
  * points at an entry that registers a Provider supplying a synthetic tool.
  */
 async function buildExtensionFixture(opts: {
@@ -35,10 +35,10 @@ async function buildExtensionFixture(opts: {
       {
         name: fullName,
         version: "0.1.0",
-        description: "Synthetic Glass extension for tests",
+        description: "Synthetic Loom extension for tests",
         type: "module",
         main: "./index.js",
-        glass: { extension: "./index.js" },
+        loom: { extension: "./index.js" },
       },
       null,
       2,
@@ -47,7 +47,7 @@ async function buildExtensionFixture(opts: {
   // Entry: ESM module exporting register().
   await fs.writeFile(
     path.join(packageDir, "index.js"),
-    `// Synthetic Glass extension fixture.
+    `// Synthetic Loom extension fixture.
 //
 // Two side-effects on register():
 //   1. Auto-activates a Provider instance that supplies 'fixture.echo'.
@@ -65,14 +65,12 @@ export function register(api) {
         manifest: {
           manifestPath: "synthetic://fixture.echo",
           toolDir: "synthetic://fixture.echo",
-          tool: {
-            name: "fixture.echo",
-            description: "Echo with greeting prefix",
-            schema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
-            invocation: { command: "(synthetic)", args: [] },
-            secrets: { required: [] },
-            capabilities: { filesystem: [], network: [] },
-          },
+          name: "fixture.echo",
+          description: "Echo with greeting prefix",
+          schema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
+          invocation: { command: "(synthetic)", args: [] },
+          secrets: { required: [] },
+          capabilities: { filesystem: [], network: [] },
           shipsBinary: false,
         },
         tool: {
@@ -100,14 +98,17 @@ export function register(api) {
 }
 
 describe("extension package loader", () => {
-  it("locates and imports a package with glass.extension metadata", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-loc-"));
+  it("locates and imports a package with loom.extension metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-loc-"));
     try {
-      await buildExtensionFixture({ rootDir: root, packageName: "fixture-glass-ext" });
-      const info = await locateExtensionPackage("fixture-glass-ext", {
+      await buildExtensionFixture({
+        rootDir: root,
+        packageName: "fixture-loom-ext",
+      });
+      const info = await locateExtensionPackage("fixture-loom-ext", {
         agentManifestDir: root,
       });
-      expect(info.name).toBe("fixture-glass-ext");
+      expect(info.name).toBe("fixture-loom-ext");
       expect(info.entryPath).toMatch(/index\.js$/);
       expect(info.version).toBe("0.1.0");
     } finally {
@@ -116,36 +117,42 @@ describe("extension package loader", () => {
   });
 
   it("throws a clear error for missing packages", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-miss-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-miss-"));
     try {
       await expect(
-        locateExtensionPackage("does-not-exist-glass-ext", { agentManifestDir: root }),
-      ).rejects.toThrow(/Cannot find Glass extension/);
+        locateExtensionPackage("does-not-exist-loom-ext", {
+          agentManifestDir: root,
+        }),
+      ).rejects.toThrow(/Cannot find Loom extension/);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
 
-  it("rejects packages without a glass.extension field (treats as 'not an extension')", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-nope-"));
+  it("rejects packages without a loom.extension field (treats as 'not an extension')", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-nope-"));
     try {
       const nm = path.join(root, "node_modules", "boring-pkg");
       await fs.mkdir(nm, { recursive: true });
       await fs.writeFile(
         path.join(nm, "package.json"),
-        JSON.stringify({ name: "boring-pkg", version: "1.0.0", main: "./index.js" }),
+        JSON.stringify({
+          name: "boring-pkg",
+          version: "1.0.0",
+          main: "./index.js",
+        }),
       );
       await fs.writeFile(path.join(nm, "index.js"), "export const x = 1;");
       await expect(
         locateExtensionPackage("boring-pkg", { agentManifestDir: root }),
-      ).rejects.toThrow(/Cannot find Glass extension/);
+      ).rejects.toThrow(/Cannot find Loom extension/);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
 
   it("supports scoped package names (@scope/name)", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-scope-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-scope-"));
     try {
       await buildExtensionFixture({
         rootDir: root,
@@ -161,8 +168,8 @@ describe("extension package loader", () => {
     }
   });
 
-  it("listInstalledExtensions enumerates packages with glass.extension metadata", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-list-"));
+  it("listInstalledExtensions enumerates packages with loom.extension metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-list-"));
     try {
       await buildExtensionFixture({ rootDir: root, packageName: "fixture-a" });
       await buildExtensionFixture({ rootDir: root, packageName: "fixture-b" });
@@ -187,15 +194,18 @@ describe("extension package loader", () => {
   });
 
   it("loadExtensionPackage executes register() and registers factories", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-load-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-load-"));
     try {
       const { listProviders } = await import("../src/extensions/index.js");
-      await buildExtensionFixture({ rootDir: root, packageName: "register-side-effect-ext" });
+      await buildExtensionFixture({
+        rootDir: root,
+        packageName: "register-side-effect-ext",
+      });
       const before = new Set(listProviders());
       await loadExtensionPackage(
         "register-side-effect-ext",
         { greeting: "yo" },
-        { agentManifestDir: root, agentName: "test", glassVersion: "0.1.0" },
+        { agentManifestDir: root, agentName: "test", loomVersion: "0.1.0" },
       );
       const after = listProviders();
       // The fixture registers itself by its package name as the provider name.
@@ -207,7 +217,7 @@ describe("extension package loader", () => {
   });
 
   it("rejects packages whose entry doesn't export register()", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-bad-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-bad-"));
     try {
       const pkgDir = path.join(root, "node_modules", "no-register");
       await fs.mkdir(pkgDir, { recursive: true });
@@ -217,17 +227,20 @@ describe("extension package loader", () => {
           name: "no-register",
           version: "1.0.0",
           type: "module",
-          glass: { extension: "./index.js" },
+          loom: { extension: "./index.js" },
         }),
       );
-      await fs.writeFile(path.join(pkgDir, "index.js"), `export const noop = true;`);
+      await fs.writeFile(
+        path.join(pkgDir, "index.js"),
+        `export const noop = true;`,
+      );
       await expect(
         loadExtensionPackage(
           "no-register",
           {},
-          { agentManifestDir: root, agentName: "x", glassVersion: "0" },
+          { agentManifestDir: root, agentName: "x", loomVersion: "0" },
         ),
-      ).rejects.toThrow(GlassError);
+      ).rejects.toThrow(LoomError);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -236,7 +249,7 @@ describe("extension package loader", () => {
 
 describe("agent.toml [extensions] activation end-to-end", () => {
   it("extensions listed in [extensions] are loaded before tool/skill resolution", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-ext-e2e-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-e2e-"));
     try {
       const agentDir = path.join(root, "agent");
       await fs.mkdir(agentDir, { recursive: true });
@@ -270,9 +283,6 @@ remove_builtin_tools = true
 [harness]
 provider = "test"
 
-[session]
-provider = "memory"
-
 [sandbox]
 filesystem = []
 network = []
@@ -286,21 +296,21 @@ e = "./skills/echo-skill"
 `,
       );
 
-      const { testHarnessFactory } = await import("../src/extensions/harness/test.js");
-      const agent = await runAgent(path.join(agentDir, "agent.toml"), {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            script: [
-              [
-                { call: { tool: "fixture.echo", input: { text: "world" } } },
-                { stop: "end_turn" },
-              ],
-            ],
-          },
-        },
-      });
+      // Parse the manifest and mutate the harness to inject the test
+      // script. Easier than expressing the script as TOML, and the
+      // manifest is what runAgent ultimately consumes either way.
+      const manifest = await parseAgentManifest(
+        path.join(agentDir, "agent.toml"),
+      );
+      if ("provider" in manifest.harness) {
+        manifest.harness.script = [
+          [
+            { call: { tool: "fixture.echo", input: { text: "world" } } },
+            { stop: "end_turn" },
+          ],
+        ];
+      }
+      const agent = await runAgent(manifest, {});
       try {
         await agent.prompt("go");
         const events = await agent.session.getEvents();
@@ -309,7 +319,8 @@ e = "./skills/echo-skill"
         if (tu && tu.sessionUpdate === "tool_call_update") {
           expect(tu.status).toBe("completed");
           const text =
-            tu.content?.[0]?.type === "content" && tu.content[0].content.type === "text"
+            tu.content?.[0]?.type === "content" &&
+            tu.content[0].content.type === "text"
               ? tu.content[0].content.text
               : "";
           expect(text).toBe("yo: world");

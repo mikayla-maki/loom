@@ -1,6 +1,6 @@
 [agent]
 name = "sample-agent"
-description = "An end-to-end Glass v0 demo agent. Greets the user and shouts."
+description = "An end-to-end Loom v0 demo agent. Greets the user and shouts."
 system_prompt = "./identity.md"
 
 [harness]
@@ -15,7 +15,6 @@ path = "./session.jsonl"
 filesystem = ["./"]
 network = []
 secrets = ["sample_user_name"]
-subagent = []
 
 [skills]
 greeter = "../skills/greeter"

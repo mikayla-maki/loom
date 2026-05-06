@@ -1,11 +1,11 @@
 /**
- * Glass error hierarchy.
+ * Loom error hierarchy.
  *
- * Errors thrown by the resolver, runtime, and SDK are instances of GlassError
+ * Errors thrown by the resolver, runtime, and SDK are instances of LoomError
  * so callers can catch them by class. Specific subclasses help with reporting.
  */
 
-export class GlassError extends Error {
+export class LoomError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message);
     this.name = this.constructor.name;
@@ -16,13 +16,13 @@ export class GlassError extends Error {
 }
 
 /** Raised when a manifest fails to parse or fails schema validation. */
-export class ManifestError extends GlassError {}
+export class ManifestError extends LoomError {}
 
 /** Raised when a referenced extension / skill / tool can't be found. */
-export class ResolutionError extends GlassError {}
+export class ResolutionError extends LoomError {}
 
 /** Raised when tool capabilities exceed the agent's [sandbox] ceiling. */
-export class CapabilityError extends GlassError {
+export class CapabilityError extends LoomError {
   constructor(
     message: string,
     public readonly required: Record<string, unknown>,
@@ -33,13 +33,13 @@ export class CapabilityError extends GlassError {
 }
 
 /** Raised when a required secret can't be resolved. */
-export class SecretError extends GlassError {}
+export class SecretError extends LoomError {}
 
 /** Raised when tool input fails JSON-schema validation. */
-export class ToolInputError extends GlassError {}
+export class ToolInputError extends LoomError {}
 
 /** Raised when a tool process exits non-zero. */
-export class ToolExecutionError extends GlassError {
+export class ToolExecutionError extends LoomError {
   constructor(
     message: string,
     public readonly toolName: string,
@@ -51,4 +51,4 @@ export class ToolExecutionError extends GlassError {
 }
 
 /** Raised when a turn is cancelled. */
-export class TurnCancelledError extends GlassError {}
+export class TurnCancelledError extends LoomError {}

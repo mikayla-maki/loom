@@ -1,4 +1,4 @@
-export { runAgent, GLASS_VERSION } from "./run-agent.js";
+export { runAgent, LOOM_VERSION } from "./run-agent.js";
 export type { RunAgentOptions } from "./run-agent.js";
 export { RunningAgentImpl } from "./running-agent.js";
 export type { RunningAgent } from "./running-agent.js";

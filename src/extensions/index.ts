@@ -3,7 +3,7 @@
  *
  * Built-in extensions are registered here. Third-party extensions can call
  * `registerHarness` / `registerSession` from app code before booting an
- * agent. (Future: dynamic loading from `~/.glass/extensions`.)
+ * agent. (Future: dynamic loading from `~/.loom/extensions`.)
  */
 
 import { ResolutionError } from "../errors.js";

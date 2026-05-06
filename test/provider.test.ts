@@ -1,21 +1,18 @@
 import { describe, expect, it } from "vitest";
-import * as path from "node:path";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 
 import { runAgent } from "../src/sdk/run-agent.js";
-import { memorySessionFactory } from "../src/extensions/session/memory.js";
-import { testHarnessFactory } from "../src/extensions/harness/test.js";
-import { registerProvider } from "../src/extensions/index.js";
 import type {
   Provider,
-  ProviderFactory,
   ProviderSkillResolution,
   ProviderToolResolution,
   Tool,
   ToolResult,
 } from "../src/types/interfaces.js";
-import type { ToolManifest } from "../src/types/manifest.js";
+import type {
+  AgentManifest,
+  ToolCapabilities,
+  ToolManifest,
+} from "../src/types/manifest.js";
 import { auditAgent } from "../src/audit/audit.js";
 
 /**
@@ -26,23 +23,21 @@ import { auditAgent } from "../src/audit/audit.js";
 function syntheticToolManifest(opts: {
   name: string;
   description: string;
-  capabilities?: ToolManifest["tool"]["capabilities"];
+  capabilities?: ToolCapabilities;
 }): ToolManifest {
   return {
     manifestPath: `synthetic://${opts.name}`,
     toolDir: `synthetic://${opts.name}`,
-    tool: {
-      name: opts.name,
-      description: opts.description,
-      schema: {
-        type: "object",
-        required: ["text"],
-        properties: { text: { type: "string" } },
-      },
-      invocation: { command: "(synthetic)", args: [] },
-      secrets: { required: [] },
-      capabilities: opts.capabilities ?? { filesystem: [], network: [] },
+    name: opts.name,
+    description: opts.description,
+    schema: {
+      type: "object",
+      required: ["text"],
+      properties: { text: { type: "string" } },
     },
+    invocation: { command: "(synthetic)", args: [] },
+    secrets: { required: [] },
+    capabilities: opts.capabilities ?? { filesystem: [], network: [] },
     shipsBinary: false,
   };
 }
@@ -53,8 +48,15 @@ describe("Provider extension — dynamic tool/skill resolution", () => {
     class StubTool implements Tool {
       name = "stub.shout";
       description = "Shout text from the provider's in-memory tool.";
-      inputSchema = { type: "object", required: ["text"], properties: { text: { type: "string" } } };
-      async execute(input: unknown, _secrets: Record<string, string>): Promise<ToolResult> {
+      inputSchema = {
+        type: "object",
+        required: ["text"],
+        properties: { text: { type: "string" } },
+      };
+      async execute(
+        input: unknown,
+        _secrets: Record<string, string>,
+      ): Promise<ToolResult> {
         receivedInput = input;
         const text = String((input as { text: string }).text);
         return { content: text.toUpperCase() + "!" };
@@ -66,87 +68,65 @@ describe("Provider extension — dynamic tool/skill resolution", () => {
         if (name === "stub:shout") {
           const r: ProviderToolResolution = {
             kind: "synthetic",
-            manifest: syntheticToolManifest({ name: "stub.shout", description: "shout" }),
+            manifest: syntheticToolManifest({
+              name: "stub.shout",
+              description: "shout",
+            }),
             tool: new StubTool(),
           };
           return r;
         }
         return null;
       },
+      resolveSkill: () => null,
+      list: () => ({}),
+      close: () => {},
     };
 
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-provider-"));
-    try {
-      // SKILL.md `requires` references the tool by the provider's bare name.
-      const skillDir = path.join(root, "skills", "shout");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: shout
-description: Provider-backed shout
-requires:
-  stub.shout: stub:shout
----
-body
-`,
-      );
-      const agentDir = path.join(root, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "provider-agent"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-s = "../skills/shout"
-`,
-      );
-
-      const agent = await runAgent(path.join(agentDir, "agent.toml"), {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            script: [
-              [
-                { call: { tool: "stub.shout", input: { text: "hi" } } },
-                { stop: "end_turn" },
-              ],
-            ],
-          },
+    // Inline parent agent. The "shout" skill references the tool by the
+    // provider's bare name, exactly as it would on disk.
+    const spec: AgentManifest = {
+      name: "provider-agent",
+      systemPrompt: "x",
+      removeBuiltinTools: true,
+      harness: {
+        provider: "test",
+        script: [
+          [
+            { call: { tool: "stub.shout", input: { text: "hi" } } },
+            { stop: "end_turn" },
+          ],
+        ],
+      },
+      sandbox: { filesystem: [], network: [], secrets: [] },
+      skills: {
+        shout: {
+          description: "Provider-backed shout",
+          requires: { "stub.shout": "stub:shout" },
         },
-        providers: [provider],
-      });
-      try {
-        await agent.prompt("go");
-        const events = await agent.session.getEvents();
-        const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
-        expect(tu).toBeTruthy();
-        if (tu && tu.sessionUpdate === "tool_call_update") {
-          expect(tu.status).toBe("completed");
-          const text =
-            tu.content?.[0]?.type === "content" && tu.content[0].content.type === "text"
-              ? tu.content[0].content.text
-              : "";
-          expect(text).toBe("HI!");
-        }
-        expect(receivedInput).toEqual({ text: "hi" });
-      } finally {
-        await agent.close();
+      },
+    };
+
+    const agent = await runAgent(spec, {
+      providers: [provider],
+    });
+    try {
+      await agent.prompt("go");
+      const events = await agent.session.getEvents();
+      const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
+      expect(tu).toBeTruthy();
+      if (tu && tu.sessionUpdate === "tool_call_update") {
+        expect(tu.status).toBe("completed");
+        const text =
+          tu.content?.[0]?.type === "content" &&
+          tu.content[0].content.type === "text"
+            ? tu.content[0].content.text
+            : "";
+        expect(text).toBe("HI!");
       }
+      expect(receivedInput).toEqual({ text: "hi" });
     } finally {
-      await fs.rm(root, { recursive: true, force: true });
+      await agent.close();
     }
   });
 
@@ -154,7 +134,11 @@ s = "../skills/shout"
     class FsSearch implements Tool {
       name = "fs.search";
       description = "Search files (synthetic).";
-      inputSchema = { type: "object", required: ["q"], properties: { q: { type: "string" } } };
+      inputSchema = {
+        type: "object",
+        required: ["q"],
+        properties: { q: { type: "string" } },
+      };
       async execute(input: unknown): Promise<ToolResult> {
         return { content: `searched: ${(input as { q: string }).q}` };
       }
@@ -162,7 +146,11 @@ s = "../skills/shout"
     class FsRead implements Tool {
       name = "fs.read";
       description = "Read a file (synthetic).";
-      inputSchema = { type: "object", required: ["path"], properties: { path: { type: "string" } } };
+      inputSchema = {
+        type: "object",
+        required: ["path"],
+        properties: { path: { type: "string" } },
+      };
       async execute(input: unknown): Promise<ToolResult> {
         return { content: `read: ${(input as { path: string }).path}` };
       }
@@ -172,8 +160,20 @@ s = "../skills/shout"
       resolveSkill: (name): ProviderSkillResolution | null => {
         if (name !== "mcp:filesystem") return null;
         const tools = new Map<string, { manifest: ToolManifest; tool: Tool }>();
-        tools.set("fs.search", { manifest: syntheticToolManifest({ name: "fs.search", description: "search" }), tool: new FsSearch() });
-        tools.set("fs.read", { manifest: syntheticToolManifest({ name: "fs.read", description: "read" }), tool: new FsRead() });
+        tools.set("fs.search", {
+          manifest: syntheticToolManifest({
+            name: "fs.search",
+            description: "search",
+          }),
+          tool: new FsSearch(),
+        });
+        tools.set("fs.read", {
+          manifest: syntheticToolManifest({
+            name: "fs.read",
+            description: "read",
+          }),
+          tool: new FsRead(),
+        });
         return {
           kind: "synthetic",
           manifest: {
@@ -187,169 +187,62 @@ s = "../skills/shout"
           tools,
         };
       },
+      resolveTool: () => null,
+      list: () => ({}),
+      close: () => {},
     };
 
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-skill-prov-"));
-    try {
-      const agentDir = path.join(root, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "skill-provider-agent"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-fs = "mcp:filesystem"
-`,
-      );
-
-      const agent = await runAgent(path.join(agentDir, "agent.toml"), {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            script: [
-              [
-                { call: { tool: "fs.search", input: { q: "needle" } } },
-                { call: { tool: "fs.read", input: { path: "/etc/hosts" } } },
-                { stop: "end_turn" },
-              ],
-            ],
-          },
-        },
-        providers: [provider],
-      });
-      try {
-        await agent.prompt("go");
-        const events = await agent.session.getEvents();
-        const updates = events.filter((e) => e.sessionUpdate === "tool_call_update");
-        expect(updates).toHaveLength(2);
-
-        const texts = updates.map((u) =>
-          u.sessionUpdate === "tool_call_update" &&
-          u.content?.[0]?.type === "content" &&
-          u.content[0].content.type === "text"
-            ? u.content[0].content.text
-            : "",
-        );
-        expect(texts).toEqual(["searched: needle", "read: /etc/hosts"]);
-      } finally {
-        await agent.close();
-      }
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("a manifest-declared provider boots from [providers] table and gets close()'d", async () => {
-    const events: string[] = [];
-    let booted = false;
-    class StubTool implements Tool {
-      name = "demo.echo";
-      description = "echo";
-      inputSchema = { type: "object", required: ["text"], properties: { text: { type: "string" } } };
-      async execute(input: unknown): Promise<ToolResult> {
-        events.push("execute");
-        return { content: String((input as { text: string }).text) };
-      }
-    }
-    const factory: ProviderFactory = {
-      name: "fake-provider-ext",
-      create: async (config) => {
-        events.push(`create:${JSON.stringify(config)}`);
-        booted = true;
-        const provider: Provider = {
-          resolveTool: (name) =>
-            name === "fake:echo"
-              ? {
-                  kind: "synthetic",
-                  manifest: syntheticToolManifest({ name: "demo.echo", description: "echo" }),
-                  tool: new StubTool(),
-                }
-              : null,
-          close: async () => {
-            events.push("close");
-          },
-        };
-        return provider;
+    // The skill reference itself is the provider name `mcp:filesystem`;
+    // the parent agent stays inline.
+    const spec: AgentManifest = {
+      name: "skill-provider-agent",
+      systemPrompt: "x",
+      removeBuiltinTools: true,
+      harness: {
+        provider: "test",
+        script: [
+          [
+            { call: { tool: "fs.search", input: { q: "needle" } } },
+            { call: { tool: "fs.read", input: { path: "/etc/hosts" } } },
+            { stop: "end_turn" },
+          ],
+        ],
       },
+      sandbox: { filesystem: [], network: [], secrets: [] },
+      skills: { fs: "mcp:filesystem" },
     };
-    registerProvider(factory);
 
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-mfact-prov-"));
+    const agent = await runAgent(spec, {
+      providers: [provider],
+    });
     try {
-      const skillDir = path.join(root, "skills", "echo");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: echo
-description: echo skill via provider
-requires:
-  demo.echo: fake:echo
----
-body
-`,
+      await agent.prompt("go");
+      const events = await agent.session.getEvents();
+      const updates = events.filter(
+        (e) => e.sessionUpdate === "tool_call_update",
       );
-      const agentDir = path.join(root, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "manifest-provider-agent"
-system_prompt = "x"
-remove_builtin_tools = true
+      expect(updates).toHaveLength(2);
 
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[providers]
-fake-provider-ext = { greeting = "hi" }
-[skills]
-e = "../skills/echo"
-`,
+      const texts = updates.map((u) =>
+        u.sessionUpdate === "tool_call_update" &&
+        u.content?.[0]?.type === "content" &&
+        u.content[0].content.type === "text"
+          ? u.content[0].content.text
+          : "",
       );
-
-      const agent = await runAgent(path.join(agentDir, "agent.toml"), {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            script: [
-              [{ call: { tool: "demo.echo", input: { text: "yo" } } }, { stop: "end_turn" }],
-            ],
-          },
-        },
-      });
-      try {
-        await agent.prompt("go");
-        expect(booted).toBe(true);
-        expect(events.some((e) => e.startsWith("create:"))).toBe(true);
-        expect(events).toContain("execute");
-      } finally {
-        await agent.close();
-      }
-      // close() must propagate to providers
-      expect(events).toContain("close");
+      expect(texts).toEqual(["searched: needle", "read: /etc/hosts"]);
     } finally {
-      await fs.rm(root, { recursive: true, force: true });
+      await agent.close();
     }
   });
+
+  // Removed: "a manifest-declared provider boots from [providers] table and
+  // gets close()'d". The [providers] table is gone (everything lives under
+  // [extensions] now), and [extensions] entries resolve as npm packages —
+  // the in-process registered-factory lookup path the old test depended on
+  // doesn't exist for manifest-declared providers. Programmatic providers
+  // via `runAgent(spec, { providers: [...] })` are still covered by the
+  // sibling tests in this describe block.
 
   it("provider-supplied tool capabilities still get checked against the [sandbox] ceiling", async () => {
     const provider: Provider = {
@@ -372,51 +265,29 @@ e = "../skills/echo"
               },
             }
           : null,
+      resolveSkill: () => null,
+      list: () => ({}),
+      close: () => {},
     };
 
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-prov-cap-"));
-    try {
-      const skillDir = path.join(root, "skills", "d");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: d
-description: dangerous
-requires:
-  danger.net: danger:net
----
-body`,
-      );
-      const agentDir = path.join(root, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "n"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-d = "../skills/d"
-`,
-      );
-      await expect(
-        runAgent(path.join(agentDir, "agent.toml"), {
-          providers: [provider],
-        }),
-      ).rejects.toThrow(/exceed|ceiling/i);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
+    const spec: AgentManifest = {
+      name: "n",
+      systemPrompt: "x",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      sandbox: { filesystem: [], network: [], secrets: [] },
+      skills: {
+        d: {
+          description: "dangerous",
+          requires: { "danger.net": "danger:net" },
+        },
+      },
+    };
+    await expect(
+      runAgent(spec, {
+        providers: [provider],
+      }),
+    ).rejects.toThrow(/exceed|ceiling/i);
   });
 
   it("auditAgent reflects provider-supplied tools", async () => {
@@ -425,7 +296,10 @@ d = "../skills/d"
         name === "demo:tool"
           ? {
               kind: "synthetic",
-              manifest: syntheticToolManifest({ name: "demo.tool", description: "x" }),
+              manifest: syntheticToolManifest({
+                name: "demo.tool",
+                description: "x",
+              }),
               tool: {
                 name: "demo.tool",
                 description: "x",
@@ -436,48 +310,24 @@ d = "../skills/d"
               },
             }
           : null,
+      resolveSkill: () => null,
+      list: () => ({}),
+      close: () => {},
     };
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-prov-audit-"));
-    try {
-      const skillDir = path.join(root, "skills", "x");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: x
-description: x
-requires:
-  demo.tool: demo:tool
----
-body`,
-      );
-      const agentDir = path.join(root, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "audit-prov"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-x = "../skills/x"
-`,
-      );
-      const tree = await auditAgent(path.join(agentDir, "agent.toml"), {
-        providers: [provider],
-      });
-      expect(tree.tools.map((t) => t.name)).toEqual(["demo.tool"]);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
+    const spec: AgentManifest = {
+      name: "audit-prov",
+      systemPrompt: "x",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      sandbox: { filesystem: [], network: [], secrets: [] },
+      skills: {
+        x: {
+          description: "x",
+          requires: { "demo.tool": "demo:tool" },
+        },
+      },
+    };
+    const tree = await auditAgent(spec, { providers: [provider] });
+    expect(tree.tools.map((t) => t.name)).toEqual(["demo.tool"]);
   });
 });

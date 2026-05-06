@@ -10,7 +10,7 @@ import { testHarnessFactory } from "../src/extensions/harness/test.js";
 
 describe("FileSession", () => {
   it("appends and reads back JSONL", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-fs-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-fs-"));
     try {
       const p = path.join(dir, "session.jsonl");
       const s = new FileSession(p);
@@ -26,7 +26,7 @@ describe("FileSession", () => {
   });
 
   it("persists across runs (e2e)", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-fs-e2e-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-fs-e2e-"));
     try {
       // Build a self-contained agent in tmp (so file session writes here).
       const fixturesRoot = path.resolve("test/fixtures");

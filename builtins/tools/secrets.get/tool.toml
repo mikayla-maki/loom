@@ -9,7 +9,7 @@ properties.name.type = "string"
 properties.name.description = "The secret key to read."
 
 [tool.invocation]
-command = "glass-secrets-get"
+command = "loom-secrets-get"
 
 [tool.secrets]
 required = []

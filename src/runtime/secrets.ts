@@ -2,7 +2,7 @@
  * Secrets store.
  *
  * V0 ships two implementations:
- *  - EnvSecretsStore — looks up upper-cased + GLASS_-prefixed env vars.
+ *  - EnvSecretsStore — looks up upper-cased + LOOM_-prefixed env vars.
  *  - FileSecretsStore — reads a JSON or .env-style file (used in tests).
  *
  * The runtime never lets a secret value reach the model — it's only ever
@@ -21,14 +21,14 @@ export interface SecretsStore {
 export class EnvSecretsStore implements SecretsStore {
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
   async get(name: string): Promise<string | null> {
-    // Try multiple aliasings: exact, upper, GLASS_ prefixed.
+    // Try multiple aliasings: exact, upper, LOOM_ prefixed.
     const candidates = [
       name,
       name.toUpperCase(),
-      `GLASS_${name.toUpperCase()}`,
+      `LOOM_${name.toUpperCase()}`,
       // also dot.case → DOT_CASE
       name.replace(/[.\-]/g, "_").toUpperCase(),
-      `GLASS_${name.replace(/[.\-]/g, "_").toUpperCase()}`,
+      `LOOM_${name.replace(/[.\-]/g, "_").toUpperCase()}`,
     ];
     for (const c of candidates) {
       const v = this.env[c];

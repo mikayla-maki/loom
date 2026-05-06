@@ -11,7 +11,7 @@
  * prompt was actually needed).
  */
 
-import type { SkillManifest, Capabilities } from "../types/manifest.js";
+import type { SkillManifest, SandboxCeiling } from "../types/manifest.js";
 import type { Tool } from "../types/interfaces.js";
 
 import { unionCapabilities } from "../manifest/capabilities.js";
@@ -21,7 +21,7 @@ export interface AddSkillArgs {
   skill: SkillManifest;
   tools: Tool[];
   /** Capabilities the new tools collectively require. */
-  required: Capabilities;
+  required: SandboxCeiling;
   /** Secrets to merge into the runtime secret store. */
   secrets?: Record<string, string>;
 }
@@ -31,7 +31,7 @@ export interface AddSkillOutcome {
   /** New tool names made visible to the model. */
   newTools: string[];
   /** Capabilities granted by this addition (post-expansion view). */
-  ceilingAfter: Capabilities;
+  ceilingAfter: SandboxCeiling;
   /** Whether the agent's ceiling actually had to grow. */
   ceilingChanged: boolean;
 }
@@ -40,13 +40,13 @@ export class AgentState {
   /** Read by RuntimeImpl every turn (when assembling the system prompt). */
   readonly skills: SkillManifest[];
   /** The currently-effective capability ceiling. Mutates as add_skill expands it. */
-  ceiling: Capabilities;
+  ceiling: SandboxCeiling;
   /** Mutable name→Tool table the runtime executes against. */
   readonly toolTable: ToolTable;
 
   constructor(opts: {
     skills: SkillManifest[];
-    ceiling: Capabilities;
+    ceiling: SandboxCeiling;
     toolTable: ToolTable;
   }) {
     this.skills = [...opts.skills];
@@ -74,21 +74,17 @@ export class AgentState {
       JSON.stringify(normalize(before)) !== JSON.stringify(normalize(after));
     this.ceiling = after;
 
-    if (!this.hasSkill(args.skill.name)) {
+    if (args.skill.name && !this.hasSkill(args.skill.name)) {
       this.skills.push(args.skill);
     }
     return { added: true, newTools, ceilingAfter: after, ceilingChanged };
   }
 }
 
-function normalize(c: Capabilities): Record<string, unknown> {
+function normalize(c: SandboxCeiling): Record<string, unknown> {
   return {
     filesystem: [...(c.filesystem ?? [])].sort(),
     network: [...(c.network ?? [])].sort(),
     secrets: [...(c.secrets ?? [])].sort(),
-    subagent:
-      c.subagent === "*"
-        ? "*"
-        : [...(c.subagent ?? [])].sort(),
   };
 }

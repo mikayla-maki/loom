@@ -16,14 +16,18 @@ import { assertSubset, unionCapabilities } from "../manifest/capabilities.js";
 import { parseSkillManifest, parseToolManifest } from "../manifest/parser.js";
 import { LocalRegistry } from "../registry/registry.js";
 import { ResolutionError } from "../errors.js";
+import type { Provider, Tool, ToolResult } from "../types/interfaces.js";
 import type {
-  Provider,
-  Tool,
-  ToolResult,
-} from "../types/interfaces.js";
-import type { Capabilities, SkillManifest, ToolManifest } from "../types/manifest.js";
+  SandboxCeiling,
+  SkillManifest,
+  ToolCapabilities,
+  ToolManifest,
+} from "../types/manifest.js";
 import type { JSONSchema } from "../types/schema.js";
-import type { PermissionRequest, PermissionResult } from "../types/permissions.js";
+import type {
+  PermissionRequest,
+  PermissionResult,
+} from "../types/permissions.js";
 
 import type { AgentState } from "./agent-state.js";
 import { ProcessTool } from "./tool-table.js";
@@ -47,7 +51,7 @@ interface SkillSummary {
   source: "registry" | "builtin" | "provider";
   location: string;
   tools: string[];
-  capabilities: Capabilities;
+  capabilities: SandboxCeiling;
   fitsCeiling?: boolean;
 }
 
@@ -59,7 +63,10 @@ interface ResolvedAddition {
 const SEARCH_SCHEMA: JSONSchema = {
   type: "object",
   properties: {
-    query: { type: "string", description: "Optional substring filter on name + description." },
+    query: {
+      type: "string",
+      description: "Optional substring filter on name + description.",
+    },
   },
 };
 
@@ -67,10 +74,14 @@ const ADD_SCHEMA: JSONSchema = {
   type: "object",
   required: ["name"],
   properties: {
-    name: { type: "string", description: "Skill name (as returned by search_skills)." },
+    name: {
+      type: "string",
+      description: "Skill name (as returned by search_skills).",
+    },
     rationale: {
       type: "string",
-      description: "Optional explanation shown to the user when permission is requested.",
+      description:
+        "Optional explanation shown to the user when permission is requested.",
     },
   },
 };
@@ -124,7 +135,9 @@ export class AddSkillTool implements Tool {
       return { content: `add_skill: ${(e as Error).message}`, isError: true };
     }
 
-    const required = unionCapabilities(resolved.tools.map((t) => t.manifest.tool.capabilities));
+    const required = unionCapabilities(
+      resolved.tools.map((t) => t.manifest.capabilities ?? {}),
+    );
     const ceiling = this.deps.state.ceiling;
 
     if (!capabilityFits(required, ceiling)) {
@@ -136,7 +149,10 @@ export class AddSkillTool implements Tool {
           `Add skill '${name}' which requires capabilities outside the current ceiling.`,
         newCapabilities: diff,
         currentCeiling: ceiling,
-        metadata: { skill: name, tools: resolved.tools.map((t) => t.manifest.tool.name) },
+        metadata: {
+          skill: name,
+          tools: resolved.tools.map((t) => t.manifest.name),
+        },
       });
       if (decision.decision === "deny") {
         return {
@@ -146,10 +162,13 @@ export class AddSkillTool implements Tool {
       }
     }
 
-    const extraSecrets = collectExtraSecrets(resolved.tools, this.deps.loadedSecrets);
+    const extraSecrets = collectExtraSecrets(
+      resolved.tools,
+      this.deps.loadedSecrets,
+    );
     if ("missing" in extraSecrets) {
       return {
-        content: `add_skill: '${name}' requires secret '${extraSecrets.missing}' which is not in the agent's secret store. Add it to ~/.glass-secrets or set the env var, then retry.`,
+        content: `add_skill: '${name}' requires secret '${extraSecrets.missing}' which is not in the agent's secret store. Add it to ~/.loom-secrets or set the env var, then retry.`,
         isError: true,
       };
     }
@@ -174,11 +193,12 @@ export class AddSkillTool implements Tool {
 
 // ─── discovery ─────────────────────────────────────────────────────────────
 
-async function collectAvailableSkills(deps: SkillDiscoveryDeps): Promise<SkillSummary[]> {
+async function collectAvailableSkills(
+  deps: SkillDiscoveryDeps,
+): Promise<SkillSummary[]> {
   const out = new Map<string, SkillSummary>();
 
   for (const p of deps.providers) {
-    if (!p.list) continue;
     const r = await Promise.resolve(p.list());
     for (const sk of r.skills ?? []) {
       if (out.has(sk)) continue;
@@ -198,7 +218,8 @@ async function collectAvailableSkills(deps: SkillDiscoveryDeps): Promise<SkillSu
   await scanSkillDir(path.join(deps.builtinsDir, "skills"), out, "builtin");
 
   const list = [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
-  for (const s of list) s.fitsCeiling = capabilityFits(s.capabilities, deps.state.ceiling);
+  for (const s of list)
+    s.fitsCeiling = capabilityFits(s.capabilities, deps.state.ceiling);
   return list;
 }
 
@@ -222,19 +243,28 @@ async function scanSkillDir(
     } catch {
       continue;
     }
-    if (out.has(skill.name)) continue;
+    if (!skill.name || out.has(skill.name)) continue;
 
     // Best-effort capability rollup: parse each declared tool. Failures
     // (missing tool, opaque builtin shorthand) just leave caps empty.
-    const caps: Capabilities[] = [];
+    const caps: ToolCapabilities[] = [];
     const toolNames: string[] = [];
-    for (const ref of Object.values(skill.requires)) {
-      const toolDir = listingToolDir(ref, skill.skillDir);
+    for (const ref of Object.values(skill.requires ?? {})) {
+      // Inline tool refs are already in-hand: use directly.
+      if (typeof ref !== "string") {
+        if (ref.capabilities) caps.push(ref.capabilities);
+        if (ref.name) toolNames.push(ref.name);
+        continue;
+      }
+      const toolDir =
+        skill.skillDir !== undefined
+          ? listingToolDir(ref, skill.skillDir)
+          : null;
       if (!toolDir) continue;
       try {
         const t = await parseToolManifest(toolDir);
-        caps.push(t.tool.capabilities);
-        toolNames.push(t.tool.name);
+        if (t.capabilities) caps.push(t.capabilities);
+        if (t.name) toolNames.push(t.name);
       } catch {
         // skip
       }
@@ -279,7 +309,7 @@ async function resolveSkillForAddition(
   const builtin = path.join(deps.builtinsDir, "skills", name);
   if (await dirExists(builtin)) return await loadSkillFromDir(builtin, deps);
   throw new ResolutionError(
-    `skill '${name}' not found in providers, ~/.glass/skills, or builtins`,
+    `skill '${name}' not found in providers, ~/.loom/skills, or builtins`,
   );
 }
 
@@ -289,17 +319,38 @@ async function loadSkillFromDir(
 ): Promise<ResolvedAddition> {
   const skill = await parseSkillManifest(skillDir);
   const tools: ResolvedAddition["tools"] = [];
-  for (const [modelName, ref] of Object.entries(skill.requires)) {
-    const toolDir = await resolveToolForAddition(ref, modelName, skill.skillDir, deps);
+  for (const [modelName, ref] of Object.entries(skill.requires ?? {})) {
+    if (typeof ref !== "string") {
+      // Skills loaded from disk should always have string refs; an
+      // inline-tool ref here implies the SKILL.md round-tripped through
+      // an in-memory manifest. Use directly.
+      const m: ToolManifest = { ...ref, name: modelName };
+      tools.push({
+        manifest: m,
+        tool: new ProcessTool(m, {
+          extraPath: deps.pathAdditions,
+          ...(deps.toolTimeoutMs ? { timeoutMs: deps.toolTimeoutMs } : {}),
+        }),
+      });
+      continue;
+    }
+    const toolDir = await resolveToolForAddition(
+      ref,
+      modelName,
+      skill.skillDir ?? skillDir,
+      deps,
+    );
     const m = await parseToolManifest(toolDir);
-    if (m.tool.name !== modelName) {
+    if (m.name !== modelName) {
       throw new ResolutionError(
-        `Skill ${skill.name} requires tool '${modelName}' but ${m.manifestPath} declares '${m.tool.name}'`,
+        `Skill ${skill.name} requires tool '${modelName}' but ${m.manifestPath} declares '${m.name}'`,
       );
     }
     // New tool's bin/ goes first on PATH so its invocation.command resolves.
     const extraPath =
-      m.shipsBinary && m.binDir ? [m.binDir, ...deps.pathAdditions] : deps.pathAdditions;
+      m.shipsBinary && m.binDir
+        ? [m.binDir, ...deps.pathAdditions]
+        : deps.pathAdditions;
     tools.push({
       manifest: m,
       tool: new ProcessTool(m, {
@@ -334,12 +385,10 @@ async function resolveToolForAddition(
 function collectExtraSecrets(
   tools: Array<{ manifest: ToolManifest }>,
   loaded: Record<string, string>,
-):
-  | { secrets: Record<string, string> }
-  | { missing: string } {
+): { secrets: Record<string, string> } | { missing: string } {
   const out: Record<string, string> = {};
   for (const t of tools) {
-    for (const name of t.manifest.tool.secrets.required) {
+    for (const name of t.manifest.secrets?.required ?? []) {
       if (name in loaded || name in out) continue;
       const fromEnv = process.env[name] ?? process.env[name.toUpperCase()];
       if (!fromEnv) return { missing: name };
@@ -349,27 +398,23 @@ function collectExtraSecrets(
   return { secrets: out };
 }
 
-function capabilityDiff(required: Capabilities, ceiling: Capabilities): Capabilities {
-  const out: Capabilities = {};
+function capabilityDiff(
+  required: SandboxCeiling,
+  ceiling: SandboxCeiling,
+): SandboxCeiling {
+  const out: SandboxCeiling = {};
   for (const axis of ["filesystem", "network", "secrets"] as const) {
-    const r = (required[axis] ?? []) as string[];
-    const c = new Set((ceiling[axis] ?? []) as string[]);
+    // Absent ceiling axis = unconstrained, so nothing is "missing".
+    if (ceiling[axis] === undefined) continue;
+    const r = required[axis] ?? [];
+    const c = new Set(ceiling[axis] ?? []);
     const missing = r.filter((x) => !c.has(x));
     if (missing.length > 0) out[axis] = missing;
-  }
-  if (required.subagent && required.subagent !== "*") {
-    if (ceiling.subagent !== "*") {
-      const c = new Set(ceiling.subagent ?? []);
-      const missing = (required.subagent as string[]).filter((x) => !c.has(x));
-      if (missing.length > 0) out.subagent = missing;
-    }
-  } else if (required.subagent === "*" && ceiling.subagent !== "*") {
-    out.subagent = "*";
   }
   return out;
 }
 
-function capabilityFits(req: Capabilities, ceiling: Capabilities): boolean {
+function capabilityFits(req: SandboxCeiling, ceiling: SandboxCeiling): boolean {
   try {
     assertSubset(req, ceiling);
     return true;

@@ -1,11 +1,11 @@
 /**
  * System prompt assembly.
  *
- * Glass owns the system prompt. Each turn, the runtime composes a single
+ * Loom owns the system prompt. Each turn, the runtime composes a single
  * string from three sources:
  *   1. Runtime-owned (structural): the skill/tool catalog
  *   2. Manifest-owned (semantic): [agent].system_prompt content
- *   3. Per-turn (dynamic): current date and any other context Glass injects
+ *   3. Per-turn (dynamic): current date and any other context Loom injects
  *
  * Harness extensions consume the final string via runtime.systemPrompt().
  * They MAY override by reading components separately (identity(),

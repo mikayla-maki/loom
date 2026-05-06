@@ -1,7 +1,7 @@
 {
-  "name": "glass",
+  "name": "loom",
   "version": "0.1.0",
-  "description": "Glass — A manifest-driven agent meta-harness",
+  "description": "Loom — A manifest-driven agent meta-harness",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -20,14 +20,15 @@
     }
   },
   "bin": {
-    "glass": "./dist/cli/main.js"
+    "loom": "./dist/cli/main.js",
+    "loom-invoke": "./dist/cli/loom-invoke.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.test.json",
     "clean": "rm -rf dist"
   },
   "keywords": [

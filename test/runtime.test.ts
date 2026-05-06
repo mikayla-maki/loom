@@ -5,31 +5,85 @@ import * as os from "node:os";
 
 import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
-import { memorySessionFactory } from "../src/extensions/session/memory.js";
-import { testHarnessFactory } from "../src/extensions/harness/test.js";
 import { assembleSystemPrompt } from "../src/runtime/system-prompt.js";
+import type { AgentManifest } from "../src/types/manifest.js";
+import type { TurnScript } from "../src/extensions/harness/test.js";
 
 const FIXTURES = path.resolve("test/fixtures");
+const GREET_BIN = path.join(FIXTURES, "tools/whoami/bin/sample-greet");
+const UPPERCASE_BIN = path.join(
+  FIXTURES,
+  "tools/uppercase/bin/sample-uppercase",
+);
+
+/** Build the canonical sample-agent inline spec used by these tests. */
+function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
+  return {
+    name: "sample-agent",
+    description: "An end-to-end Loom v0 demo agent.",
+    systemPrompt:
+      "You are the Loom sample agent — greet the user and shout the result.",
+    removeBuiltinTools: true,
+    harness: {
+      provider: "test",
+      ...(harnessScript ? { script: harnessScript } : {}),
+    },
+    sandbox: {
+      filesystem: ["./"],
+      network: [],
+      secrets: ["sample_user_name"],
+    },
+    skills: {
+      greeter: {
+        description: "Greet the user by name and shout the greeting.",
+        body: "Use `greet` then `uppercase`.",
+        requires: {
+          greet: {
+            description:
+              "Build a greeting using the user's name (read from secrets).",
+            schema: {
+              type: "object",
+              required: ["greeting"],
+              properties: { greeting: { type: "string" } },
+            },
+            invocation: { command: GREET_BIN },
+            secrets: { required: ["sample_user_name"] },
+            capabilities: {
+              filesystem: [],
+              network: [],
+              secrets: ["sample_user_name"],
+            },
+          },
+          uppercase: {
+            description: "Uppercase a string.",
+            schema: {
+              type: "object",
+              required: ["text"],
+              properties: { text: { type: "string" } },
+            },
+            invocation: { command: UPPERCASE_BIN },
+            capabilities: { filesystem: [], network: [] },
+          },
+        },
+      },
+    },
+  };
+}
 
 describe("runAgent → end-to-end with TestHarness + memory session", () => {
   it("runs scripted steps including a tool call", async () => {
-    const agent = await runAgent(path.join(FIXTURES, "sample-agent/agent.toml"), {
-      secrets: new StaticSecretsStore({ sample_user_name: "ALICE" }),
-      sessionOverride: memorySessionFactory,
-      sessionConfigOverride: {},
-      harnessOverride: {
-        factory: testHarnessFactory,
-        config: {
-          script: [
-            [
-              { say: "On it." },
-              { call: { tool: "greet", input: { greeting: "hello" } } },
-              { stop: "end_turn" },
-            ],
-          ],
-        },
+    const agent = await runAgent(
+      sampleAgentSpec([
+        [
+          { say: "On it." },
+          { call: { tool: "greet", input: { greeting: "hello" } } },
+          { stop: "end_turn" },
+        ],
+      ]),
+      {
+        secrets: new StaticSecretsStore({ sample_user_name: "ALICE" }),
       },
-    });
+    );
     try {
       const stop = await agent.prompt("Hi there!");
       expect(stop).toBe("end_turn");
@@ -50,18 +104,12 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
   });
 
   it("emits live updates to subscribers", async () => {
-    const agent = await runAgent(path.join(FIXTURES, "sample-agent/agent.toml"), {
-      secrets: new StaticSecretsStore({ sample_user_name: "BOB" }),
-      sessionOverride: memorySessionFactory,
-      harnessOverride: {
-        factory: testHarnessFactory,
-        config: {
-          script: [
-            [{ say: "ack" }, { stop: "end_turn" }],
-          ],
-        },
+    const agent = await runAgent(
+      sampleAgentSpec([[{ say: "ack" }, { stop: "end_turn" }]]),
+      {
+        secrets: new StaticSecretsStore({ sample_user_name: "BOB" }),
       },
-    });
+    );
     const seen: string[] = [];
     const sub = agent.updates();
     const consumer = (async () => {
@@ -82,26 +130,26 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
   });
 
   it("cancels an in-flight turn", async () => {
-    const agent = await runAgent(path.join(FIXTURES, "sample-agent/agent.toml"), {
+    const spec = sampleAgentSpec();
+    // Long script, but harness checks abortSignal between steps. Use
+    // the function form for `script` (configured inline on the harness).
+    if ("provider" in spec.harness) {
+      spec.harness.script = async (rt: unknown) => {
+        const out = [{ say: "starting" }] as Array<
+          | { say: string }
+          | { call: { tool: string; input: unknown } }
+          | { stop: "end_turn" | "cancelled" }
+        >;
+        for (let i = 0; i < 50; i++) out.push({ say: `step ${i}` });
+        // Force a yield so the abort can land.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        void rt;
+        out.push({ stop: "end_turn" });
+        return out;
+      };
+    }
+    const agent = await runAgent(spec, {
       secrets: new StaticSecretsStore({ sample_user_name: "CARL" }),
-      sessionOverride: memorySessionFactory,
-      harnessOverride: {
-        factory: testHarnessFactory,
-        config: {
-          // Long script, but harness checks abortSignal between steps.
-          script: async (rt) => {
-            const out = [{ say: "starting" }] as Array<
-              { say: string } | { call: { tool: string; input: unknown } } | { stop: "end_turn" | "cancelled" }
-            >;
-            for (let i = 0; i < 50; i++) out.push({ say: `step ${i}` });
-            // Force a yield so the abort can land.
-            await new Promise((resolve) => setTimeout(resolve, 10));
-            void rt;
-            out.push({ stop: "end_turn" });
-            return out;
-          },
-        },
-      },
     });
     try {
       const p = agent.prompt("go");
@@ -117,21 +165,17 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
   });
 
   it("validates tool input against the JSON schema", async () => {
-    const agent = await runAgent(path.join(FIXTURES, "sample-agent/agent.toml"), {
-      secrets: new StaticSecretsStore({ sample_user_name: "DIANA" }),
-      sessionOverride: memorySessionFactory,
-      harnessOverride: {
-        factory: testHarnessFactory,
-        config: {
-          script: [
-            [
-              { call: { tool: "uppercase", input: { wrong: "field" } } },
-              { stop: "end_turn" },
-            ],
-          ],
-        },
+    const agent = await runAgent(
+      sampleAgentSpec([
+        [
+          { call: { tool: "uppercase", input: { wrong: "field" } } },
+          { stop: "end_turn" },
+        ],
+      ]),
+      {
+        secrets: new StaticSecretsStore({ sample_user_name: "DIANA" }),
       },
-    });
+    );
     try {
       await agent.prompt("go");
       const events = await agent.session.getEvents();
@@ -146,29 +190,13 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
   });
 
   it("does not leak tool-undeclared secrets to tool processes", async () => {
-    // Ask the uppercase tool to print env to test secret isolation.
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-iso-"));
+    // A small ad-hoc envprint script lives on disk (executable bit
+    // matters), but the agent/skill/tool are declared inline.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-iso-"));
     try {
-      const toolDir = path.join(dir, "tools", "envprint");
-      await fs.mkdir(path.join(toolDir, "bin"), { recursive: true });
+      const envprintPath = path.join(dir, "envprint");
       await fs.writeFile(
-        path.join(toolDir, "tool.toml"),
-        `[tool]
-name = "envprint"
-description = "print env"
-[tool.schema]
-type = "object"
-[tool.invocation]
-command = "envprint"
-[tool.secrets]
-required = []
-[tool.capabilities]
-filesystem = []
-network = []
-`,
-      );
-      await fs.writeFile(
-        path.join(toolDir, "bin", "envprint"),
+        envprintPath,
         `#!/usr/bin/env node
 const env = process.env;
 const interesting = ['MY_SECRET','OTHER_SECRET','sample_user_name'];
@@ -177,56 +205,39 @@ for (const k of interesting) result[k] = env[k] ?? null;
 process.stdout.write(JSON.stringify(result));
 `,
       );
-      await fs.chmod(path.join(toolDir, "bin", "envprint"), 0o755);
-      const skillDir = path.join(dir, "skills", "envskill");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: envskill
-description: snoops env
-requires:
-  envprint: ../../tools/envprint
----
-body`,
-      );
-      const agentDir = path.join(dir, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "iso"
-system_prompt = "x"
-remove_builtin_tools = true
+      await fs.chmod(envprintPath, 0o755);
 
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = ["./"]
-network = []
-secrets = []
-[skills]
-e = "../skills/envskill"
-`,
-      );
+      const spec: AgentManifest = {
+        name: "iso",
+        systemPrompt: "x",
+        removeBuiltinTools: true,
+        harness: {
+          provider: "test",
+          script: [
+            [{ call: { tool: "envprint", input: {} } }, { stop: "end_turn" }],
+          ],
+        },
+        sandbox: { filesystem: ["./"], network: [], secrets: [] },
+        skills: {
+          envskill: {
+            description: "snoops env",
+            requires: {
+              envprint: {
+                description: "print env",
+                schema: { type: "object" },
+                invocation: { command: envprintPath },
+                capabilities: { filesystem: [], network: [] },
+              },
+            },
+          },
+        },
+      };
 
       // Set sensitive env vars in the parent process; tool MUST NOT see them.
       process.env.MY_SECRET = "leak-me";
       process.env.OTHER_SECRET = "leak-too";
 
-      const agent = await runAgent(path.join(agentDir, "agent.toml"), {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            script: [
-              [{ call: { tool: "envprint", input: {} } }, { stop: "end_turn" }],
-            ],
-          },
-        },
-      });
+      const agent = await runAgent(spec, {});
       try {
         await agent.prompt("go");
         const events = await agent.session.getEvents();
@@ -234,7 +245,8 @@ e = "../skills/envskill"
         expect(tu).toBeTruthy();
         if (tu && tu.sessionUpdate === "tool_call_update") {
           const text =
-            tu.content?.[0]?.type === "content" && tu.content[0].content.type === "text"
+            tu.content?.[0]?.type === "content" &&
+            tu.content[0].content.type === "text"
               ? tu.content[0].content.text
               : "";
           const got = JSON.parse(text);

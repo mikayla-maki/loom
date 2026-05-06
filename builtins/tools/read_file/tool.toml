@@ -9,7 +9,7 @@ properties.path.type = "string"
 properties.path.description = "Path to the file to read."
 
 [tool.invocation]
-command = "glass-read-file"
+command = "loom-read-file"
 
 [tool.secrets]
 required = []

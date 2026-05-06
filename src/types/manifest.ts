@@ -1,110 +1,127 @@
 /**
- * Manifest types — the parsed shape of agent.toml, tool.toml, and SKILL.md.
+ * Manifest types — the shape of an agent definition, whether parsed from
+ * disk (agent.toml + SKILL.md + tool.toml) or constructed in memory by an
+ * SDK consumer.
  *
- * These are the result of parsing + minimal normalization. Resolution
- * (walking skill→tool deps, fetching secrets, validating capabilities)
- * happens in src/manifest/resolver.ts.
+ * The manifest carries *unresolved* references (skill names, tool paths,
+ * etc.). The resolver walks them and produces a `ResolvedAgentManifest`
+ * with everything bound to concrete data.
  */
 
-/** Capability ceiling on an agent / actually-required surface of a tool. */
-export interface Capabilities {
+// ─── Capabilities ────────────────────────────────────────────────────────────
+
+/**
+ * Sandbox ceiling axes — the surface the agent's `[sandbox]` declaration
+ * constrains. Absent axis = unconstrained on that axis (`*`). Empty array
+ * = explicitly nothing.
+ */
+export interface SandboxCeiling {
   filesystem?: string[];
   network?: string[];
   secrets?: string[];
-  /** Names of subagents this scope is allowed to invoke (v1). */
+}
+
+/**
+ * Capabilities a tool declares about itself. Inherits the three sandbox
+ * axes (used to validate that the union of tool needs ⊆ agent ceiling),
+ * plus a `subagent` axis that's broker opt-in: a non-empty value tells the
+ * runtime to wire this tool's spawn with `LOOM_INVOKE_*` env vars so it
+ * can call subagents through `loom-invoke`.
+ */
+export interface ToolCapabilities extends SandboxCeiling {
   subagent?: string[] | "*";
 }
 
-/** Parsed `agent.toml` (after path resolution but before dependency walk). */
+// ─── System prompt ───────────────────────────────────────────────────────────
+
+/**
+ * `[agent].system_prompt` — either an inline literal, or a path to read
+ * from disk. The string form is disambiguated by prefix (`./`, `../`,
+ * `/`, `~/` → path; otherwise literal); the structured form is
+ * unambiguous and allowed even when the literal would be path-shaped.
+ */
+export type SystemPromptSpec = string | { path: string };
+
+// ─── Subagent reference ──────────────────────────────────────────────────────
+
+export type SubagentReference =
+  | { kind: "path"; path: string }
+  | { kind: "registry"; name: string }
+  | { kind: "acp"; url: string };
+
+// ─── Agent manifest (input shape) ──────────────────────────────────
+//
+// The manifest is what the user provides — directly via `runAgent(spec)`
+// or indirectly via `parseAgentManifest("./agent.toml")`. Agent identity
+// fields (name / description / systemPrompt / removeBuiltinTools) live at
+// the top level; the parser flattens TOML's `[agent]` table onto the same
+// shape so file-based and inline forms produce identical objects.
+//
+// Skills, tools, and subagents may be expressed inline as nested objects
+// OR as string refs (paths / registry names / "builtin"). The resolver
+// dispatches on each.
+
+/**
+ * Configuration form: `{ provider: "name", ...config }`. The runtime
+ * looks the factory up in the in-process registry by `provider` name,
+ * passes the rest as config.
+ */
+export interface ProviderRefConfig {
+  provider: string;
+  [k: string]: unknown;
+}
+
+/**
+ * Harness slot: either a config record (looked up by `provider` name) or
+ * a pre-built `Harness` instance the runtime uses as-is. Detection is by
+ * presence of a `provider: string` field — instances do not carry that.
+ */
+export type HarnessSpec = ProviderRefConfig | import("./interfaces.js").Harness;
+
+/** Session slot — same shape rules as Harness. */
+export type SessionSpec = ProviderRefConfig | import("./interfaces.js").Session;
+
 export interface AgentManifest {
-  /** Absolute path to the manifest file. Used as the base for relative paths. */
-  manifestPath: string;
-  agent: {
-    name: string;
-    description?: string;
-    /**
-     * `[agent].system_prompt` — the static, manifest-owned portion of the
-     * system prompt the runtime assembles each turn.
-     *
-     * Stored verbatim. The resolver decides whether it's a path or inline:
-     *   - path-like (`./`, `../`, `/`, `~/` prefix) → read from disk
-     *   - anything else → used as the literal text
-     */
-    systemPrompt?: string;
-    /**
-     * `[agent].remove_builtin_tools` — when true, suppress the auto-loaded
-     * `core` builtin skill (bash / read_file / write_file / find). The
-     * agent only sees the tools its manifest brings in via `[skills]`.
-     * Default: false.
-     */
-    removeBuiltinTools?: boolean;
-  };
-  harness: {
-    provider: string;
-    [key: string]: unknown;
-  };
-  session: {
-    provider: string;
-    [key: string]: unknown;
-  };
-  sandbox: Capabilities;
-  /** Map of skill name → path (relative or registry name). */
-  skills: Record<string, string>;
-  /**
-   * Map of extension-name → config for *Provider* extensions. Providers
-   * dynamically contribute tools/skills at boot — for example, an MCP
-   * extension that exposes MCP-server tools as Glass tools.
-   */
-  providers: Record<string, Record<string, unknown>>;
-  /**
-   * Map of npm-package-name → config for Glass *extension packages*. At
-   * boot, each listed package is dynamic-imported and its register()
-   * function is called; the package decides what to install (harnesses,
-   * sessions, providers).
-   *
-   *   [extensions]
-   *   "mcp-glass-extension" = { servers = ["filesystem"] }
-   *   "@example/glass-foo" = {}
-   *
-   * Discovery scopes <manifestDir>/node_modules → npm global root →
-   * ~/.glass/extensions.
-   */
-  extensions: Record<string, Record<string, unknown>>;
-}
-
-/** Parsed `tool.toml` declaration. */
-export interface ToolManifest {
-  manifestPath: string;
-  toolDir: string;
-  tool: {
-    name: string;
-    description: string;
-    schema: import("./schema.js").JSONSchema;
-    invocation: {
-      command: string;
-      /** Optional explicit args before the JSON-on-stdin payload. */
-      args?: string[];
-    };
-    secrets: { required: string[]; optional?: string[] };
-    capabilities: Capabilities;
-  };
-  /** Whether the tool ships its own bin/ directory (auto-PATH'd). */
-  shipsBinary: boolean;
-  binDir?: string;
-}
-
-/** Parsed `SKILL.md` — frontmatter + body. */
-export interface SkillManifest {
-  manifestPath: string;
-  skillDir: string;
+  /** Absolute path to the source file, if loaded from disk. */
+  manifestPath?: string;
+  /** Agent display name. Required. */
   name: string;
+  description?: string;
+  systemPrompt?: SystemPromptSpec;
+  /** When true, suppress the auto-loaded `core` builtin skill. */
+  removeBuiltinTools?: boolean;
+  harness: HarnessSpec;
+  /** Optional. Defaults to `{ provider: "memory" }` if absent. */
+  session?: SessionSpec;
+  /**
+   * Per-axis sandbox ceiling. Whole table absent OR axis absent =
+   * unconstrained (`*`). Empty array on an axis = explicitly nothing.
+   */
+  sandbox?: SandboxCeiling;
+  /** Skill name → path / registry name / inline skill manifest. */
+  skills?: Record<string, string | SkillManifest>;
+  /**
+   * Extensions: npm packages with a `loom.extension` field, loaded at boot.
+   * Each entry's name is the package name; the value is the config object
+   * passed to the package's `register()` function.
+   *
+   * For programmatic `Provider` instances, use `RunAgentOptions.providers`
+   * instead. Extensions are a plugin-loading mechanism, not a place to
+   * embed live runtime objects.
+   */
+  extensions?: Record<string, Record<string, unknown>>;
+}
+
+export interface SkillManifest {
+  /** If present, must equal the parent map key. */
+  name?: string;
   description: string;
-  /** model-facing knowledge content (markdown body). */
-  body: string;
-  /** Map of tool name (model-facing) → path or "builtin". */
-  requires: Record<string, string>;
-  /** v1: subagents this skill may invoke (path / inline / acp:// / registry). */
-  subagents?: Record<string, SubagentReference>;
+  /** Markdown body. Defaults to empty string. */
+  body?: string;
+  /** Tool name → path / "builtin" / "builtin:<name>" / inline tool manifest. */
+  requires?: Record<string, string | ToolManifest>;
+  /** Subagent name → path / registry name / acp:// URL / structured reference. */
+  subagents?: Record<string, string | SubagentReference>;
   /**
    * If true, the runtime renders this skill's body as part of the manifest's
    * core system prompt (rather than under `# Available Skills`), so the
@@ -112,10 +129,35 @@ export interface SkillManifest {
    * uses this to behave like ambient guidance, not an opt-in capability.
    */
   inlineInSystemPrompt?: boolean;
+
+  // ── Disk-derived (parser-only fields) ──
+  /** Absolute path to SKILL.md, when loaded from disk. */
+  manifestPath?: string;
+  /** Skill directory, when loaded from disk. Used as the base for relative tool paths. */
+  skillDir?: string;
 }
 
-export type SubagentReference =
-  | { kind: "path"; path: string }
-  | { kind: "registry"; name: string }
-  | { kind: "inline"; manifest: AgentManifest }
-  | { kind: "acp"; url: string };
+export interface ToolManifest {
+  /** If present, must equal the parent map key. */
+  name?: string;
+  description: string;
+  schema: import("./schema.js").JSONSchema;
+  invocation: { command: string; args?: string[] };
+  secrets?: { required?: string[]; optional?: string[] };
+  capabilities?: ToolCapabilities;
+  /**
+   * Working directory for the spawned tool process. Defaults to the
+   * tool's `toolDir` (when loaded from disk) or `process.cwd()` (when
+   * declared inline).
+   */
+  cwd?: string;
+
+  // ── Disk-derived (parser-only fields) ──
+  /** Absolute path to tool.toml, when loaded from disk. */
+  manifestPath?: string;
+  /** Tool directory, when loaded from disk. */
+  toolDir?: string;
+  /** True iff the tool ships a `bin/` directory (auto-PATH'd). */
+  shipsBinary?: boolean;
+  binDir?: string;
+}

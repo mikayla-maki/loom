@@ -65,7 +65,9 @@ export class RuntimeImpl implements Runtime {
       skills: this.listSkills(),
       tools: this.listTools(),
       agentName: this.opts.agentName,
-      ...(this.opts.agentDescription ? { agentDescription: this.opts.agentDescription } : {}),
+      ...(this.opts.agentDescription
+        ? { agentDescription: this.opts.agentDescription }
+        : {}),
       now: this.opts.now ? this.opts.now() : new Date(),
     });
   }
@@ -76,10 +78,10 @@ export class RuntimeImpl implements Runtime {
 
   listSkills(): SkillDescriptor[] {
     return this.opts.state.skills.map((s) => ({
-      name: s.name,
+      name: s.name ?? "",
       description: s.description,
-      body: s.body,
-      toolNames: Object.keys(s.requires),
+      body: s.body ?? "",
+      toolNames: Object.keys(s.requires ?? {}),
       ...(s.inlineInSystemPrompt ? { inlineInSystemPrompt: true } : {}),
     }));
   }

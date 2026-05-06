@@ -5,31 +5,24 @@ import * as os from "node:os";
 
 import { runAgent } from "../src/sdk/run-agent.js";
 import { auditAgent } from "../src/audit/audit.js";
-import { CapabilityError } from "../src/errors.js";
-import { memorySessionFactory } from "../src/extensions/session/memory.js";
-import { testHarnessFactory } from "../src/extensions/harness/test.js";
-import { StaticSecretsStore } from "../src/runtime/secrets.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 
 /**
- * Build a small fixtures tree on disk:
- *   parent/agent.toml    — parent agent that has skill 'composer'
- *   skills/composer       — declares subagent 'helper'
- *   helper/agent.toml    — child agent (test harness, scripted to say "child here")
+ * Materialize a small helper child agent on disk and return its absolute
+ * `agent.toml` path. The child runs the test harness in echo mode.
+ *
+ * The child has to live on disk because subagent references are paths /
+ * registry names / acp:// URLs — runAgent loads them as separate agents
+ * via `runAgent(<path>)`. Inline-only at the parent level is fine; the
+ * subagent dependency points outward.
  */
-async function buildSubagentFixture(opts: {
-  parentSubagentCeiling: string[] | "*";
-  skillSubagents: { helper: string; rude?: string };
-}): Promise<{ root: string; parentManifest: string }> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-sub-"));
-
-  // Helper child agent under skills/ so subagents.toml's relative paths
-  // (which resolve from skills/composer/) can reach it via ../helper/...
-  const helperDir = path.join(root, "skills", "helper");
-  await fs.mkdir(helperDir, { recursive: true });
+async function writeEchoChild(rootDir: string): Promise<string> {
+  const childDir = path.join(rootDir, "child");
+  await fs.mkdir(childDir, { recursive: true });
   await fs.writeFile(
-    path.join(helperDir, "agent.toml"),
+    path.join(childDir, "agent.toml"),
     `[agent]
-name = "helper"
+name = "child"
 system_prompt = "child"
 remove_builtin_tools = true
 
@@ -38,93 +31,43 @@ provider = "test"
 echo = true
 [session]
 provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
 `,
   );
-
-  // Composer skill.
-  const skillDir = path.join(root, "skills", "composer");
-  await fs.mkdir(skillDir, { recursive: true });
-  const subagentsToml = Object.entries(opts.skillSubagents)
-    .map(([k, v]) => `${k} = "${v}"`)
-    .join("\n");
-  await fs.writeFile(path.join(skillDir, "subagents.toml"), subagentsToml);
-  await fs.writeFile(
-    path.join(skillDir, "SKILL.md"),
-    `---
-name: composer
-description: Compose by delegating
-requires: {}
-subagents: ./subagents.toml
----
-body
-`,
-  );
-
-  // Parent agent.
-  const parentDir = path.join(root, "parent");
-  await fs.mkdir(parentDir, { recursive: true });
-  const ceiling =
-    opts.parentSubagentCeiling === "*"
-      ? `subagent = "*"`
-      : `subagent = [${opts.parentSubagentCeiling.map((s) => `"${s}"`).join(", ")}]`;
-  await fs.writeFile(
-    path.join(parentDir, "agent.toml"),
-    `[agent]
-name = "parent"
-system_prompt = "parent"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-${ceiling}
-[skills]
-composer = "../skills/composer"
-`,
-  );
-
-  return { root, parentManifest: path.join(parentDir, "agent.toml") };
+  return path.join(childDir, "agent.toml");
 }
 
 describe("subagents", () => {
-  it("v1: parent calls helper via spawn_subagent end-to-end", async () => {
-    const { root, parentManifest } = await buildSubagentFixture({
-      parentSubagentCeiling: ["helper"],
-      skillSubagents: { helper: "../helper/agent.toml" },
-    });
+  it("parent calls helper via spawn_subagent end-to-end", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sub-"));
     try {
-      const agent = await runAgent(parentManifest, {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            // Sub-harness for the child runs by default; pass child config via
-            // a separate runAgent invocation if needed. Here we drive the parent
-            // to call spawn_subagent.
-            script: [
-              [
-                {
-                  call: {
-                    tool: "spawn_subagent",
-                    input: { scope: "helper", prompt: "hello child" },
-                  },
+      const childManifest = await writeEchoChild(root);
+      const spec: AgentManifest = {
+        name: "parent",
+        systemPrompt: "parent",
+        removeBuiltinTools: true,
+        harness: {
+          provider: "test",
+          script: [
+            [
+              {
+                call: {
+                  tool: "spawn_subagent",
+                  input: { scope: "helper", prompt: "hello child" },
                 },
-                { stop: "end_turn" },
-              ],
+              },
+              { stop: "end_turn" },
             ],
+          ],
+        },
+        skills: {
+          composer: {
+            description: "Compose by delegating",
+            requires: { spawn_subagent: "builtin" },
+            subagents: { helper: childManifest },
           },
         },
-      });
+      };
+      const agent = await runAgent(spec, {});
       try {
         await agent.prompt("delegate");
         const events = await agent.session.getEvents();
@@ -133,10 +76,10 @@ describe("subagents", () => {
         if (tu && tu.sessionUpdate === "tool_call_update") {
           expect(tu.status).toBe("completed");
           const text =
-            tu.content?.[0]?.type === "content" && tu.content[0].content.type === "text"
+            tu.content?.[0]?.type === "content" &&
+            tu.content[0].content.type === "text"
               ? tu.content[0].content.text
               : "";
-          // Child runs in echo mode → returns "echo: hello child"
           expect(text).toContain("echo: hello child");
         }
       } finally {
@@ -147,113 +90,98 @@ describe("subagents", () => {
     }
   });
 
-  it("v1: refuses to escape parent's [sandbox].subagent ceiling", async () => {
-    const { root, parentManifest } = await buildSubagentFixture({
-      parentSubagentCeiling: ["helper"],
-      skillSubagents: { helper: "../helper/agent.toml", rude: "../helper/agent.toml" },
-    });
+  it("auditAgent recursively traverses subagents", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sub-audit-"));
     try {
-      // Resolver should refuse to even start since 'rude' is not in ceiling.
-      await expect(
-        runAgent(parentManifest, {
-          sessionOverride: memorySessionFactory,
-          harnessOverride: {
-            factory: testHarnessFactory,
-            config: { script: [] },
+      const childManifest = await writeEchoChild(root);
+      const spec: AgentManifest = {
+        name: "parent",
+        systemPrompt: "p",
+        removeBuiltinTools: true,
+        harness: { provider: "test" },
+        skills: {
+          composer: {
+            description: "x",
+            subagents: { helper: childManifest },
           },
-        }),
-      ).rejects.toThrow(CapabilityError);
+        },
+      };
+      const tree = await auditAgent(spec);
+      expect(tree.subagents).toHaveLength(1);
+      expect(tree.subagents[0]?.name).toBe("helper");
+      expect(tree.subagents[0]?.tree?.name).toBe("child");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
 
-  it("v1: subagent='*' passthrough is permitted only when ceiling is also '*'", async () => {
-    const { root, parentManifest } = await buildSubagentFixture({
-      parentSubagentCeiling: "*",
-      skillSubagents: { helper: "../helper/agent.toml" },
-    });
+  it("auditAgent surfaces acp:// subagents as remote (no recursion)", async () => {
+    const spec: AgentManifest = {
+      name: "p",
+      systemPrompt: "p",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      skills: {
+        remote: {
+          description: "remote subagent",
+          subagents: { helper: "acp://example.com:9000/helper" },
+        },
+      },
+    };
+    const tree = await auditAgent(spec);
+    expect(tree.subagents).toHaveLength(1);
+    expect(tree.subagents[0]?.kind).toBe("acp");
+    expect(tree.subagents[0]?.note).toMatch(/acp:\/\/example.com/);
+  });
+
+  it("unknown subagent scope at runtime raises a tool error", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sub-unknown-"));
     try {
-      const agent = await runAgent(parentManifest, {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            script: [
-              [{ call: { tool: "spawn_subagent", input: { scope: "helper", prompt: "ping" } } }, { stop: "end_turn" }],
+      const childManifest = await writeEchoChild(root);
+      const spec: AgentManifest = {
+        name: "p",
+        systemPrompt: "p",
+        removeBuiltinTools: true,
+        harness: {
+          provider: "test",
+          script: [
+            [
+              {
+                call: {
+                  tool: "spawn_subagent",
+                  input: { scope: "ghost", prompt: "x" },
+                },
+              },
+              { stop: "end_turn" },
             ],
+          ],
+        },
+        skills: {
+          s: {
+            description: "x",
+            requires: { spawn_subagent: "builtin" },
+            subagents: { helper: childManifest },
           },
         },
-      });
+      };
+      const agent = await runAgent(spec, {});
       try {
-        const stop = await agent.prompt("go");
-        expect(stop).toBe("end_turn");
+        await agent.prompt("go");
+        const events = await agent.session.getEvents();
+        const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
+        expect(tu).toBeTruthy();
+        if (tu && tu.sessionUpdate === "tool_call_update") {
+          expect(tu.status).toBe("failed");
+          const text =
+            tu.content?.[0]?.type === "content" &&
+            tu.content[0].content.type === "text"
+              ? tu.content[0].content.text
+              : "";
+          expect(text).toMatch(/Unknown subagent scope 'ghost'/);
+        }
       } finally {
         await agent.close();
       }
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("auditAgent recursively traverses subagents", async () => {
-    const { root, parentManifest } = await buildSubagentFixture({
-      parentSubagentCeiling: ["helper"],
-      skillSubagents: { helper: "../helper/agent.toml" },
-    });
-    try {
-      const tree = await auditAgent(parentManifest);
-      expect(tree.subagents).toHaveLength(1);
-      expect(tree.subagents[0]?.name).toBe("helper");
-      expect(tree.subagents[0]?.tree?.name).toBe("helper");
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("auditAgent surfaces acp:// subagents as remote", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-acp-"));
-    try {
-      const skillDir = path.join(root, "skills", "remote");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: remote
-description: remote subagent
-requires: {}
-subagents:
-  helper: acp://example.com:9000/helper
----
-body
-`,
-      );
-      const parentDir = path.join(root, "p");
-      await fs.mkdir(parentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(parentDir, "agent.toml"),
-        `[agent]
-name = "p"
-system_prompt = "p"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-subagent = ["helper"]
-[skills]
-r = "../skills/remote"
-`,
-      );
-      const tree = await auditAgent(path.join(parentDir, "agent.toml"));
-      expect(tree.subagents).toHaveLength(1);
-      expect(tree.subagents[0]?.kind).toBe("acp");
-      expect(tree.subagents[0]?.note).toMatch(/acp:\/\/example.com/);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

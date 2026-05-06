@@ -1,50 +1,75 @@
 /**
- * Static capability audit — walks an agent.toml + every reachable subagent
- * to compute the total declared capability surface. No LLM is ever invoked.
+ * Static capability audit — walks an agent manifest + every reachable
+ * subagent to compute the total declared capability surface. No LLM is
+ * ever invoked.
  */
 
 import * as path from "node:path";
 
 import { resolveAgent, type ResolveOptions } from "../manifest/resolver.js";
 import { unionCapabilities } from "../manifest/capabilities.js";
-import type { Capabilities } from "../types/manifest.js";
+import type {
+  AgentManifest,
+  SandboxCeiling,
+  ToolCapabilities,
+} from "../types/manifest.js";
 
 export interface CapabilityTree {
   manifestPath: string;
   name: string;
-  ceiling: Capabilities;
-  required: Capabilities;
-  tools: Array<{ name: string; capabilities: Capabilities; introducedBy: string }>;
+  ceiling: SandboxCeiling;
+  required: SandboxCeiling;
+  tools: Array<{
+    name: string;
+    capabilities: ToolCapabilities;
+    introducedBy: string;
+  }>;
   subagents: Array<{
     skill: string;
     name: string;
-    kind: "path" | "registry" | "inline" | "acp";
+    kind: "path" | "registry" | "acp";
     tree?: CapabilityTree;
     note?: string;
   }>;
 }
 
 export async function auditAgent(
-  manifestPath: string,
+  source: string | AgentManifest,
   options: ResolveOptions = {},
 ): Promise<CapabilityTree> {
-  return await auditOne(path.resolve(manifestPath), options, new Set());
+  if (typeof source === "string") {
+    return await auditOne(path.resolve(source), options, new Set());
+  }
+  return await auditOne(source, options, new Set());
 }
 
 async function auditOne(
-  manifestPath: string,
+  source: string | AgentManifest,
   options: ResolveOptions,
   visited: Set<string>,
 ): Promise<CapabilityTree> {
+  // Identity for cycle detection: the manifest's path on disk, or a
+  // synthetic identifier for inline manifests.
+  const manifestPath =
+    typeof source === "string"
+      ? source
+      : (source.manifestPath ?? `<inline:${source.name}>`);
   if (visited.has(manifestPath)) {
-    return { manifestPath, name: "(cycle)", ceiling: {}, required: {}, tools: [], subagents: [] };
+    return {
+      manifestPath,
+      name: "(cycle)",
+      ceiling: {},
+      required: {},
+      tools: [],
+      subagents: [],
+    };
   }
   visited.add(manifestPath);
 
-  const resolved = await resolveAgent(manifestPath, options);
+  const resolved = await resolveAgent(source, options);
   const tools = resolved.tools.map((t) => ({
-    name: t.manifest.tool.name,
-    capabilities: t.manifest.tool.capabilities,
+    name: t.manifest.name,
+    capabilities: t.manifest.capabilities ?? {},
     introducedBy: t.introducedBy,
   }));
   const required = unionCapabilities(tools.map((t) => t.capabilities));
@@ -55,16 +80,28 @@ async function auditOne(
       const skillName = skill.manifest.name;
       switch (ref.kind) {
         case "path":
-          subagents.push({ skill: skillName, name, kind: "path", tree: await auditOne(ref.path, options, visited) });
+          subagents.push({
+            skill: skillName,
+            name,
+            kind: "path",
+            tree: await auditOne(ref.path, options, visited),
+          });
           break;
         case "registry":
-          subagents.push({ skill: skillName, name, kind: "registry", tree: await auditOne(ref.resolvedPath, options, visited) });
-          break;
-        case "inline":
-          subagents.push({ skill: skillName, name, kind: "inline", note: "inline manifest (audit support pending)" });
+          subagents.push({
+            skill: skillName,
+            name,
+            kind: "registry",
+            tree: await auditOne(ref.resolvedPath, options, visited),
+          });
           break;
         case "acp":
-          subagents.push({ skill: skillName, name, kind: "acp", note: `remote: ${ref.url}` });
+          subagents.push({
+            skill: skillName,
+            name,
+            kind: "acp",
+            note: `remote: ${ref.url}`,
+          });
           break;
       }
     }
@@ -72,8 +109,8 @@ async function auditOne(
 
   return {
     manifestPath,
-    name: resolved.manifest.agent.name,
-    ceiling: resolved.manifest.sandbox,
+    name: resolved.source.name,
+    ceiling: resolved.sandbox,
     required,
     tools,
     subagents,
@@ -85,12 +122,14 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
   const pad = "  ".repeat(indent);
   const lines: string[] = [];
   lines.push(`${pad}${tree.name}  (${tree.manifestPath})`);
-  lines.push(`${pad}  ceiling : ${formatCaps(tree.ceiling)}`);
-  lines.push(`${pad}  required: ${formatCaps(tree.required)}`);
+  lines.push(`${pad}  ceiling : ${formatCeiling(tree.ceiling)}`);
+  lines.push(`${pad}  required: ${formatCeiling(tree.required)}`);
   if (tree.tools.length > 0) {
     lines.push(`${pad}  tools:`);
     for (const t of tree.tools) {
-      lines.push(`${pad}    - ${t.name} (from ${t.introducedBy}): ${formatCaps(t.capabilities)}`);
+      lines.push(
+        `${pad}    - ${t.name} (from ${t.introducedBy}): ${formatToolCaps(t.capabilities)}`,
+      );
     }
   }
   if (tree.subagents.length > 0) {
@@ -104,12 +143,27 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
   return lines.join("\n");
 }
 
-function formatCaps(c: Capabilities): string {
+function formatCeiling(c: SandboxCeiling): string {
   const parts: string[] = [];
-  if (c.filesystem?.length) parts.push(`fs[${c.filesystem.join(",")}]`);
-  if (c.network?.length) parts.push(`net[${c.network.join(",")}]`);
-  if (c.secrets?.length) parts.push(`secrets[${c.secrets.join(",")}]`);
+  parts.push(formatAxis("fs", c.filesystem));
+  parts.push(formatAxis("net", c.network));
+  parts.push(formatAxis("secrets", c.secrets));
+  return parts.join(" ");
+}
+
+function formatToolCaps(c: ToolCapabilities): string {
+  const parts: string[] = [];
+  parts.push(formatAxis("fs", c.filesystem));
+  parts.push(formatAxis("net", c.network));
+  parts.push(formatAxis("secrets", c.secrets));
   if (c.subagent === "*") parts.push("subagent[*]");
-  else if (Array.isArray(c.subagent) && c.subagent.length) parts.push(`subagent[${c.subagent.join(",")}]`);
-  return parts.length === 0 ? "(none)" : parts.join(" ");
+  else if (Array.isArray(c.subagent) && c.subagent.length)
+    parts.push(`subagent[${c.subagent.join(",")}]`);
+  return parts.join(" ");
+}
+
+function formatAxis(label: string, axis: string[] | undefined): string {
+  if (axis === undefined) return `${label}[*]`;
+  if (axis.length === 0) return `${label}[]`;
+  return `${label}[${axis.join(",")}]`;
 }

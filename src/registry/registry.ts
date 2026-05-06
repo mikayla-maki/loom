@@ -1,15 +1,15 @@
 /**
- * Local registry — bare-name resolution against ~/.glass/{skills,tools,agents}.
+ * Local registry — bare-name resolution against ~/.loom/{skills,tools,agents}.
  *
  * v1 layout (from the design doc):
- *   ~/.glass/
+ *   ~/.loom/
  *   ├── extensions/
  *   ├── skills/
  *   ├── tools/
  *   └── agents/
  *
  * Manifests in any of these directories are addressable by bare name from
- * any agent.toml. `glass install <path>` is just a copy/symlink helper.
+ * any agent.toml. `loom install <path>` is just a copy/symlink helper.
  */
 
 import * as fs from "node:fs/promises";
@@ -19,14 +19,14 @@ import * as os from "node:os";
 import type { RegistryLookup } from "../manifest/resolver.js";
 
 export interface RegistryOptions {
-  /** Override the registry root. Defaults to $GLASS_HOME or ~/.glass. */
+  /** Override the registry root. Defaults to $LOOM_HOME or ~/.loom. */
   root?: string;
 }
 
 export class LocalRegistry {
   public readonly root: string;
   constructor(opts: RegistryOptions = {}) {
-    this.root = opts.root ?? process.env.GLASS_HOME ?? path.join(os.homedir(), ".glass");
+    this.root = opts.root ?? process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom");
   }
 
   lookup: RegistryLookup = async (kind, name) => {

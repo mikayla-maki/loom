@@ -1,18 +1,23 @@
 /**
  * In-process spawn_subagent tool.
  *
- * The v0 design ships spawn-subagent as a builtin tool (process-backed). v1
- * tightens this with a token-broker pattern: tools never resolve subagent
- * paths themselves; they ask the runtime, which checks the calling skill's
- * declared subagents against the agent's [sandbox].subagent ceiling.
+ * The model invokes a subagent by name; the registry maps that name to a
+ * resolved reference (path / registry-resolved path / acp:// URL), which
+ * came from some skill's `subagents:` declaration. There is no separate
+ * agent-level subagent ceiling — a skill that declared the subagent is
+ * the contract.
  *
- * In-process means: no subprocess Glass cold-start, no env-var registry,
- * no socket. The parent Glass directly instantiates a child RunningAgent
+ * In-process means: no subprocess Loom cold-start, no env-var registry,
+ * no socket. The parent Loom directly instantiates a child RunningAgent
  * via runAgent(), drives one prompt, extracts the final agent message,
  * and returns it.
  *
+ * The broker socket exists for a different audience: spawned tool
+ * subprocesses that want to invoke subagents (via the `loom-invoke` shim).
+ * That path is in `src/server/server.ts` + `src/cli/loom-invoke.ts`.
+ *
  * The subagent's own [sandbox] applies — children do NOT inherit the
- * parent's capabilities. That falls out of just calling runAgent() on the
+ * parent's ceiling. That falls out of just calling runAgent() on the
  * child manifest.
  */
 
@@ -20,7 +25,6 @@ import { connectAcpUrl } from "../acp/client.js";
 import { ResolutionError } from "../errors.js";
 import { runAgent, type RunAgentOptions } from "../sdk/run-agent.js";
 import type { ResolvedSubagent } from "../manifest/resolver.js";
-import type { Capabilities } from "../types/manifest.js";
 import type { Tool, ToolResult } from "../types/interfaces.js";
 import { lastAgentMessage } from "./extract-message.js";
 
@@ -34,17 +38,14 @@ export interface SubagentRegistryEntry {
 /**
  * The runtime-side registry of subagents available to the agent.
  *
- * Entries are keyed by name (the model uses this name as the `scope` arg).
- * If the agent's `[sandbox].subagent === "*"`, any name is admissible at
- * resolution time as long as the skill that declared it is on this list.
+ * Entries are keyed by name (the model uses this name as the `scope`
+ * argument). Whatever skills declared is what's invokable — there is no
+ * separate agent-level subagent ceiling.
  */
 export class SubagentRegistry {
   private readonly byName = new Map<string, SubagentRegistryEntry>();
 
-  constructor(
-    entries: Iterable<SubagentRegistryEntry & { name: string }>,
-    public readonly ceiling: Capabilities,
-  ) {
+  constructor(entries: Iterable<SubagentRegistryEntry & { name: string }>) {
     for (const e of entries) {
       this.byName.set(e.name, { ref: e.ref, skill: e.skill });
     }
@@ -55,25 +56,13 @@ export class SubagentRegistry {
     return [...this.byName.keys()];
   }
 
-  /**
-   * Resolve a scope: returns the entry, or throws if either the name is
-   * unknown or it falls outside the agent's ceiling.
-   */
+  /** Resolve a scope; throws if unknown. */
   resolve(scope: string): SubagentRegistryEntry {
     const entry = this.byName.get(scope);
     if (!entry) {
       throw new ResolutionError(
         `Unknown subagent scope '${scope}'. Available: ${this.names().join(", ") || "(none)"}`,
       );
-    }
-    const c = this.ceiling.subagent;
-    if (c !== "*") {
-      const allowed = new Set<string>(c ?? []);
-      if (!allowed.has(scope)) {
-        throw new ResolutionError(
-          `Subagent '${scope}' is declared by skill '${entry.skill}' but not permitted by [sandbox].subagent. Add it to the ceiling.`,
-        );
-      }
     }
     return entry;
   }
@@ -104,7 +93,7 @@ const SPAWN_SCHEMA: JSONSchema = {
 export class SpawnSubagentTool implements Tool {
   public readonly name = "spawn_subagent";
   public readonly description =
-    "Run another Glass agent (a subagent) and return its final assistant message.";
+    "Run another Loom agent (a subagent) and return its final assistant message.";
   public readonly inputSchema = SPAWN_SCHEMA;
 
   constructor(
@@ -112,10 +101,16 @@ export class SpawnSubagentTool implements Tool {
     private readonly options: { runOptions?: RunAgentOptions } = {},
   ) {}
 
-  async execute(input: unknown, _secrets: Record<string, string>): Promise<ToolResult> {
+  async execute(
+    input: unknown,
+    _secrets: Record<string, string>,
+  ): Promise<ToolResult> {
     const params = (input ?? {}) as { scope?: string; prompt?: string };
     if (typeof params.scope !== "string" || typeof params.prompt !== "string") {
-      return { content: "spawn_subagent: 'scope' and 'prompt' are required strings", isError: true };
+      return {
+        content: "spawn_subagent: 'scope' and 'prompt' are required strings",
+        isError: true,
+      };
     }
 
     let entry: SubagentRegistryEntry;
@@ -129,11 +124,17 @@ export class SpawnSubagentTool implements Tool {
       const final = await this.runOne(entry, params.prompt);
       return { content: final };
     } catch (e) {
-      return { content: `spawn_subagent error: ${(e as Error).message}`, isError: true };
+      return {
+        content: `spawn_subagent error: ${(e as Error).message}`,
+        isError: true,
+      };
     }
   }
 
-  private async runOne(entry: SubagentRegistryEntry, prompt: string): Promise<string> {
+  private async runOne(
+    entry: SubagentRegistryEntry,
+    prompt: string,
+  ): Promise<string> {
     const ref = entry.ref;
     if (ref.kind === "acp") {
       const client = await connectAcpUrl(ref.url);
@@ -147,11 +148,7 @@ export class SpawnSubagentTool implements Tool {
         await client.close();
       }
     }
-    if (ref.kind === "inline") {
-      throw new Error("inline subagent manifests are not yet supported");
-    }
-    const manifestPath =
-      ref.kind === "path" ? ref.path : ref.resolvedPath;
+    const manifestPath = ref.kind === "path" ? ref.path : ref.resolvedPath;
     const sub = await runAgent(manifestPath, this.options.runOptions ?? {});
     try {
       await sub.prompt(prompt);

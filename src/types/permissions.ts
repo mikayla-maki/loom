@@ -16,7 +16,7 @@
  * to the connected client.
  */
 
-import type { Capabilities } from "./manifest.js";
+import type { SandboxCeiling } from "./manifest.js";
 
 /** Discrete user choices — mirrors ACP `RequestPermissionOutcome`. */
 export type PermissionDecision = "allow_once" | "allow_session" | "deny";
@@ -30,9 +30,9 @@ export interface PermissionRequest {
    * Capabilities being requested. For `expand_sandbox`, this is the *diff*
    * — the set of capabilities NOT already in the current ceiling.
    */
-  newCapabilities?: Capabilities;
+  newCapabilities?: SandboxCeiling;
   /** Snapshot of the current ceiling, for context. */
-  currentCeiling?: Capabilities;
+  currentCeiling?: SandboxCeiling;
   /** Free-form metadata (skill name, tool name, etc.). */
   metadata?: Record<string, unknown>;
 }
@@ -46,7 +46,11 @@ export type PermissionHandler = (
 ) => Promise<PermissionResult> | PermissionResult;
 
 /** Convenience: a handler that denies everything (the secure default). */
-export const denyAllPermissionHandler: PermissionHandler = () => ({ decision: "deny" });
+export const denyAllPermissionHandler: PermissionHandler = () => ({
+  decision: "deny",
+});
 
 /** Convenience: a handler that allows everything (test/embedded contexts). */
-export const allowAllPermissionHandler: PermissionHandler = () => ({ decision: "allow_session" });
+export const allowAllPermissionHandler: PermissionHandler = () => ({
+  decision: "allow_session",
+});

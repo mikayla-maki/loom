@@ -1,7 +1,7 @@
 /**
  * The four core interfaces.
  *
- * Each one corresponds to a "resource" in the manifest model. The Glass
+ * Each one corresponds to a "resource" in the manifest model. The Loom
  * runtime wires implementations of these together.
  */
 
@@ -152,12 +152,18 @@ export interface Harness {
 export interface SessionFactory {
   /** Bare-name the runtime resolves to find this extension. */
   readonly name: string;
-  create(config: Record<string, unknown>, ctx: ExtensionContext): Promise<Session> | Session;
+  create(
+    config: Record<string, unknown>,
+    ctx: ExtensionContext,
+  ): Promise<Session> | Session;
 }
 
 export interface HarnessFactory {
   readonly name: string;
-  create(config: Record<string, unknown>, ctx: ExtensionContext): Promise<Harness> | Harness;
+  create(
+    config: Record<string, unknown>,
+    ctx: ExtensionContext,
+  ): Promise<Harness> | Harness;
 }
 
 export interface ExtensionContext {
@@ -165,8 +171,8 @@ export interface ExtensionContext {
   manifestDir: string;
   /** A read-only snapshot of the agent's name. */
   agentName: string;
-  /** Glass version. */
-  glassVersion: string;
+  /** Loom version. */
+  loomVersion: string;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -174,7 +180,7 @@ export interface ExtensionContext {
 //
 // The resolver consults provider instances *before* falling back to the
 // LocalRegistry / builtins. This is how a future MCP extension would
-// surface MCP-server tools as Glass tools without anything ever existing
+// surface MCP-server tools as Loom tools without anything ever existing
 // on disk: at boot the provider connects to the server(s), and resolveTool
 // returns a synthetic ToolManifest plus a pre-built Tool that proxies to
 // the MCP server.
@@ -200,26 +206,37 @@ export type ProviderSkillResolution =
       tools: Map<string, { manifest: ToolManifest; tool: Tool }>;
     };
 
+/**
+ * A pluggable resolver for tools and/or skills. The four methods are all
+ * required so the type narrows cleanly; impls return the documented "I
+ * don't do this" value (`null` / `{}` / `void`) for what they don't
+ * implement.
+ */
 export interface Provider {
-  /** Optional: resolve a tool by model-facing name. Return null to pass. */
-  resolveTool?(
+  /** Resolve a tool by model-facing name. Return null to pass. */
+  resolveTool(
     name: string,
   ): Promise<ProviderToolResolution | null> | ProviderToolResolution | null;
 
-  /** Optional: resolve a skill by name. Return null to pass. */
-  resolveSkill?(
+  /** Resolve a skill by name. Return null to pass. */
+  resolveSkill(
     name: string,
   ): Promise<ProviderSkillResolution | null> | ProviderSkillResolution | null;
 
-  /** Optional: enumerate all currently-available tools/skills (for audit / listing). */
-  list?(): Promise<{ skills?: string[]; tools?: string[] }> | { skills?: string[]; tools?: string[] };
+  /** Enumerate currently-available tools/skills (for audit / listing). */
+  list():
+    | Promise<{ skills?: string[]; tools?: string[] }>
+    | { skills?: string[]; tools?: string[] };
 
-  /** Optional cleanup. Called when the agent closes. */
-  close?(): Promise<void>;
+  /** Cleanup. Called when the agent closes. */
+  close(): Promise<void> | void;
 }
 
 export interface ProviderFactory {
   /** Bare-name the runtime resolves to find this extension. */
   readonly name: string;
-  create(config: Record<string, unknown>, ctx: ExtensionContext): Promise<Provider> | Provider;
+  create(
+    config: Record<string, unknown>,
+    ctx: ExtensionContext,
+  ): Promise<Provider> | Provider;
 }

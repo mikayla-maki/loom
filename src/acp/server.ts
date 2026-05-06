@@ -46,7 +46,7 @@ export async function serveOverStdio(agent: RunningAgent): Promise<void> {
   const stream = ndjsonStream(process.stdin, process.stdout);
   const router = new AcpRouter({
     agentFactory: async () => agent,
-    fixedManifestPath: agent.resolved.manifest.manifestPath,
+    fixedManifestPath: agent.resolved.source.manifestPath,
   });
   const sessionId = await router.bindSession(agent, stream);
   await router.run(stream, sessionId);
@@ -192,7 +192,7 @@ export class AcpRouter {
     const sessionId = `s${this.nextId++}`;
     this.sessions.set(sessionId, agent);
     this.startUpdateForwarder(sessionId, agent, stream);
-    return { sessionId, agentName: agent.resolved.manifest.agent.name };
+    return { sessionId, agentName: agent.resolved.source.name };
   }
 
   private async handleSessionPrompt(

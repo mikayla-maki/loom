@@ -1,4 +1,4 @@
-# Glass — A Manifest-Driven Agent Meta-Harness
+# Loom — A Manifest-Driven Agent Meta-Harness
 
 A declarative runtime for composing agents. Built around four resources, four
 interfaces, two faces, one external protocol, and one security principle.
@@ -8,13 +8,13 @@ interfaces, two faces, one external protocol, and one security principle.
 An agent is an `agent.toml` declaring a harness extension, a session extension,
 an identity, a sandbox capability ceiling, and a set of skills. Skills bring
 tools transitively; tools bring secret declarations and capability declarations.
-Glass resolves the manifest (loads extensions, walks the skill→tool dependency
+Loom resolves the manifest (loads extensions, walks the skill→tool dependency
 graph, fetches secrets, validates capabilities, sets up `PATH` for tool
 binaries), instantiates a `Session` and a `Harness`, and returns a
 `RunningAgent` SDK handle. Clients drive the agent by calling `prompt(text)`
 per turn and subscribing to `updates()` for live progress; each turn runs to
 completion and returns a `StopReason`. During a turn, the `Harness` owns the
-loop — it pulls the system prompt from the runtime (which Glass assembled),
+loop — it pulls the system prompt from the runtime (which Loom assembled),
 calls the model, dispatches tool calls through a `Runtime` that exposes
 session reads + tool execution + update emission, and decides parallelism and
 termination. Tools are processes invoked with input on
@@ -97,7 +97,7 @@ The recipient is configured at install time and stored as a secret.
 ```
 
 `requires` maps the tool name the model will see to where the tool lives.
-`builtin` resolves to Glass's own tools directory.
+`builtin` resolves to Loom's own tools directory.
 
 ### `tool.toml`
 
@@ -139,11 +139,11 @@ discord-send/
 
 ### Builtin tools
 
-Tools whose `bin/` lives in Glass's own directory. Structurally identical to
+Tools whose `bin/` lives in Loom's own directory. Structurally identical to
 user-installed tools; just pre-installed.
 
 ```txt
-glass/
+loom/
 ├── bin/                    # auto-PATH'd
 │   ├── bash
 │   ├── secrets-get
@@ -186,7 +186,7 @@ otherwise. Actual OS-level isolation (process boundaries, network policy,
 filesystem jails) lands when a tool needs it. The architecture has the slot;
 v0 doesn't fill it.
 
-The principle that earns its keep here is the one from old-Glass:
+The principle that earns its keep here is the one from old-Loom:
 
 > If something shouldn't be possible, make it structurally impossible.
 
@@ -195,7 +195,7 @@ it wires in.
 
 ## System prompt and identity
 
-**Glass owns system-prompt assembly.** Every turn, the runtime composes a
+**Loom owns system-prompt assembly.** Every turn, the runtime composes a
 single system prompt string from three sources and exposes it to the Harness
 via `runtime.systemPrompt()`. The Harness consumes the assembled prompt; it
 does not build one.
@@ -203,10 +203,10 @@ does not build one.
 The three sources:
 
 1. **Runtime-owned (structural).** "Here are the skills available and how to
-   invoke them." Glass knows the resolved skill/tool graph.
+   invoke them." Loom knows the resolved skill/tool graph.
 2. **Manifest-owned (semantic).** The `[agent].identity` content. Static-ish;
    the same across all reflections of one self.
-3. **Per-turn (dynamic).** Current date, anything else Glass injects per turn.
+3. **Per-turn (dynamic).** Current date, anything else Loom injects per turn.
 
 This keeps prompt format consistent across providers and means swapping a
 Harness extension does not change what the model sees in the system slot. A
@@ -247,12 +247,12 @@ interface Session {
   resume?(id: string): Promise<Session>;
 }
 
-// Runtime: services Glass provides to the Harness during a turn.
+// Runtime: services Loom provides to the Harness during a turn.
 interface Runtime {
   getEvents(from?: number, to?: number): Promise<SessionUpdate[]>;
   update(update: SessionUpdate): Promise<void>;  // appends to session + emits to client
 
-  systemPrompt(): string;        // assembled by Glass; the Harness's default
+  systemPrompt(): string;        // assembled by Loom; the Harness's default
 
   // Components — for Harness extensions that need to override systemPrompt()
   identity(): string;            // resolved [agent].identity content
@@ -295,7 +295,7 @@ implementation.
 
 ## The two faces (SDK + Runtime)
 
-Glass is both an SDK (for clients embedding agents) and a runtime (for
+Loom is both an SDK (for clients embedding agents) and a runtime (for
 harnesses to call into during a turn). Different consumers, different
 surfaces.
 
@@ -333,17 +333,17 @@ The same SDK face, exposed over the wire. Anyone driving an agent — a CLI,
 a Discord listener, Zed, a parent agent — can speak ACP instead of using the
 in-process SDK.
 
-- `session/prompt` (client → Glass): drive the agent with a user message.
+- `session/prompt` (client → Loom): drive the agent with a user message.
   Maps to `RunningAgent.prompt()`.
-- `session/update` (Glass → client): streaming notifications as the turn
+- `session/update` (Loom → client): streaming notifications as the turn
   progresses. Maps to `RunningAgent.updates()`.
 - `StopReason` (response): turn ended; here's why. Maps to
   `RunningAgent.prompt()`'s return.
-- `session/cancel` (client → Glass): interrupt the running turn. Maps to
+- `session/cancel` (client → Loom): interrupt the running turn. Maps to
   `RunningAgent.cancel()`.
 
 ACP is the wire version of the SDK. Subagent spawning composes naturally
-because the parent Glass becomes an ACP client of the child Glass — same
+because the parent Loom becomes an ACP client of the child Loom — same
 protocol both ways.
 
 ## How a conversation flows
@@ -406,7 +406,7 @@ class AnthropicHarness implements Harness {
       const messages = this.eventsToMessages(events);
 
       const response = await this.callAnthropic(
-        runtime.systemPrompt(),   // assembled by Glass
+        runtime.systemPrompt(),   // assembled by Loom
         messages,
         runtime.listTools(),
       );
@@ -487,7 +487,7 @@ fetch(webhook, {
 Stdin: JSON input. Stdout: result string. Stderr (on nonzero exit): error
 string. Secrets: env vars. Model never sees the webhook URL.
 
-## Pseudocode: Glass itself
+## Pseudocode: Loom itself
 
 ```ts
 async function runAgent(manifestPath: string): Promise<RunningAgent> {
@@ -577,7 +577,7 @@ consumers.
   display protocol; consumers render however they want.
 - **No automatic session-skill installation.** If a session needs the agent
   to manage memory, the user adds the corresponding skills to `[skills]`
-  explicitly (or uses a CLI helper like `glass install-template rlm-agent`).
+  explicitly (or uses a CLI helper like `loom install-template rlm-agent`).
   Nothing happens behind the manifest's back.
 
 ## References and influences
@@ -585,22 +585,22 @@ consumers.
 - **Anthropic — *Scaling Managed Agents: Decoupling the brain from the hands*.**
   <https://www.anthropic.com/engineering/managed-agents>
   The component model (Session / Orchestration / Harness / Sandbox /
-  Resources / Tools) is the conceptual ancestor. Glass collapses it to four
+  Resources / Tools) is the conceptual ancestor. Loom collapses it to four
   resources by folding orchestration into the SDK driver and merging
   Sandbox + Resources into capability-declaring tools.
 - **Agent Skills specification.**
   <https://agentskills.io/specification>
-  SKILL.md as-is. Glass adds one field (`requires`) to give skills a
+  SKILL.md as-is. Loom adds one field (`requires`) to give skills a
   transitive tool-dependency story.
 - **Agent Client Protocol (ACP).**
   <https://agentclientprotocol.com/get-started/introduction> /
   <https://agentclientprotocol.com/protocol/prompt-turn>
   The SDK face and the wire protocol are the same shape because the wire
   protocol is good. `SessionUpdate` is reused verbatim. Subagent spawning is
-  modeled as the parent Glass becoming an ACP client of the child.
+  modeled as the parent Loom becoming an ACP client of the child.
 - **Pi.** <https://pi.dev>
   Pi's defaults — manifest-driven agents, declarative skill loading,
-  process-per-tool — closely prefigure this design. Glass generalizes the
+  process-per-tool — closely prefigure this design. Loom generalizes the
   shape and exposes the SDK / Runtime split explicitly.
 - **Recurrent / RLM-style memory architectures.**
   <https://arxiv.org/html/2512.24601v2>
@@ -612,4 +612,4 @@ consumers.
 
 Four manifests, four interfaces, two faces (SDK + Runtime), one external
 protocol (ACP), one security principle (every scope sandboxed; tools punch
-out). A small Glass core that wires it all together. Hand it off and go.
+out). A small Loom core that wires it all together. Hand it off and go.

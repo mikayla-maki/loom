@@ -276,8 +276,8 @@ export interface ParsedAcpUrl {
  *
  * Examples:
  *   acp://192.168.1.5:8910/search       → { scheme: acp, host, port, agentName: 'search' }
- *   acp+unix:///run/glass.sock          → { scheme: acp+unix, socketPath: '/run/glass.sock' }
- *   acp+unix:///run/glass.sock:helper   → { scheme: acp+unix, socketPath: '/run/glass.sock', agentName: 'helper' }
+ *   acp+unix:///run/loom.sock          → { scheme: acp+unix, socketPath: '/run/loom.sock' }
+ *   acp+unix:///run/loom.sock:helper   → { scheme: acp+unix, socketPath: '/run/loom.sock', agentName: 'helper' }
  *
  * The acp+unix variant uses ':' as the socket-vs-name separator because Unix
  * paths can contain '/'. Either or both halves may be omitted.

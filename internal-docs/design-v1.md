@@ -1,4 +1,4 @@
-# Glass v1 — Expansion points
+# Loom v1 — Expansion points
 
 This document describes capabilities planned beyond
 [v0](./design-v0.md). Each is structurally reachable from the v0 architecture
@@ -11,7 +11,7 @@ The v1 work groups into five themes:
 
 1. Hardened sub-agent invocation
 2. OS-level sandbox enforcement
-3. Long-running Glass as a daemon
+3. Long-running Loom as a daemon
 4. Registry and naming
 5. Network-located agents over ACP
 
@@ -23,7 +23,7 @@ primitives unlock without committing to building them.
 ## 1. Hardened sub-agent invocation
 
 V0's `[tool.capabilities] subagent = ...` is declared but not enforced. A
-tool subprocess can shell out to `glass run --inline ...` and spawn arbitrary
+tool subprocess can shell out to `loom run --inline ...` and spawn arbitrary
 agents, escaping the parent's `[sandbox]` ceiling. This is fine for
 one-operator use, but breaks the moment a third-party skill enters the
 picture.
@@ -73,7 +73,7 @@ skill's tools may invoke only the named sub-agents declared here.
 
 ### 1b. Capability bubble-up
 
-At parent agent load time, Glass walks every skill's `subagents`, unions them
+At parent agent load time, Loom walks every skill's `subagents`, unions them
 into a required-capability set, and validates against the parent's
 `[sandbox].subagent` ceiling:
 
@@ -115,34 +115,34 @@ anything. CI on agent definitions becomes possible.
 
 ### 1c. Token-and-broker invocation
 
-In v0, tools shell out to `glass run` directly — fine because the operator
+In v0, tools shell out to `loom run` directly — fine because the operator
 is the only one writing skills. In v1, the runtime mediates:
 
 ```
-parent Glass (running)
+parent Loom (running)
    │
-   │  binds Unix socket at $XDG_RUNTIME_DIR/glass-<rand>.sock
+   │  binds Unix socket at $XDG_RUNTIME_DIR/loom-<rand>.sock
    │  generates per-tool token bound to:
    │     - skill that owns this tool
    │     - sub-agents that skill is allowed to invoke
    │     - parent's capability ceiling
    │
    ├─ spawns memory.compact tool with:
-   │     env:  GLASS_INVOKE_TOKEN=<opaque>
-   │     PATH: /private/tool-shim:...   (no real `glass` binary)
+   │     env:  LOOM_INVOKE_TOKEN=<opaque>
+   │     PATH: /private/tool-shim:...   (no real `loom` binary)
    │     stdin: JSON input
    │
-   │  tool runs `glass-invoke compactor --prompt "..."`
+   │  tool runs `loom-invoke compactor --prompt "..."`
    │     │
-   │     ├─ glass-invoke reads GLASS_INVOKE_TOKEN
-   │     ├─ connects to glass socket
+   │     ├─ loom-invoke reads LOOM_INVOKE_TOKEN
+   │     ├─ connects to loom socket
    │     ├─ sends ACP {scope: "compactor", prompt: "...", token: <opaque>}
    │     │
    │     parent resolves token → looks up skill → checks "compactor"
    │       is in the skill's declared subagents → runs the sub-agent →
    │       streams result back over socket
    │     │
-   │     └─ glass-invoke prints final message to stdout
+   │     └─ loom-invoke prints final message to stdout
    │
    └─ tool captures stdout, returns to parent
 ```
@@ -207,19 +207,19 @@ enforcement engaged.
 
 ### What this does NOT cover
 
-- The parent Glass process itself, which holds the secrets vault and the
+- The parent Loom process itself, which holds the secrets vault and the
   model client. That's the trust root, not a sandbox target.
 - Side-channel exfiltration (timing, resource usage). Out of scope for v1.
 
 ---
 
-## 3. Long-running Glass as a daemon
+## 3. Long-running Loom as a daemon
 
-V0 invokes Glass as a CLI for sub-agent calls — each `glass run` is a fresh
+V0 invokes Loom as a CLI for sub-agent calls — each `loom run` is a fresh
 process. Cold start: parse manifest, load extensions, set up secrets.
 Acceptable for compaction (rare); painful for hot-path sub-agent invocation.
 
-V1 makes Glass a daemon. A single Glass process holds:
+V1 makes Loom a daemon. A single Loom process holds:
 
 - The secrets vault (decrypted once).
 - All loaded extensions (parsed manifests, instantiated harness/session
@@ -231,13 +231,13 @@ Sub-agent invocation becomes:
 
 ```
 tool subprocess
-  → glass-invoke (shim, ~50 lines)
+  → loom-invoke (shim, ~50 lines)
   → daemon socket
   → daemon spins up a sub-agent in-memory (no cold start)
   → result streams back
 ```
 
-The CLI is preserved for one-shot use (`glass run ./agent.toml`), and
+The CLI is preserved for one-shot use (`loom run ./agent.toml`), and
 auto-detects a running daemon to join it.
 
 ### Properties this gives us
@@ -261,7 +261,7 @@ skills, tools, and agents — not just builtins.
 ### Local registry layout
 
 ```
-~/.glass/
+~/.loom/
 ├── extensions/
 │   ├── harness/
 │   │   └── anthropic/        (a third-party harness installed locally)
@@ -278,8 +278,8 @@ skills, tools, and agents — not just builtins.
     └── morning-checkin/
 ```
 
-`glass install <path-or-url>` symlinks or copies a manifest into the
-appropriate directory. Manifests in any directory of `~/.glass` are
+`loom install <path-or-url>` symlinks or copies a manifest into the
+appropriate directory. Manifests in any directory of `~/.loom` are
 addressable by bare name from any `agent.toml`.
 
 ### Bare-name resolution becomes uniform
@@ -295,7 +295,7 @@ V1 syntax (still path-based, but bare names resolve to registry):
 
 ```toml
 [skills]
-discord-dm = "discord-dm"             # resolves to ~/.glass/skills/discord-dm
+discord-dm = "discord-dm"             # resolves to ~/.loom/skills/discord-dm
 memory     = "../skills/memory"       # local path still works
 ```
 
@@ -314,7 +314,7 @@ Defers SemVer enforcement to the registry; v1 ships a string-equality match.
 
 ### Distribution
 
-V1 ships local install only. Remote install (`glass install github:user/skill`)
+V1 ships local install only. Remote install (`loom install github:user/skill`)
 builds on local install when the moment comes — the registry directory is
 the substrate, install commands are sugar.
 
@@ -359,13 +359,13 @@ the named sub-agent), but the actual execution happens on a remote machine.
 These are not committed roadmap, but they fall out of v1 + ACP + the registry
 without new architecture:
 
-- **An agent package manager.** `glass install anthropic/research-pro@1.4`.
+- **An agent package manager.** `loom install anthropic/research-pro@1.4`.
   Distributed manifests over git or a registry.
 - **Multi-agent "team" manifests.** A `team.toml` declaring a set of named
   members and their inter-call permissions. The whole thing audits as one
   unit.
-- **Agents-as-MCP-servers.** Expose any Glass agent as an MCP server with
-  one flag. Cursor / Claude Desktop / anything MCP can call Glass agents as
+- **Agents-as-MCP-servers.** Expose any Loom agent as an MCP server with
+  one flag. Cursor / Claude Desktop / anything MCP can call Loom agents as
   tools. The composition goes both ways.
 - **Self-extending agents.** A tool that registers a new sub-agent into its
   own scope at runtime — under the parent's `[sandbox]` ceiling, so
@@ -385,7 +385,7 @@ transport. Once those four are solid, the rest is composition.
 
 ## Summary
 
-V1 is the version of Glass that survives third-party skills, multi-machine
+V1 is the version of Loom that survives third-party skills, multi-machine
 deployment, and performance-sensitive use. It does so by making three v0
 declarations actually-enforced:
 
@@ -396,7 +396,7 @@ declarations actually-enforced:
 | Sub-agent ceiling | Computed but not validated | Computed and validated recursively |
 
 And by making one v0 limitation go away: the cold-start cost of subprocess
-Glass invocation, via the daemon transport.
+Loom invocation, via the daemon transport.
 
 Everything else — registry, network-located sub-agents, the dream-list — is
 composition on top of those primitives.

@@ -4,12 +4,18 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
 describe("auditAgent", () => {
   it("produces a static capability tree for the sample agent", async () => {
-    const tree = await auditAgent(path.join(FIXTURES, "sample-agent/agent.toml"));
+    // The sample agent fixture stays file-based on purpose: it exercises
+    // both the [skills] disk dependency walk and tool/skill capability
+    // ceiling aggregation end-to-end. Inline specs are covered below.
+    const tree = await auditAgent(
+      path.join(FIXTURES, "sample-agent/agent.toml"),
+    );
     expect(tree.name).toBe("sample-agent");
     expect(tree.tools.map((t) => t.name).sort()).toEqual([
       "bash",
@@ -26,15 +32,43 @@ describe("auditAgent", () => {
     expect(printed).toContain("uppercase");
   });
 
+  it("audits an inline spec without touching the filesystem", async () => {
+    const spec: AgentManifest = {
+      name: "inline",
+      systemPrompt: "p",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      sandbox: { filesystem: [], network: [], secrets: [] },
+      skills: {
+        s: {
+          description: "x",
+          requires: {
+            t: {
+              description: "noop",
+              schema: { type: "object" },
+              invocation: { command: "echo" },
+              capabilities: { filesystem: [], network: [] },
+            },
+          },
+        },
+      },
+    };
+    const tree = await auditAgent(spec);
+    expect(tree.name).toBe("inline");
+    expect(tree.tools.map((t) => t.name).sort()).toEqual(["t"]);
+    expect(tree.subagents).toHaveLength(0);
+  });
+
   it("breaks cycles when a subagent references itself", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "glass-cycle-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-cycle-"));
     try {
-      // Build agent A that calls A as a subagent (via skill).
+      // The self-loop has to live on disk: the inline parent declares a
+      // subagent pointing at the very same agent.toml the auditor is
+      // walking. The cycle must be broken regardless.
       const agentDir = path.join(root, "self");
       await fs.mkdir(agentDir, { recursive: true });
       const skillDir = path.join(root, "skills", "loop");
       await fs.mkdir(skillDir, { recursive: true });
-      // Subagent points back at the same agent.toml.
       await fs.writeFile(
         path.join(skillDir, "SKILL.md"),
         `---
@@ -62,7 +96,6 @@ provider = "memory"
 filesystem = []
 network = []
 secrets = []
-subagent = ["me"]
 [skills]
 l = "../skills/loop"
 `,

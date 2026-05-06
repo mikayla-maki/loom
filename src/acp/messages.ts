@@ -2,7 +2,7 @@
  * ACP wire types — JSON-RPC 2.0 framing of the Agent Client Protocol.
  *
  * The shape mirrors agentclientprotocol.com but is reduced to the surface
- * Glass actually uses:
+ * Loom actually uses:
  *   - session/prompt    (request)        client → agent
  *   - session/cancel    (notification)   client → agent
  *   - session/update    (notification)   agent → client
@@ -58,7 +58,7 @@ export interface SessionUpdateNotification {
 export interface SessionNewParams {
   /** Path to an agent.toml. Mutually exclusive with `name`. */
   manifestPath?: string;
-  /** Registry name (~/.glass/agents/<name>). Mutually exclusive with `manifestPath`. */
+  /** Registry name (~/.loom/agents/<name>). Mutually exclusive with `manifestPath`. */
   name?: string;
 }
 export interface SessionNewResult {

@@ -13,7 +13,7 @@ properties.limit.type = "number"
 properties.limit.description = "Max results to return (default: 200)."
 
 [tool.invocation]
-command = "glass-find"
+command = "loom-find"
 
 [tool.secrets]
 required = []

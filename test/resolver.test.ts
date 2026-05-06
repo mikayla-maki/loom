@@ -5,20 +5,30 @@ import * as os from "node:os";
 
 import { resolveAgent } from "../src/manifest/resolver.js";
 import { CapabilityError, ManifestError } from "../src/errors.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
 describe("resolveAgent", () => {
   it("resolves the sample agent end-to-end (includes the auto-loaded 'core' builtin)", async () => {
-    const r = await resolveAgent(path.join(FIXTURES, "sample-agent/agent.toml"));
+    // The sample agent fixture stays file-based on purpose: it exercises
+    // both the [skills] disk dependency walk and tool/skill capability
+    // ceiling aggregation end-to-end.
+    const r = await resolveAgent(
+      path.join(FIXTURES, "sample-agent/agent.toml"),
+    );
     // 2 skills: the auto-loaded `core` (file/shell tools) + the manifest's `greeter`.
     expect(r.skills).toHaveLength(2);
-    expect(r.skills.map((s) => s.manifest.name).sort()).toEqual(["core", "greeter"]);
-    expect(r.skills.find((s) => s.manifest.name === "core")?.manifest.inlineInSystemPrompt).toBe(
-      true,
-    );
+    expect(r.skills.map((s) => s.manifest.name).sort()).toEqual([
+      "core",
+      "greeter",
+    ]);
+    expect(
+      r.skills.find((s) => s.manifest.name === "core")?.manifest
+        .inlineInSystemPrompt,
+    ).toBe(true);
     // Tools include the manifest's pair plus the 4 core builtins.
-    expect(r.tools.map((t) => t.manifest.tool.name).sort()).toEqual([
+    expect(r.tools.map((t) => t.manifest.name).sort()).toEqual([
       "bash",
       "find",
       "greet",
@@ -33,113 +43,56 @@ describe("resolveAgent", () => {
   });
 
   it("[agent].remove_builtin_tools = true suppresses the auto-loaded core skill", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-no-core-"));
-    try {
-      const fixturesRoot = path.resolve("test/fixtures");
-      const agentDir = path.join(dir, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.cp(
-        path.join(fixturesRoot, "sample-agent", "identity.md"),
-        path.join(agentDir, "identity.md"),
-      );
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "no-core"
-system_prompt = "./identity.md"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-
-[session]
-provider = "memory"
-
-[sandbox]
-filesystem = ["./"]
-secrets = ["sample_user_name"]
-
-[skills]
-greeter = "${path.join(fixturesRoot, "skills/greeter").replace(/\\/g, "/")}"
-`,
-      );
-      const r = await resolveAgent(path.join(agentDir, "agent.toml"));
-      expect(r.skills).toHaveLength(1);
-      expect(r.skills[0]?.manifest.name).toBe("greeter");
-      expect(r.tools.map((t) => t.manifest.tool.name).sort()).toEqual(["greet", "uppercase"]);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    // The greeter skill stays on disk (it's a fixture) but the parent
+    // agent is declared inline and points at it via absolute path.
+    const greeterPath = path.join(FIXTURES, "skills/greeter");
+    const spec: AgentManifest = {
+      name: "no-core",
+      systemPrompt: "be brief",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      sandbox: { filesystem: ["./"], secrets: ["sample_user_name"] },
+      skills: { greeter: greeterPath },
+    };
+    const r = await resolveAgent(spec);
+    expect(r.skills).toHaveLength(1);
+    expect(r.skills[0]?.manifest.name).toBe("greeter");
+    expect(r.tools.map((t) => t.manifest.name).sort()).toEqual([
+      "greet",
+      "uppercase",
+    ]);
   });
 
   it("rejects when a tool needs a capability outside the ceiling", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-cap-"));
-    try {
-      // Create a tool that wants network = ["evil.com"] outside the ceiling
-      const toolDir = path.join(dir, "tools", "snoop");
-      await fs.mkdir(toolDir, { recursive: true });
-      await fs.writeFile(
-        path.join(toolDir, "tool.toml"),
-        `[tool]
-name = "snoop"
-description = "snoop"
-[tool.schema]
-type = "object"
-[tool.invocation]
-command = "echo"
-[tool.secrets]
-required = []
-[tool.capabilities]
-filesystem = []
-network = ["evil.com"]
-`,
-        "utf8",
-      );
-      const skillDir = path.join(dir, "skills", "snoop-skill");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: snoop-skill
-description: tries to snoop
-requires:
-  snoop: ../../tools/snoop
----
-body`,
-        "utf8",
-      );
-      const agentDir = path.join(dir, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "snoopy"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-s = "../skills/snoop-skill"
-`,
-        "utf8",
-      );
-      await expect(resolveAgent(path.join(agentDir, "agent.toml"))).rejects.toThrow(
-        CapabilityError,
-      );
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    const spec: AgentManifest = {
+      name: "snoopy",
+      systemPrompt: "x",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      sandbox: { filesystem: [], network: [], secrets: [] },
+      skills: {
+        s: {
+          description: "tries to snoop",
+          requires: {
+            snoop: {
+              description: "snoop",
+              schema: { type: "object" },
+              invocation: { command: "echo" },
+              capabilities: { filesystem: [], network: ["evil.com"] },
+            },
+          },
+        },
+      },
+    };
+    await expect(resolveAgent(spec)).rejects.toThrow(CapabilityError);
   });
 
   it("rejects when SKILL.md requires a tool whose [tool].name disagrees", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-name-"));
+    // This test specifically exercises parser-level name validation
+    // where the on-disk tool.toml's [tool].name differs from the
+    // requires-key. Inline specs validate name-vs-key at materialize
+    // time (different code path), so we keep this on disk.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-name-"));
     try {
       const toolDir = path.join(dir, "tools", "actually-bar");
       await fs.mkdir(toolDir, { recursive: true });
@@ -195,50 +148,37 @@ w = "../skills/wrong"
 `,
         "utf8",
       );
-      await expect(resolveAgent(path.join(agentDir, "agent.toml"))).rejects.toThrow(
-        ManifestError,
-      );
+      await expect(
+        resolveAgent(path.join(agentDir, "agent.toml")),
+      ).rejects.toThrow(ManifestError);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
 
   it("resolves [agent].system_prompt as inline string when not path-like", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-sp-inline-"));
+    const spec: AgentManifest = {
+      name: "inline-sp",
+      systemPrompt: "Be concise. Use only tools provided.",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      skills: {},
+    };
+    const r = await resolveAgent(spec);
+    expect(r.systemPrompt).toBe("Be concise. Use only tools provided.");
+  });
+
+  it("resolves [agent].system_prompt as a file when path-like", async () => {
+    // Path-like system_prompt is a file-on-disk feature; the inline
+    // path stays a literal string. This test must remain file-based.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sp-path-"));
     try {
       const agentDir = path.join(dir, "agent");
       await fs.mkdir(agentDir, { recursive: true });
       await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "inline-sp"
-system_prompt = "Be concise. Use only tools provided."
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-`,
+        path.join(agentDir, "core.md"),
+        "# Core\n\nbe brief\n",
       );
-      const r = await resolveAgent(path.join(agentDir, "agent.toml"));
-      expect(r.systemPrompt).toBe("Be concise. Use only tools provided.");
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("resolves [agent].system_prompt as a file when path-like", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-sp-path-"));
-    try {
-      const agentDir = path.join(dir, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(path.join(agentDir, "core.md"), "# Core\n\nbe brief\n");
       await fs.writeFile(
         path.join(agentDir, "agent.toml"),
         `[agent]
@@ -265,47 +205,20 @@ secrets = []
   });
 
   it("resolves builtin tools by the requires-key shorthand", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-builtin-"));
-    try {
-      const skillDir = path.join(dir, "skills", "shell");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: shell
-description: bash access
-requires:
-  bash: builtin
----
-body`,
-        "utf8",
-      );
-      const agentDir = path.join(dir, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "x"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = ["./"]
-network = []
-secrets = []
-[skills]
-s = "../skills/shell"
-`,
-        "utf8",
-      );
-      const r = await resolveAgent(path.join(agentDir, "agent.toml"));
-      expect(r.tools.map((t) => t.manifest.tool.name)).toEqual(["bash"]);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    const spec: AgentManifest = {
+      name: "x",
+      systemPrompt: "x",
+      removeBuiltinTools: true,
+      harness: { provider: "test" },
+      sandbox: { filesystem: ["./"], network: [], secrets: [] },
+      skills: {
+        s: {
+          description: "bash access",
+          requires: { bash: "builtin" },
+        },
+      },
+    };
+    const r = await resolveAgent(spec);
+    expect(r.tools.map((t) => t.manifest.name)).toEqual(["bash"]);
   });
 });

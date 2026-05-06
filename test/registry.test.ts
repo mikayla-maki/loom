@@ -6,17 +6,19 @@ import * as os from "node:os";
 import { LocalRegistry } from "../src/registry/registry.js";
 import { resolveAgent } from "../src/manifest/resolver.js";
 import { runAgent } from "../src/sdk/run-agent.js";
-import { memorySessionFactory } from "../src/extensions/session/memory.js";
-import { testHarnessFactory } from "../src/extensions/harness/test.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 
 describe("LocalRegistry", () => {
   it("installs and looks up skills/tools by bare name", async () => {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), "glass-home-"));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "loom-home-"));
     try {
       const fixturesRoot = path.resolve("test/fixtures");
       const reg = new LocalRegistry({ root: home });
 
-      const installedSkill = await reg.install("skill", path.join(fixturesRoot, "skills/greeter"));
+      const installedSkill = await reg.install(
+        "skill",
+        path.join(fixturesRoot, "skills/greeter"),
+      );
       expect(installedSkill).toBe(path.join(home, "skills", "greeter"));
       expect(await reg.lookup("skill", "greeter")).toBe(installedSkill);
 
@@ -32,12 +34,12 @@ describe("LocalRegistry", () => {
     }
   });
 
-  it("resolves a bare-name skill at runAgent boot via GLASS_HOME", async () => {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), "glass-home2-"));
-    const project = await fs.mkdtemp(path.join(os.tmpdir(), "glass-proj-"));
+  it("resolves a bare-name skill at runAgent boot via LOOM_HOME", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "loom-home2-"));
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "loom-proj-"));
     const fixturesRoot = path.resolve("test/fixtures");
-    const oldHome = process.env.GLASS_HOME;
-    process.env.GLASS_HOME = home;
+    const oldHome = process.env.LOOM_HOME;
+    process.env.LOOM_HOME = home;
     try {
       const reg = new LocalRegistry({ root: home });
       // Install the greeter skill AND its two tools (since greeter requires
@@ -91,44 +93,27 @@ process.stdout.write(String(i.text ?? "").toUpperCase());
       await reg.install("skill", skillSrc);
       void fixturesRoot;
 
-      // Author an agent.toml that uses the bare name.
-      const agentDir = path.join(project, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "bare-name-test"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = ["./"]
-network = []
-secrets = []
-[skills]
-greeter-bare = "greeter-bare"
-`,
-      );
-
-      // Resolve via runAgent (which auto-mounts the LocalRegistry from GLASS_HOME).
-      const agent = await runAgent(path.join(agentDir, "agent.toml"), {
-        sessionOverride: memorySessionFactory,
-        harnessOverride: {
-          factory: testHarnessFactory,
-          config: {
-            script: [
-              [
-                { call: { tool: "upper", input: { text: "hello" } } },
-                { stop: "end_turn" },
-              ],
+      // Inline parent agent that references the registered skill by
+      // bare name. The registry resolution still happens at runAgent
+      // boot (which auto-mounts a LocalRegistry from LOOM_HOME).
+      const spec: AgentManifest = {
+        name: "bare-name-test",
+        systemPrompt: "x",
+        removeBuiltinTools: true,
+        harness: {
+          provider: "test",
+          script: [
+            [
+              { call: { tool: "upper", input: { text: "hello" } } },
+              { stop: "end_turn" },
             ],
-          },
+          ],
         },
-      });
+        sandbox: { filesystem: ["./"], network: [], secrets: [] },
+        skills: { "greeter-bare": "greeter-bare" },
+      };
+
+      const agent = await runAgent(spec, {});
       try {
         await agent.prompt("go");
         const events = await agent.session.getEvents();
@@ -136,7 +121,8 @@ greeter-bare = "greeter-bare"
         expect(tu).toBeTruthy();
         if (tu && tu.sessionUpdate === "tool_call_update") {
           const text =
-            tu.content?.[0]?.type === "content" && tu.content[0].content.type === "text"
+            tu.content?.[0]?.type === "content" &&
+            tu.content[0].content.type === "text"
               ? tu.content[0].content.text
               : "";
           expect(text).toBe("HELLO");
@@ -145,15 +131,15 @@ greeter-bare = "greeter-bare"
         await agent.close();
       }
     } finally {
-      if (oldHome === undefined) delete process.env.GLASS_HOME;
-      else process.env.GLASS_HOME = oldHome;
+      if (oldHome === undefined) delete process.env.LOOM_HOME;
+      else process.env.LOOM_HOME = oldHome;
       await fs.rm(home, { recursive: true, force: true });
       await fs.rm(project, { recursive: true, force: true });
     }
   });
 
   it("registry is consulted before builtin fallback", async () => {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), "glass-home3-"));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "loom-home3-"));
     try {
       const reg = new LocalRegistry({ root: home });
       // Install a skill at the registry called 'shadow' that wraps a builtin.
@@ -171,37 +157,19 @@ shadowed`,
       );
       await reg.install("skill", src);
       expect(await reg.lookup("skill", "shadow")).toMatch(/skills\/shadow$/);
-      // The resolver call would now find shadow under registry.
-      const project = await fs.mkdtemp(path.join(os.tmpdir(), "glass-shadow-"));
-      try {
-        const agentDir = path.join(project, "a");
-        await fs.mkdir(agentDir, { recursive: true });
-        await fs.writeFile(
-          path.join(agentDir, "agent.toml"),
-          `[agent]
-name = "x"
-system_prompt = "x"
-remove_builtin_tools = true
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = ["./"]
-network = []
-secrets = []
-[skills]
-shadow = "shadow"
-`,
-        );
-        const r = await resolveAgent(path.join(agentDir, "agent.toml"), {
-          registry: reg.lookup,
-        });
-        expect(r.skills[0]?.manifest.name).toBe("shadow");
-      } finally {
-        await fs.rm(project, { recursive: true, force: true });
-      }
+      // The resolver call would now find shadow under registry. The
+      // parent agent itself is inline; only the skill is on disk
+      // (because that's the registry's whole job).
+      const spec: AgentManifest = {
+        name: "x",
+        systemPrompt: "x",
+        removeBuiltinTools: true,
+        harness: { provider: "test" },
+        sandbox: { filesystem: ["./"], network: [], secrets: [] },
+        skills: { shadow: "shadow" },
+      };
+      const r = await resolveAgent(spec, { registry: reg.lookup });
+      expect(r.skills[0]?.manifest.name).toBe("shadow");
     } finally {
       await fs.rm(home, { recursive: true, force: true });
     }

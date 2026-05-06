@@ -15,20 +15,26 @@ const FIXTURES = path.resolve("test/fixtures");
 
 describe("agent.toml parser", () => {
   it("parses the sample agent.toml", async () => {
-    const m = await parseAgentManifest(path.join(FIXTURES, "sample-agent/agent.toml"));
-    expect(m.agent.name).toBe("sample-agent");
-    expect(m.harness.provider).toBe("test");
-    expect(m.session.provider).toBe("file");
-    expect(m.sandbox.filesystem).toEqual(["./"]);
-    expect(m.sandbox.secrets).toEqual(["sample_user_name"]);
+    const m = await parseAgentManifest(
+      path.join(FIXTURES, "sample-agent/agent.toml"),
+    );
+    expect(m.name).toBe("sample-agent");
+    if ("provider" in m.harness) expect(m.harness.provider).toBe("test");
+    if (m.session && "provider" in m.session)
+      expect(m.session.provider).toBe("file");
+    expect(m.sandbox?.filesystem).toEqual(["./"]);
+    expect(m.sandbox?.secrets).toEqual(["sample_user_name"]);
     expect(m.skills).toMatchObject({ greeter: "../skills/greeter" });
   });
 
   it("rejects manifests missing required sections", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-bad-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-bad-"));
     try {
+      // [session] and [sandbox] are now optional, so a manifest can omit
+      // them. Missing required sections that should still throw: [agent]
+      // (or [agent].name), and [harness].provider.
       const p = path.join(dir, "agent.toml");
-      await fs.writeFile(p, '[agent]\nname = "x"\n[harness]\nprovider = "test"\n', "utf8");
+      await fs.writeFile(p, '[agent]\nname = "x"\n[harness]\n', "utf8");
       await expect(parseAgentManifest(p)).rejects.toThrow(ManifestError);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
@@ -36,7 +42,7 @@ describe("agent.toml parser", () => {
   });
 
   it("rejects the legacy identity / identity_inline fields with a migration message", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-bad-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-bad-"));
     try {
       const p = path.join(dir, "agent.toml");
       await fs.writeFile(
@@ -63,7 +69,7 @@ filesystem = []
   });
 
   it("system_prompt accepts an inline string (no path prefix)", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-inline-sp-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inline-sp-"));
     try {
       const p = path.join(dir, "agent.toml");
       await fs.writeFile(
@@ -84,14 +90,14 @@ filesystem = []
         "utf8",
       );
       const m = await parseAgentManifest(p);
-      expect(m.agent.systemPrompt).toBe("You are a friendly demo agent.");
+      expect(m.systemPrompt).toBe("You are a friendly demo agent.");
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
 
   it("system_prompt accepts a path-like string", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-path-sp-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-path-sp-"));
     try {
       const p = path.join(dir, "agent.toml");
       await fs.writeFile(
@@ -112,7 +118,7 @@ filesystem = []
         "utf8",
       );
       const m = await parseAgentManifest(p);
-      expect(m.agent.systemPrompt).toBe("./prompt.md");
+      expect(m.systemPrompt).toBe("./prompt.md");
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
@@ -122,16 +128,16 @@ filesystem = []
 describe("tool.toml parser", () => {
   it("parses a complete tool manifest including capabilities", async () => {
     const t = await parseToolManifest(path.join(FIXTURES, "tools/whoami"));
-    expect(t.tool.name).toBe("greet");
-    expect(t.tool.invocation.command).toBe("sample-greet");
-    expect(t.tool.secrets.required).toEqual(["sample_user_name"]);
-    expect(t.tool.capabilities.secrets).toEqual(["sample_user_name"]);
+    expect(t.name).toBe("greet");
+    expect(t.invocation.command).toBe("sample-greet");
+    expect(t.secrets?.required).toEqual(["sample_user_name"]);
+    expect(t.capabilities?.secrets).toEqual(["sample_user_name"]);
     expect(t.shipsBinary).toBe(true);
     expect(t.binDir).toBe(path.join(FIXTURES, "tools/whoami", "bin"));
   });
 
   it("flags shipsBinary false when no bin/ exists", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-tool-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-tool-"));
     try {
       await fs.writeFile(
         path.join(dir, "tool.toml"),
@@ -172,7 +178,7 @@ describe("SKILL.md parser", () => {
   });
 
   it("supports inline subagents mapping", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-skill-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-skill-"));
     try {
       await fs.writeFile(
         path.join(dir, "SKILL.md"),
@@ -190,16 +196,25 @@ body
         "utf8",
       );
       const s = await parseSkillManifest(dir);
-      expect(s.subagents?.helper).toEqual({ kind: "path", path: "../helper/agent.toml" });
-      expect(s.subagents?.remote).toEqual({ kind: "acp", url: "acp://example.com:1234/foo" });
-      expect(s.subagents?.registry).toEqual({ kind: "registry", name: "my-helper" });
+      expect(s.subagents?.helper).toEqual({
+        kind: "path",
+        path: "../helper/agent.toml",
+      });
+      expect(s.subagents?.remote).toEqual({
+        kind: "acp",
+        url: "acp://example.com:1234/foo",
+      });
+      expect(s.subagents?.registry).toEqual({
+        kind: "registry",
+        name: "my-helper",
+      });
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
 
   it("supports subagents declared as a path to subagents.toml", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glass-skill-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-skill-"));
     try {
       await fs.writeFile(
         path.join(dir, "SKILL.md"),
@@ -218,10 +233,16 @@ body`,
         "utf8",
       );
       const s = await parseSkillManifest(dir);
-      expect(s.subagents?.__file__).toEqual({ kind: "path", path: "./subagents.toml" });
+      expect(s.subagents?.__file__).toEqual({
+        kind: "path",
+        path: "./subagents.toml",
+      });
 
       const file = await parseSubagentsFile(path.join(dir, "subagents.toml"));
-      expect(file.compactor).toEqual({ kind: "path", path: "./compactor/agent.toml" });
+      expect(file.compactor).toEqual({
+        kind: "path",
+        path: "./compactor/agent.toml",
+      });
       expect(file.remote).toEqual({ kind: "acp", url: "acp://x:1/y" });
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
