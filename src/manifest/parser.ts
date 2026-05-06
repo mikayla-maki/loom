@@ -43,15 +43,12 @@ export async function parseAgentManifest(
       `agent.toml at ${abs}: [agent].identity / [agent].identity_inline have been replaced by [agent].system_prompt (path or inline string)`,
     );
   }
-  const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
-  if (
-    agent.remove_builtin_tools != null &&
-    typeof agent.remove_builtin_tools !== "boolean"
-  ) {
+  if (agent.remove_builtin_tools != null) {
     throw new ManifestError(
-      `agent.toml at ${abs}: [agent].remove_builtin_tools must be a boolean (got ${typeof agent.remove_builtin_tools})`,
+      `agent.toml at ${abs}: [agent].remove_builtin_tools is no longer supported. Declare an explicit (possibly empty) [tools] table instead — absence of [tools] auto-loads the default builtin set; an empty [tools] table opts out entirely.`,
     );
   }
+  const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
 
   const harness = ensureObject(raw.harness, "[harness]", abs);
   if (typeof harness.provider !== "string" || !harness.provider) {
@@ -76,6 +73,12 @@ export async function parseAgentManifest(
     raw.sandbox === undefined
       ? undefined
       : parseSandboxCeiling(raw.sandbox, abs);
+  // [tools] in file form is string-valued; SDK consumers can pass
+  // inline ToolManifest objects through the JS shape.
+  const tools =
+    raw.tools === undefined
+      ? undefined
+      : parseStringValueTable(raw.tools, "[tools]", abs);
   const skills = parseStringValueTable(raw.skills, "[skills]", abs);
   if (raw.providers !== undefined) {
     throw new ManifestError(
@@ -91,15 +94,13 @@ export async function parseAgentManifest(
       ? { description: agent.description }
       : {}),
     ...(systemPrompt !== undefined ? { systemPrompt } : {}),
-    ...(typeof agent.remove_builtin_tools === "boolean"
-      ? { removeBuiltinTools: agent.remove_builtin_tools }
-      : {}),
     harness: {
       ...(harness as Record<string, unknown>),
       provider: harness.provider as string,
     },
     ...(session ? { session } : {}),
     ...(sandbox ? { sandbox } : {}),
+    ...(tools !== undefined ? { tools } : {}),
     skills,
     extensions,
   };

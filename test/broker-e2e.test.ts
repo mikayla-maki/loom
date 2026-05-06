@@ -29,7 +29,7 @@ async function writeEchoChild(rootDir: string): Promise<string> {
     `[agent]
 name = "child"
 system_prompt = "c"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"
@@ -91,7 +91,7 @@ exec loom-invoke helper "$prompt"
       const spec: AgentManifest = {
         name: "parent",
         systemPrompt: "p",
-        removeBuiltinTools: true,
+        tools: {},
         harness: {
           provider: "test",
           script: [
@@ -191,7 +191,7 @@ fi
       const spec: AgentManifest = {
         name: "p",
         systemPrompt: "p",
-        removeBuiltinTools: true,
+        tools: {},
         harness: {
           provider: "test",
           script: [

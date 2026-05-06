@@ -91,6 +91,22 @@ export interface ResolvedAgentManifest {
 
 const DEFAULT_SESSION = { provider: "memory" } as const;
 
+/**
+ * Default top-level tool set when `[tools]` is omitted from the
+ * manifest. Each entry resolves through the normal builtin path. To
+ * change the set, declare an explicit `[tools]` table; to opt out
+ * entirely, declare an empty `[tools]` table.
+ */
+const DEFAULT_TOP_LEVEL_TOOLS: Record<string, string> = {
+  bash: "builtin",
+  read_file: "builtin",
+  write_file: "builtin",
+  find: "builtin",
+};
+
+/** introducedBy label for tools declared at the top level of agent.toml. */
+const TOP_LEVEL_INTRODUCER = "(top-level)";
+
 export async function resolveAgent(
   source: string | AgentManifest,
   options: ResolveOptions = {},
@@ -116,22 +132,6 @@ export async function resolveAgent(
   // ─── skills + tools ─────────────────────────────────────────────────────
   const skills: ResolvedSkill[] = [];
 
-  // Auto-load the `core` builtin skill (bash/read_file/write_file/find)
-  // unless explicitly opted out. Renders inline in the system prompt.
-  if (!manifest.removeBuiltinTools) {
-    const coreDir = path.join(opts.builtinsDir, "skills", "core");
-    if (await isDir(coreDir)) {
-      const m = await parseSkillManifest(coreDir);
-      m.inlineInSystemPrompt = true;
-      const tools = await resolveSkillRequires(m, baseDir, opts, providers);
-      skills.push({
-        manifest: m as SkillManifest & { name: string },
-        tools,
-        subagents: {},
-      });
-    }
-  }
-
   for (const [skillKey, skillRef] of Object.entries(manifest.skills ?? {})) {
     const { manifest: skillManifest, providerSuppliedTools } = await loadSkill(
       skillKey,
@@ -154,34 +154,45 @@ export async function resolveAgent(
     });
   }
 
-  // Dedupe tools by name (last writer wins; user skills shadow core).
-  const flat = new Map<string, ResolvedTool>();
-  for (const sk of skills)
-    for (const t of sk.tools) flat.set(t.manifest.name, t);
-  const tools = [...flat.values()];
+  // ─── top-level tools ──────────────────────────────────────
+  // Absent `tools` field → default builtin set; present (any) →
+  // exactly what's listed; empty table → no top-level tools.
+  const topLevelSpec = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
+  const topLevelTools = await resolveTopLevelTools(
+    topLevelSpec,
+    baseDir,
+    opts,
+    providers,
+  );
 
-  // ─── sandbox check (only when sandbox was explicitly declared) ─────────
+  // ─── conflict check ──────────────────────────────────────
+  // A name in BOTH top-level [tools] AND a skill's requires is a hard
+  // error. Top-level is additive; collisions are footguns and we
+  // refuse to silently override.
+  const skillToolByName = new Map<string, string>(); // name → skill
+  for (const sk of skills) {
+    for (const t of sk.tools) {
+      skillToolByName.set(t.manifest.name, sk.manifest.name);
+    }
+  }
+  for (const t of topLevelTools) {
+    const skillName = skillToolByName.get(t.manifest.name);
+    if (skillName !== undefined) {
+      throw new ResolutionError(
+        `Tool '${t.manifest.name}' is declared at the top level AND brought in by skill '${skillName}'. Top-level [tools] is additive; remove the top-level entry or rename one of them to avoid the collision.`,
+      );
+    }
+  }
+
+  // Top-level first, then skill-supplied. No dedupe needed (collisions
+  // throw above).
+  const tools = [...topLevelTools];
+  for (const sk of skills) for (const t of sk.tools) tools.push(t);
+
+  // ─── sandbox check (only when sandbox was explicitly declared) ─────
   const required = unionCapabilities(tools.map((t) => t.manifest.capabilities));
   const sandbox = manifest.sandbox ?? {};
-  try {
-    assertSubset(required, sandbox);
-  } catch (e) {
-    const coreToolNames = tools
-      .filter((t) => t.introducedBy === "core")
-      .map((t) => t.manifest.name);
-    if (
-      manifest.sandbox !== undefined &&
-      coreToolNames.length > 0 &&
-      !manifest.removeBuiltinTools
-    ) {
-      const wrapped = new Error(
-        `${(e as Error).message}\n\nHint: this includes the auto-loaded 'core' builtin skill (${coreToolNames.join(", ")}). Either widen [sandbox] to fit, or set [agent].remove_builtin_tools = true.`,
-      );
-      wrapped.name = (e as Error).name;
-      throw wrapped;
-    }
-    throw e;
-  }
+  assertSubset(required, sandbox);
 
   // ─── secrets index ────────────────────────────────────────────
   const requiredSecrets = new Map<string, string[]>();
@@ -271,6 +282,55 @@ function normalizeInlineSkill(
 }
 
 // ─── tool loading ──────────────────────────────────────────────────────────
+
+/**
+ * Resolve top-level `[tools]` from agent.toml. Same value union as a
+ * skill's `requires:` (string ref → builtin/path/registry/provider, or
+ * inline ToolManifest), but unscoped to any skill. Tools resolved here
+ * are tagged with `introducedBy: "(top-level)"` for audit purposes.
+ */
+async function resolveTopLevelTools(
+  spec: Record<string, string | ToolManifest>,
+  agentBaseDir: string,
+  opts: ResolveOptions & { builtinsDir: string },
+  providers: Provider[],
+): Promise<ResolvedTool[]> {
+  const out: ResolvedTool[] = [];
+  for (const [toolKey, toolRef] of Object.entries(spec)) {
+    // Inline tool spec.
+    if (typeof toolRef !== "string") {
+      const m = ensureToolName(toolKey, TOP_LEVEL_INTRODUCER, toolRef);
+      out.push({ manifest: m, introducedBy: TOP_LEVEL_INTRODUCER });
+      continue;
+    }
+
+    // Provider-resolved bare names.
+    const fromProvider = await tryProviderTool(toolRef, providers);
+    if (fromProvider) {
+      const rawManifest =
+        fromProvider.kind === "synthetic"
+          ? fromProvider.manifest
+          : await parseToolManifest(fromProvider.path);
+      const m = ensureToolName(toolKey, TOP_LEVEL_INTRODUCER, rawManifest);
+      out.push({
+        manifest: m,
+        introducedBy: TOP_LEVEL_INTRODUCER,
+        ...(fromProvider.kind === "synthetic"
+          ? { tool: fromProvider.tool }
+          : {}),
+      });
+      continue;
+    }
+
+    // Path / "builtin" / registry fallback.
+    const tm = await parseToolManifest(
+      await resolveToolPath(toolRef, agentBaseDir, opts, toolKey),
+    );
+    const m = ensureToolName(toolKey, TOP_LEVEL_INTRODUCER, tm);
+    out.push({ manifest: m, introducedBy: TOP_LEVEL_INTRODUCER });
+  }
+  return out;
+}
 
 async function resolveSkillRequires(
   skill: SkillManifest,

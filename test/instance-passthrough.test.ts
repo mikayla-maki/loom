@@ -34,7 +34,7 @@ describe("manifest accepts instances directly", () => {
 
     const agent = await runAgent({
       name: "inst-harness",
-      removeBuiltinTools: true,
+      tools: {},
       harness, // ← raw instance, not { provider: "test" }
     });
     try {
@@ -72,7 +72,7 @@ describe("manifest accepts instances directly", () => {
 
     const agent = await runAgent({
       name: "inst-session",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test", echo: true },
       session, // ← raw instance
     });
@@ -126,7 +126,7 @@ describe("manifest accepts instances directly", () => {
     const agent = await runAgent(
       {
         name: "inst-provider",
-        removeBuiltinTools: true,
+        tools: {},
         harness: {
           provider: "test",
           script: [

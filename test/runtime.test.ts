@@ -23,7 +23,7 @@ function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
     description: "An end-to-end Loom v0 demo agent.",
     systemPrompt:
       "You are the Loom sample agent — greet the user and shout the result.",
-    removeBuiltinTools: true,
+    tools: {},
     harness: {
       provider: "test",
       ...(harnessScript ? { script: harnessScript } : {}),
@@ -210,7 +210,7 @@ process.stdout.write(JSON.stringify(result));
       const spec: AgentManifest = {
         name: "iso",
         systemPrompt: "x",
-        removeBuiltinTools: true,
+        tools: {},
         harness: {
           provider: "test",
           script: [

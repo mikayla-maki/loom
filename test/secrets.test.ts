@@ -54,7 +54,7 @@ describe("secrets pipeline", () => {
     const agent = await runAgent(
       {
         name: "factory-slice",
-        removeBuiltinTools: true,
+        tools: {},
         harness: { provider: "capture" },
       },
       {
@@ -82,7 +82,7 @@ describe("secrets pipeline", () => {
       runAgent(
         {
           name: "missing-required",
-          removeBuiltinTools: true,
+          tools: {},
           harness: { provider: "capture" },
         },
         { secrets: new StaticSecretsStore({}) }, // no CAPTURE_REQUIRED
@@ -95,7 +95,7 @@ describe("secrets pipeline", () => {
     const agent = await runAgent(
       {
         name: "optional-missing",
-        removeBuiltinTools: true,
+        tools: {},
         harness: { provider: "capture" },
       },
       {
@@ -134,7 +134,7 @@ process.stdout.write(JSON.stringify(out));
       const agent = await runAgent(
         {
           name: "secret-iso",
-          removeBuiltinTools: true,
+          tools: {},
           harness: {
             provider: "test",
             script: [
@@ -216,7 +216,7 @@ process.stdout.write(JSON.stringify(out));
       },
     };
     const agent = await runAgent(
-      { name: "harness-instance", removeBuiltinTools: true, harness: inst },
+      { name: "harness-instance", tools: {}, harness: inst },
       {
         // Empty store: the test verifies no secrets are demanded.
         secrets: new StaticSecretsStore({}),
@@ -240,7 +240,7 @@ process.stdout.write(JSON.stringify(out));
     const agent = await runAgent(
       {
         name: "hook-required",
-        removeBuiltinTools: true,
+        tools: {},
         harness: { provider: "capture" },
       },
       {
@@ -279,7 +279,7 @@ process.stdout.write(JSON.stringify(out));
       runAgent(
         {
           name: "hook-null",
-          removeBuiltinTools: true,
+          tools: {},
           harness: { provider: "capture" },
         },
         {
@@ -296,7 +296,7 @@ process.stdout.write(JSON.stringify(out));
     const agent = await runAgent(
       {
         name: "hook-bypass",
-        removeBuiltinTools: true,
+        tools: {},
         harness: { provider: "capture" },
       },
       {

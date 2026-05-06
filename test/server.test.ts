@@ -20,7 +20,7 @@ describe("LoomServer.embed() — broker socket", () => {
         `[agent]
 name = "child"
 system_prompt = "c"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"

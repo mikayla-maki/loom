@@ -284,7 +284,7 @@ body
 name = "ext-driven"
 system_prompt = "be brief"
 
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"

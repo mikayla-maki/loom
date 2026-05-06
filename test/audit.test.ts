@@ -36,7 +36,7 @@ describe("auditAgent", () => {
     const spec: AgentManifest = {
       name: "secret-surface",
       systemPrompt: "p",
-      removeBuiltinTools: true,
+      tools: {},
       // Anthropic harness declares ANTHROPIC_API_KEY required.
       harness: { provider: "anthropic", model: "claude-3-haiku-20240307" },
       sandbox: { filesystem: [], network: [], secrets: [] },
@@ -83,7 +83,7 @@ describe("auditAgent", () => {
     const spec: AgentManifest = {
       name: "inline",
       systemPrompt: "p",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       sandbox: { filesystem: [], network: [], secrets: [] },
       skills: {
@@ -133,7 +133,7 @@ body
         `[agent]
 name = "self"
 system_prompt = "x"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"

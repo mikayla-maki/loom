@@ -24,7 +24,7 @@ async function writeEchoChild(rootDir: string): Promise<string> {
     `[agent]
 name = "child"
 system_prompt = "child"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"
@@ -44,7 +44,7 @@ describe("subagents", () => {
       const spec: AgentManifest = {
         name: "parent",
         systemPrompt: "parent",
-        removeBuiltinTools: true,
+        tools: {},
         harness: {
           provider: "test",
           script: [
@@ -97,7 +97,7 @@ describe("subagents", () => {
       const spec: AgentManifest = {
         name: "parent",
         systemPrompt: "p",
-        removeBuiltinTools: true,
+        tools: {},
         harness: { provider: "test" },
         skills: {
           composer: {
@@ -119,7 +119,7 @@ describe("subagents", () => {
     const spec: AgentManifest = {
       name: "p",
       systemPrompt: "p",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       skills: {
         remote: {
@@ -141,7 +141,7 @@ describe("subagents", () => {
       const spec: AgentManifest = {
         name: "p",
         systemPrompt: "p",
-        removeBuiltinTools: true,
+        tools: {},
         harness: {
           provider: "test",
           script: [

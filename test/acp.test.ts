@@ -41,7 +41,7 @@ describe("ACP round-trip (in-process streams)", () => {
     const spec: AgentManifest = {
       name: "acp-inline",
       systemPrompt: "You are an ACP test agent.",
-      removeBuiltinTools: true,
+      tools: {},
       harness: {
         provider: "test",
         script: [[{ say: "hi from agent" }, { stop: "end_turn" }]],
@@ -165,7 +165,7 @@ describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
         `[agent]
 name = "acp-sample"
 system_prompt = "./identity.md"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"

@@ -120,7 +120,7 @@ function buildAgent(
   return {
     name: "discoverer",
     systemPrompt: "x",
-    removeBuiltinTools: true,
+    tools: {},
     harness: {
       provider: "test",
       ...(opts.script ? { script: opts.script } : {}),

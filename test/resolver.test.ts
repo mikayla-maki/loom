@@ -10,24 +10,17 @@ import type { AgentManifest } from "../src/types/manifest.js";
 const FIXTURES = path.resolve("test/fixtures");
 
 describe("resolveAgent", () => {
-  it("resolves the sample agent end-to-end (includes the auto-loaded 'core' builtin)", async () => {
+  it("resolves the sample agent end-to-end (with the default top-level tool set)", async () => {
     // The sample agent fixture stays file-based on purpose: it exercises
     // both the [skills] disk dependency walk and tool/skill capability
     // ceiling aggregation end-to-end.
     const r = await resolveAgent(
       path.join(FIXTURES, "sample-agent/agent.toml"),
     );
-    // 2 skills: the auto-loaded `core` (file/shell tools) + the manifest's `greeter`.
-    expect(r.skills).toHaveLength(2);
-    expect(r.skills.map((s) => s.manifest.name).sort()).toEqual([
-      "core",
-      "greeter",
-    ]);
-    expect(
-      r.skills.find((s) => s.manifest.name === "core")?.manifest
-        .inlineInSystemPrompt,
-    ).toBe(true);
-    // Tools include the manifest's pair plus the 4 core builtins.
+    // The sample agent doesn't declare [tools], so it gets the default
+    // builtin set; one explicit skill brings two more tools.
+    expect(r.skills).toHaveLength(1);
+    expect(r.skills[0]?.manifest.name).toBe("greeter");
     expect(r.tools.map((t) => t.manifest.name).sort()).toEqual([
       "bash",
       "find",
@@ -36,20 +29,26 @@ describe("resolveAgent", () => {
       "uppercase",
       "write_file",
     ]);
+    // Top-level tools are tagged distinctly from skill-supplied tools.
+    const topLevelNames = r.tools
+      .filter((t) => t.introducedBy === "(top-level)")
+      .map((t) => t.manifest.name)
+      .sort();
+    expect(topLevelNames).toEqual(["bash", "find", "read_file", "write_file"]);
     expect(r.systemPrompt).toMatch(/Sample Agent/);
     expect(r.requiredSecrets.has("sample_user_name")).toBe(true);
-    // pathAdditions: 4 core tool bin dirs + 2 manifest tool bin dirs.
+    // pathAdditions: 4 default-set tool bin dirs + 2 manifest tool bin dirs.
     expect(r.pathAdditions).toHaveLength(6);
   });
 
-  it("[agent].remove_builtin_tools = true suppresses the auto-loaded core skill", async () => {
+  it("empty [tools] table opts out of the default builtin set", async () => {
     // The greeter skill stays on disk (it's a fixture) but the parent
     // agent is declared inline and points at it via absolute path.
     const greeterPath = path.join(FIXTURES, "skills/greeter");
     const spec: AgentManifest = {
-      name: "no-core",
+      name: "no-defaults",
       systemPrompt: "be brief",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       sandbox: { filesystem: ["./"], secrets: ["sample_user_name"] },
       skills: { greeter: greeterPath },
@@ -63,11 +62,30 @@ describe("resolveAgent", () => {
     ]);
   });
 
+  it("top-level [tools] is a hard error when colliding with a skill's requires", async () => {
+    const spec: AgentManifest = {
+      name: "collision",
+      systemPrompt: "x",
+      tools: { bash: "builtin" },
+      harness: { provider: "test" },
+      sandbox: { filesystem: ["./"], network: [], secrets: [] },
+      skills: {
+        s: {
+          description: "also brings bash",
+          requires: { bash: "builtin" },
+        },
+      },
+    };
+    await expect(resolveAgent(spec)).rejects.toThrow(
+      /declared at the top level AND brought in by skill/,
+    );
+  });
+
   it("rejects when a tool needs a capability outside the ceiling", async () => {
     const spec: AgentManifest = {
       name: "snoopy",
       systemPrompt: "x",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       sandbox: { filesystem: [], network: [], secrets: [] },
       skills: {
@@ -133,7 +151,7 @@ body`,
         `[agent]
 name = "n"
 system_prompt = "x"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"
@@ -160,7 +178,7 @@ w = "../skills/wrong"
     const spec: AgentManifest = {
       name: "inline-sp",
       systemPrompt: "Be concise. Use only tools provided.",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       skills: {},
     };
@@ -184,7 +202,7 @@ w = "../skills/wrong"
         `[agent]
 name = "path-sp"
 system_prompt = "./core.md"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"
@@ -208,7 +226,7 @@ secrets = []
     const spec: AgentManifest = {
       name: "x",
       systemPrompt: "x",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       sandbox: { filesystem: ["./"], network: [], secrets: [] },
       skills: {

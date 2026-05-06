@@ -88,7 +88,7 @@ describe("Provider extension — dynamic tool/skill resolution", () => {
     const spec: AgentManifest = {
       name: "provider-agent",
       systemPrompt: "x",
-      removeBuiltinTools: true,
+      tools: {},
       harness: {
         provider: "test",
         script: [
@@ -197,7 +197,7 @@ describe("Provider extension — dynamic tool/skill resolution", () => {
     const spec: AgentManifest = {
       name: "skill-provider-agent",
       systemPrompt: "x",
-      removeBuiltinTools: true,
+      tools: {},
       harness: {
         provider: "test",
         script: [
@@ -273,7 +273,7 @@ describe("Provider extension — dynamic tool/skill resolution", () => {
     const spec: AgentManifest = {
       name: "n",
       systemPrompt: "x",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       sandbox: { filesystem: [], network: [], secrets: [] },
       skills: {
@@ -317,7 +317,7 @@ describe("Provider extension — dynamic tool/skill resolution", () => {
     const spec: AgentManifest = {
       name: "audit-prov",
       systemPrompt: "x",
-      removeBuiltinTools: true,
+      tools: {},
       harness: { provider: "test" },
       sandbox: { filesystem: [], network: [], secrets: [] },
       skills: {

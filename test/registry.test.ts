@@ -99,7 +99,7 @@ process.stdout.write(String(i.text ?? "").toUpperCase());
       const spec: AgentManifest = {
         name: "bare-name-test",
         systemPrompt: "x",
-        removeBuiltinTools: true,
+        tools: {},
         harness: {
           provider: "test",
           script: [
@@ -163,7 +163,7 @@ shadowed`,
       const spec: AgentManifest = {
         name: "x",
         systemPrompt: "x",
-        removeBuiltinTools: true,
+        tools: {},
         harness: { provider: "test" },
         sandbox: { filesystem: ["./"], network: [], secrets: [] },
         skills: { shadow: "shadow" },

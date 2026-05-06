@@ -49,13 +49,13 @@ export type SubagentReference =
   | { kind: "registry"; name: string }
   | { kind: "acp"; url: string };
 
-// ─── Agent manifest (input shape) ──────────────────────────────────
+// ─── Agent manifest (input shape) ───────────────────────────────────────
 //
 // The manifest is what the user provides — directly via `runAgent(spec)`
 // or indirectly via `parseAgentManifest("./agent.toml")`. Agent identity
-// fields (name / description / systemPrompt / removeBuiltinTools) live at
-// the top level; the parser flattens TOML's `[agent]` table onto the same
-// shape so file-based and inline forms produce identical objects.
+// fields (name / description / systemPrompt) live at the top level; the
+// parser flattens TOML's `[agent]` table onto the same shape so
+// file-based and inline forms produce identical objects.
 //
 // Skills, tools, and subagents may be expressed inline as nested objects
 // OR as string refs (paths / registry names / "builtin"). The resolver
@@ -88,8 +88,6 @@ export interface AgentManifest {
   name: string;
   description?: string;
   systemPrompt?: SystemPromptSpec;
-  /** When true, suppress the auto-loaded `core` builtin skill. */
-  removeBuiltinTools?: boolean;
   harness: HarnessSpec;
   /** Optional. Defaults to `{ provider: "memory" }` if absent. */
   session?: SessionSpec;
@@ -98,6 +96,23 @@ export interface AgentManifest {
    * unconstrained (`*`). Empty array on an axis = explicitly nothing.
    */
   sandbox?: SandboxCeiling;
+  /**
+   * Top-level tools — model-facing name → path / registry name /
+   * "builtin" / inline tool manifest. Same value union as a skill's
+   * `requires:` field; resolved through the same machinery.
+   *
+   * Semantics:
+   *   - field absent       → the runtime auto-loads a default builtin set
+   *                         (`bash`, `read_file`, `write_file`, `find`).
+   *   - field present (any) → exactly what's listed; no defaults.
+   *   - empty table        → no top-level tools at all.
+   *
+   * Skills' `requires:` are *additive*: a skill that brings `bash` into
+   * scope is fine even if `bash` isn't listed here. A name appearing in
+   * both top-level `tools` AND a skill's `requires` is a hard error —
+   * silent overrides are footguns.
+   */
+  tools?: Record<string, string | ToolManifest>;
   /** Skill name → path / registry name / inline skill manifest. */
   skills?: Record<string, string | SkillManifest>;
   /**
@@ -122,13 +137,6 @@ export interface SkillManifest {
   requires?: Record<string, string | ToolManifest>;
   /** Subagent name → path / registry name / acp:// URL / structured reference. */
   subagents?: Record<string, string | SubagentReference>;
-  /**
-   * If true, the runtime renders this skill's body as part of the manifest's
-   * core system prompt (rather than under `# Available Skills`), so the
-   * model treats its tools as always-on. The auto-loaded `core` builtin
-   * uses this to behave like ambient guidance, not an opt-in capability.
-   */
-  inlineInSystemPrompt?: boolean;
 
   // ── Disk-derived (parser-only fields) ──
   /** Absolute path to SKILL.md, when loaded from disk. */

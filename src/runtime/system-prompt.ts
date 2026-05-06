@@ -39,20 +39,12 @@ export function assembleSystemPrompt(inputs: SystemPromptInputs): string {
     );
   }
 
-  // 1b. Inlined skills — flagged as part of the core. Most importantly: the
-  // auto-loaded `core` builtin skill, which lists the always-on file/shell
-  // tools and how to use them. Rendered as raw body so the model treats
-  // them as ambient guidance, not a discrete capability to invoke.
-  const inlineSkills = inputs.skills.filter((s) => s.inlineInSystemPrompt);
-  for (const sk of inlineSkills) {
-    if (sk.body.trim()) parts.push(sk.body.trim());
-  }
-
-  // 2. Capabilities (structural, runtime-owned). Excludes inlined skills.
-  const visibleSkills = inputs.skills.filter((s) => !s.inlineInSystemPrompt);
-  if (visibleSkills.length > 0) {
+  // 2. Capabilities (structural, runtime-owned). Skills only — top-level
+  // tools surface through the Tool Reference section below; they don't
+  // carry a body to render.
+  if (inputs.skills.length > 0) {
     const lines: string[] = ["# Available Skills"];
-    for (const sk of visibleSkills) {
+    for (const sk of inputs.skills) {
       lines.push(`## ${sk.name}\n${sk.description}`);
       if (sk.toolNames.length > 0) {
         lines.push(`Tools: ${sk.toolNames.join(", ")}`);

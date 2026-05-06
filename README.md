@@ -80,24 +80,46 @@ Defaults applied:
 
 - `session` → `{ provider: "memory" }` (in-process log; events lost on close)
 - `sandbox` → unconstrained on every axis (permissive)
-- The `core` builtin skill (bash/read_file/write_file/find) auto-loads
-  unless `agent.removeBuiltinTools = true`.
+- `tools` (top-level) → the default builtin set
+  (`bash`, `read_file`, `write_file`, `find`) auto-loads when the field is
+  absent. Declare an explicit `tools` table (even empty) to opt out.
 
 Tighten any of those when you want to:
 
 ```ts
 await runAgent({
-  agent: { name: "lockdown", removeBuiltinTools: true },
+  name: "lockdown",
+  tools: {},                                 // no top-level tools
   harness: { provider: "anthropic", model: "claude-3-5-sonnet-latest" },
   session: { provider: "file", path: "./session.jsonl" },
   sandbox: { filesystem: [], network: ["api.anthropic.com"] },
-  // ...
 });
 ```
 
-## Inline skills + tools
+## Top-level `tools` and inline skills
 
-Skills and tools can be declared inline alongside the agent:
+The minimal `agent.toml` that customizes its tool surface:
+
+```toml
+[agent]
+name = "locked-down"
+system_prompt = "..."
+
+[harness]
+provider = "anthropic"
+model = "claude-3-5-sonnet-latest"
+
+[tools]
+# explicit empty table → no top-level tools at all
+# OR list a subset:
+# bash = "builtin"
+```
+
+Top-level tools are *additive* with skills' `requires:` — a skill that
+brings `bash` is fine even if `bash` isn't listed at the top level. A
+name appearing in BOTH is a hard error (no silent shadowing).
+
+Skills and tools can also be declared inline alongside the agent:
 
 ```ts
 await runAgent({
@@ -170,9 +192,9 @@ node dist/cli/main.js prompt test/fixtures/sample-agent/agent.toml "hi"
 - **Subagents** are *not* a sandbox axis. A skill's `subagents:` declaration
   is the contract; what a skill ships is what its tools can invoke. To veto
   a subagent, remove the skill.
-- The auto-loaded `core` skill needs `filesystem = ["./"]`; if you set
-  `sandbox.filesystem` to something tighter and don't `removeBuiltinTools`,
-  the resolver fails with a hint pointing at the opt-out flag.
+- The default top-level tool set needs `filesystem = ["./"]`. If you tighten
+  `sandbox.filesystem` past that, set an explicit `tools` table to drop the
+  defaults (or list the subset you want).
 
 ## Subagent invocation (the broker)
 

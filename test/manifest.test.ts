@@ -41,6 +41,107 @@ describe("agent.toml parser", () => {
     }
   });
 
+  it("parses an explicit [tools] table (string-valued)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-tools-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "with-tools"
+system_prompt = "x"
+
+[harness]
+provider = "test"
+[sandbox]
+filesystem = ["./"]
+network = []
+secrets = []
+[tools]
+bash = "builtin"
+my_thing = "./local-tool"
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(m.tools).toEqual({
+        bash: "builtin",
+        my_thing: "./local-tool",
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes absent [tools] from empty [tools] (defaults vs. opt-out)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-tools-empty-"));
+    try {
+      // 1) absent [tools] section
+      const a = path.join(dir, "absent.toml");
+      await fs.writeFile(
+        a,
+        `[agent]
+name = "absent"
+system_prompt = "x"
+[harness]
+provider = "test"
+`,
+        "utf8",
+      );
+      const ma = await parseAgentManifest(a);
+      expect(ma.tools).toBeUndefined();
+
+      // 2) explicit empty [tools] section
+      const b = path.join(dir, "empty.toml");
+      await fs.writeFile(
+        b,
+        `[agent]
+name = "empty"
+system_prompt = "x"
+[harness]
+provider = "test"
+[tools]
+`,
+        "utf8",
+      );
+      const mb = await parseAgentManifest(b);
+      expect(mb.tools).toEqual({});
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects [agent].remove_builtin_tools with a migration message pointing at [tools]", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-rmbt-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "legacy"
+system_prompt = "x"
+remove_builtin_tools = true
+
+[harness]
+provider = "test"
+[session]
+provider = "memory"
+[sandbox]
+filesystem = []
+network = []
+secrets = []
+[skills]
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /remove_builtin_tools is no longer supported.*\[tools\]/s,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects the legacy identity / identity_inline fields with a migration message", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-bad-"));
     try {
@@ -50,7 +151,7 @@ describe("agent.toml parser", () => {
         `[agent]
 name = "x"
 identity = "./i.md"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"
@@ -77,7 +178,7 @@ filesystem = []
         `[agent]
 name = "x"
 system_prompt = "You are a friendly demo agent."
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"
@@ -105,7 +206,7 @@ filesystem = []
         `[agent]
 name = "x"
 system_prompt = "./prompt.md"
-remove_builtin_tools = true
+[tools]
 
 [harness]
 provider = "test"
