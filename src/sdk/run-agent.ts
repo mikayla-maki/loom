@@ -1,14 +1,13 @@
 /**
  * runAgent — the top-level SDK entry point.
  *
- * Resolves a manifest, loads extensions, walks the skill→tool graph, fetches
- * secrets, validates capabilities, sets up PATH for tool binaries, instantiates
- * the session and harness, and returns a RunningAgent SDK handle. Does NOT
- * run a turn — the client triggers turns via prompt().
+ * Resolves a manifest, loads extensions / providers, fetches secrets,
+ * validates capabilities, instantiates session + harness, and returns a
+ * RunningAgent SDK handle. Does NOT run a turn — the client triggers
+ * turns via prompt().
  */
 
 import * as path from "node:path";
-// path is used below.
 
 import {
   getHarnessFactory,
@@ -16,16 +15,17 @@ import {
   getSessionFactory,
 } from "../extensions/index.js";
 import { loadExtensionPackage, type LoadOptions } from "../extensions/loader.js";
-import { resolveAgent, type ResolveOptions, type ResolvedAgent } from "../manifest/resolver.js";
+import {
+  resolveAgent,
+  type ResolveOptions,
+  type ResolvedAgent,
+  type ResolvedSubagent,
+} from "../manifest/resolver.js";
 import { parseAgentManifest } from "../manifest/parser.js";
 import { LocalRegistry } from "../registry/registry.js";
 import { AgentState } from "../runtime/agent-state.js";
+import { findBuiltinsDir } from "../runtime/builtins-dir.js";
 import { AddSkillTool, SearchSkillsTool, type SkillDiscoveryDeps } from "../runtime/skill-discovery.js";
-import { fileURLToPath } from "node:url";
-import * as fsSync from "node:fs";
-import type { Provider } from "../types/interfaces.js";
-import type { PermissionHandler } from "../types/permissions.js";
-import { RuntimeImpl } from "../runtime/runtime.js";
 import { ProcessTool, ToolTable } from "../runtime/tool-table.js";
 import { SpawnSubagentTool, SubagentRegistry } from "../runtime/subagent.js";
 import { UpdateSink } from "../runtime/update-sink.js";
@@ -37,49 +37,43 @@ import {
   StaticSecretsStore,
   type SecretsStore,
 } from "../runtime/secrets.js";
-import type { ExtensionContext, Session, SessionFactory, Tool } from "../types/interfaces.js";
+import type {
+  ExtensionContext,
+  HarnessFactory,
+  Provider,
+  Session,
+  SessionFactory,
+  Tool,
+} from "../types/interfaces.js";
+import type { PermissionHandler } from "../types/permissions.js";
 import type { SkillManifest } from "../types/manifest.js";
 
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 
 export const GLASS_VERSION = "0.1.0";
 
+const PRIVILEGED_BUILTINS = new Set(["spawn_subagent", "search_skills", "add_skill"]);
+
 export interface RunAgentOptions {
-  /** Resolver options (registry, custom builtins, providers). */
   resolve?: ResolveOptions;
-  /** Custom secrets store. Defaults to env + optional secrets file in manifest dir. */
   secrets?: SecretsStore;
-  /** If a secret is missing, omit it from the env rather than throwing. */
+  /** If a secret is missing, omit it rather than throwing. */
   allowMissingSecrets?: boolean;
-  /** Override the agent's session provider (e.g. tests want memory). */
+  /** Override the agent's session factory (e.g. tests want memory). */
   sessionOverride?: SessionFactory;
-  /** Override the agent's harness provider (e.g. tests want test). */
-  harnessOverride?: { factory: import("../types/interfaces.js").HarnessFactory; config?: Record<string, unknown> };
-  /** Override the harness config inline (without changing the factory). */
+  /** Override the agent's harness factory (e.g. tests want test). */
+  harnessOverride?: { factory: HarnessFactory; config?: Record<string, unknown> };
   harnessConfigOverride?: Record<string, unknown>;
-  /** Override the session config inline (without changing the factory). */
   sessionConfigOverride?: Record<string, unknown>;
-  /**
-   * Programmatic provider overrides — appended to whatever the manifest's
-   * [providers] table declares. Useful for tests and embedding.
-   */
+  /** Programmatic providers — appended to manifest [providers]. */
   providers?: Provider[];
-  /**
-   * Capability-expansion + tool-consent handler. Runtime-mediated operations
-   * (most importantly the `add_skill` builtin) call this before granting
-   * the agent capabilities outside its declared `[sandbox]`. When omitted,
-   * such requests fail closed.
-   */
+  /** Capability-expansion gate. Defaults to deny-all if unset. */
   permissionHandler?: PermissionHandler;
-  /**
-   * Override the search paths used to resolve `[extensions]` package names.
-   * In test contexts this typically points at a fixtures directory that
-   * looks like a node_modules tree.
-   */
+  /** Extension-package search-path overrides (used in tests). */
   extensionLoadOptions?: LoadOptions;
-  /** For testing: deterministic 'now' used in system-prompt assembly. */
+  /** Test hook: deterministic 'now' for system-prompt assembly. */
   now?: () => Date;
-  /** Per-tool execution timeout in ms (passed through to ProcessTool). */
+  /** Per-tool execution timeout in ms. */
   toolTimeoutMs?: number;
 }
 
@@ -87,193 +81,72 @@ export async function runAgent(
   manifestPath: string,
   options: RunAgentOptions = {},
 ): Promise<RunningAgent> {
-  // Resolve options: if no registry was provided and a registry exists at
-  // $GLASS_HOME / ~/.glass, plumb it in so bare names resolve there.
   const resolveOptions: ResolveOptions = { ...(options.resolve ?? {}) };
   if (!resolveOptions.registry) {
-    const lr = new LocalRegistry();
-    resolveOptions.registry = lr.lookup;
+    resolveOptions.registry = new LocalRegistry().lookup;
   }
 
-  // Boot providers from the manifest's [providers] table BEFORE resolution
-  // so they get a chance to claim tool/skill names. Pre-parse the manifest
-  // here just to inspect [providers] and [agent].name; resolveAgent re-parses
-  // the manifest internally, which is cheap.
   const preManifest = await parseAgentManifest(manifestPath);
+  const ctx: ExtensionContext = {
+    manifestDir: path.dirname(preManifest.manifestPath),
+    agentName: preManifest.agent.name,
+    glassVersion: GLASS_VERSION,
+  };
 
-  // Activate npm-installed Glass extension packages BEFORE we resolve
-  // anything else. Each listed package's register() may install harness /
-  // session / provider factories (named, activated through manifest tables)
-  // OR call api.addProvider(...) to auto-activate provider instances for
-  // this agent.
-  const extensionEntries = Object.entries(preManifest.extensions ?? {});
-  const extensionProviders: Provider[] = [];
-  for (const [pkgName, pkgConfig] of extensionEntries) {
-    const { addedProviders } = await loadExtensionPackage(
-      pkgName,
-      pkgConfig,
-      {
-        agentManifestDir: path.dirname(preManifest.manifestPath),
-        agentName: preManifest.agent.name,
-        glassVersion: GLASS_VERSION,
-      },
-      options.extensionLoadOptions ?? {},
-    );
-    extensionProviders.push(...addedProviders);
-  }
-
-  const providerEntries = Object.entries(preManifest.providers ?? {});
-  const bootedProviders: Provider[] = [];
-  if (providerEntries.length > 0) {
-    const providerCtx = {
-      manifestDir: path.dirname(preManifest.manifestPath),
-      agentName: preManifest.agent.name,
-      glassVersion: GLASS_VERSION,
-    };
-    for (const [name, config] of providerEntries) {
-      const factory = getProviderFactory(name);
-      const inst = await factory.create(config, providerCtx);
-      bootedProviders.push(inst);
-    }
-  }
-  // Provider chain priority: extension-auto-added → manifest [providers] →
-  // programmatic options.providers. Earlier entries claim names first.
-  const allProviders = [
-    ...extensionProviders,
-    ...bootedProviders,
-    ...(options.providers ?? []),
-  ];
+  // Boot extension packages and manifest-declared providers BEFORE the
+  // resolver runs so they can claim tool/skill names.
+  const extensionProviders = await bootExtensions(preManifest, ctx, options);
+  const bootedProviders = await bootProviders(preManifest, ctx);
+  const allProviders = [...extensionProviders, ...bootedProviders, ...(options.providers ?? [])];
   if (allProviders.length > 0) {
     resolveOptions.providers = [...(resolveOptions.providers ?? []), ...allProviders];
   }
 
   const resolved = await resolveAgent(manifestPath, resolveOptions);
 
-  // Secrets store (chained: explicit > env > optional file in manifest dir).
-  const stores: SecretsStore[] = [];
-  if (options.secrets) stores.push(options.secrets);
-  stores.push(new EnvSecretsStore());
-  const manifestDir = path.dirname(resolved.manifest.manifestPath);
-  stores.push(new FileSecretsStore(path.join(manifestDir, ".glass-secrets")));
-  const store = new ChainedSecretsStore(stores);
-
-  // Load every secret named in the agent's [sandbox] ceiling. Tool-required
-  // secrets must be present (or `allowMissingSecrets` is set); ceiling-only
-  // secrets that aren't strictly required are loaded best-effort (so the
-  // builtin `secrets.get` can hand them to the model on demand).
-  const requiredSecretNames = Array.from(resolved.requiredSecrets.keys());
-  const ceilingSecretNames = resolved.manifest.sandbox.secrets ?? [];
-  const ceilingOnly = ceilingSecretNames.filter((n) => !resolved.requiredSecrets.has(n));
-
-  const required = await resolveSecrets(store, requiredSecretNames, {
-    allowMissing: options.allowMissingSecrets ?? false,
-  });
-  const optional = await resolveSecrets(store, ceilingOnly, { allowMissing: true });
-  const secrets: Record<string, string> = { ...required, ...optional };
-
-  // Build the subagent registry from each skill's declared subagents. The
-  // resolver already validated that the union sits inside the agent's
-  // [sandbox].subagent ceiling.
-  const subagentEntries: Array<{ name: string; ref: import("../manifest/resolver.js").ResolvedSubagent; skill: string }> = [];
-  for (const sk of resolved.skills) {
-    for (const [name, ref] of Object.entries(sk.subagents)) {
-      subagentEntries.push({ name, ref, skill: sk.manifest.name });
-    }
-  }
-  const subagentRegistry = new SubagentRegistry(
-    subagentEntries,
-    resolved.manifest.sandbox,
-  );
-
-  // Extensions: factories.
-  const ctx: ExtensionContext = {
-    manifestDir,
-    agentName: resolved.manifest.agent.name,
-    glassVersion: GLASS_VERSION,
-  };
-
-  const sessionFactory = options.sessionOverride
-    ? options.sessionOverride
-    : getSessionFactory(resolved.manifest.session.provider);
-  const sessionConfig: Record<string, unknown> = {
-    ...resolved.manifest.session,
-    ...(options.sessionConfigOverride ?? {}),
-  };
-  delete sessionConfig.provider;
-  const session = await sessionFactory.create(sessionConfig, ctx);
+  const secrets = await loadSecrets(resolved, options);
+  const session = await instantiateSession(resolved, options, ctx);
   const sessionSkills = await collectSessionSkills(session);
+  const harness = await instantiateHarness(resolved, options, ctx);
 
-  const harnessFactory = options.harnessOverride
-    ? options.harnessOverride.factory
-    : getHarnessFactory(resolved.manifest.harness.provider);
-  const harnessConfig: Record<string, unknown> = options.harnessOverride?.config
-    ? options.harnessOverride.config
-    : { ...resolved.manifest.harness, ...(options.harnessConfigOverride ?? {}) };
-  delete harnessConfig.provider;
-  const harness = await harnessFactory.create(harnessConfig, ctx);
-
-  // Tools — provider-supplied tools win over ProcessTool construction. For
-  // builtins backed by privileged in-process implementations
-  // (spawn_subagent, search_skills, add_skill) we drop the ProcessTool and
-  // attach the in-process variant instead. This keeps `requires: builtin`
-  // working as the user-facing affordance while routing the actual call
-  // through the runtime.
-  const PRIVILEGED_BUILTINS = new Set(["spawn_subagent", "search_skills", "add_skill"]);
-  const processTools: Tool[] = resolved.tools
-    .filter((rt) => !PRIVILEGED_BUILTINS.has(rt.manifest.tool.name))
-    .map((rt) => {
-      if (rt.tool) return rt.tool;
-      return new ProcessTool(rt.manifest, {
-        extraPath: resolved.pathAdditions,
-        ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
-      });
-    });
-  const declaredBuiltins = new Set(
-    resolved.tools.map((rt) => rt.manifest.tool.name).filter((n) => PRIVILEGED_BUILTINS.has(n)),
+  // Build the tool table: ProcessTool for each declared tool (provider-
+  // supplied impls win), plus the privileged in-process variants.
+  const toolTable = new ToolTable(
+    resolved.tools
+      .filter((rt) => !PRIVILEGED_BUILTINS.has(rt.manifest.tool.name))
+      .map(
+        (rt) =>
+          rt.tool ??
+          new ProcessTool(rt.manifest, {
+            extraPath: resolved.pathAdditions,
+            ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
+          }),
+      ),
+    secrets,
   );
-  const tools: Tool[] = [...processTools];
-  const toolTable = new ToolTable(tools, secrets);
 
-  // Build AgentState (mutable view onto skills/ceiling/toolTable).
   const state = new AgentState({
     skills: [...resolved.skills.map((s) => s.manifest), ...sessionSkills],
     ceiling: resolved.manifest.sandbox,
     toolTable,
   });
 
-  // spawn_subagent (privileged in-process tool).
-  if (declaredBuiltins.has("spawn_subagent") || subagentEntries.length > 0) {
-    toolTable.addTool(
-      new SpawnSubagentTool(subagentRegistry, {
-        runOptions: options.resolve ? { resolve: options.resolve } : {},
-      }),
-    );
-  }
-  // Permission handler holder. The RunningAgentImpl writes through this on
-  // setPermissionHandler() so the in-process add_skill tool always sees the
-  // current handler (e.g. one set after boot by an ACP server).
+  // Permission-handler holder shared with privileged in-process tools so
+  // setPermissionHandler() at runtime is reflected in their consent calls.
   const permissionHolder: { current: PermissionHandler | null } = {
     current: options.permissionHandler ?? null,
   };
 
-  // search_skills / add_skill (privileged; gate add through permissionHandler).
-  if (declaredBuiltins.has("search_skills") || declaredBuiltins.has("add_skill")) {
-    const discoveryDeps: SkillDiscoveryDeps = {
-      state,
-      providers: allProviders,
-      builtinsDir: resolveBuiltinsDir(resolveOptions.builtinsDir),
-      requestPermission: async (req) =>
-        permissionHolder.current ? permissionHolder.current(req) : { decision: "deny" },
-      agentName: resolved.manifest.agent.name,
-      pathAdditions: resolved.pathAdditions,
-      ...(options.toolTimeoutMs ? { toolTimeoutMs: options.toolTimeoutMs } : {}),
-      loadedSecrets: secrets,
-    };
-    if (declaredBuiltins.has("search_skills")) toolTable.addTool(new SearchSkillsTool(discoveryDeps));
-    if (declaredBuiltins.has("add_skill")) toolTable.addTool(new AddSkillTool(discoveryDeps));
-  }
-
-  const updateSink = new UpdateSink();
+  attachPrivilegedBuiltins({
+    resolved,
+    state,
+    toolTable,
+    options,
+    resolveOptions,
+    allProviders,
+    secrets,
+    permissionHolder,
+  });
 
   return new RunningAgentImpl({
     resolved,
@@ -281,35 +154,153 @@ export async function runAgent(
     session,
     harness,
     state,
-    updateSink,
+    updateSink: new UpdateSink(),
     providers: allProviders,
     permissionHolder,
     ...(options.now ? { now: options.now } : {}),
   });
 }
 
-function resolveBuiltinsDir(override: string | undefined): string {
-  if (override) return override;
-  // Match resolver.builtinsDir() heuristics — walk up from this module.
-  const here = fileURLToPath(import.meta.url);
-  let dir = path.dirname(here);
-  for (let i = 0; i < 5; i++) {
-    const candidate = path.join(dir, "builtins");
-    try {
-      if (fsSync.existsSync(candidate)) return candidate;
-    } catch {
-      // ignore
-    }
-    dir = path.dirname(dir);
+// ─── boot-time helpers ────────────────────────────────────────────────────
+
+async function bootExtensions(
+  manifest: import("../types/manifest.js").AgentManifest,
+  ctx: ExtensionContext,
+  options: RunAgentOptions,
+): Promise<Provider[]> {
+  const providers: Provider[] = [];
+  for (const [pkgName, pkgConfig] of Object.entries(manifest.extensions ?? {})) {
+    const { addedProviders } = await loadExtensionPackage(
+      pkgName,
+      pkgConfig,
+      { agentManifestDir: ctx.manifestDir, agentName: ctx.agentName, glassVersion: ctx.glassVersion },
+      options.extensionLoadOptions ?? {},
+    );
+    providers.push(...addedProviders);
   }
-  return path.join(path.dirname(path.dirname(here)), "builtins");
+  return providers;
+}
+
+async function bootProviders(
+  manifest: import("../types/manifest.js").AgentManifest,
+  ctx: ExtensionContext,
+): Promise<Provider[]> {
+  const out: Provider[] = [];
+  for (const [name, config] of Object.entries(manifest.providers ?? {})) {
+    out.push(await getProviderFactory(name).create(config, ctx));
+  }
+  return out;
+}
+
+async function loadSecrets(
+  resolved: ResolvedAgent,
+  options: RunAgentOptions,
+): Promise<Record<string, string>> {
+  const stores: SecretsStore[] = [];
+  if (options.secrets) stores.push(options.secrets);
+  stores.push(new EnvSecretsStore());
+  stores.push(
+    new FileSecretsStore(path.join(path.dirname(resolved.manifest.manifestPath), ".glass-secrets")),
+  );
+  const store = new ChainedSecretsStore(stores);
+
+  const requiredNames = [...resolved.requiredSecrets.keys()];
+  const ceilingNames = resolved.manifest.sandbox.secrets ?? [];
+  const ceilingOnly = ceilingNames.filter((n) => !resolved.requiredSecrets.has(n));
+
+  // Tool-required secrets must resolve (or `allowMissingSecrets`); ceiling-
+  // only secrets load best-effort so `secrets.get` can hand them out on demand.
+  const required = await resolveSecrets(store, requiredNames, {
+    allowMissing: options.allowMissingSecrets ?? false,
+  });
+  const optional = await resolveSecrets(store, ceilingOnly, { allowMissing: true });
+  return { ...required, ...optional };
+}
+
+async function instantiateSession(
+  resolved: ResolvedAgent,
+  options: RunAgentOptions,
+  ctx: ExtensionContext,
+): Promise<Session> {
+  const factory = options.sessionOverride ?? getSessionFactory(resolved.manifest.session.provider);
+  const config: Record<string, unknown> = {
+    ...resolved.manifest.session,
+    ...(options.sessionConfigOverride ?? {}),
+  };
+  delete config.provider;
+  return await factory.create(config, ctx);
+}
+
+async function instantiateHarness(
+  resolved: ResolvedAgent,
+  options: RunAgentOptions,
+  ctx: ExtensionContext,
+): Promise<import("../types/interfaces.js").Harness> {
+  const factory = options.harnessOverride?.factory ?? getHarnessFactory(resolved.manifest.harness.provider);
+  const config: Record<string, unknown> = options.harnessOverride?.config
+    ? options.harnessOverride.config
+    : { ...resolved.manifest.harness, ...(options.harnessConfigOverride ?? {}) };
+  delete config.provider;
+  return await factory.create(config, ctx);
 }
 
 async function collectSessionSkills(session: Session): Promise<SkillManifest[]> {
   if (!session.skills) return [];
-  const result = session.skills();
-  return Array.isArray(result) ? result : await result;
+  const r = session.skills();
+  return Array.isArray(r) ? r : await r;
 }
 
-// Re-export commonly used helpers
-export { RuntimeImpl, UpdateSink, StaticSecretsStore };
+interface AttachBuiltinsArgs {
+  resolved: ResolvedAgent;
+  state: AgentState;
+  toolTable: ToolTable;
+  options: RunAgentOptions;
+  resolveOptions: ResolveOptions;
+  allProviders: Provider[];
+  secrets: Record<string, string>;
+  permissionHolder: { current: PermissionHandler | null };
+}
+
+function attachPrivilegedBuiltins(args: AttachBuiltinsArgs): void {
+  const declaredBuiltins = new Set(
+    args.resolved.tools
+      .map((t) => t.manifest.tool.name)
+      .filter((n) => PRIVILEGED_BUILTINS.has(n)),
+  );
+
+  // Subagents: union all declared by skills.
+  const subagents: Array<{ name: string; ref: ResolvedSubagent; skill: string }> = [];
+  for (const sk of args.resolved.skills) {
+    for (const [name, ref] of Object.entries(sk.subagents)) {
+      subagents.push({ name, ref, skill: sk.manifest.name });
+    }
+  }
+  if (declaredBuiltins.has("spawn_subagent") || subagents.length > 0) {
+    args.toolTable.addTool(
+      new SpawnSubagentTool(
+        new SubagentRegistry(subagents, args.resolved.manifest.sandbox),
+        { runOptions: args.options.resolve ? { resolve: args.options.resolve } : {} },
+      ),
+    );
+  }
+
+  if (declaredBuiltins.has("search_skills") || declaredBuiltins.has("add_skill")) {
+    const deps: SkillDiscoveryDeps = {
+      state: args.state,
+      providers: args.allProviders,
+      builtinsDir: args.resolveOptions.builtinsDir ?? findBuiltinsDir(import.meta.url),
+      requestPermission: async (req) =>
+        args.permissionHolder.current
+          ? args.permissionHolder.current(req)
+          : { decision: "deny" },
+      agentName: args.resolved.manifest.agent.name,
+      pathAdditions: args.resolved.pathAdditions,
+      ...(args.options.toolTimeoutMs ? { toolTimeoutMs: args.options.toolTimeoutMs } : {}),
+      loadedSecrets: args.secrets,
+    };
+    if (declaredBuiltins.has("search_skills")) args.toolTable.addTool(new SearchSkillsTool(deps));
+    if (declaredBuiltins.has("add_skill")) args.toolTable.addTool(new AddSkillTool(deps));
+  }
+}
+
+export { StaticSecretsStore };

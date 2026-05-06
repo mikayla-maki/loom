@@ -25,7 +25,6 @@ import type {
   HarnessFactory,
   Runtime,
 } from "../../types/interfaces.js";
-import { randomUUID } from "node:crypto";
 
 interface AnthropicConfig {
   model?: string;
@@ -266,5 +265,3 @@ export const anthropicHarnessFactory: HarnessFactory = {
   },
 };
 
-// keep import used to satisfy ts if randomUUID becomes unused later
-void randomUUID;

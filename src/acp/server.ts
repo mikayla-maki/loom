@@ -1,19 +1,17 @@
 /**
- * ACP server — exposes a RunningAgent (or a manifest registry) over a
- * JSON-RPC stream.
+ * ACP server. Two entry points:
  *
- * Two entry points:
+ *   serveOverStdio(agent)  — single-agent stdio loop (pre-booted agent)
+ *   AcpRouter              — multi-agent dispatcher used by the daemon
  *
- *   serveOverStdio(agent)    — single-agent mode, pre-booted RunningAgent.
- *   AcpRouter                — multi-agent mode used by the daemon.
- *
- * The wire format is newline-delimited JSON-RPC 2.0.
+ * Framing is newline-delimited JSON-RPC 2.0. Inbound dispatch is concurrent
+ * because a `session/prompt` may issue an outbound `session/request_permission`
+ * on the same connection and await the reply — serial dispatch deadlocks.
  */
 
-import { Readable, Writable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 
 import type { RunningAgent } from "../sdk/running-agent.js";
-import { runAgent } from "../sdk/run-agent.js";
 
 import { ndjsonStream, type MessageStream } from "./framing.js";
 import {
@@ -28,6 +26,7 @@ import {
   type SessionRequestPermissionParams,
   type SessionRequestPermissionResult,
 } from "./messages.js";
+import { lastAgentMessage } from "../runtime/extract-message.js";
 import type { SessionUpdate } from "../types/acp.js";
 import type {
   PermissionHandler,
@@ -113,14 +112,6 @@ export class AcpRouter {
   }
 
   async run(stream: MessageStream, primarySessionId?: string): Promise<void> {
-    /**
-     * Inbound dispatch is concurrent. Reason: a `session/prompt` may run a
-     * turn that calls `requestPermission`, which sends an outbound JSON-RPC
-     * request to this same connection and awaits the reply. If we awaited
-     * `handleSessionPrompt` inline, the loop wouldn't read the reply and
-     * we'd deadlock. So each request is dispatched in its own task and the
-     * loop keeps draining.
-     */
     const inflight = new Set<Promise<void>>();
     for await (const raw of stream.messages()) {
       if (typeof raw !== "object" || raw === null) continue;
@@ -213,13 +204,7 @@ export class AcpRouter {
     const agent = this.sessions.get(sid);
     if (!agent) throw new Error(`unknown sessionId: ${sid}`);
     const stopReason = await agent.prompt(params.prompt);
-    const events = await agent.session.getEvents();
-    const last = [...events]
-      .reverse()
-      .find((e) => e.sessionUpdate === "agent_message_chunk");
-    const finalMessage =
-      last && last.content && last.content.type === "text" ? last.content.text : "";
-    return { stopReason, finalMessage };
+    return { stopReason, finalMessage: await lastAgentMessage(agent.session) };
   }
 
   private async handleSessionCancel(params: SessionCancelParams): Promise<void> {

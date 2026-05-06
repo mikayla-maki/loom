@@ -1,10 +1,6 @@
 /**
- * Manifest parsing — agent.toml, tool.toml, SKILL.md.
- *
- * Each parser does TOML / frontmatter parsing + minimal validation. It DOES
- * NOT do dependency resolution or capability checking; that's the resolver's
- * job. Paths inside the manifest stay as strings; the resolver decides
- * whether they resolve as local paths, registry names, or inline content.
+ * Parsers for `agent.toml`, `tool.toml`, and `SKILL.md`. Validation only
+ * — dependency walking and capability checks live in the resolver.
  */
 
 import * as fs from "node:fs/promises";
@@ -21,30 +17,16 @@ import type {
   ToolManifest,
 } from "../types/manifest.js";
 
-// ────────────────────────────────────────────────────────────────────────────
-// agent.toml
-// ────────────────────────────────────────────────────────────────────────────
+// ─── agent.toml ────────────────────────────────────────────────────────────
 
 export async function parseAgentManifest(manifestPath: string): Promise<AgentManifest> {
   const abs = path.resolve(manifestPath);
-  const text = await readFileOrThrow(abs, "agent.toml");
-  let raw: Record<string, unknown>;
-  try {
-    raw = TOML.parse(text) as Record<string, unknown>;
-  } catch (e) {
-    throw new ManifestError(`Failed to parse agent.toml at ${abs}: ${(e as Error).message}`, {
-      cause: e,
-    });
-  }
+  const raw = await readToml(abs, "agent.toml");
 
   const agent = ensureObject(raw.agent, "[agent]", abs);
   if (typeof agent.name !== "string" || !agent.name) {
     throw new ManifestError(`agent.toml at ${abs} is missing required [agent].name`);
   }
-
-  // [agent].system_prompt — single field, accepts either a path-like value
-  // or a literal string. The two-field `identity` / `identity_inline` shape
-  // was retired in favour of this one.
   if (agent.identity != null || agent.identity_inline != null) {
     throw new ManifestError(
       `agent.toml at ${abs}: [agent].identity / [agent].identity_inline have been replaced by [agent].system_prompt (path or inline string)`,
@@ -55,10 +37,7 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
       `agent.toml at ${abs}: [agent].system_prompt must be a string (got ${typeof agent.system_prompt})`,
     );
   }
-  if (
-    agent.remove_builtin_tools != null &&
-    typeof agent.remove_builtin_tools !== "boolean"
-  ) {
+  if (agent.remove_builtin_tools != null && typeof agent.remove_builtin_tools !== "boolean") {
     throw new ManifestError(
       `agent.toml at ${abs}: [agent].remove_builtin_tools must be a boolean (got ${typeof agent.remove_builtin_tools})`,
     );
@@ -68,68 +47,17 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
   if (typeof harness.provider !== "string" || !harness.provider) {
     throw new ManifestError(`agent.toml at ${abs} is missing required [harness].provider`);
   }
-
   const session = ensureObject(raw.session, "[session]", abs);
   if (typeof session.provider !== "string" || !session.provider) {
     throw new ManifestError(`agent.toml at ${abs} is missing required [session].provider`);
   }
 
   const sandbox = parseCapabilities(raw.sandbox, "[sandbox]", abs);
+  const skills = parseStringValueTable(raw.skills, "[skills]", abs);
+  const providers = parseConfigTable(raw.providers, "[providers]", abs);
+  const extensions = parseConfigTable(raw.extensions, "[extensions]", abs);
 
-  const skillsRaw = raw.skills ?? {};
-  if (typeof skillsRaw !== "object" || Array.isArray(skillsRaw)) {
-    throw new ManifestError(`agent.toml at ${abs}: [skills] must be a table`);
-  }
-  const skills: Record<string, string> = {};
-  for (const [k, v] of Object.entries(skillsRaw as Record<string, unknown>)) {
-    if (typeof v !== "string") {
-      throw new ManifestError(
-        `agent.toml at ${abs}: [skills].${k} must be a string (path or name), got ${typeof v}`,
-      );
-    }
-    skills[k] = v;
-  }
-
-  // [providers] — pluggable resolvers (e.g. mcp). Each entry is keyed by the
-  // extension's bare-name; value is an arbitrary config table.
-  const providersRaw = raw.providers ?? {};
-  if (typeof providersRaw !== "object" || Array.isArray(providersRaw)) {
-    throw new ManifestError(`agent.toml at ${abs}: [providers] must be a table`);
-  }
-  const providers: Record<string, Record<string, unknown>> = {};
-  for (const [k, v] of Object.entries(providersRaw as Record<string, unknown>)) {
-    if (v === null || v === undefined) {
-      providers[k] = {};
-    } else if (typeof v !== "object" || Array.isArray(v)) {
-      throw new ManifestError(
-        `agent.toml at ${abs}: [providers].${k} must be a table, got ${typeof v}`,
-      );
-    } else {
-      providers[k] = v as Record<string, unknown>;
-    }
-  }
-
-  // [extensions] — npm packages to dynamic-import at boot. Keys are package
-  // names (which may be scoped). Values are arbitrary config tables passed
-  // to the package's register() function.
-  const extensionsRaw = raw.extensions ?? {};
-  if (typeof extensionsRaw !== "object" || Array.isArray(extensionsRaw)) {
-    throw new ManifestError(`agent.toml at ${abs}: [extensions] must be a table`);
-  }
-  const extensions: Record<string, Record<string, unknown>> = {};
-  for (const [k, v] of Object.entries(extensionsRaw as Record<string, unknown>)) {
-    if (v === null || v === undefined) {
-      extensions[k] = {};
-    } else if (typeof v !== "object" || Array.isArray(v)) {
-      throw new ManifestError(
-        `agent.toml at ${abs}: [extensions]."${k}" must be a table, got ${typeof v}`,
-      );
-    } else {
-      extensions[k] = v as Record<string, unknown>;
-    }
-  }
-
-  const manifest: AgentManifest = {
+  return {
     manifestPath: abs,
     agent: {
       name: agent.name,
@@ -148,25 +76,14 @@ export async function parseAgentManifest(manifestPath: string): Promise<AgentMan
     providers,
     extensions,
   };
-  return manifest;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// tool.toml
-// ────────────────────────────────────────────────────────────────────────────
+// ─── tool.toml ─────────────────────────────────────────────────────────────
 
 export async function parseToolManifest(toolDir: string): Promise<ToolManifest> {
   const dir = path.resolve(toolDir);
   const manifestPath = path.join(dir, "tool.toml");
-  const text = await readFileOrThrow(manifestPath, "tool.toml");
-  let raw: Record<string, unknown>;
-  try {
-    raw = TOML.parse(text) as Record<string, unknown>;
-  } catch (e) {
-    throw new ManifestError(`Failed to parse tool.toml at ${manifestPath}: ${(e as Error).message}`, {
-      cause: e,
-    });
-  }
+  const raw = await readToml(manifestPath, "tool.toml");
 
   const tool = ensureObject(raw.tool, "[tool]", manifestPath);
   if (typeof tool.name !== "string" || !tool.name) {
@@ -183,32 +100,27 @@ export async function parseToolManifest(toolDir: string): Promise<ToolManifest> 
       `tool.toml at ${manifestPath} missing required [tool.invocation].command`,
     );
   }
-  const args = invocation.args;
-  const parsedArgs: string[] = [];
-  if (args !== undefined) {
-    if (!Array.isArray(args) || !args.every((a) => typeof a === "string")) {
+  let args: string[] = [];
+  if (invocation.args !== undefined) {
+    if (!Array.isArray(invocation.args) || !invocation.args.every((a) => typeof a === "string")) {
       throw new ManifestError(
         `tool.toml at ${manifestPath}: [tool.invocation].args must be an array of strings`,
       );
     }
-    parsedArgs.push(...(args as string[]));
+    args = invocation.args as string[];
   }
 
-  // Secrets — required + optional arrays.
   const secretsRaw = (tool.secrets ?? {}) as Record<string, unknown>;
   const required = parseStringArray(secretsRaw.required, "[tool.secrets].required", manifestPath, true);
   const optional = parseStringArray(secretsRaw.optional, "[tool.secrets].optional", manifestPath, true);
-
   const capabilities = parseCapabilities(tool.capabilities, "[tool.capabilities]", manifestPath);
 
-  // Determine whether the tool ships its own bin/ directory.
   const binDir = path.join(dir, "bin");
   let shipsBinary = false;
   try {
-    const stat = await fs.stat(binDir);
-    shipsBinary = stat.isDirectory();
+    shipsBinary = (await fs.stat(binDir)).isDirectory();
   } catch {
-    shipsBinary = false;
+    /* no bin/ */
   }
 
   return {
@@ -218,7 +130,7 @@ export async function parseToolManifest(toolDir: string): Promise<ToolManifest> 
       name: tool.name,
       description: tool.description,
       schema: schema as ToolManifest["tool"]["schema"],
-      invocation: { command: invocation.command, args: parsedArgs },
+      invocation: { command: invocation.command, args },
       secrets: { required, optional },
       capabilities,
     },
@@ -227,9 +139,7 @@ export async function parseToolManifest(toolDir: string): Promise<ToolManifest> 
   };
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// SKILL.md
-// ────────────────────────────────────────────────────────────────────────────
+// ─── SKILL.md ──────────────────────────────────────────────────────────────
 
 export async function parseSkillManifest(skillDir: string): Promise<SkillManifest> {
   const dir = path.resolve(skillDir);
@@ -247,15 +157,14 @@ export async function parseSkillManifest(skillDir: string): Promise<SkillManifes
     throw new ManifestError(`SKILL.md at ${manifestPath} missing required frontmatter 'description'`);
   }
 
-  const requiresRaw = data.requires;
   const requires: Record<string, string> = {};
-  if (requiresRaw !== undefined && requiresRaw !== null) {
-    if (typeof requiresRaw !== "object" || Array.isArray(requiresRaw)) {
+  if (data.requires != null) {
+    if (typeof data.requires !== "object" || Array.isArray(data.requires)) {
       throw new ManifestError(
         `SKILL.md at ${manifestPath}: 'requires' must be a mapping of tool name → path`,
       );
     }
-    for (const [k, v] of Object.entries(requiresRaw as Record<string, unknown>)) {
+    for (const [k, v] of Object.entries(data.requires as Record<string, unknown>)) {
       if (typeof v !== "string") {
         throw new ManifestError(
           `SKILL.md at ${manifestPath}: requires.${k} must be a string, got ${typeof v}`,
@@ -265,12 +174,11 @@ export async function parseSkillManifest(skillDir: string): Promise<SkillManifes
     }
   }
 
-  // Optional v1: subagents declared inline (mapping) or by file path (string).
   let subagents: Record<string, SubagentReference> | undefined;
-  if (data.subagents !== undefined && data.subagents !== null) {
+  if (data.subagents != null) {
     if (typeof data.subagents === "string") {
-      // Path to a subagents.toml file — resolved by the resolver, not here.
-      // We tag it as a path reference under the synthetic name "__file__".
+      // The string form means "load a separate subagents.toml at this
+      // path"; the resolver handles it under the synthetic '__file__' key.
       subagents = { __file__: { kind: "path", path: data.subagents } };
     } else if (typeof data.subagents === "object" && !Array.isArray(data.subagents)) {
       subagents = {};
@@ -295,20 +203,11 @@ export async function parseSkillManifest(skillDir: string): Promise<SkillManifes
   };
 }
 
-/** Parse a standalone `subagents.toml` file, used when SKILL.md `subagents` is a path. */
 export async function parseSubagentsFile(
   filePath: string,
 ): Promise<Record<string, SubagentReference>> {
   const abs = path.resolve(filePath);
-  const text = await readFileOrThrow(abs, "subagents.toml");
-  let raw: Record<string, unknown>;
-  try {
-    raw = TOML.parse(text) as Record<string, unknown>;
-  } catch (e) {
-    throw new ManifestError(`Failed to parse subagents.toml at ${abs}: ${(e as Error).message}`, {
-      cause: e,
-    });
-  }
+  const raw = await readToml(abs, "subagents.toml");
   const out: Record<string, SubagentReference> = {};
   for (const [k, v] of Object.entries(raw)) {
     out[k] = parseSubagentEntry(v, k, abs);
@@ -336,8 +235,8 @@ function parseSubagentEntry(
     if (typeof obj.name === "string") return { kind: "registry", name: obj.name };
     if (typeof obj.acp === "string") return { kind: "acp", url: obj.acp };
     if (typeof obj.inline === "string") {
-      // inline literal manifest (unparsed) — resolver handles parsing.
-      // We stash it as a synthetic path-with-content; resolver will inspect.
+      // Stash inline literal under an 'inline:' path tag; the resolver
+      // currently rejects it as not-yet-implemented.
       return { kind: "path", path: `inline:${obj.inline}` };
     }
   }
@@ -346,14 +245,31 @@ function parseSubagentEntry(
   );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// helpers
-// ────────────────────────────────────────────────────────────────────────────
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+async function readToml(abs: string, kind: string): Promise<Record<string, unknown>> {
+  const text = await readFileOrThrow(abs, kind);
+  try {
+    return TOML.parse(text) as Record<string, unknown>;
+  } catch (e) {
+    throw new ManifestError(`Failed to parse ${kind} at ${abs}: ${(e as Error).message}`, {
+      cause: e,
+    });
+  }
+}
+
+async function readFileOrThrow(filePath: string, kind: string): Promise<string> {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch (e) {
+    throw new ManifestError(`Cannot read ${kind} at ${filePath}: ${(e as Error).message}`, {
+      cause: e,
+    });
+  }
+}
 
 function ensureObject(v: unknown, label: string, where: string): Record<string, unknown> {
-  if (v === undefined || v === null) {
-    return {};
-  }
+  if (v == null) return {};
   if (typeof v !== "object" || Array.isArray(v)) {
     throw new ManifestError(`${where}: ${label} must be a table`);
   }
@@ -366,7 +282,7 @@ function parseStringArray(
   where: string,
   allowMissing = false,
 ): string[] {
-  if (v === undefined || v === null) {
+  if (v == null) {
     if (allowMissing) return [];
     throw new ManifestError(`${where}: ${label} is required`);
   }
@@ -376,12 +292,41 @@ function parseStringArray(
   return v as string[];
 }
 
-function parseCapabilities(v: unknown, label: string, where: string): Capabilities {
-  if (v === undefined || v === null) return {};
-  if (typeof v !== "object" || Array.isArray(v)) {
-    throw new ManifestError(`${where}: ${label} must be a table`);
+/** Tables of `name = "string"` (used for [skills]). */
+function parseStringValueTable(v: unknown, label: string, where: string): Record<string, string> {
+  const obj = ensureObject(v, label, where);
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(obj)) {
+    if (typeof val !== "string") {
+      throw new ManifestError(`${where}: ${label}.${k} must be a string, got ${typeof val}`);
+    }
+    out[k] = val;
   }
-  const obj = v as Record<string, unknown>;
+  return out;
+}
+
+/** Tables of `name = { ...config }` (used for [providers] and [extensions]). */
+function parseConfigTable(
+  v: unknown,
+  label: string,
+  where: string,
+): Record<string, Record<string, unknown>> {
+  const obj = ensureObject(v, label, where);
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const [k, val] of Object.entries(obj)) {
+    if (val == null) {
+      out[k] = {};
+    } else if (typeof val !== "object" || Array.isArray(val)) {
+      throw new ManifestError(`${where}: ${label}."${k}" must be a table, got ${typeof val}`);
+    } else {
+      out[k] = val as Record<string, unknown>;
+    }
+  }
+  return out;
+}
+
+function parseCapabilities(v: unknown, label: string, where: string): Capabilities {
+  const obj = ensureObject(v, label, where);
   const out: Capabilities = {};
   if (obj.filesystem !== undefined) {
     out.filesystem = parseStringArray(obj.filesystem, `${label}.filesystem`, where);
@@ -393,21 +338,10 @@ function parseCapabilities(v: unknown, label: string, where: string): Capabiliti
     out.secrets = parseStringArray(obj.secrets, `${label}.secrets`, where);
   }
   if (obj.subagent !== undefined) {
-    if (obj.subagent === "*") {
-      out.subagent = "*";
-    } else {
-      out.subagent = parseStringArray(obj.subagent, `${label}.subagent`, where);
-    }
+    out.subagent =
+      obj.subagent === "*"
+        ? "*"
+        : parseStringArray(obj.subagent, `${label}.subagent`, where);
   }
   return out;
-}
-
-async function readFileOrThrow(filePath: string, kind: string): Promise<string> {
-  try {
-    return await fs.readFile(filePath, "utf8");
-  } catch (e) {
-    throw new ManifestError(`Cannot read ${kind} at ${filePath}: ${(e as Error).message}`, {
-      cause: e,
-    });
-  }
 }

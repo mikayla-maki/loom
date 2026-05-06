@@ -22,6 +22,7 @@ import { runAgent, type RunAgentOptions } from "../sdk/run-agent.js";
 import type { ResolvedSubagent } from "../manifest/resolver.js";
 import type { Capabilities } from "../types/manifest.js";
 import type { Tool, ToolResult } from "../types/interfaces.js";
+import { lastAgentMessage } from "./extract-message.js";
 
 export interface SubagentRegistryEntry {
   /** The resolved subagent reference. */
@@ -154,11 +155,7 @@ export class SpawnSubagentTool implements Tool {
     const sub = await runAgent(manifestPath, this.options.runOptions ?? {});
     try {
       await sub.prompt(prompt);
-      const events = await sub.session.getEvents();
-      const last = [...events]
-        .reverse()
-        .find((e) => e.sessionUpdate === "agent_message_chunk");
-      return last && last.content && last.content.type === "text" ? last.content.text : "";
+      return await lastAgentMessage(sub.session);
     } finally {
       await sub.close();
     }

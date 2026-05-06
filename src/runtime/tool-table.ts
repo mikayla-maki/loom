@@ -1,15 +1,11 @@
 /**
- * Tool table — the runtime-side registry of tools available to the harness,
- * plus the executor that turns a `ToolCall` into a process invocation.
+ * Tool table + ProcessTool — invoke tools as child processes.
  *
- * Process model (v0):
- *   - input  → JSON on stdin
- *   - output → string on stdout (last process exit code 0)
- *   - error  → string on stderr (exit code != 0 → ToolExecutionError)
- *   - secrets → env vars (uppercased + GLASS_-prefixed; never visible to model)
- *
- * Capability declarations are the input to v1 OS-level enforcement; in v0
- * we already validate them at boot time in the resolver.
+ * Wire format:
+ *   stdin  = JSON-encoded input
+ *   stdout = string result (utf-8) on exit code 0
+ *   stderr = error string when exit != 0
+ *   env    = system whitelist + tool-declared secrets only
  */
 
 import { spawn } from "node:child_process";
@@ -20,22 +16,39 @@ import Ajv from "ajv";
 import { ToolExecutionError, ToolInputError } from "../errors.js";
 import type { Tool, ToolCall, ToolDescriptor, ToolResult } from "../types/interfaces.js";
 import type { ToolManifest } from "../types/manifest.js";
-import type { SecretsStore } from "./secrets.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false, useDefaults: true });
 
+/**
+ * Env vars passed through to every tool subprocess. The parent's env
+ * frequently holds unrelated credentials we don't want tools to see, so
+ * we pass through ONLY this whitelist (plus tool-declared secrets).
+ */
+const SYSTEM_ENV_WHITELIST = [
+  "HOME",
+  "USER",
+  "LANG",
+  "LC_ALL",
+  "TZ",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "NODE_OPTIONS",
+  "NODE_ENV",
+  "NODE_PATH",
+  "PWD",
+] as const;
+
 export interface ProcessToolOptions {
-  /** Extra env vars merged into every tool process. */
+  /** Extra env vars merged on top (useful for tests). */
   env?: Record<string, string>;
-  /** Working directory for tool processes. Defaults to the tool's directory. */
   cwd?: string;
-  /** PATH additions (each tool's bin/ if shipsBinary). */
+  /** Prepended to PATH — usually each tool's own bin/ if shipsBinary. */
   extraPath?: string[];
-  /** Per-tool execution timeout in ms (0 = no timeout). */
+  /** 0 = no timeout. */
   timeoutMs?: number;
 }
 
-/** A Tool implementation backed by a child-process invocation. */
 export class ProcessTool implements Tool {
   public readonly name: string;
   public readonly description: string;
@@ -71,59 +84,43 @@ export class ProcessTool implements Tool {
     const cwd = this.options.cwd ?? this.manifest.toolDir;
     const command = this.manifest.tool.invocation.command;
     const args = this.manifest.tool.invocation.args ?? [];
+    const timeout = this.options.timeoutMs ?? 0;
 
     return new Promise<ToolResult>((resolve, reject) => {
-      const child = spawn(command, args, {
-        env,
-        cwd,
-        stdio: ["pipe", "pipe", "pipe"],
-        shell: false,
-      });
-
+      const child = spawn(command, args, { env, cwd, stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
       let timedOut = false;
-      let timer: NodeJS.Timeout | null = null;
-      const timeout = this.options.timeoutMs ?? 0;
-      if (timeout > 0) {
-        timer = setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGKILL");
-        }, timeout);
-      }
+      const timer = timeout > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            child.kill("SIGKILL");
+          }, timeout)
+        : null;
 
       child.stdout.on("data", (b: Buffer) => (stdout += b.toString("utf8")));
       child.stderr.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
       child.on("error", (err) => {
         if (timer) clearTimeout(timer);
-        reject(
-          new ToolExecutionError(
-            `Tool '${this.name}' failed to spawn: ${err.message}`,
-            this.name,
-            null,
-            stderr,
-          ),
-        );
+        reject(new ToolExecutionError(
+          `Tool '${this.name}' failed to spawn: ${err.message}`,
+          this.name, null, stderr,
+        ));
       });
       child.on("close", (code) => {
         if (timer) clearTimeout(timer);
         if (timedOut) {
-          reject(
-            new ToolExecutionError(
-              `Tool '${this.name}' timed out after ${timeout}ms`,
-              this.name,
-              null,
-              stderr,
-            ),
-          );
+          reject(new ToolExecutionError(
+            `Tool '${this.name}' timed out after ${timeout}ms`,
+            this.name, null, stderr,
+          ));
           return;
         }
         if (code === 0) {
           resolve({ content: stdout.trimEnd() });
         } else {
-          // Non-zero: surface stderr + stdout into the tool result rather than
-          // throwing, so the model can see what went wrong and adapt. The
-          // harness can decide whether to keep going.
+          // Surface failure into the tool result instead of throwing — the
+          // model needs to see what went wrong to adapt.
           resolve({
             content: stderr || stdout || `tool '${this.name}' exited with code ${code}`,
             isError: true,
@@ -136,45 +133,15 @@ export class ProcessTool implements Tool {
   }
 
   private buildEnv(secrets: Record<string, string>): NodeJS.ProcessEnv {
-    /**
-     * Tool env model:
-     *  - Start from a small system whitelist (PATH, locale, HOME, NODE_*).
-     *  - Add ONLY the secrets this tool declared (under the original name +
-     *    upper-snake alias).
-     *  - Optional explicit env from ProcessToolOptions.env wins over the above.
-     *
-     * Why: parent process env can contain unrelated API keys / credentials
-     * we never want a tool to see (this is the v0 take on "every scope is
-     * sandboxed by default; tools are the only mechanism that grants
-     * capability"). v1 OS-level enforcement layers atop this; v0's defense
-     * is at the env boundary.
-     */
-    const SYSTEM_WHITELIST = [
-      "HOME",
-      "USER",
-      "LANG",
-      "LC_ALL",
-      "TZ",
-      "TMPDIR",
-      "TEMP",
-      "TMP",
-      "NODE_OPTIONS",
-      "NODE_ENV",
-      "NODE_PATH",
-      "PWD",
-    ];
     const base: NodeJS.ProcessEnv = {};
-    for (const key of SYSTEM_WHITELIST) {
+    for (const key of SYSTEM_ENV_WHITELIST) {
       const v = process.env[key];
       if (typeof v === "string") base[key] = v;
     }
-    // PATH (whitelisted + extensions)
-    const extra = this.options.extraPath ?? [];
-    base.PATH = [...extra, process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"]
+    base.PATH = [...(this.options.extraPath ?? []), process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"]
       .filter(Boolean)
       .join(path.delimiter);
 
-    // Declared secrets only.
     const requested = new Set([
       ...this.manifest.tool.secrets.required,
       ...(this.manifest.tool.secrets.optional ?? []),
@@ -185,39 +152,32 @@ export class ProcessTool implements Tool {
       base[name.replace(/[.\-]/g, "_").toUpperCase()] = value;
     }
 
-    // Special: the builtin `secrets.get` tool exposes all loaded agent secrets
-    // as a JSON-encoded env var so the model can request them by name. This
-    // is gated by the tool's name (only set for the builtin; users can't
-    // recreate it under a different name). The agent's [sandbox].secrets
-    // ceiling already bounded what's loaded.
+    // The builtin `secrets.get` is the one tool that may read any loaded
+    // secret on the model's behalf. Gated by tool-name match — users can't
+    // recreate it under a different name. The agent's [sandbox].secrets
+    // already bounds what's loaded.
     if (this.manifest.tool.name === "secrets.get") {
       base.GLASS_SECRETS_JSON = JSON.stringify(secrets);
     }
 
-    // Caller overrides last — useful for tests.
-    if (this.options.env) {
-      Object.assign(base, this.options.env);
-    }
-
+    if (this.options.env) Object.assign(base, this.options.env);
     base.GLASS_TOOL_NAME = this.name;
     return base;
   }
 }
 
-/** Holds a name→Tool map and an executor. Mutable: tools can be added. */
+/** Mutable name→Tool registry; the runtime executes through this. */
 export class ToolTable {
   private readonly byName = new Map<string, Tool>();
   private secrets: Record<string, string>;
 
   constructor(tools: Tool[], secrets: Record<string, string>) {
     this.secrets = secrets;
-    for (const t of tools) {
-      this.byName.set(t.name, t);
-    }
+    for (const t of tools) this.byName.set(t.name, t);
   }
 
   list(): ToolDescriptor[] {
-    return Array.from(this.byName.values()).map((t) => ({
+    return [...this.byName.values()].map((t) => ({
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema,
@@ -228,20 +188,13 @@ export class ToolTable {
     return this.byName.has(name);
   }
 
-  /**
-   * Add a tool to the table. Returns true if the tool was added; false if a
-   * tool with the same name already existed (in which case no replacement
-   * happens — duplicate adds are silently ignored to keep capability state
-   * audit-able).
-   */
+  /** Returns false if a tool by this name already exists (no replacement). */
   addTool(tool: Tool): boolean {
     if (this.byName.has(tool.name)) return false;
     this.byName.set(tool.name, tool);
     return true;
   }
 
-  /** Merge additional secrets into the in-memory store (used when add_skill
-   *  brings a tool that needs a secret already in the agent's ceiling). */
   addSecrets(extra: Record<string, string>): void {
     this.secrets = { ...this.secrets, ...extra };
   }
@@ -250,17 +203,14 @@ export class ToolTable {
     const t = this.byName.get(call.name);
     if (!t) {
       return {
-        content: `Unknown tool: ${call.name}. Available: ${Array.from(this.byName.keys()).join(", ")}`,
+        content: `Unknown tool: ${call.name}. Available: ${[...this.byName.keys()].join(", ")}`,
         isError: true,
       };
     }
     try {
       return await t.execute(call.input, this.secrets);
     } catch (e) {
-      if (e instanceof ToolInputError) {
-        return { content: (e as Error).message, isError: true };
-      }
-      if (e instanceof ToolExecutionError) {
+      if (e instanceof ToolInputError || e instanceof ToolExecutionError) {
         return { content: (e as Error).message, isError: true };
       }
       throw e;

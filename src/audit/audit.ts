@@ -1,57 +1,34 @@
 /**
- * Capability audit — walks an agent.toml plus all reachable subagents
- * (skill.subagents → recursively) and produces a tree of declared
- * capabilities. The tree is statically computable: no LLM is ever invoked.
- *
- * Use cases:
- *   - CI on agent definitions ("does this manifest exceed allowed scope?")
- *   - User-facing UI before running an agent ("here's what it can do")
- *   - Sanity-check at boot time
+ * Static capability audit — walks an agent.toml + every reachable subagent
+ * to compute the total declared capability surface. No LLM is ever invoked.
  */
 
 import * as path from "node:path";
 
-import { resolveAgent, type ResolvedAgent, type ResolveOptions } from "../manifest/resolver.js";
+import { resolveAgent, type ResolveOptions } from "../manifest/resolver.js";
 import { unionCapabilities } from "../manifest/capabilities.js";
 import type { Capabilities } from "../types/manifest.js";
 
 export interface CapabilityTree {
-  /** Path of the agent.toml. */
   manifestPath: string;
-  /** Agent name. */
   name: string;
-  /** Manifest [sandbox] ceiling. */
   ceiling: Capabilities;
-  /** Union of tool-required capabilities (not yet including subagents). */
   required: Capabilities;
-  /** Each tool's name + capabilities. */
-  tools: Array<{
-    name: string;
-    capabilities: Capabilities;
-    introducedBy: string;
-  }>;
-  /** Subagents reachable from this manifest, by skill+ref-name. */
+  tools: Array<{ name: string; capabilities: Capabilities; introducedBy: string }>;
   subagents: Array<{
     skill: string;
     name: string;
     kind: "path" | "registry" | "inline" | "acp";
-    /** For path/registry: a resolved CapabilityTree. */
     tree?: CapabilityTree;
-    /** For acp/inline-not-supported: a brief note. */
     note?: string;
   }>;
 }
 
-/**
- * Walk an agent.toml, returning a CapabilityTree. Cycles are guarded by a
- * visited set keyed by absolute manifest path.
- */
 export async function auditAgent(
   manifestPath: string,
   options: ResolveOptions = {},
 ): Promise<CapabilityTree> {
-  const visited = new Set<string>();
-  return await auditOne(path.resolve(manifestPath), options, visited);
+  return await auditOne(path.resolve(manifestPath), options, new Set());
 }
 
 async function auditOne(
@@ -60,18 +37,11 @@ async function auditOne(
   visited: Set<string>,
 ): Promise<CapabilityTree> {
   if (visited.has(manifestPath)) {
-    return {
-      manifestPath,
-      name: "(cycle)",
-      ceiling: {},
-      required: {},
-      tools: [],
-      subagents: [],
-    };
+    return { manifestPath, name: "(cycle)", ceiling: {}, required: {}, tools: [], subagents: [] };
   }
   visited.add(manifestPath);
 
-  const resolved: ResolvedAgent = await resolveAgent(manifestPath, options);
+  const resolved = await resolveAgent(manifestPath, options);
   const tools = resolved.tools.map((t) => ({
     name: t.manifest.tool.name,
     capabilities: t.manifest.tool.capabilities,
@@ -82,37 +52,19 @@ async function auditOne(
   const subagents: CapabilityTree["subagents"] = [];
   for (const skill of resolved.skills) {
     for (const [name, ref] of Object.entries(skill.subagents)) {
+      const skillName = skill.manifest.name;
       switch (ref.kind) {
-        case "path": {
-          const tree = await auditOne(ref.path, options, visited);
-          subagents.push({ skill: skill.manifest.name, name, kind: "path", tree });
+        case "path":
+          subagents.push({ skill: skillName, name, kind: "path", tree: await auditOne(ref.path, options, visited) });
           break;
-        }
-        case "registry": {
-          const tree = await auditOne(ref.resolvedPath, options, visited);
-          subagents.push({
-            skill: skill.manifest.name,
-            name,
-            kind: "registry",
-            tree,
-          });
+        case "registry":
+          subagents.push({ skill: skillName, name, kind: "registry", tree: await auditOne(ref.resolvedPath, options, visited) });
           break;
-        }
         case "inline":
-          subagents.push({
-            skill: skill.manifest.name,
-            name,
-            kind: "inline",
-            note: "inline manifest (audit support pending)",
-          });
+          subagents.push({ skill: skillName, name, kind: "inline", note: "inline manifest (audit support pending)" });
           break;
         case "acp":
-          subagents.push({
-            skill: skill.manifest.name,
-            name,
-            kind: "acp",
-            note: `remote: ${ref.url}`,
-          });
+          subagents.push({ skill: skillName, name, kind: "acp", note: `remote: ${ref.url}` });
           break;
       }
     }

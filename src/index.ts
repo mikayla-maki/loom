@@ -52,5 +52,17 @@ export type {
   LoadOptions as ExtensionLoadOptions,
 } from "./extensions/loader.js";
 
-export { auditAgent } from "./audit/audit.js";
+export { auditAgent, formatCapabilityTree } from "./audit/audit.js";
 export type { CapabilityTree } from "./audit/audit.js";
+
+export { LocalRegistry } from "./registry/registry.js";
+export type { RegistryOptions } from "./registry/registry.js";
+
+export {
+  EnvSecretsStore,
+  FileSecretsStore,
+  StaticSecretsStore,
+  ChainedSecretsStore,
+  resolveSecrets,
+} from "./runtime/secrets.js";
+export type { SecretsStore } from "./runtime/secrets.js";
