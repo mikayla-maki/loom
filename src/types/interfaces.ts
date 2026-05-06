@@ -109,6 +109,16 @@ export interface Runtime {
 
   /** AbortSignal for the current turn — flips when the client cancels. */
   readonly abortSignal: AbortSignal;
+
+  /**
+   * Request a capability decision from the SDK consumer. Returns the
+   * handler's reply, or `{ decision: "deny" }` if no handler is registered.
+   * Builtin tools that want to expand the agent's scope (e.g. `add_skill`)
+   * route their consent flow through this method.
+   */
+  requestPermission(
+    req: import("./permissions.js").PermissionRequest,
+  ): Promise<import("./permissions.js").PermissionResult>;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

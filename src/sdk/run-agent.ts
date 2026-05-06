@@ -18,7 +18,11 @@ import {
 import { resolveAgent, type ResolveOptions, type ResolvedAgent } from "../manifest/resolver.js";
 import { parseAgentManifest } from "../manifest/parser.js";
 import { LocalRegistry } from "../registry/registry.js";
+import { AgentState } from "../runtime/agent-state.js";
+import { AddSkillTool, SearchSkillsTool, type SkillDiscoveryDeps } from "../runtime/skill-discovery.js";
+import { fileURLToPath } from "node:url";
 import type { Provider } from "../types/interfaces.js";
+import type { PermissionHandler } from "../types/permissions.js";
 import { RuntimeImpl } from "../runtime/runtime.js";
 import { ProcessTool, ToolTable } from "../runtime/tool-table.js";
 import { SpawnSubagentTool, SubagentRegistry } from "../runtime/subagent.js";
@@ -58,6 +62,13 @@ export interface RunAgentOptions {
    * [providers] table declares. Useful for tests and embedding.
    */
   providers?: Provider[];
+  /**
+   * Capability-expansion + tool-consent handler. Runtime-mediated operations
+   * (most importantly the `add_skill` builtin) call this before granting
+   * the agent capabilities outside its declared `[sandbox]`. When omitted,
+   * such requests fail closed.
+   */
+  permissionHandler?: PermissionHandler;
   /** For testing: deterministic 'now' used in system-prompt assembly. */
   now?: () => Date;
   /** Per-tool execution timeout in ms (passed through to ProcessTool). */
@@ -140,24 +151,6 @@ export async function runAgent(
     resolved.manifest.sandbox,
   );
 
-  // Tools — provider-supplied tools win over ProcessTool construction; for
-  // any tool without a pre-built impl, fall back to spawning a subprocess.
-  const processTools: Tool[] = resolved.tools
-    .filter((rt) => rt.manifest.tool.name !== "spawn_subagent")
-    .map((rt) => {
-      if (rt.tool) return rt.tool;
-      return new ProcessTool(rt.manifest, {
-        extraPath: resolved.pathAdditions,
-        ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
-      });
-    });
-  const tools: Tool[] = [...processTools];
-  const hasProcessSpawn = resolved.tools.some((rt) => rt.manifest.tool.name === "spawn_subagent");
-  if (hasProcessSpawn || subagentEntries.length > 0) {
-    tools.push(new SpawnSubagentTool(subagentRegistry, { runOptions: options.resolve ? { resolve: options.resolve } : {} }));
-  }
-  const toolTable = new ToolTable(tools, secrets);
-
   // Extensions: factories.
   const ctx: ExtensionContext = {
     manifestDir,
@@ -174,6 +167,7 @@ export async function runAgent(
   };
   delete sessionConfig.provider;
   const session = await sessionFactory.create(sessionConfig, ctx);
+  const sessionSkills = await collectSessionSkills(session);
 
   const harnessFactory = options.harnessOverride
     ? options.harnessOverride.factory
@@ -184,12 +178,66 @@ export async function runAgent(
   delete harnessConfig.provider;
   const harness = await harnessFactory.create(harnessConfig, ctx);
 
-  // Merge skills (manifest + session-contributed).
-  const sessionSkills = await collectSessionSkills(session);
-  const allSkills: SkillManifest[] = [
-    ...resolved.skills.map((s) => s.manifest),
-    ...sessionSkills,
-  ];
+  // Tools — provider-supplied tools win over ProcessTool construction. For
+  // builtins backed by privileged in-process implementations
+  // (spawn_subagent, search_skills, add_skill) we drop the ProcessTool and
+  // attach the in-process variant instead. This keeps `requires: builtin`
+  // working as the user-facing affordance while routing the actual call
+  // through the runtime.
+  const PRIVILEGED_BUILTINS = new Set(["spawn_subagent", "search_skills", "add_skill"]);
+  const processTools: Tool[] = resolved.tools
+    .filter((rt) => !PRIVILEGED_BUILTINS.has(rt.manifest.tool.name))
+    .map((rt) => {
+      if (rt.tool) return rt.tool;
+      return new ProcessTool(rt.manifest, {
+        extraPath: resolved.pathAdditions,
+        ...(options.toolTimeoutMs ? { timeoutMs: options.toolTimeoutMs } : {}),
+      });
+    });
+  const declaredBuiltins = new Set(
+    resolved.tools.map((rt) => rt.manifest.tool.name).filter((n) => PRIVILEGED_BUILTINS.has(n)),
+  );
+  const tools: Tool[] = [...processTools];
+  const toolTable = new ToolTable(tools, secrets);
+
+  // Build AgentState (mutable view onto skills/ceiling/toolTable).
+  const state = new AgentState({
+    skills: [...resolved.skills.map((s) => s.manifest), ...sessionSkills],
+    ceiling: resolved.manifest.sandbox,
+    toolTable,
+  });
+
+  // spawn_subagent (privileged in-process tool).
+  if (declaredBuiltins.has("spawn_subagent") || subagentEntries.length > 0) {
+    toolTable.addTool(
+      new SpawnSubagentTool(subagentRegistry, {
+        runOptions: options.resolve ? { resolve: options.resolve } : {},
+      }),
+    );
+  }
+  // Permission handler holder. The RunningAgentImpl writes through this on
+  // setPermissionHandler() so the in-process add_skill tool always sees the
+  // current handler (e.g. one set after boot by an ACP server).
+  const permissionHolder: { current: PermissionHandler | null } = {
+    current: options.permissionHandler ?? null,
+  };
+
+  // search_skills / add_skill (privileged; gate add through permissionHandler).
+  if (declaredBuiltins.has("search_skills") || declaredBuiltins.has("add_skill")) {
+    const discoveryDeps: SkillDiscoveryDeps = {
+      state,
+      providers: allProviders,
+      builtinsDir: resolveBuiltinsDir(resolveOptions.builtinsDir),
+      requestPermission: async (req) =>
+        permissionHolder.current ? permissionHolder.current(req) : { decision: "deny" },
+      agentName: resolved.manifest.agent.name,
+      pathAdditions: resolved.pathAdditions,
+      ...(options.toolTimeoutMs ? { toolTimeoutMs: options.toolTimeoutMs } : {}),
+      loadedSecrets: secrets,
+    };
+    if (declaredBuiltins.has("search_skills")) toolTable.addTool(new SearchSkillsTool(discoveryDeps));
+    if (declaredBuiltins.has("add_skill")) toolTable.addTool(new AddSkillTool(discoveryDeps));
+  }
 
   const updateSink = new UpdateSink();
 
@@ -198,12 +246,31 @@ export async function runAgent(
     secrets,
     session,
     harness,
-    toolTable,
-    skills: allSkills,
+    state,
     updateSink,
     providers: allProviders,
+    permissionHolder,
     ...(options.now ? { now: options.now } : {}),
   });
+}
+
+function resolveBuiltinsDir(override: string | undefined): string {
+  if (override) return override;
+  // Match resolver.builtinsDir() heuristics — walk up from this module.
+  const here = fileURLToPath(import.meta.url);
+  let dir = path.dirname(here);
+  for (let i = 0; i < 5; i++) {
+    const candidate = path.join(dir, "builtins");
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const sync = require("node:fs") as typeof import("node:fs");
+      if (sync.existsSync(candidate)) return candidate;
+    } catch {
+      // ignore
+    }
+    dir = path.dirname(dir);
+  }
+  return path.join(path.dirname(path.dirname(here)), "builtins");
 }
 
 async function collectSessionSkills(session: Session): Promise<SkillManifest[]> {

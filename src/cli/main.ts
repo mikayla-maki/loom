@@ -16,6 +16,7 @@ import * as readline from "node:readline";
 import { runAgent } from "../sdk/run-agent.js";
 import { TextRenderer } from "./renderer.js";
 import { auditAgent, formatCapabilityTree } from "../audit/audit.js";
+import { ttyPermissionHandler } from "./permissions.js";
 
 async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
@@ -74,7 +75,9 @@ async function cmdRun(args: string[]): Promise<number> {
     console.error("usage: glass run <agent.toml>");
     return 2;
   }
-  const agent = await runAgent(manifestPath);
+  const agent = await runAgent(manifestPath, {
+    permissionHandler: ttyPermissionHandler(),
+  });
   const renderer = new TextRenderer({
     useColors: !opts.flags["no-colors"],
     showThoughts: !!opts.flags["show-thoughts"],
@@ -126,7 +129,9 @@ async function cmdPrompt(args: string[]): Promise<number> {
     console.error("error: no prompt text supplied (pipe via stdin or pass as arg)");
     return 2;
   }
-  const agent = await runAgent(manifestPath);
+  const agent = await runAgent(manifestPath, {
+    permissionHandler: ttyPermissionHandler(),
+  });
   const renderer = new TextRenderer({
     useColors: !opts.flags["no-colors"],
     showThoughts: !!opts.flags["show-thoughts"],

@@ -12,12 +12,12 @@
 
 import type { SessionUpdate, StopReason } from "../types/acp.js";
 import type { Harness, Provider, Runtime, Session } from "../types/interfaces.js";
+import type { PermissionHandler } from "../types/permissions.js";
 
 import { RuntimeImpl } from "../runtime/runtime.js";
-import type { ToolTable } from "../runtime/tool-table.js";
+import type { AgentState } from "../runtime/agent-state.js";
 import type { UpdateSink } from "../runtime/update-sink.js";
 import type { ResolvedAgent } from "../manifest/resolver.js";
-import type { SkillManifest } from "../types/manifest.js";
 
 export interface RunningAgent {
   prompt(text: string): Promise<StopReason>;
@@ -27,6 +27,13 @@ export interface RunningAgent {
   readonly resolved: ResolvedAgent;
   /** Resolved secret values (for diagnostics; never logged). */
   readonly secretNames: string[];
+  /** Mutable runtime state — live tool table, skills list, ceiling. */
+  readonly agentState: AgentState;
+  /**
+   * Attach (or replace) the capability-expansion + tool-consent handler.
+   * The next turn's runtime captures this value. Pass null to clear.
+   */
+  setPermissionHandler(handler: PermissionHandler | null): void;
   close(): Promise<void>;
 }
 
@@ -35,10 +42,16 @@ interface RunningAgentImplOptions {
   secrets: Record<string, string>;
   session: Session;
   harness: Harness;
-  toolTable: ToolTable;
-  skills: SkillManifest[];
+  state: AgentState;
   updateSink: UpdateSink;
   providers?: Provider[];
+  /**
+   * Shared mutable holder for the active permission handler. Both this
+   * RunningAgentImpl and the privileged in-process tools read through the
+   * same reference, so a setPermissionHandler() call after boot is visible
+   * everywhere.
+   */
+  permissionHolder: { current: PermissionHandler | null };
   now?: () => Date;
 }
 
@@ -48,10 +61,10 @@ export class RunningAgentImpl implements RunningAgent {
   public readonly secretNames: string[];
 
   private readonly harness: Harness;
-  private readonly toolTable: ToolTable;
-  private readonly skills: SkillManifest[];
+  private readonly state: AgentState;
   private readonly updateSink: UpdateSink;
   private readonly providers: Provider[];
+  private readonly permissionHolder: { current: PermissionHandler | null };
   private readonly now: (() => Date) | undefined;
 
   private currentAbortCtl: AbortController | null = null;
@@ -62,12 +75,21 @@ export class RunningAgentImpl implements RunningAgent {
     this.resolved = opts.resolved;
     this.session = opts.session;
     this.harness = opts.harness;
-    this.toolTable = opts.toolTable;
-    this.skills = opts.skills;
+    this.state = opts.state;
     this.updateSink = opts.updateSink;
     this.providers = opts.providers ?? [];
+    this.permissionHolder = opts.permissionHolder;
     this.secretNames = Object.keys(opts.secrets);
     this.now = opts.now;
+  }
+
+  /** Live access to the mutable AgentState (skills/ceiling/tool table). */
+  get agentState(): AgentState {
+    return this.state;
+  }
+
+  setPermissionHandler(handler: PermissionHandler | null): void {
+    this.permissionHolder.current = handler ?? null;
   }
 
   async prompt(text: string): Promise<StopReason> {
@@ -87,8 +109,7 @@ export class RunningAgentImpl implements RunningAgent {
     this.currentAbortCtl = ctl;
     const runtime: Runtime = new RuntimeImpl({
       session: this.session,
-      toolTable: this.toolTable,
-      skills: this.skills,
+      state: this.state,
       identity: this.resolved.identity,
       updateSink: this.updateSink,
       agentName: this.resolved.manifest.agent.name,
@@ -96,6 +117,9 @@ export class RunningAgentImpl implements RunningAgent {
         ? { agentDescription: this.resolved.manifest.agent.description }
         : {}),
       abortSignal: ctl.signal,
+      ...(this.permissionHolder.current
+        ? { permissionHandler: this.permissionHolder.current }
+        : {}),
       ...(this.now ? { now: this.now } : {}),
     });
 

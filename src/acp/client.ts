@@ -29,8 +29,25 @@ export interface AcpClient {
   closeSession(sessionId: string): Promise<void>;
   /** Subscribe to update notifications for a session. */
   updates(sessionId: string): AsyncIterableIterator<SessionUpdate>;
+  /**
+   * Register a handler invoked when the agent requests permission to expand
+   * its declared scope (or perform any other consent-gated operation).
+   * If no handler is set, the client returns method-not-found, which the
+   * server interprets as a deny.
+   */
+  setPermissionHandler(
+    handler:
+      | ((req: import("../types/permissions.js").PermissionRequest) => Promise<import("../types/permissions.js").PermissionResult> | import("../types/permissions.js").PermissionResult)
+      | null,
+  ): void;
   close(): Promise<void>;
 }
+
+type PermissionHandlerCb = (
+  req: import("../types/permissions.js").PermissionRequest,
+) =>
+  | Promise<import("../types/permissions.js").PermissionResult>
+  | import("../types/permissions.js").PermissionResult;
 
 class JsonRpcClient implements AcpClient {
   private nextId = 1;
@@ -43,16 +60,64 @@ class JsonRpcClient implements AcpClient {
     Array<(u: SessionUpdate) => void>
   >();
   private readonly subEnded = new Map<string, () => void>();
+  private permissionHandler: PermissionHandlerCb | null = null;
   private closed = false;
 
   constructor(private readonly stream: MessageStream, private readonly cleanup?: () => void) {
     void this.pump();
   }
 
+  setPermissionHandler(handler: PermissionHandlerCb | null): void {
+    this.permissionHandler = handler;
+  }
+
   private async pump(): Promise<void> {
     for await (const raw of this.stream.messages()) {
       if (typeof raw !== "object" || raw === null) continue;
       const m = raw as JSONRPCRequest & JSONRPCResponse;
+
+      // Inbound *request* from the agent — currently only
+      // session/request_permission.
+      if (
+        "method" in m &&
+        m.method === ACP_METHODS.sessionRequestPermission &&
+        typeof m.id === "number"
+      ) {
+        const params = m.params as {
+          sessionId: string;
+          request: import("../types/permissions.js").PermissionRequest;
+        };
+        if (!this.permissionHandler) {
+          this.stream.write(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: m.id,
+              error: { code: -32601, message: "session/request_permission not implemented" },
+            }),
+          );
+          continue;
+        }
+        try {
+          const result = await Promise.resolve(this.permissionHandler(params.request));
+          this.stream.write(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: m.id,
+              result,
+            }),
+          );
+        } catch (e) {
+          this.stream.write(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: m.id,
+              error: { code: -32000, message: (e as Error).message },
+            }),
+          );
+        }
+        continue;
+      }
+
       if ("method" in m && m.method === ACP_METHODS.sessionUpdate) {
         const params = m.params as { sessionId: string; update: SessionUpdate };
         const subs = this.subs.get(params.sessionId);

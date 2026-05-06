@@ -204,13 +204,13 @@ export class ProcessTool implements Tool {
   }
 }
 
-/** Holds a name→Tool map and an executor. */
+/** Holds a name→Tool map and an executor. Mutable: tools can be added. */
 export class ToolTable {
   private readonly byName = new Map<string, Tool>();
-  constructor(
-    tools: Tool[],
-    private readonly secrets: Record<string, string>,
-  ) {
+  private secrets: Record<string, string>;
+
+  constructor(tools: Tool[], secrets: Record<string, string>) {
+    this.secrets = secrets;
     for (const t of tools) {
       this.byName.set(t.name, t);
     }
@@ -226,6 +226,24 @@ export class ToolTable {
 
   has(name: string): boolean {
     return this.byName.has(name);
+  }
+
+  /**
+   * Add a tool to the table. Returns true if the tool was added; false if a
+   * tool with the same name already existed (in which case no replacement
+   * happens — duplicate adds are silently ignored to keep capability state
+   * audit-able).
+   */
+  addTool(tool: Tool): boolean {
+    if (this.byName.has(tool.name)) return false;
+    this.byName.set(tool.name, tool);
+    return true;
+  }
+
+  /** Merge additional secrets into the in-memory store (used when add_skill
+   *  brings a tool that needs a secret already in the agent's ceiling). */
+  addSecrets(extra: Record<string, string>): void {
+    this.secrets = { ...this.secrets, ...extra };
   }
 
   async execute(call: ToolCall): Promise<ToolResult> {

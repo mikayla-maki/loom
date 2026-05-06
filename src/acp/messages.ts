@@ -70,10 +70,27 @@ export interface SessionCancelParams {
   sessionId: string;
 }
 
+/**
+ * `session/request_permission` — agent → client.
+ *
+ * Mirrors ACP's request-for-permission shape. The runtime calls this when
+ * an in-process tool (e.g. add_skill) wants to expand the agent's declared
+ * scope. Clients that don't implement the method MUST return an error,
+ * which the runtime treats as a deny.
+ */
+export interface SessionRequestPermissionParams {
+  sessionId: string;
+  request: import("../types/permissions.js").PermissionRequest;
+}
+export interface SessionRequestPermissionResult {
+  decision: import("../types/permissions.js").PermissionDecision;
+}
+
 export const ACP_METHODS = {
   sessionNew: "session/new",
   sessionPrompt: "session/prompt",
   sessionUpdate: "session/update",
   sessionCancel: "session/cancel",
   sessionClose: "session/close",
+  sessionRequestPermission: "session/request_permission",
 } as const;

@@ -120,6 +120,9 @@ export class GlassDaemon {
   private async serve(stream: MessageStream): Promise<void> {
     const localSessions = new Set<string>();
     const updateSubs = new Map<string, Promise<void>>();
+    /** Outbound (agent → client) permission-request bookkeeping. */
+    let nextOutId = 100000;
+    const pendingOut = new Map<number, (v: import("../types/permissions.js").PermissionResult) => void>();
 
     const respond = (id: unknown, result: unknown) => {
       const r: JSONRPCResponse = {
@@ -138,30 +141,47 @@ export class GlassDaemon {
       stream.write(JSON.stringify(r));
     };
 
+    /** Concurrent dispatch — see AcpRouter.run for the rationale. */
+    const inflight = new Set<Promise<void>>();
     for await (const raw of stream.messages()) {
       if (typeof raw !== "object" || raw === null) continue;
-      const msg = raw as JSONRPCRequest;
-      const id = msg.id ?? null;
+      const msg = raw as JSONRPCRequest & JSONRPCResponse;
 
-      try {
-        // Broker shape: session/prompt with token+scope (no sessionId yet).
-        if (
-          msg.method === ACP_METHODS.sessionPrompt &&
-          (msg.params as Partial<BrokerInvokeParams>)?.token &&
-          (msg.params as Partial<BrokerInvokeParams>)?.scope
-        ) {
-          const params = msg.params as BrokerInvokeParams;
-          const ref = this.resolveInvocation(params.token, params.scope);
-          if (!ref) {
-            respondError(id, -32001, "invalid token or scope");
-            continue;
+      // Inbound response to an outbound request (agent → client → us).
+      if (
+        typeof msg.id === "number" &&
+        !msg.method &&
+        (msg.result !== undefined || msg.error !== undefined) &&
+        pendingOut.has(msg.id)
+      ) {
+        const cb = pendingOut.get(msg.id)!;
+        pendingOut.delete(msg.id);
+        if (msg.error) cb({ decision: "deny" });
+        else cb(msg.result as import("../types/permissions.js").PermissionResult);
+        continue;
+      }
+
+      const task = (async () => {
+        const id = msg.id ?? null;
+        try {
+          // Broker shape: session/prompt with token+scope (no sessionId yet).
+          if (
+            msg.method === ACP_METHODS.sessionPrompt &&
+            (msg.params as Partial<BrokerInvokeParams>)?.token &&
+            (msg.params as Partial<BrokerInvokeParams>)?.scope
+          ) {
+            const params = msg.params as BrokerInvokeParams;
+            const ref = this.resolveInvocation(params.token, params.scope);
+            if (!ref) {
+              respondError(id, -32001, "invalid token or scope");
+              return;
+            }
+            const final = await this.runRefOnce(ref, params.prompt);
+            respond(id, { stopReason: "end_turn", finalMessage: final });
+            return;
           }
-          const final = await this.runRefOnce(ref, params.prompt);
-          respond(id, { stopReason: "end_turn", finalMessage: final });
-          continue;
-        }
 
-        switch (msg.method) {
+          switch (msg.method) {
           case ACP_METHODS.sessionNew: {
             const params = (msg.params ?? {}) as { manifestPath?: string; name?: string };
             let manifestPath = params.manifestPath;
@@ -179,6 +199,21 @@ export class GlassDaemon {
             const sessionId = `s${this.nextSession++}`;
             this.sessions.set(sessionId, agent);
             localSessions.add(sessionId);
+            // Forward agent permission requests to the connected client.
+            agent.setPermissionHandler(async (req) => {
+              const reqId = nextOutId++;
+              return await new Promise((resolve) => {
+                pendingOut.set(reqId, resolve);
+                stream.write(
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: reqId,
+                    method: ACP_METHODS.sessionRequestPermission,
+                    params: { sessionId, request: req },
+                  }),
+                );
+              });
+            });
             // Subscribe to updates and forward.
             const sub = agent.updates();
             const subPromise = (async () => {
@@ -244,14 +279,18 @@ export class GlassDaemon {
             break;
           }
 
-          default:
-            respondError(id, -32601, `Method not found: ${msg.method}`);
+            default:
+              respondError(id, -32601, `Method not found: ${msg.method}`);
+          }
+        } catch (e) {
+          respondError(id, -32000, (e as Error).message);
         }
-      } catch (e) {
-        respondError(id, -32000, (e as Error).message);
-      }
+      })();
+      inflight.add(task);
+      task.finally(() => inflight.delete(task));
     }
 
+    await Promise.allSettled(inflight);
     // Clean up sessions opened on this connection.
     for (const sid of localSessions) {
       const a = this.sessions.get(sid);

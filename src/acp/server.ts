@@ -25,8 +25,15 @@ import {
   type SessionNewResult,
   type SessionPromptParams,
   type SessionPromptResult,
+  type SessionRequestPermissionParams,
+  type SessionRequestPermissionResult,
 } from "./messages.js";
 import type { SessionUpdate } from "../types/acp.js";
+import type {
+  PermissionHandler,
+  PermissionRequest,
+  PermissionResult,
+} from "../types/permissions.js";
 
 interface ServeAgentBinding {
   /** A pre-booted agent, or a factory that produces one on demand. */
@@ -51,6 +58,13 @@ export class AcpRouter {
   private readonly sessions = new Map<string, RunningAgent>();
   private readonly subscriptions = new Map<string, Promise<void>>();
   private nextId = 1;
+  /** Outgoing request-id counter (server → client). */
+  private nextOutId = 10000;
+  /** Pending agent→client requests by id. */
+  private readonly pendingOutbound = new Map<
+    number,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >();
 
   constructor(private readonly binding: ServeAgentBinding) {}
 
@@ -59,53 +73,121 @@ export class AcpRouter {
     const sessionId = `s${this.nextId++}`;
     this.sessions.set(sessionId, agent);
     this.startUpdateForwarder(sessionId, agent, stream);
+    // Wire the agent's permission requests to the connected client.
+    agent.setPermissionHandler(this.makeForwardingPermissionHandler(sessionId, stream));
     return sessionId;
   }
 
+  /**
+   * Build a PermissionHandler that, when invoked, sends a JSON-RPC request
+   * to the connected client and awaits the result. If the client doesn't
+   * implement `session/request_permission` (returns method-not-found) we
+   * treat that as a deny — the safe default.
+   */
+  private makeForwardingPermissionHandler(
+    sessionId: string,
+    stream: MessageStream,
+  ): PermissionHandler {
+    return async (req: PermissionRequest): Promise<PermissionResult> => {
+      const id = this.nextOutId++;
+      const envelope = {
+        jsonrpc: "2.0",
+        id,
+        method: ACP_METHODS.sessionRequestPermission,
+        params: {
+          sessionId,
+          request: req,
+        } satisfies SessionRequestPermissionParams,
+      };
+      const reply = await new Promise<unknown>((resolve, reject) => {
+        this.pendingOutbound.set(id, { resolve, reject });
+        stream.write(JSON.stringify(envelope));
+      }).catch((e) => {
+        return { error: e };
+      });
+      if (reply && typeof reply === "object" && "decision" in (reply as Record<string, unknown>)) {
+        return reply as SessionRequestPermissionResult;
+      }
+      return { decision: "deny" };
+    };
+  }
+
   async run(stream: MessageStream, primarySessionId?: string): Promise<void> {
+    /**
+     * Inbound dispatch is concurrent. Reason: a `session/prompt` may run a
+     * turn that calls `requestPermission`, which sends an outbound JSON-RPC
+     * request to this same connection and awaits the reply. If we awaited
+     * `handleSessionPrompt` inline, the loop wouldn't read the reply and
+     * we'd deadlock. So each request is dispatched in its own task and the
+     * loop keeps draining.
+     */
+    const inflight = new Set<Promise<void>>();
     for await (const raw of stream.messages()) {
       if (typeof raw !== "object" || raw === null) continue;
-      const msg = raw as JSONRPCRequest;
-      const id = msg.id ?? null;
-      try {
-        switch (msg.method) {
-          case ACP_METHODS.sessionNew: {
-            const result = await this.handleSessionNew(
-              (msg.params ?? {}) as SessionNewParams,
-              stream,
-            );
-            this.respond(stream, id, result);
-            break;
-          }
-          case ACP_METHODS.sessionPrompt: {
-            const result = await this.handleSessionPrompt(
-              (msg.params ?? {}) as SessionPromptParams,
-              primarySessionId,
-            );
-            this.respond(stream, id, result);
-            break;
-          }
-          case ACP_METHODS.sessionCancel: {
-            await this.handleSessionCancel((msg.params ?? {}) as SessionCancelParams);
-            this.respond(stream, id, {});
-            break;
-          }
-          case ACP_METHODS.sessionClose: {
-            const sid = (msg.params as { sessionId?: string } | undefined)?.sessionId;
-            if (sid) await this.closeSession(sid);
-            this.respond(stream, id, {});
-            break;
-          }
-          default:
-            this.respondError(stream, id, -32601, `Method not found: ${msg.method}`);
+      const msg = raw as JSONRPCRequest & JSONRPCResponse;
+
+      // Inbound response to one of OUR outbound requests (e.g. permission).
+      if (typeof msg.id === "number" && (msg.result !== undefined || msg.error !== undefined) && !msg.method) {
+        const pending = this.pendingOutbound.get(msg.id);
+        if (pending) {
+          this.pendingOutbound.delete(msg.id);
+          if (msg.error) pending.reject(new Error(msg.error.message));
+          else pending.resolve(msg.result);
         }
-      } catch (e) {
-        this.respondError(stream, id, -32000, (e as Error).message);
+        continue;
       }
+
+      const task = this.dispatch(msg, stream, primarySessionId);
+      inflight.add(task);
+      task.finally(() => inflight.delete(task));
     }
-    // Stream closed — clean up remaining sessions.
+    // Stream closed — wait for any in-flight handlers, then clean up sessions.
+    await Promise.allSettled(inflight);
     for (const sid of [...this.sessions.keys()]) {
       await this.closeSession(sid);
+    }
+  }
+
+  private async dispatch(
+    msg: JSONRPCRequest,
+    stream: MessageStream,
+    primarySessionId?: string,
+  ): Promise<void> {
+    const id = msg.id ?? null;
+    try {
+      switch (msg.method) {
+        case ACP_METHODS.sessionNew: {
+          const result = await this.handleSessionNew(
+            (msg.params ?? {}) as SessionNewParams,
+            stream,
+          );
+          this.respond(stream, id, result);
+          break;
+        }
+        case ACP_METHODS.sessionPrompt: {
+          const result = await this.handleSessionPrompt(
+            (msg.params ?? {}) as SessionPromptParams,
+            primarySessionId,
+          );
+          this.respond(stream, id, result);
+          break;
+        }
+        case ACP_METHODS.sessionCancel: {
+          await this.handleSessionCancel((msg.params ?? {}) as SessionCancelParams);
+          this.respond(stream, id, {});
+          break;
+        }
+        case ACP_METHODS.sessionClose: {
+          const sid = (msg.params as { sessionId?: string } | undefined)?.sessionId;
+          if (sid) await this.closeSession(sid);
+          this.respond(stream, id, {});
+          break;
+        }
+        default:
+          this.respondError(stream, id, -32601, `Method not found: ${msg.method}`);
+      }
+    } catch (e) {
+      this.respondError(stream, id, -32000, (e as Error).message);
     }
   }
 
