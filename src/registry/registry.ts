@@ -16,7 +16,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import type { RegistryLookup } from "../manifest/resolver.js";
+/** Bare-name lookup hook: kind + name → path on disk, or null. */
+export type RegistryLookup = (
+  kind: "skill" | "tool" | "agent",
+  name: string,
+) => string | null | Promise<string | null>;
 
 export interface RegistryOptions {
   /** Override the registry root. Defaults to $LOOM_HOME or ~/.loom. */
@@ -26,7 +30,8 @@ export interface RegistryOptions {
 export class LocalRegistry {
   public readonly root: string;
   constructor(opts: RegistryOptions = {}) {
-    this.root = opts.root ?? process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom");
+    this.root =
+      opts.root ?? process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom");
   }
 
   lookup: RegistryLookup = async (kind, name) => {
@@ -54,8 +59,10 @@ export class LocalRegistry {
   ): Promise<string> {
     const src = path.resolve(sourcePath);
     const stat = await fs.stat(src);
-    if (!stat.isDirectory()) throw new Error(`Cannot install non-directory: ${src}`);
-    const inferred = options.name ?? (await inferName(kind, src)) ?? path.basename(src);
+    if (!stat.isDirectory())
+      throw new Error(`Cannot install non-directory: ${src}`);
+    const inferred =
+      options.name ?? (await inferName(kind, src)) ?? path.basename(src);
     const dest = path.join(this.root, kindDir(kind), inferred);
     await fs.mkdir(path.dirname(dest), { recursive: true });
     try {

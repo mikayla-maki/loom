@@ -44,59 +44,34 @@ async function buildExtensionFixture(opts: {
       2,
     ),
   );
-  // Entry: ESM module exporting register().
+  // Entry: ESM module exporting register(). Registers a ProviderFactory
+  // via api.addProvider(); the factory's Provider.resolveTool() returns a
+  // synthetic 'fixture.echo' tool by name.
   await fs.writeFile(
     path.join(packageDir, "index.js"),
-    `// Synthetic Loom extension fixture.
-//
-// Two side-effects on register():
-//   1. Auto-activates a ProviderFactory that supplies 'fixture.echo'.
-//      This is the common case — listing the extension in [extensions]
-//      is enough.
-//   2. ALSO registers a named ProviderFactory (so a separate test can
-//      assert factories get registered).
-export function register(api) {
+    `export function register(api) {
   const greeting = api.config && typeof api.config.greeting === "string" ? api.config.greeting : "hi";
   const factory = {
-    name: "fixture-provider",
-    create(_config, _ctx, _secrets) {
-      return {
-        resolveTool(name) {
-          if (name !== "fixture:echo") return null;
-          return {
-            kind: "synthetic",
-            manifest: {
-              manifestPath: "synthetic://fixture.echo",
-              toolDir: "synthetic://fixture.echo",
-              name: "fixture.echo",
-              description: "Echo with greeting prefix",
-              schema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
-              invocation: { command: "(synthetic)", args: [] },
-              secrets: { required: [] },
-              capabilities: { filesystem: [], network: [] },
-              shipsBinary: false,
-            },
-            tool: {
-              name: "fixture.echo",
-              description: "Echo with greeting prefix",
-              inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
-              async execute(input) {
-                return { content: greeting + ": " + String((input || {}).text || "") };
-              },
-            },
-          };
+    name: "${fullName}",
+    create() {
+      const tool = {
+        name: "fixture.echo",
+        description: "Echo with greeting prefix",
+        inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
+        async execute(input) {
+          return { content: greeting + ": " + String((input || {}).text || "") };
         },
-        resolveSkill() { return null; },
-        async list() { return { tools: ["fixture.echo"], skills: [] }; },
+      };
+      return {
+        resolveTool(name, _config) {
+          if (name === "fixture.echo") return tool;
+          return null;
+        },
         async close() { /* noop */ },
       };
     },
   };
   api.addProvider(factory);
-  api.registerProvider({
-    name: "${fullName}",
-    create(_config, _ctx, _secrets) { return factory.create(_config, _ctx, _secrets); },
-  });
 }
 `,
   );
@@ -199,24 +174,22 @@ describe("extension package loader", () => {
     }
   });
 
-  it("loadExtensionPackage executes register() and registers factories", async () => {
+  it("loadExtensionPackage executes register() and surfaces added provider factories", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-load-"));
     try {
-      const { listProviders } = await import("../src/extensions/index.js");
       await buildExtensionFixture({
         rootDir: root,
         packageName: "register-side-effect-ext",
       });
-      const before = new Set(listProviders());
-      await loadExtensionPackage(
+      const { addedProviderFactories } = await loadExtensionPackage(
         "register-side-effect-ext",
         { greeting: "yo" },
         { agentManifestDir: root, agentName: "test", loomVersion: "0.1.0" },
       );
-      const after = listProviders();
-      // The fixture registers itself by its package name as the provider name.
-      expect(after).toContain("register-side-effect-ext");
-      void before;
+      // The fixture's register() calls api.addProvider() with a factory
+      // whose name matches the package.
+      const names = addedProviderFactories.map((f) => f.name);
+      expect(names).toContain("register-side-effect-ext");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -264,20 +237,8 @@ describe("agent.toml [extensions] activation end-to-end", () => {
         packageName: "ext-pkg-e2e",
       });
 
-      // Skill that pulls in the extension's synthetic tool by its provider key.
-      const skillDir = path.join(agentDir, "skills", "echo-skill");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: echo-skill
-description: Echo via extension-supplied tool
-requires:
-  fixture.echo: fixture:echo
----
-body
-`,
-      );
+      // [tools] references the extension's tool by name; the extension
+      // provider's resolveTool() claims it ahead of the native chain.
       await fs.writeFile(
         path.join(agentDir, "agent.toml"),
         `[agent]
@@ -285,20 +246,13 @@ name = "ext-driven"
 system_prompt = "be brief"
 
 [tools]
+"fixture.echo" = {}
 
 [harness]
 provider = "test"
 
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-
 [extensions]
 "ext-pkg-e2e" = { greeting = "yo" }
-
-[skills]
-e = "./skills/echo-skill"
 `,
       );
 

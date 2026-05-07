@@ -1,25 +1,26 @@
 /**
- * Static capability audit — walks an agent manifest + every reachable
- * subagent to compute the total declared capability surface. No LLM is
- * ever invoked.
+ * Static capability audit — instantiates the native provider against an
+ * agent manifest and prints what it would expose. No LLM is ever invoked,
+ * and no extension providers are loaded; audit is conservative and
+ * deterministic. Extension-supplied tools and skills don't appear in the
+ * tree (they'd require running provider init, which can have side
+ * effects like opening MCP connections).
  */
 
 import * as path from "node:path";
 
-import { resolveAgent, type ResolveOptions } from "../manifest/resolver.js";
-import { unionCapabilities } from "../manifest/capabilities.js";
+import { resolveSystemPrompt } from "../manifest/resolver.js";
 import { getHarnessFactory, getSessionFactory } from "../extensions/index.js";
+import { buildNativeProvider } from "../extensions/provider/native.js";
+import { parseAgentManifest, parseSkillManifest } from "../manifest/parser.js";
+import { LocalRegistry } from "../registry/registry.js";
 import type {
   AgentManifest,
-  SandboxCeiling,
-  ToolCapabilities,
+  SkillManifest,
+  Capabilities,
 } from "../types/manifest.js";
+import type { Tool, ToolConfig } from "../types/interfaces.js";
 
-/**
- * One declared secret name plus a human-readable list of who asked for
- * it (`harness:anthropic`, `tool:bash`, etc.) and whether any requester
- * marked it required.
- */
 export interface SecretRequest {
   name: string;
   required: boolean;
@@ -29,113 +30,104 @@ export interface SecretRequest {
 export interface CapabilityTree {
   manifestPath: string;
   name: string;
-  ceiling: SandboxCeiling;
-  required: SandboxCeiling;
+  /** The agent's `[capabilities]` ceiling (per-tool, opaque). */
+  ceiling: Capabilities;
+  /**
+   * Each tool the native provider could resolve, with its declared
+   * capability footprint and the source that introduced it.
+   */
   tools: Array<{
     name: string;
-    capabilities: ToolCapabilities;
+    capabilities: unknown;
     introducedBy: string;
   }>;
   /**
    * Every secret name a component of this agent declares it needs. Built
-   * from harness + session factory `secrets` and each tool's
-   * `[tool.secrets]`. Provider-factory secrets aren't included because
-   * audit doesn't load extensions — see the comment in `collectSecrets`.
+   * from harness + session factory `secrets` and each tool's declared
+   * `secrets`. Provider-factory secrets aren't included because audit
+   * doesn't load extensions — see the comment in `collectSecrets`.
    */
   secrets: SecretRequest[];
-  subagents: Array<{
-    skill: string;
-    name: string;
-    kind: "path" | "registry" | "acp";
-    tree?: CapabilityTree;
-    note?: string;
-  }>;
 }
+
+const DEFAULT_TOP_LEVEL_TOOLS: Record<string, ToolConfig> = {
+  bash: {},
+  read_file: { paths: ["./"] },
+  write_file: { paths: ["./"] },
+  find: { paths: ["./"] },
+};
+
+const TOP_LEVEL = "(top-level)";
 
 export async function auditAgent(
   source: string | AgentManifest,
-  options: ResolveOptions = {},
 ): Promise<CapabilityTree> {
-  if (typeof source === "string") {
-    return await auditOne(path.resolve(source), options, new Set());
-  }
-  return await auditOne(source, options, new Set());
-}
-
-async function auditOne(
-  source: string | AgentManifest,
-  options: ResolveOptions,
-  visited: Set<string>,
-): Promise<CapabilityTree> {
-  // Identity for cycle detection: the manifest's path on disk, or a
-  // synthetic identifier for inline manifests.
+  const manifest =
+    typeof source === "string" ? await parseAgentManifest(source) : source;
   const manifestPath =
     typeof source === "string"
       ? source
       : (source.manifestPath ?? `<inline:${source.name}>`);
-  if (visited.has(manifestPath)) {
-    return {
-      manifestPath,
-      name: "(cycle)",
-      ceiling: {},
-      required: {},
-      tools: [],
-      secrets: [],
-      subagents: [],
-    };
+
+  const baseDir = manifest.manifestPath
+    ? path.dirname(manifest.manifestPath)
+    : process.cwd();
+  // Resolve system prompt for parity with runAgent (validates path-form).
+  void (await resolveSystemPrompt(manifest, baseDir));
+
+  // Walk skills the same way runAgent does (no provider init needed).
+  const registry = new LocalRegistry();
+  const skills: SkillManifest[] = [];
+  for (const [skillKey, skillRef] of Object.entries(manifest.skills ?? {})) {
+    const skill = await loadSkillForAudit(
+      skillKey,
+      skillRef,
+      baseDir,
+      registry,
+    );
+    skills.push(skill);
   }
-  visited.add(manifestPath);
 
-  const resolved = await resolveAgent(source, options);
-  const tools = resolved.tools.map((t) => ({
-    name: t.manifest.name,
-    capabilities: t.manifest.capabilities ?? {},
-    introducedBy: t.introducedBy,
-  }));
-  const required = unionCapabilities(tools.map((t) => t.capabilities));
-  const secrets = collectSecrets(resolved.source, resolved.tools);
-
-  const subagents: CapabilityTree["subagents"] = [];
-  for (const skill of resolved.skills) {
-    for (const [name, ref] of Object.entries(skill.subagents)) {
-      const skillName = skill.manifest.name;
-      switch (ref.kind) {
-        case "path":
-          subagents.push({
-            skill: skillName,
-            name,
-            kind: "path",
-            tree: await auditOne(ref.path, options, visited),
-          });
-          break;
-        case "registry":
-          subagents.push({
-            skill: skillName,
-            name,
-            kind: "registry",
-            tree: await auditOne(ref.resolvedPath, options, visited),
-          });
-          break;
-        case "acp":
-          subagents.push({
-            skill: skillName,
-            name,
-            kind: "acp",
-            note: `remote: ${ref.url}`,
-          });
-          break;
-      }
+  // Build the same tool-ref list runAgent builds.
+  const refs: Array<{ name: string; config: ToolConfig; origin: string }> = [];
+  const seen = new Map<string, string>();
+  const topLevel = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
+  for (const [name, config] of Object.entries(topLevel)) {
+    refs.push({ name, config, origin: TOP_LEVEL });
+    seen.set(name, TOP_LEVEL);
+  }
+  for (const skill of skills) {
+    for (const [name, config] of Object.entries(skill.requires ?? {})) {
+      if (seen.has(name)) continue; // collisions surface in runAgent; audit is best-effort
+      refs.push({ name, config, origin: skill.name ?? "(unnamed-skill)" });
+      seen.set(name, skill.name ?? "(unnamed-skill)");
     }
   }
 
+  // Run only the native provider. Extension providers stay un-audited.
+  const native = buildNativeProvider();
+  const tools: CapabilityTree["tools"] = [];
+  const resolvedTools = new Map<string, Tool>();
+  for (const ref of refs) {
+    const t = await Promise.resolve(native.resolveTool(ref.name, ref.config));
+    if (!t) continue; // not a native tool — audit silently skips
+    resolvedTools.set(ref.name, t);
+    tools.push({
+      name: ref.name,
+      capabilities: t.capabilities ?? {},
+      introducedBy: ref.origin,
+    });
+  }
+  await native.close();
+
+  const secrets = collectSecrets(manifest, resolvedTools);
+
   return {
     manifestPath,
-    name: resolved.source.name,
-    ceiling: resolved.sandbox,
-    required,
+    name: manifest.name,
+    ceiling: manifest.capabilities ?? {},
     tools,
     secrets,
-    subagents,
   };
 }
 
@@ -145,19 +137,16 @@ async function auditOne(
  * Sources:
  *   - harness factory's `secrets` (if `[harness]` references one by name)
  *   - session factory's `secrets`
- *   - every resolved tool's `[tool.secrets]`
+ *   - every native-resolved tool's `secrets`
  *
  * NOT included: extension-added provider factories. Audit doesn't load
- * `[extensions]` packages — that's a side-effect surface and would
- * make audit dynamic. The result is that an `audit` of a manifest
- * with `[extensions.foo-mcp]` won't show foo-mcp's required tokens.
- * `loom run` will still resolve them; `loom audit` is conservative.
+ * `[extensions]` packages.
  */
 function collectSecrets(
   manifest: AgentManifest,
-  tools: import("../manifest/resolver.js").ResolvedTool[],
+  tools: Map<string, Tool>,
 ): SecretRequest[] {
-  const required = new Map<string, Set<string>>(); // name → requesters
+  const required = new Map<string, Set<string>>();
   const optional = new Map<string, Set<string>>();
 
   const addNeeds = (
@@ -177,34 +166,26 @@ function collectSecrets(
     }
   };
 
-  // Harness
   if ("provider" in manifest.harness) {
     try {
       const f = getHarnessFactory(manifest.harness.provider);
       addNeeds(f.secrets, `harness:${f.name}`);
     } catch {
-      // Unknown harness provider — skip; resolveAgent already validated
-      // it for the run path. Audit shouldn't fail just because a
-      // hypothetical extension isn't loaded yet.
+      /* unknown harness — skip */
     }
   }
-
-  // Session
   if (manifest.session && "provider" in manifest.session) {
     try {
       const f = getSessionFactory(manifest.session.provider);
       addNeeds(f.secrets, `session:${f.name}`);
     } catch {
-      // ditto
+      /* unknown session — skip */
     }
   }
-
-  // Tools
-  for (const t of tools) {
-    addNeeds(t.manifest.secrets, `tool:${t.manifest.name}`);
+  for (const [name, tool] of tools) {
+    addNeeds(tool.secrets, `tool:${name}`);
   }
 
-  // Required wins on conflict.
   for (const k of required.keys()) optional.delete(k);
 
   const out: SecretRequest[] = [];
@@ -218,18 +199,62 @@ function collectSecrets(
   return out;
 }
 
+async function loadSkillForAudit(
+  skillKey: string,
+  ref: string | SkillManifest,
+  baseDir: string,
+  registry: LocalRegistry,
+): Promise<SkillManifest> {
+  if (typeof ref !== "string") {
+    return { ...ref, name: skillKey, body: ref.body ?? "" };
+  }
+  const fs = await import("node:fs/promises");
+  const isPathLike = (s: string) =>
+    s.startsWith("./") ||
+    s.startsWith("../") ||
+    s.startsWith("/") ||
+    s.startsWith("~");
+  let dir: string;
+  if (isPathLike(ref)) {
+    dir = path.resolve(baseDir, ref);
+  } else {
+    const r = await registry.lookup("skill", ref);
+    if (!r) {
+      // Skip skills audit can't resolve (e.g. extension-supplied).
+      return { name: skillKey, description: "(unresolved)", body: "" };
+    }
+    dir = r;
+  }
+  try {
+    const stat = await fs.stat(dir);
+    if (!stat.isDirectory()) {
+      return { name: skillKey, description: "(unresolved)", body: "" };
+    }
+  } catch {
+    return { name: skillKey, description: "(unresolved)", body: "" };
+  }
+  const skill = await parseSkillManifest(dir);
+  return { ...skill, name: skillKey };
+}
+
 /** Pretty-print a CapabilityTree as a tree of strings (for CLI use). */
 export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
   const pad = "  ".repeat(indent);
   const lines: string[] = [];
   lines.push(`${pad}${tree.name}  (${tree.manifestPath})`);
-  lines.push(`${pad}  ceiling : ${formatCeiling(tree.ceiling)}`);
-  lines.push(`${pad}  required: ${formatCeiling(tree.required)}`);
+  if (Object.keys(tree.ceiling).length > 0) {
+    lines.push(`${pad}  ceiling:`);
+    for (const [k, v] of Object.entries(tree.ceiling)) {
+      lines.push(`${pad}    - ${k}: ${JSON.stringify(v)}`);
+    }
+  } else {
+    lines.push(`${pad}  ceiling: (none — every tool's caps stand)`);
+  }
   if (tree.tools.length > 0) {
     lines.push(`${pad}  tools:`);
     for (const t of tree.tools) {
       lines.push(
-        `${pad}    - ${t.name} (from ${t.introducedBy}): ${formatToolCaps(t.capabilities)}`,
+        `${pad}    - ${t.name} (from ${t.introducedBy}): ${JSON.stringify(t.capabilities)}`,
       );
     }
   }
@@ -242,38 +267,5 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
       );
     }
   }
-  if (tree.subagents.length > 0) {
-    lines.push(`${pad}  subagents:`);
-    for (const sa of tree.subagents) {
-      const tag = sa.tree ? "" : ` [${sa.kind}: ${sa.note ?? ""}]`;
-      lines.push(`${pad}    - ${sa.skill}.${sa.name}${tag}`);
-      if (sa.tree) lines.push(formatCapabilityTree(sa.tree, indent + 3));
-    }
-  }
   return lines.join("\n");
-}
-
-function formatCeiling(c: SandboxCeiling): string {
-  const parts: string[] = [];
-  parts.push(formatAxis("fs", c.filesystem));
-  parts.push(formatAxis("net", c.network));
-  parts.push(formatAxis("secrets", c.secrets));
-  return parts.join(" ");
-}
-
-function formatToolCaps(c: ToolCapabilities): string {
-  const parts: string[] = [];
-  parts.push(formatAxis("fs", c.filesystem));
-  parts.push(formatAxis("net", c.network));
-  parts.push(formatAxis("secrets", c.secrets));
-  if (c.subagent === "*") parts.push("subagent[*]");
-  else if (Array.isArray(c.subagent) && c.subagent.length)
-    parts.push(`subagent[${c.subagent.join(",")}]`);
-  return parts.join(" ");
-}
-
-function formatAxis(label: string, axis: string[] | undefined): string {
-  if (axis === undefined) return `${label}[*]`;
-  if (axis.length === 0) return `${label}[]`;
-  return `${label}[${axis.join(",")}]`;
 }

@@ -1,17 +1,19 @@
 /**
- * Extension registry — bare-name resolution of harness/session providers.
+ * Extension registry — bare-name resolution of harness/session factories.
  *
  * Built-in extensions are registered here. Third-party extensions can call
  * `registerHarness` / `registerSession` from app code before booting an
  * agent. (Future: dynamic loading from `~/.loom/extensions`.)
+ *
+ * Tool/skill providers are NOT in this registry — they're contributed
+ * by the native provider (always loaded) plus any
+ * `[extensions].<pkg>` entries in the manifest, which `runAgent` loads
+ * dynamically and instantiates via their `ProviderFactory`. The
+ * `Provider` interface lives in `types/interfaces.ts`.
  */
 
 import { ResolutionError } from "../errors.js";
-import type {
-  HarnessFactory,
-  ProviderFactory,
-  SessionFactory,
-} from "../types/interfaces.js";
+import type { HarnessFactory, SessionFactory } from "../types/interfaces.js";
 
 import { anthropicHarnessFactory } from "./harness/anthropic.js";
 import { openaiHarnessFactory } from "./harness/openai.js";
@@ -22,16 +24,12 @@ import { memorySessionFactory } from "./session/memory.js";
 
 const harnessRegistry = new Map<string, HarnessFactory>();
 const sessionRegistry = new Map<string, SessionFactory>();
-const providerRegistry = new Map<string, ProviderFactory>();
 
 export function registerHarness(factory: HarnessFactory): void {
   harnessRegistry.set(factory.name, factory);
 }
 export function registerSession(factory: SessionFactory): void {
   sessionRegistry.set(factory.name, factory);
-}
-export function registerProvider(factory: ProviderFactory): void {
-  providerRegistry.set(factory.name, factory);
 }
 
 export function getHarnessFactory(name: string): HarnessFactory {
@@ -52,24 +50,12 @@ export function getSessionFactory(name: string): SessionFactory {
   }
   return f;
 }
-export function getProviderFactory(name: string): ProviderFactory {
-  const f = providerRegistry.get(name);
-  if (!f) {
-    throw new ResolutionError(
-      `Unknown provider extension '${name}'. Registered: ${[...providerRegistry.keys()].join(", ")}`,
-    );
-  }
-  return f;
-}
 
 export function listHarnesses(): string[] {
   return [...harnessRegistry.keys()];
 }
 export function listSessions(): string[] {
   return [...sessionRegistry.keys()];
-}
-export function listProviders(): string[] {
-  return [...providerRegistry.keys()];
 }
 
 // Register built-ins.

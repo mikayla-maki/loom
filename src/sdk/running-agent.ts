@@ -7,7 +7,7 @@
  *     AbortSignal and stop promptly).
  *   - updates() returns an async iterable that yields every SessionUpdate
  *     emitted during turns (and any that the runtime emits out-of-band).
- *   - close() releases resources (sessions, sink subscribers).
+ *   - close() releases resources (sessions, providers, sink subscribers).
  */
 
 import type { SessionUpdate, StopReason } from "../types/acp.js";
@@ -18,62 +18,72 @@ import type {
   Session,
 } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
+import type { AgentManifest, Capabilities } from "../types/manifest.js";
 
 import { RuntimeImpl } from "../runtime/runtime.js";
 import type { AgentState } from "../runtime/agent-state.js";
 import type { UpdateSink } from "../runtime/update-sink.js";
-import type { ResolvedAgentManifest } from "../manifest/resolver.js";
-import type { LoomServer } from "../server/server.js";
+import type { RuntimeServicesImpl } from "./run-agent.js";
 
 export interface RunningAgent {
   prompt(text: string): Promise<StopReason>;
   cancel(): Promise<void>;
   updates(opts?: { capacity?: number }): AsyncIterableIterator<SessionUpdate>;
   readonly session: Session;
-  readonly resolved: ResolvedAgentManifest;
-  /** Resolved secret values (for diagnostics; never logged). */
+  /** Source manifest the agent was constructed from (diagnostics only). */
+  readonly manifest: AgentManifest;
+  /** Resolved [agent].system_prompt content. */
+  readonly systemPrompt: string;
+  /** Effective per-tool capability ceiling. */
+  readonly capabilities: Capabilities;
+  /** Resolved secret names (for diagnostics; never the values). */
   readonly secretNames: string[];
-  /** Mutable runtime state — live tool table, skills list, ceiling. */
+  /** Live skills/tools/ceiling view. */
   readonly agentState: AgentState;
   /**
-   * Attach (or replace) the capability-expansion + tool-consent handler.
-   * The next turn's runtime captures this value. Pass null to clear.
+   * Attach (or replace) the user-consent handler. Tools' next call to
+   * `ctx.requestPermission()` observes the new handler. Pass null to
+   * clear.
    */
   setPermissionHandler(handler: PermissionHandler | null): void;
   close(): Promise<void>;
 }
 
 interface RunningAgentImplOptions {
-  resolved: ResolvedAgentManifest;
+  manifest: AgentManifest;
+  systemPrompt: string;
+  capabilities: Capabilities;
   secrets: Record<string, string>;
   session: Session;
   harness: Harness;
   state: AgentState;
   updateSink: UpdateSink;
-  providers?: Provider[];
-  /** Embed-mode broker server. Closed when the agent closes. */
-  server?: LoomServer;
+  providers: Provider[];
   /**
-   * Shared mutable holder for the active permission handler. Both this
-   * RunningAgentImpl and the privileged in-process tools read through the
-   * same reference, so a setPermissionHandler() call after boot is visible
-   * everywhere.
+   * Shared mutable holder for the active permission handler. Both the
+   * RunningAgent and the runtime services read through the same
+   * reference so `setPermissionHandler()` after boot is visible to
+   * tools mid-turn.
    */
   permissionHolder: { current: PermissionHandler | null };
+  /** Runtime services impl — receives setAbortSignal each turn. */
+  runtimeServices: RuntimeServicesImpl;
   now?: () => Date;
 }
 
 export class RunningAgentImpl implements RunningAgent {
+  public readonly manifest: AgentManifest;
+  public readonly systemPrompt: string;
+  public readonly capabilities: Capabilities;
   public readonly session: Session;
-  public readonly resolved: ResolvedAgentManifest;
   public readonly secretNames: string[];
 
   private readonly harness: Harness;
   private readonly state: AgentState;
   private readonly updateSink: UpdateSink;
   private readonly providers: Provider[];
-  private readonly server: LoomServer | undefined;
   private readonly permissionHolder: { current: PermissionHandler | null };
+  private readonly runtimeServices: RuntimeServicesImpl;
   private readonly now: (() => Date) | undefined;
 
   private currentAbortCtl: AbortController | null = null;
@@ -81,19 +91,20 @@ export class RunningAgentImpl implements RunningAgent {
   private closed = false;
 
   constructor(opts: RunningAgentImplOptions) {
-    this.resolved = opts.resolved;
+    this.manifest = opts.manifest;
+    this.systemPrompt = opts.systemPrompt;
+    this.capabilities = opts.capabilities;
     this.session = opts.session;
     this.harness = opts.harness;
     this.state = opts.state;
     this.updateSink = opts.updateSink;
-    this.providers = opts.providers ?? [];
-    this.server = opts.server;
+    this.providers = opts.providers;
     this.permissionHolder = opts.permissionHolder;
+    this.runtimeServices = opts.runtimeServices;
     this.secretNames = Object.keys(opts.secrets);
     this.now = opts.now;
   }
 
-  /** Live access to the mutable AgentState (skills/ceiling/tool table). */
   get agentState(): AgentState {
     return this.state;
   }
@@ -117,19 +128,20 @@ export class RunningAgentImpl implements RunningAgent {
 
     const ctl = new AbortController();
     this.currentAbortCtl = ctl;
+    // Tools running this turn read ctx.abortSignal through the shared
+    // runtimeServices object, which we update here.
+    this.runtimeServices.setAbortSignal(ctl.signal);
+
     const runtime: Runtime = new RuntimeImpl({
       session: this.session,
       state: this.state,
-      systemPromptCore: this.resolved.systemPrompt,
+      systemPromptCore: this.systemPrompt,
       updateSink: this.updateSink,
-      agentName: this.resolved.source.name,
-      ...(this.resolved.source.description
-        ? { agentDescription: this.resolved.source.description }
+      agentName: this.manifest.name,
+      ...(this.manifest.description
+        ? { agentDescription: this.manifest.description }
         : {}),
       abortSignal: ctl.signal,
-      ...(this.permissionHolder.current
-        ? { permissionHandler: this.permissionHolder.current }
-        : {}),
       ...(this.now ? { now: this.now } : {}),
     });
 
@@ -169,9 +181,6 @@ export class RunningAgentImpl implements RunningAgent {
       } catch {
         /* ignore cleanup errors */
       }
-    }
-    if (this.server) {
-      await this.server.close().catch(() => undefined);
     }
   }
 }

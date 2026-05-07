@@ -2,55 +2,63 @@
 
 > A manifest-driven agent meta-harness.
 
-Loom is a declarative runtime for composing LLM agents. It is built around
-**four resources** (Harness, Session, Skill, Tool), **four interfaces** of the
-same names, **two faces** (an in-process SDK and a JSON-RPC ACP server),
-**one external protocol** (ACP), and **one security principle**: every scope
-is sandboxed by what it declares; the agent's `[sandbox]` is an upper bound
-the operator can tighten.
+Loom is a declarative runtime for composing LLM agents. The user writes
+an `agent.toml` (or constructs an `AgentManifest` in JS); loom parses it,
+resolves secrets, instantiates a harness + session + a chain of
+providers, and runs turns.
+
+The central abstraction is the **provider chain**: each tool reference
+in the manifest is a `(name, config)` pair, and loom asks each
+provider in turn whether it claims the name. The native provider
+claims the builtins (`bash`, `read_file`, etc.); extension providers
+claim domain-specific tools (S3, Discord, MCP). Skills are loom's
+concern; capabilities are tool-defined; sandboxing is each tool's own
+responsibility (or its provider's, when the tool needs real isolation).
 
 ## Status
 
-This repository implements the **v0** + most of **v1** of the
-[design](#design). Highlights:
-
-- **Single `AgentManifest` type** — file-parsed (`agent.toml` + `SKILL.md` +
-  `tool.toml`) or constructed in-memory by an SDK consumer. Skills and tools
-  may be expressed inline as nested objects OR as string refs.
-- **Static capability validation** — `[sandbox]` ceilings on three axes
-  (`filesystem`, `network`, `secrets`). Permissive by default: an absent
-  `[sandbox]` table or absent axis means unconstrained on that axis.
-- **`Runtime`** that owns system-prompt assembly, session reads, update
-  fan-out, and tool execution.
+- **Single `AgentManifest` type** — file-parsed (`agent.toml` +
+  `SKILL.md`) or constructed in-memory.
+- **Tools are JS objects.** Each builtin lives in
+  `src/runtime/builtins/`. There's no on-disk tool format; extensions
+  ship tools as code in npm packages.
+- **Per-tool capability declarations** — each tool advertises its own
+  capability shape (e.g. `read_file` uses `{ paths: [...] }`). Loom
+  doesn't interpret the shape; tools self-police at execute time.
+- **Optional `[capabilities]` ceiling** — a per-tool upper bound on the
+  same shape. When present, each tool's declared caps must fit inside
+  the matching entry, using the tool's own `capabilitiesContain` (or a
+  structural deep-subset default).
 - **Session extensions:** `file` (JSONL append log) and `memory` (in-process,
   the default if `[session]` is absent).
 - **Harness extensions:** `test` (deterministic, scripted), `anthropic`
-  (Messages API), `openai` (Chat Completions). Bring your own via the
-  extension package mechanism.
-- **Process-backed tools** with strict env isolation: only declared secrets
-  reach the tool; the parent's env is filtered to a system whitelist.
+  (Messages API), `openai` (Chat Completions).
 - **Builtin tools:** `bash`, `echo`, `read_file`, `write_file`, `find`,
-  `spawn_subagent`, `search_skills`.
+  `search_skills`.
 - **CLI:** `loom run`, `loom prompt`, `loom audit`, `loom acp serve`,
   `loom install`, `loom list`, `loom extensions`.
-- An end-to-end **sample agent** under `test/fixtures/sample-agent`.
+- **`LocalRegistry`** at `~/.loom/skills/` for bare-name skill
+  resolution (tools come from code, not disk).
+- **ACP wire protocol** (server + client + `connectAcpUrl` for `acp://`
+  and `acp+unix://` URLs).
 
-v1 layers:
+### Architecture
 
-- Skills declare `subagents` (inline mapping or `subagents.toml`).
-- Recursive **capability audit** (`auditAgent` / `loom audit`).
-- **`LocalRegistry`** at `~/.loom/{skills,tools,agents}` with bare-name
-  resolution (the resolver tries inline → providers → local path → registry → builtin).
-- **ACP wire protocol** (server + client + `connectAcpUrl` for `acp://` and
-  `acp+unix://` URLs).
-- **`LoomServer.embed()`** — an in-process broker that lets spawned tool
-  subprocesses invoke subagents via the `loom-invoke` shim. Ephemeral
-  socket; no persistent daemon. Started lazily only when a tool actually
-  declares `subagent` capability.
+Loom owns: manifest parsing, secrets, system-prompt assembly,
+`[capabilities]` validation, the turn loop, and skills (loading SKILL.md,
+resolving the `requires:` map). Providers own: building Tool objects
+from `(name, config)` references, and any state those tools need.
 
-What is intentionally not yet implemented: OS-level sandbox enforcement
-(macOS `sandbox-exec`, Linux Landlock/namespaces). The capability declarations
-already exist; engaging them at the OS level is a separate phase.
+The trust model is the install boundary. Tools and extension providers
+are code the user installed (the loom package itself for builtins; an
+npm dep for everything else). Loom doesn't sandbox tools at runtime;
+tools that need real isolation own their sandbox setup (e.g. a future
+`bash`-with-container variant). Loom is a manifest-driven runtime, not
+a sandbox.
+
+What is intentionally not yet implemented: OS-level sandbox
+enforcement, subagent invocation (one agent calling another), and tool
+or skill distribution beyond the per-project `[extensions]` mechanism.
 
 ## Install / develop
 
@@ -79,10 +87,11 @@ await agent.close();
 Defaults applied:
 
 - `session` → `{ provider: "memory" }` (in-process log; events lost on close)
-- `sandbox` → unconstrained on every axis (permissive)
-- `tools` (top-level) → the default builtin set
-  (`bash`, `read_file`, `write_file`, `find`) auto-loads when the field is
-  absent. Declare an explicit `tools` table (even empty) to opt out.
+- `capabilities` (top-level ceiling) → absent (no boot-time check; each
+  tool's declared caps stand)
+- `tools` → the default builtin set (`bash`, `read_file`, `write_file`,
+  `find`) auto-loads when the field is absent, configured for the
+  project root. Declare an explicit `tools` table (even empty) to opt out.
 
 Tighten any of those when you want to:
 
@@ -92,13 +101,10 @@ await runAgent({
   tools: {},                                 // no top-level tools
   harness: { provider: "anthropic", model: "claude-3-5-sonnet-latest" },
   session: { provider: "file", path: "./session.jsonl" },
-  sandbox: { filesystem: [], network: ["api.anthropic.com"] },
 });
 ```
 
-## Top-level `tools` and inline skills
-
-The minimal `agent.toml` that customizes its tool surface:
+## Top-level `[tools]` and skills
 
 ```toml
 [agent]
@@ -110,47 +116,40 @@ provider = "anthropic"
 model = "claude-3-5-sonnet-latest"
 
 [tools]
-# explicit empty table → no top-level tools at all
-# OR list a subset:
-# bash = "builtin"
+# Each entry is `name = config`. Loom routes (name, config) through the
+# provider chain; the first non-null result wins.
+bash = {}
+read_file = { paths = ["./src", "./test"] }
+# Tools added by an [extensions].<pkg> entry are claimed by their
+# extension's provider and configured the same way:
+# "discord.send" = { channels = ["#general"] }
 ```
 
-Top-level tools are *additive* with skills' `requires:` — a skill that
-brings `bash` is fine even if `bash` isn't listed at the top level. A
-name appearing in BOTH is a hard error (no silent shadowing).
+The `tools` value is `string | Record<string, unknown>` — loom doesn't
+interpret it; the claiming provider does. Top-level tools are
+*additive* with skills' `requires:` — a skill that brings `bash` is
+fine even if `bash` isn't listed at the top level. A name appearing in
+BOTH is a hard error (no silent shadowing).
 
-Skills and tools can also be declared inline alongside the agent:
+Skills and tools can also be declared inline in the JS shape:
 
 ```ts
 await runAgent({
-  agent: { name: "delegator" },
+  name: "delegator",
   harness: { provider: "test", script: [/* ... */] },
+  tools: { bash: {} },
   skills: {
-    weather: {
-      description: "Look up weather.",
-      requires: {
-        forecast: {
-          description: "Fetch today's forecast for a city.",
-          schema: { type: "object", required: ["city"], properties: { city: { type: "string" } } },
-          invocation: { command: "/path/to/forecast-bin" },
-          capabilities: { network: ["api.weather.gov"] },
-        },
-      },
+    research: {
+      description: "Web research.",
+      body: "...",
+      requires: { fetch: { hosts: ["api.example.com"] } },
     },
   },
 });
 ```
 
-Map keys (`weather`, `forecast`) are the canonical names. Mix and match
-inline objects with string refs:
-
-```ts
-skills: {
-  weather: { description: "...", requires: { forecast: "builtin" } },
-  pre_existing: "../skills/something",
-  by_name: "registry-skill-name",
-}
-```
+Map keys (`research`, `fetch`) are the canonical names. Skills can mix
+string refs (path or registry name) with inline manifests.
 
 ## File-based agents
 
@@ -168,68 +167,38 @@ provider = "test"
 provider = "file"
 path = "./session.jsonl"
 
-[sandbox]
-filesystem = ["./"]
-network = []
-secrets = ["sample_user_name"]
+[capabilities]
+# Optional per-tool ceiling. Each tool's declared caps must fit inside
+# its matching entry (using the tool's `capabilitiesContain`).
+read_file = { paths = ["./"] }
+write_file = { paths = ["./"] }
 
-[skills]
-greeter = "../skills/greeter"
+[tools]
+read_file = { paths = ["./"] }
+write_file = { paths = ["./"] }
+bash = {}
 ```
 
 ```sh
-echo '{"sample_user_name":"world"}' > test/fixtures/sample-agent/.loom-secrets
 node dist/cli/main.js audit  test/fixtures/sample-agent/agent.toml
 node dist/cli/main.js prompt test/fixtures/sample-agent/agent.toml "hi"
 ```
 
-## Sandbox semantics
+## Capability semantics
 
-- **Absent table or axis** → unconstrained (`*`) for that axis. The minimal
-  manifest is fully permissive.
-- **Empty array** → explicitly nothing. `[sandbox] network = []` permits no
-  network access at all.
-- **Subagents** are *not* a sandbox axis. A skill's `subagents:` declaration
-  is the contract; what a skill ships is what its tools can invoke. To veto
-  a subagent, remove the skill.
-- The default top-level tool set needs `filesystem = ["./"]`. If you tighten
-  `sandbox.filesystem` past that, set an explicit `tools` table to drop the
-  defaults (or list the subset you want).
+- Each tool defines its own capability shape. `read_file`'s caps are
+  `{ paths: string[] }`; an MCP-supplied `discord.send` might use
+  `{ channels: string[] }`. Loom doesn't interpret the shape.
+- Tools self-police at execute time. `read_file` rejects requests for
+  paths outside its configured roots. The runtime doesn't enforce caps
+  — the tool author does, in their own code.
+- `[capabilities]` (optional, top-level) is a per-tool ceiling. When
+  present, each tool's declared caps must fit inside the matching
+  entry, checked at boot via the tool's `capabilitiesContain` (or a
+  structural deep-subset default). Use it as a defense-in-depth rail
+  against a skill bringing a tool with looser caps than you intended.
 
-## Subagent invocation (the broker)
 
-A skill can declare subagents:
-
-```ts
-skills: {
-  research: {
-    description: "Web research.",
-    requires: { delegate: "./tools/delegate" },
-    subagents: {
-      compactor: "/abs/path/to/compactor/agent.toml",
-      retriever: "registry-name",
-      planner: "acp://planner.example.com:9000/planner",
-    },
-  },
-}
-```
-
-A tool that declares `[tool.capabilities] subagent = ["compactor", ...]`
-will be spawned with `LOOM_INVOKE_TOKEN` and `LOOM_INVOKE_SOCKET` env vars
-plus a `loom-invoke` binary on PATH:
-
-```sh
-# inside the spawned tool subprocess
-loom-invoke compactor "summarize this text"
-```
-
-The shim posts to the parent's broker socket; the parent validates the
-token (skill-scoped to the calling tool's owning skill), dispatches the
-subagent, and returns its final message on stdout. Tokens are minted per
-invocation and revoked when the child exits.
-
-The model can also invoke subagents directly via the in-process
-`spawn_subagent` builtin (no broker needed; same registry).
 
 ## Distributing extensions via npm / GitHub
 

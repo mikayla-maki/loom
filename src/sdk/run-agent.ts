@@ -1,27 +1,25 @@
 /**
  * runAgent — the top-level SDK entry point.
  *
- * Resolves a manifest, loads extensions, fetches secrets, validates
- * capabilities, instantiates session + harness + providers, and returns a
- * RunningAgent SDK handle. Does NOT run a turn — the client triggers
- * turns via `prompt()`.
+ * Lifecycle:
+ *   1. Parse manifest (or accept inline AgentManifest), resolve system_prompt.
+ *   2. Build secrets store; load phase-1 secrets (harness/session/provider factory needs).
+ *   3. Instantiate harness + session.
+ *   4. Build runtime primitives (the methods that flow into ToolContext).
+ *   5. Instantiate providers: SDK-supplied → extension-loaded → native (last).
+ *      Call optional `provider.init()` on each.
+ *   6. Walk `[skills]`: load SKILL.md for path/registry refs, normalize inline.
+ *   7. Build the flat tool-ref list: top-level `[tools]` (with default builtin
+ *      set when absent) + every skill's `requires:`. Detect top-level/skill
+ *      collisions (hard error).
+ *   8. For each `(name, config)` ref, walk providers in order; first non-null
+ *      result wins. Throw if no provider claims the name.
+ *   9. Phase-2 secrets (per-tool secret needs from resolved Tools).
+ *  10. Validate `[capabilities.<name>]` ceilings against each tool's declared caps.
+ *  11. Build ToolTable + AgentState + RunningAgent.
  *
- * The single source-of-truth for runtime configuration is the manifest:
- * pass either a path or an `AgentManifest` object. The harness's choice
- * of provider plus its config live under `[harness]` (or in the inline
- * spec's `harness` field); same for `[session]`. Tests don't "override" —
- * they construct the manifest they want and pass it in.
- *
- * Secrets pipeline:
- *   1. Each factory (harness / session / provider) declares its required
- *      and optional secret names.
- *   2. Tools declare their secrets via `[tool.secrets]`.
- *   3. The runtime resolves the closure of required names against a
- *      `ChainedSecretsStore` (caller-supplied → env → file). Required
- *      misses fail the run with a clean message; optional misses are
- *      silently skipped.
- *   4. Each component receives ONLY its declared subset at instantiate
- *      time. Implementations never read `process.env` directly.
+ * Tools are JS objects, fully constructed by providers. Loom doesn't
+ * sandbox tools at runtime; tools enforce their own declared caps.
  */
 
 import * as path from "node:path";
@@ -31,28 +29,13 @@ import {
   loadExtensionPackage,
   type LoadOptions,
 } from "../extensions/loader.js";
-import {
-  resolveAgent,
-  type ResolveOptions,
-  type ResolvedAgentManifest,
-  type ResolvedSkill,
-  type ResolvedSubagent,
-  type ResolvedTool,
-} from "../manifest/resolver.js";
+import { nativeProviderFactory } from "../extensions/provider/native.js";
 import { LocalRegistry } from "../registry/registry.js";
+import { resolveSystemPrompt } from "../manifest/resolver.js";
+import { parseSkillManifest } from "../manifest/parser.js";
+import { assertCapabilities } from "../manifest/capabilities.js";
 import { AgentState } from "../runtime/agent-state.js";
-import { findBuiltinsDir } from "../runtime/builtins-dir.js";
-import {
-  SearchSkillsTool,
-  type SkillDiscoveryDeps,
-} from "../runtime/skill-discovery.js";
-import {
-  ProcessTool,
-  ToolTable,
-  type BrokerBinding,
-} from "../runtime/tool-table.js";
-import { LoomServer } from "../server/server.js";
-import { SpawnSubagentTool, SubagentRegistry } from "../runtime/subagent.js";
+import { ToolTable } from "../runtime/tool-table.js";
 import { UpdateSink } from "../runtime/update-sink.js";
 import {
   ChainedSecretsStore,
@@ -63,215 +46,71 @@ import {
   XDGSecretsStore,
   type SecretsStore,
 } from "../runtime/secrets.js";
-import { SecretError } from "../errors.js";
+import { ManifestError, ResolutionError, SecretError } from "../errors.js";
 import type {
   ExtensionContext,
   Harness,
   Provider,
   ProviderFactory,
+  ProviderInitArgs,
+  RuntimePrimitives,
   SecretNeeds,
   Session,
+  SkillSummary,
+  Tool,
+  ToolConfig,
 } from "../types/interfaces.js";
-import type { PermissionHandler } from "../types/permissions.js";
-import type { AgentManifest, SkillManifest } from "../types/manifest.js";
+import type {
+  PermissionHandler,
+  PermissionRequest,
+  PermissionResult,
+} from "../types/permissions.js";
+import type {
+  AgentManifest,
+  Capabilities,
+  SessionSpec,
+  SkillManifest,
+} from "../types/manifest.js";
 
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 
 export const LOOM_VERSION = "0.1.0";
 
-const PRIVILEGED_BUILTINS = new Set(["spawn_subagent", "search_skills"]);
+const DEFAULT_SESSION = { provider: "memory" } as const;
+
+/**
+ * Default top-level tool set when `[tools]` is omitted from the manifest.
+ * Each entry resolves through the native provider with empty config.
+ */
+const DEFAULT_TOP_LEVEL_TOOLS: Record<string, ToolConfig> = {
+  bash: {},
+  read_file: { paths: ["./"] },
+  write_file: { paths: ["./"] },
+  find: { paths: ["./"] },
+};
+
+/** Tool-origin label for tools declared at the top level of agent.toml. */
+const TOP_LEVEL_INTRODUCER = "(top-level)";
 
 export interface RunAgentOptions {
-  resolve?: ResolveOptions;
-  /**
-   * Highest-priority secret store. Falls through to env + .loom-secrets
-   * file if a name isn't found here.
-   */
+  /** Highest-priority secret store; falls through to env/XDG/keychain/file. */
   secrets?: SecretsStore;
   /** If a required secret is missing, omit it rather than throwing. */
   allowMissingSecrets?: boolean;
-  /**
-   * Last-chance hook for resolving secrets the chain doesn't have. The
-   * runtime calls this for each missing required (and missing optional,
-   * if the hook chooses to provide one). Returning a string treats the
-   * secret as resolved; returning null leaves it missing and the
-   * existing failure path runs. The CLI wires this to a TTY readline
-   * prompt; programmatic callers can wire it to anything (1Password CLI,
-   * a UI, etc.).
-   */
+  /** Last-chance hook called when the secrets chain misses. */
   onMissingSecret?: OnMissingSecret;
   /**
-   * Programmatic providers — appended to the active provider chain. The
-   * SDK consumer constructed these and is responsible for their secrets;
-   * the runtime does NOT resolve secrets for instances passed here.
+   * Programmatic provider instances — added BEFORE extension-loaded and
+   * native. The SDK consumer constructed these and is responsible for
+   * their trust class; loom does not resolve secrets for raw instances.
    */
   providers?: Provider[];
-  /** Capability-expansion gate. Defaults to deny-all if unset. */
+  /** Capability-expansion / consent gate. Defaults to deny-all. */
   permissionHandler?: PermissionHandler;
   /** Extension-package search-path overrides (used in tests). */
   extensionLoadOptions?: LoadOptions;
   /** Test hook: deterministic 'now' for system-prompt assembly. */
   now?: () => Date;
-  /** Per-tool execution timeout in ms. */
-  toolTimeoutMs?: number;
-}
-
-export async function runAgent(
-  source: string | AgentManifest,
-  options: RunAgentOptions = {},
-): Promise<RunningAgent> {
-  const resolveOptions: ResolveOptions = { ...(options.resolve ?? {}) };
-  if (!resolveOptions.registry) {
-    resolveOptions.registry = new LocalRegistry().lookup;
-  }
-
-  const preManifest =
-    typeof source === "string"
-      ? await (await import("../manifest/parser.js")).parseAgentManifest(source)
-      : source;
-
-  const ctx: ExtensionContext = {
-    manifestDir: preManifest.manifestPath
-      ? path.dirname(preManifest.manifestPath)
-      : process.cwd(),
-    agentName: preManifest.name,
-    loomVersion: LOOM_VERSION,
-  };
-
-  // ─── secret store ─────────────────────────────────────────────────────
-  const store = buildSecretStore(preManifest, options);
-
-  // ─── boot extensions: collect provider FACTORIES ──────────────────────
-  // Each extension's register() runs once. addProvider(factory) is
-  // captured here. Factories are instantiated later, after their declared
-  // secrets are resolved.
-  const extensionFactories = await collectExtensionFactories(
-    preManifest,
-    ctx,
-    options,
-  );
-
-  // ─── phase 1 secrets: harness + session + provider factories ──────
-  const phase1Needs = collectFactorySecretNeeds(
-    preManifest,
-    extensionFactories,
-  );
-  const phase1Secrets = await loadSecretsBundle(
-    store,
-    phase1Needs,
-    options.allowMissingSecrets ?? false,
-    options.onMissingSecret,
-  );
-
-  // Instantiate provider factories now (so they're ready for resolveAgent
-  // to consult during tool/skill resolution). Each factory gets only its
-  // own declared secrets.
-  const extensionProviders: Provider[] = [];
-  for (const f of extensionFactories) {
-    const sub = secretsFor(phase1Secrets, f.secrets);
-    extensionProviders.push(await f.create({}, ctx, sub));
-  }
-  const allProviders = [...extensionProviders, ...(options.providers ?? [])];
-  if (allProviders.length > 0) {
-    resolveOptions.providers = [
-      ...(resolveOptions.providers ?? []),
-      ...allProviders,
-    ];
-  }
-
-  // ─── resolve manifest (validate caps, walk tools) ────────────────────
-  const resolved = await resolveAgent(preManifest, resolveOptions);
-
-  // ─── phase 2 secrets: tools ───────────────────────────────────────────────────────
-  const toolNeeds = collectToolSecretNeeds(resolved);
-  const phase2Secrets = await loadSecretsBundle(
-    store,
-    toolNeeds,
-    options.allowMissingSecrets ?? false,
-    options.onMissingSecret,
-  );
-  const allSecrets = { ...phase1Secrets, ...phase2Secrets };
-
-  // ─── instantiate harness + session with their slices ─────────────────
-  const session = await instantiateSession(resolved, ctx, phase1Secrets);
-  const sessionSkills = await collectSessionSkills(session);
-  const harness = await instantiateHarness(resolved, ctx, phase1Secrets);
-
-  // ─── broker, if any tool wants subagent invocation ───────────────────
-  const server = (await maybeStartLoomServer(resolved)) ?? null;
-  const skillSubagents = flattenSkillSubagents(resolved.skills);
-
-  // ─── tool table with per-tool secret allowlists ──────────────────────
-  const toolTable = new ToolTable(
-    resolved.tools
-      .filter((rt) => !PRIVILEGED_BUILTINS.has(rt.manifest.name))
-      .map((rt) => ({
-        tool:
-          rt.tool ??
-          new ProcessTool(rt.manifest, {
-            extraPath: server
-              ? [server.binDir, ...resolved.pathAdditions]
-              : resolved.pathAdditions,
-            ...(options.toolTimeoutMs
-              ? { timeoutMs: options.toolTimeoutMs }
-              : {}),
-            ...(server
-              ? { broker: makeBrokerBinding(server, rt, skillSubagents) }
-              : {}),
-          }),
-        // Per-tool allowlist: the union of required + optional declared
-        // by the tool's own manifest. The ToolTable filters allSecrets
-        // through this set on every execute().
-        allowedSecrets: secretAllowlist({
-          required: rt.manifest.secrets?.required ?? [],
-          optional: rt.manifest.secrets?.optional ?? [],
-        }),
-      })),
-    allSecrets,
-  );
-
-  const state = new AgentState({
-    skills: [...resolved.skills.map((s) => s.manifest), ...sessionSkills],
-    ceiling: resolved.sandbox,
-    toolTable,
-  });
-
-  const permissionHolder: { current: PermissionHandler | null } = {
-    current: options.permissionHandler ?? null,
-  };
-
-  attachPrivilegedBuiltins({
-    resolved,
-    state,
-    toolTable,
-    options,
-    resolveOptions,
-    allProviders,
-    secrets: allSecrets,
-    permissionHolder,
-  });
-
-  return new RunningAgentImpl({
-    resolved,
-    secrets: allSecrets,
-    session,
-    harness,
-    state,
-    updateSink: new UpdateSink(),
-    providers: allProviders,
-    permissionHolder,
-    ...(server ? { server } : {}),
-    ...(options.now ? { now: options.now } : {}),
-  });
-}
-
-// ─── secrets pipeline ────────────────────────────────────────────────────
-
-interface SecretRequest {
-  name: string;
-  required: boolean;
-  /** Diagnostic label: "harness:anthropic" / "session:file" / "provider:mcp" / "tool:bash". */
-  requestedBy: string;
 }
 
 export type OnMissingSecret = (req: {
@@ -282,18 +121,358 @@ export type OnMissingSecret = (req: {
   required: boolean;
 }) => Promise<string | null> | string | null;
 
+export async function runAgent(
+  source: string | AgentManifest,
+  options: RunAgentOptions = {},
+): Promise<RunningAgent> {
+  // ─── 1. Parse + system prompt ───────────────────────────────────────
+  const manifest =
+    typeof source === "string"
+      ? await (await import("../manifest/parser.js")).parseAgentManifest(source)
+      : source;
+  const baseDir = manifest.manifestPath
+    ? path.dirname(manifest.manifestPath)
+    : process.cwd();
+  const systemPrompt = await resolveSystemPrompt(manifest, baseDir);
+
+  const extensionCtx: ExtensionContext = {
+    manifestDir: baseDir,
+    agentName: manifest.name,
+    loomVersion: LOOM_VERSION,
+  };
+
+  // ─── 2. Secrets store ───────────────────────────────────────────────
+  const store = buildSecretStore(manifest, options);
+
+  // ─── 3. Phase-1 secrets ─────────────────────────────────────────────
+  const extensionFactories = await collectExtensionFactories(
+    manifest,
+    extensionCtx,
+    options,
+  );
+  const phase1Needs = collectPhase1SecretNeeds(manifest, extensionFactories);
+  const phase1Secrets = await loadSecretsBundle(
+    store,
+    phase1Needs,
+    options.allowMissingSecrets ?? false,
+    options.onMissingSecret,
+  );
+
+  // ─── 4. Harness + session ───────────────────────────────────────────
+  const harness = await instantiateHarness(
+    manifest,
+    extensionCtx,
+    phase1Secrets,
+  );
+  const session = await instantiateSession(
+    manifest,
+    extensionCtx,
+    phase1Secrets,
+  );
+  const sessionSkills = await collectSessionSkills(session);
+
+  // ─── 5. Runtime services ────────────────────────────────────────────
+  const permissionHolder: { current: PermissionHandler | null } = {
+    current: options.permissionHandler ?? null,
+  };
+  const runtimeServices = new RuntimeServicesImpl(permissionHolder);
+  const runtime: RuntimePrimitives = runtimeServices;
+
+  // ─── 6. Instantiate providers ───────────────────────────────────────
+  const providers: Array<{
+    name: string;
+    instance: Provider;
+    secrets: Record<string, string>;
+    config: Record<string, unknown>;
+  }> = [];
+  for (const inst of options.providers ?? []) {
+    providers.push({
+      name: "(sdk-provider)",
+      instance: inst,
+      secrets: {},
+      config: {},
+    });
+  }
+  for (const f of extensionFactories) {
+    providers.push({
+      name: f.factory.name,
+      instance: f.factory.create(),
+      secrets: secretsFor(phase1Secrets, f.factory.secrets),
+      config: f.config,
+    });
+  }
+  providers.push({
+    name: nativeProviderFactory.name,
+    instance: nativeProviderFactory.create(),
+    secrets: {},
+    config: {},
+  });
+
+  // ─── 7. Init each provider ──────────────────────────────────────────
+  for (const p of providers) {
+    if (!p.instance.init) continue;
+    const initArgs: ProviderInitArgs = {
+      manifest,
+      config: p.config,
+      secrets: p.secrets,
+      extensionContext: extensionCtx,
+      runtime,
+    };
+    await Promise.resolve(p.instance.init(initArgs));
+  }
+
+  // ─── 8. Walk [skills] ───────────────────────────────────────────────
+  const registry = new LocalRegistry();
+  const skills: SkillManifest[] = [...sessionSkills];
+  for (const [skillKey, skillRef] of Object.entries(manifest.skills ?? {})) {
+    const skill = await loadSkill(skillKey, skillRef, baseDir, registry);
+    skills.push(skill);
+  }
+
+  // ─── 9. Build flat tool-ref list ────────────────────────────────────
+  // Top-level [tools] (with defaults if absent) + every skill's requires.
+  // Detect top-level/skill collisions (hard error).
+  const topLevelSpec = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
+  const refs: Array<{ name: string; config: ToolConfig; origin: string }> = [];
+  const seenNames = new Map<string, string>(); // name → origin
+  for (const [name, config] of Object.entries(topLevelSpec)) {
+    refs.push({ name, config, origin: TOP_LEVEL_INTRODUCER });
+    seenNames.set(name, TOP_LEVEL_INTRODUCER);
+  }
+  for (const skill of skills) {
+    for (const [name, config] of Object.entries(skill.requires ?? {})) {
+      const prior = seenNames.get(name);
+      if (prior !== undefined) {
+        throw new ResolutionError(
+          `Tool '${name}' is declared at the top level AND brought in by skill '${skill.name}'. Top-level [tools] is additive; remove the top-level entry or rename one of them to avoid the collision.`,
+        );
+      }
+      refs.push({ name, config, origin: skill.name ?? "(unnamed-skill)" });
+      seenNames.set(name, skill.name ?? "(unnamed-skill)");
+    }
+  }
+
+  // ─── 10. Resolve each ref through the provider chain ────────────
+  const resolvedTools = new Map<string, Tool>();
+  for (const ref of refs) {
+    let claimed: Tool | null = null;
+    for (const p of providers) {
+      const result = await Promise.resolve(
+        p.instance.resolveTool(ref.name, ref.config),
+      );
+      if (result) {
+        claimed = result;
+        break;
+      }
+    }
+    if (!claimed) {
+      throw new ResolutionError(
+        `Tool '${ref.name}' (introduced by ${ref.origin}) was not claimed by any provider. Registered providers: ${providers.map((p) => p.name).join(", ")}.`,
+      );
+    }
+    if (claimed.name !== ref.name) {
+      throw new ResolutionError(
+        `Tool '${ref.name}' was constructed with a mismatched name '${claimed.name}'. Provider must honor the requested name.`,
+      );
+    }
+    resolvedTools.set(ref.name, claimed);
+  }
+
+  // ─── 11. Phase-2 secrets ────────────────────────────────────────────
+  const toolNeeds = collectToolSecretNeeds(resolvedTools);
+  const phase2Secrets = await loadSecretsBundle(
+    store,
+    toolNeeds,
+    options.allowMissingSecrets ?? false,
+    options.onMissingSecret,
+  );
+  const allSecrets = { ...phase1Secrets, ...phase2Secrets };
+
+  // ─── 12. Validate [capabilities.<name>] ceilings ────────────────
+  const ceiling: Capabilities = manifest.capabilities ?? {};
+  assertCapabilities(resolvedTools, ceiling);
+
+  // ─── 13. Build skill summaries (for ctx.searchSkills) ───────────────
+  runtimeServices.setSkills(buildSkillSummaries(skills));
+
+  // ─── 14. Build ToolTable + AgentState ───────────────────────────────
+  const toolTable = new ToolTable({
+    tools: [...resolvedTools.values()].map((tool) => ({
+      tool,
+      allowedSecrets: secretAllowlist({
+        required: tool.secrets?.required ?? [],
+        optional: tool.secrets?.optional ?? [],
+      }),
+    })),
+    secrets: allSecrets,
+    contextFactory: {
+      build: () => ({
+        secrets: {}, // overridden by ToolTable per-call
+        abortSignal: runtimeServices.currentAbortSignal(),
+        requestPermission: (req) => runtime.requestPermission(req),
+        searchSkills: (q) => runtime.searchSkills(q),
+      }),
+    },
+  });
+
+  const state = new AgentState({
+    skills,
+    ceiling,
+    toolTable,
+  });
+
+  return new RunningAgentImpl({
+    manifest,
+    systemPrompt,
+    capabilities: ceiling,
+    session,
+    harness,
+    state,
+    updateSink: new UpdateSink(),
+    secrets: allSecrets,
+    providers: providers.map((p) => p.instance),
+    permissionHolder,
+    runtimeServices,
+    ...(options.now ? { now: options.now } : {}),
+  });
+}
+
+// ─── runtime services (the RuntimePrimitives implementation) ───────────────
+
+class RuntimeServicesImpl implements RuntimePrimitives {
+  private skillSet: SkillSummary[] = [];
+  private abortSignal: AbortSignal = new AbortController().signal;
+
+  constructor(
+    private readonly permissionHolder: { current: PermissionHandler | null },
+  ) {}
+
+  setSkills(skills: SkillSummary[]): void {
+    this.skillSet = skills;
+  }
+
+  /** Called by RunningAgent at the start of each turn. */
+  setAbortSignal(signal: AbortSignal): void {
+    this.abortSignal = signal;
+  }
+
+  currentAbortSignal(): AbortSignal {
+    return this.abortSignal;
+  }
+
+  requestPermission(req: PermissionRequest): Promise<PermissionResult> {
+    const handler = this.permissionHolder.current;
+    if (!handler) return Promise.resolve({ decision: "deny" });
+    return Promise.resolve(handler(req));
+  }
+
+  async searchSkills(query?: string): Promise<SkillSummary[]> {
+    if (!query) return this.skillSet;
+    const q = query.toLowerCase();
+    return this.skillSet.filter(
+      (s) =>
+        s.name.toLowerCase().includes(q) ||
+        s.description.toLowerCase().includes(q),
+    );
+  }
+}
+
+export type { RuntimeServicesImpl };
+
+function buildSkillSummaries(skills: SkillManifest[]): SkillSummary[] {
+  const out: SkillSummary[] = [];
+  for (const skill of skills) {
+    if (!skill.name) continue;
+    out.push({
+      name: skill.name,
+      description: skill.description,
+      toolNames: Object.keys(skill.requires ?? {}),
+    });
+  }
+  return out;
+}
+
+// ─── skill loading ───────────────────────────────────────────────────────
+
+async function loadSkill(
+  skillKey: string,
+  ref: string | SkillManifest,
+  baseDir: string,
+  registry: LocalRegistry,
+): Promise<SkillManifest> {
+  if (typeof ref !== "string") {
+    return normalizeInlineSkill(skillKey, ref);
+  }
+  const dir = await resolveSkillPath(ref, baseDir, registry);
+  const skill = await parseSkillManifest(dir);
+  if (skill.name !== undefined && skill.name !== skillKey) {
+    throw new ManifestError(
+      `Skill at '${dir}' has name '${skill.name}'; the agent.toml [skills] key '${skillKey}' must agree.`,
+    );
+  }
+  return { ...skill, name: skillKey };
+}
+
+function normalizeInlineSkill(
+  skillKey: string,
+  spec: SkillManifest,
+): SkillManifest {
+  if (spec.name !== undefined && spec.name !== skillKey) {
+    throw new ManifestError(
+      `Inline skill '${skillKey}' has name '${spec.name}'; the map key and the explicit name must agree (or omit the name).`,
+    );
+  }
+  return { ...spec, name: skillKey, body: spec.body ?? "" };
+}
+
+async function resolveSkillPath(
+  ref: string,
+  baseDir: string,
+  registry: LocalRegistry,
+): Promise<string> {
+  const fs = await import("node:fs/promises");
+  if (isPathLike(ref)) {
+    const p = path.resolve(baseDir, ref);
+    try {
+      if ((await fs.stat(p)).isDirectory()) return p;
+    } catch {
+      /* fall through */
+    }
+    throw new ResolutionError(
+      `Skill path does not exist or is not a directory: ${p}`,
+    );
+  }
+  const r = await registry.lookup("skill", ref);
+  if (r) return r;
+  throw new ResolutionError(`Cannot resolve skill '${ref}' from ${baseDir}`);
+}
+
+function isPathLike(s: string): boolean {
+  return (
+    s.startsWith("./") ||
+    s.startsWith("../") ||
+    s.startsWith("/") ||
+    s.startsWith("~") ||
+    /^[A-Za-z]:[\\/]/.test(s)
+  );
+}
+
+// ─── secrets pipeline ────────────────────────────────────────────────────
+
+interface SecretRequest {
+  name: string;
+  required: boolean;
+  /** Diagnostic label: "harness:anthropic" / "tool:bash" / "provider:mcp". */
+  requestedBy: string;
+}
+
 /**
  * Default chain priority (first hit wins):
  *   1. caller-supplied store (`options.secrets`)
  *   2. environment
  *   3. XDG: `$XDG_CONFIG_HOME/loom/secrets.toml`
- *   4. macOS Keychain (`security -s loom -a <name>`); silent on other OSes
- *   5. per-agent `.loom-secrets` next to the agent.toml
- *
- * Env beats files so an `ANTHROPIC_API_KEY=... loom run` invocation
- * always wins, but XDG and the Keychain are checked before the
- * per-project file because the per-project file is the most
- * "committed-to-git-by-accident" surface.
+ *   4. macOS Keychain (silent on other OSes)
+ *   5. per-agent `.loom-secrets`
  */
 function buildSecretStore(
   manifest: AgentManifest,
@@ -314,58 +493,36 @@ function buildSecretStore(
   return new ChainedSecretsStore(stores);
 }
 
-/**
- * Phase 1 needs: harness factory + session factory + each extension-added
- * provider factory. Only the factories actually being used contribute.
- *
- * If `harness` or `session` is an instance (not a config record), it was
- * constructed by the caller with its own secret arrangement; the runtime
- * doesn't introspect or resolve.
- */
-function collectFactorySecretNeeds(
+function collectPhase1SecretNeeds(
   manifest: AgentManifest,
-  extensionFactories: ProviderFactory[],
+  extensionFactories: Array<{
+    factory: ProviderFactory;
+    config: Record<string, unknown>;
+  }>,
 ): SecretRequest[] {
   const out: SecretRequest[] = [];
-
-  // Harness
   if ("provider" in manifest.harness) {
     const f = getHarnessFactory(manifest.harness.provider);
     pushNeeds(out, f.secrets, `harness:${f.name}`);
   }
-
-  // Session (defaults to memory if absent; default has no secrets)
   if (manifest.session && "provider" in manifest.session) {
     const f = getSessionFactory(manifest.session.provider);
     pushNeeds(out, f.secrets, `session:${f.name}`);
   }
-
-  // Extension-added provider factories
-  for (const f of extensionFactories) {
-    pushNeeds(out, f.secrets, `provider:${f.name}`);
+  for (const ef of extensionFactories) {
+    pushNeeds(out, ef.factory.secrets, `provider:${ef.factory.name}`);
   }
-
   return out;
 }
 
-function collectToolSecretNeeds(
-  resolved: ResolvedAgentManifest,
-): SecretRequest[] {
+function collectToolSecretNeeds(tools: Map<string, Tool>): SecretRequest[] {
   const out: SecretRequest[] = [];
-  for (const t of resolved.tools) {
-    for (const name of t.manifest.secrets?.required ?? []) {
-      out.push({
-        name,
-        required: true,
-        requestedBy: `tool:${t.manifest.name}`,
-      });
+  for (const [name, tool] of tools) {
+    for (const s of tool.secrets?.required ?? []) {
+      out.push({ name: s, required: true, requestedBy: `tool:${name}` });
     }
-    for (const name of t.manifest.secrets?.optional ?? []) {
-      out.push({
-        name,
-        required: false,
-        requestedBy: `tool:${t.manifest.name}`,
-      });
+    for (const s of tool.secrets?.optional ?? []) {
+      out.push({ name: s, required: false, requestedBy: `tool:${name}` });
     }
   }
   return out;
@@ -389,10 +546,7 @@ async function loadSecretsBundle(
   allowMissingRequired: boolean,
   onMissingSecret: OnMissingSecret | undefined,
 ): Promise<Record<string, string>> {
-  // Required wins on conflict: a name appearing as both required and
-  // optional is treated as required (one missing tool failing is louder
-  // than another tool quietly missing).
-  const required = new Map<string, string[]>(); // name → requesters
+  const required = new Map<string, string[]>();
   const optional = new Map<string, string[]>();
   for (const r of needs) {
     const target = r.required ? required : optional;
@@ -410,7 +564,6 @@ async function loadSecretsBundle(
       requiredResolved[name] = v;
       continue;
     }
-    // Last-chance hook: ask the embedder. CLI wires this to a TTY prompt.
     if (onMissingSecret) {
       const supplied = await Promise.resolve(
         onMissingSecret({
@@ -457,7 +610,6 @@ async function loadSecretsBundle(
 }
 
 function formatMissingSecrets(missing: SecretRequest[]): string {
-  // Group by name; list requesters under each.
   const byName = new Map<string, string[]>();
   for (const m of missing) {
     const arr = byName.get(m.name) ?? [];
@@ -479,10 +631,6 @@ function formatMissingSecrets(missing: SecretRequest[]): string {
   return lines.join("\n");
 }
 
-/**
- * Filter the loaded-secrets map to only the names a component declared.
- * Used by per-component instantiation and by ToolTable.execute().
- */
 export function secretsFor(
   loaded: Record<string, string>,
   needs: SecretNeeds | undefined,
@@ -506,14 +654,15 @@ function secretAllowlist(needs: {
 // ─── instantiate harness / session ────────────────────────────────────────
 
 async function instantiateHarness(
-  resolved: ResolvedAgentManifest,
+  manifest: AgentManifest,
   ctx: ExtensionContext,
   phase1Secrets: Record<string, string>,
 ): Promise<Harness> {
-  const spec = resolved.source.harness;
+  const spec = manifest.harness;
   if ("provider" in spec) {
     const factory = getHarnessFactory(spec.provider);
     const { provider: _p, ...config } = spec;
+    void _p;
     const sub = secretsFor(phase1Secrets, factory.secrets);
     return await factory.create(config, ctx, sub);
   }
@@ -521,18 +670,27 @@ async function instantiateHarness(
 }
 
 async function instantiateSession(
-  resolved: ResolvedAgentManifest,
+  manifest: AgentManifest,
   ctx: ExtensionContext,
   phase1Secrets: Record<string, string>,
 ): Promise<Session> {
-  const spec = resolved.session;
+  const spec: SessionSpec = manifest.session ?? { ...DEFAULT_SESSION };
   if ("provider" in spec) {
     const factory = getSessionFactory(spec.provider);
     const { provider: _p, ...config } = spec;
+    void _p;
     const sub = secretsFor(phase1Secrets, factory.secrets);
     return await factory.create(config, ctx, sub);
   }
   return spec;
+}
+
+async function collectSessionSkills(
+  session: Session,
+): Promise<SkillManifest[]> {
+  if (!session.skills) return [];
+  const r = session.skills();
+  return Array.isArray(r) ? r : await r;
 }
 
 // ─── extensions ──────────────────────────────────────────────────────────
@@ -541,8 +699,13 @@ async function collectExtensionFactories(
   manifest: AgentManifest,
   ctx: ExtensionContext,
   options: RunAgentOptions,
-): Promise<ProviderFactory[]> {
-  const factories: ProviderFactory[] = [];
+): Promise<
+  Array<{ factory: ProviderFactory; config: Record<string, unknown> }>
+> {
+  const factories: Array<{
+    factory: ProviderFactory;
+    config: Record<string, unknown>;
+  }> = [];
   for (const [pkgName, pkgConfig] of Object.entries(
     manifest.extensions ?? {},
   )) {
@@ -556,127 +719,11 @@ async function collectExtensionFactories(
       },
       options.extensionLoadOptions ?? {},
     );
-    factories.push(...addedProviderFactories);
+    for (const f of addedProviderFactories) {
+      factories.push({ factory: f, config: pkgConfig });
+    }
   }
   return factories;
-}
-
-// ─── broker wiring ────────────────────────────────────────────────────────
-
-async function maybeStartLoomServer(
-  resolved: ResolvedAgentManifest,
-): Promise<LoomServer | null> {
-  const needsBroker = resolved.tools.some((t) => {
-    if (PRIVILEGED_BUILTINS.has(t.manifest.name)) return false;
-    if (t.tool) return false; // provider-supplied; runs in-process
-    const sa = t.manifest.capabilities?.subagent;
-    return sa === "*" || (Array.isArray(sa) && sa.length > 0);
-  });
-  if (!needsBroker) return null;
-  return await LoomServer.embed();
-}
-
-function flattenSkillSubagents(
-  skills: ResolvedSkill[],
-): Map<string, Record<string, string>> {
-  const out = new Map<string, Record<string, string>>();
-  for (const sk of skills) {
-    const reg: Record<string, string> = {};
-    for (const [name, ref] of Object.entries(sk.subagents)) {
-      reg[name] = subagentRefToString(ref);
-    }
-    out.set(sk.manifest.name, reg);
-  }
-  return out;
-}
-
-function subagentRefToString(ref: ResolvedSubagent): string {
-  switch (ref.kind) {
-    case "acp":
-      return ref.url;
-    case "path":
-      return ref.path;
-    case "registry":
-      return ref.resolvedPath;
-  }
-}
-
-function makeBrokerBinding(
-  server: LoomServer,
-  tool: ResolvedTool,
-  skillSubagents: Map<string, Record<string, string>>,
-): BrokerBinding {
-  const skill = tool.introducedBy;
-  const registry = skillSubagents.get(skill) ?? {};
-  return {
-    socketPath: server.socketPath,
-    mintToken: () => server.mintToken(skill, registry),
-    revokeToken: (t) => server.revokeToken(t),
-  };
-}
-
-// ─── session skills ──────────────────────────────────────────────────────
-
-async function collectSessionSkills(
-  session: Session,
-): Promise<SkillManifest[]> {
-  if (!session.skills) return [];
-  const r = session.skills();
-  return Array.isArray(r) ? r : await r;
-}
-
-// ─── privileged builtins ─────────────────────────────────────────────────
-
-interface AttachBuiltinsArgs {
-  resolved: ResolvedAgentManifest;
-  state: AgentState;
-  toolTable: ToolTable;
-  options: RunAgentOptions;
-  resolveOptions: ResolveOptions;
-  allProviders: Provider[];
-  secrets: Record<string, string>;
-  permissionHolder: { current: PermissionHandler | null };
-}
-
-function attachPrivilegedBuiltins(args: AttachBuiltinsArgs): void {
-  const declaredBuiltins = new Set(
-    args.resolved.tools
-      .map((t) => t.manifest.name)
-      .filter((n) => PRIVILEGED_BUILTINS.has(n)),
-  );
-
-  const subagents: Array<{
-    name: string;
-    ref: ResolvedSubagent;
-    skill: string;
-  }> = [];
-  for (const sk of args.resolved.skills) {
-    for (const [name, ref] of Object.entries(sk.subagents)) {
-      subagents.push({ name, ref, skill: sk.manifest.name });
-    }
-  }
-  if (declaredBuiltins.has("spawn_subagent") || subagents.length > 0) {
-    args.toolTable.addTool(
-      new SpawnSubagentTool(new SubagentRegistry(subagents), {
-        runOptions: args.options.resolve
-          ? { resolve: args.options.resolve }
-          : {},
-      }),
-      // Privileged builtins receive an empty secret allowlist — they
-      // operate in-process and don't need the secret bag.
-      new Set<string>(),
-    );
-  }
-
-  if (declaredBuiltins.has("search_skills")) {
-    const deps: SkillDiscoveryDeps = {
-      state: args.state,
-      providers: args.allProviders,
-      builtinsDir:
-        args.resolveOptions.builtinsDir ?? findBuiltinsDir(import.meta.url),
-    };
-    args.toolTable.addTool(new SearchSkillsTool(deps), new Set<string>());
-  }
 }
 
 export { StaticSecretsStore };

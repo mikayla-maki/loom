@@ -3,63 +3,46 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 
-import { resolveAgent } from "../src/manifest/resolver.js";
-import { CapabilityError, ManifestError } from "../src/errors.js";
+import { resolveSystemPrompt } from "../src/manifest/resolver.js";
+import { runAgent } from "../src/sdk/run-agent.js";
+import { CapabilityError, ResolutionError } from "../src/errors.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
-describe("resolveAgent", () => {
-  it("resolves the sample agent end-to-end (with the default top-level tool set)", async () => {
-    // The sample agent fixture stays file-based on purpose: it exercises
-    // both the [skills] disk dependency walk and tool/skill capability
-    // ceiling aggregation end-to-end.
-    const r = await resolveAgent(
+describe("manifest walk via runAgent", () => {
+  it("resolves the sample agent end-to-end", async () => {
+    // The fixture stays file-based on purpose: exercises on-disk
+    // system_prompt resolution and the per-tool [capabilities] check.
+    const agent = await runAgent(
       path.join(FIXTURES, "sample-agent/agent.toml"),
+      {},
     );
-    // The sample agent doesn't declare [tools], so it gets the default
-    // builtin set; one explicit skill brings two more tools.
-    expect(r.skills).toHaveLength(1);
-    expect(r.skills[0]?.manifest.name).toBe("greeter");
-    expect(r.tools.map((t) => t.manifest.name).sort()).toEqual([
-      "bash",
-      "find",
-      "greet",
-      "read_file",
-      "uppercase",
-      "write_file",
-    ]);
-    // Top-level tools are tagged distinctly from skill-supplied tools.
-    const topLevelNames = r.tools
-      .filter((t) => t.introducedBy === "(top-level)")
-      .map((t) => t.manifest.name)
-      .sort();
-    expect(topLevelNames).toEqual(["bash", "find", "read_file", "write_file"]);
-    expect(r.systemPrompt).toMatch(/Sample Agent/);
-    expect(r.requiredSecrets.has("sample_user_name")).toBe(true);
-    // pathAdditions: 4 default-set tool bin dirs + 2 manifest tool bin dirs.
-    expect(r.pathAdditions).toHaveLength(6);
+    try {
+      expect(agent.agentState.skills).toHaveLength(0);
+      const tools = agent.agentState.toolTable.list().map((t) => t.name);
+      expect(tools.sort()).toEqual(["echo", "find", "read_file", "write_file"]);
+      // Per-tool ceiling matches each tool's declared paths.
+      expect(agent.capabilities.read_file).toEqual({ paths: ["./"] });
+    } finally {
+      await agent.close();
+    }
   });
 
   it("empty [tools] table opts out of the default builtin set", async () => {
-    // The greeter skill stays on disk (it's a fixture) but the parent
-    // agent is declared inline and points at it via absolute path.
-    const greeterPath = path.join(FIXTURES, "skills/greeter");
     const spec: AgentManifest = {
       name: "no-defaults",
       systemPrompt: "be brief",
       tools: {},
       harness: { provider: "test" },
-      sandbox: { filesystem: ["./"], secrets: ["sample_user_name"] },
-      skills: { greeter: greeterPath },
     };
-    const r = await resolveAgent(spec);
-    expect(r.skills).toHaveLength(1);
-    expect(r.skills[0]?.manifest.name).toBe("greeter");
-    expect(r.tools.map((t) => t.manifest.name).sort()).toEqual([
-      "greet",
-      "uppercase",
-    ]);
+    const agent = await runAgent(spec, {});
+    try {
+      expect(agent.agentState.skills).toHaveLength(0);
+      expect(agent.agentState.toolTable.list()).toHaveLength(0);
+    } finally {
+      await agent.close();
+    }
   });
 
   it("top-level [tools] is a hard error when colliding with a skill's requires", async () => {
@@ -68,7 +51,6 @@ describe("resolveAgent", () => {
       systemPrompt: "x",
       tools: { bash: "builtin" },
       harness: { provider: "test" },
-      sandbox: { filesystem: ["./"], network: [], secrets: [] },
       skills: {
         s: {
           description: "also brings bash",
@@ -76,102 +58,31 @@ describe("resolveAgent", () => {
         },
       },
     };
-    await expect(resolveAgent(spec)).rejects.toThrow(
+    await expect(runAgent(spec, {})).rejects.toThrow(
       /declared at the top level AND brought in by skill/,
     );
   });
 
-  it("rejects when a tool needs a capability outside the ceiling", async () => {
+  it("rejects when a tool's caps exceed the per-tool sandbox ceiling", async () => {
     const spec: AgentManifest = {
       name: "snoopy",
       systemPrompt: "x",
-      tools: {},
+      // read_file declares paths=["/etc"] — outside the ceiling's "./".
+      tools: { read_file: { paths: ["/etc"] } },
       harness: { provider: "test" },
-      sandbox: { filesystem: [], network: [], secrets: [] },
-      skills: {
-        s: {
-          description: "tries to snoop",
-          requires: {
-            snoop: {
-              description: "snoop",
-              schema: { type: "object" },
-              invocation: { command: "echo" },
-              capabilities: { filesystem: [], network: ["evil.com"] },
-            },
-          },
-        },
-      },
+      capabilities: { read_file: { paths: ["./"] } },
     };
-    await expect(resolveAgent(spec)).rejects.toThrow(CapabilityError);
+    await expect(runAgent(spec, {})).rejects.toThrow(CapabilityError);
   });
 
-  it("rejects when SKILL.md requires a tool whose [tool].name disagrees", async () => {
-    // This test specifically exercises parser-level name validation
-    // where the on-disk tool.toml's [tool].name differs from the
-    // requires-key. Inline specs validate name-vs-key at materialize
-    // time (different code path), so we keep this on disk.
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-name-"));
-    try {
-      const toolDir = path.join(dir, "tools", "actually-bar");
-      await fs.mkdir(toolDir, { recursive: true });
-      await fs.writeFile(
-        path.join(toolDir, "tool.toml"),
-        `[tool]
-name = "bar"
-description = "x"
-[tool.schema]
-type = "object"
-[tool.invocation]
-command = "echo"
-[tool.secrets]
-required = []
-[tool.capabilities]
-filesystem = []
-network = []
-`,
-        "utf8",
-      );
-      const skillDir = path.join(dir, "skills", "wrong");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
-        `---
-name: wrong
-description: bad
-requires:
-  foo: ../../tools/actually-bar
----
-body`,
-        "utf8",
-      );
-      const agentDir = path.join(dir, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
-name = "n"
-system_prompt = "x"
-[tools]
-
-[harness]
-provider = "test"
-[session]
-provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
-[skills]
-w = "../skills/wrong"
-`,
-        "utf8",
-      );
-      await expect(
-        resolveAgent(path.join(agentDir, "agent.toml")),
-      ).rejects.toThrow(ManifestError);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+  it("fails when no provider claims a referenced tool name", async () => {
+    const spec: AgentManifest = {
+      name: "unknown-tool",
+      systemPrompt: "x",
+      tools: { not_a_real_tool: {} },
+      harness: { provider: "test" },
+    };
+    await expect(runAgent(spec, {})).rejects.toThrow(ResolutionError);
   });
 
   it("resolves [agent].system_prompt as inline string when not path-like", async () => {
@@ -182,8 +93,8 @@ w = "../skills/wrong"
       harness: { provider: "test" },
       skills: {},
     };
-    const r = await resolveAgent(spec);
-    expect(r.systemPrompt).toBe("Be concise. Use only tools provided.");
+    const sp = await resolveSystemPrompt(spec, process.cwd());
+    expect(sp).toBe("Be concise. Use only tools provided.");
   });
 
   it("resolves [agent].system_prompt as a file when path-like", async () => {
@@ -208,27 +119,26 @@ system_prompt = "./core.md"
 provider = "test"
 [session]
 provider = "memory"
-[sandbox]
-filesystem = []
-network = []
-secrets = []
 [skills]
 `,
       );
-      const r = await resolveAgent(path.join(agentDir, "agent.toml"));
-      expect(r.systemPrompt).toMatch(/be brief/);
+      const { parseAgentManifest } = await import("../src/manifest/parser.js");
+      const manifest = await parseAgentManifest(
+        path.join(agentDir, "agent.toml"),
+      );
+      const sp = await resolveSystemPrompt(manifest, agentDir);
+      expect(sp).toMatch(/be brief/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
 
-  it("resolves builtin tools by the requires-key shorthand", async () => {
+  it("resolves builtin tools brought in by a skill's requires", async () => {
     const spec: AgentManifest = {
       name: "x",
       systemPrompt: "x",
       tools: {},
       harness: { provider: "test" },
-      sandbox: { filesystem: ["./"], network: [], secrets: [] },
       skills: {
         s: {
           description: "bash access",
@@ -236,7 +146,13 @@ secrets = []
         },
       },
     };
-    const r = await resolveAgent(spec);
-    expect(r.tools.map((t) => t.manifest.name)).toEqual(["bash"]);
+    const agent = await runAgent(spec, {});
+    try {
+      expect(agent.agentState.toolTable.list().map((t) => t.name)).toEqual([
+        "bash",
+      ]);
+    } finally {
+      await agent.close();
+    }
   });
 });

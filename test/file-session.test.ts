@@ -14,8 +14,14 @@ describe("FileSession", () => {
     try {
       const p = path.join(dir, "session.jsonl");
       const s = new FileSession(p);
-      await s.append({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "a" } });
-      await s.append({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "b" } });
+      await s.append({
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: "a" },
+      });
+      await s.append({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "b" },
+      });
       const events = await s.getEvents();
       expect(events).toHaveLength(2);
       const file = await fs.readFile(p, "utf8");
@@ -32,25 +38,23 @@ describe("FileSession", () => {
       const fixturesRoot = path.resolve("test/fixtures");
       const agentDir = path.join(dir, "agent");
       await fs.mkdir(agentDir, { recursive: true });
-      await fs.cp(path.join(fixturesRoot, "sample-agent", "identity.md"), path.join(agentDir, "identity.md"));
+      await fs.cp(
+        path.join(fixturesRoot, "sample-agent", "identity.md"),
+        path.join(agentDir, "identity.md"),
+      );
+      // No skills, no [tools] entry → default builtin tool set.
       await fs.writeFile(
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "persist"
 system_prompt = "./identity.md"
-[tools]
 
 [harness]
 provider = "test"
+
 [session]
 provider = "file"
 path = "./session.jsonl"
-[sandbox]
-filesystem = ["./"]
-network = []
-secrets = ["sample_user_name"]
-[skills]
-g = "${path.join(fixturesRoot, "skills/greeter").replace(/\\/g, "/")}"
 `,
         "utf8",
       );
@@ -74,7 +78,9 @@ g = "${path.join(fixturesRoot, "skills/greeter").replace(/\\/g, "/")}"
       await a2.prompt("hi again");
       const events = await a2.session.getEvents();
       // After two prompts in two separate runs, the log contains 2 user msgs.
-      const userMsgs = events.filter((e) => e.sessionUpdate === "user_message_chunk");
+      const userMsgs = events.filter(
+        (e) => e.sessionUpdate === "user_message_chunk",
+      );
       expect(userMsgs.length).toBeGreaterThanOrEqual(2);
       await a2.close();
     } finally {

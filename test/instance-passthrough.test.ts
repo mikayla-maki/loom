@@ -102,22 +102,10 @@ describe("manifest accepts instances directly", () => {
     };
     let closed = false;
     const provider: Provider = {
-      async resolveTool(name) {
-        if (name !== "stub") return null;
-        return {
-          kind: "synthetic",
-          manifest: {
-            name: "stub",
-            description: "literal output",
-            schema: { type: "object" },
-            invocation: { command: "n/a" },
-            capabilities: {},
-          },
-          tool: stubTool,
-        };
+      resolveTool(name) {
+        if (name === "stub") return stubTool;
+        return null;
       },
-      resolveSkill: () => null,
-      list: () => ({ tools: ["stub"] }),
       close: () => {
         closed = true;
       },
@@ -126,15 +114,14 @@ describe("manifest accepts instances directly", () => {
     const agent = await runAgent(
       {
         name: "inst-provider",
-        tools: {},
+        // Reference the provider-supplied tool by name in [tools] so it's
+        // in the resolution list.
+        tools: { stub: {} },
         harness: {
           provider: "test",
           script: [
             [{ call: { tool: "stub", input: {} } }, { stop: "end_turn" }],
           ],
-        },
-        skills: {
-          s: { description: "uses stub", requires: { stub: "stub" } },
         },
       },
       { providers: [provider] }, // ← raw Provider instance, programmatic injection

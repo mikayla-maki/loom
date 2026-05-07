@@ -17,7 +17,7 @@
  * to the connected client.
  */
 
-import type { SandboxCeiling } from "./manifest.js";
+import type { Capabilities } from "./manifest.js";
 
 /** Discrete user choices — mirrors ACP `RequestPermissionOutcome`. */
 export type PermissionDecision = "allow_once" | "allow_session" | "deny";
@@ -31,9 +31,9 @@ export interface PermissionRequest {
    * Capabilities being requested. For `expand_sandbox`, this is the *diff*
    * — the set of capabilities NOT already in the current ceiling.
    */
-  newCapabilities?: SandboxCeiling;
+  newCapabilities?: Capabilities;
   /** Snapshot of the current ceiling, for context. */
-  currentCeiling?: SandboxCeiling;
+  currentCeiling?: Capabilities;
   /** Free-form metadata (skill name, tool name, etc.). */
   metadata?: Record<string, unknown>;
 }

@@ -46,7 +46,7 @@ describe("ACP round-trip (in-process streams)", () => {
         provider: "test",
         script: [[{ say: "hi from agent" }, { stop: "end_turn" }]],
       },
-      sandbox: { filesystem: [], network: [], secrets: ["sample_user_name"] },
+      capabilities: { filesystem: [], network: [], secrets: ["sample_user_name"] },
     };
     const agent = await runAgent(spec, {
       secrets: new StaticSecretsStore({ sample_user_name: "ACP" }),
@@ -57,7 +57,7 @@ describe("ACP round-trip (in-process streams)", () => {
       // Inline specs have no on-disk manifestPath; the router still
       // requires *something* to satisfy session/new, but the agentFactory
       // ignores it (always returns the pre-booted agent above).
-      fixedManifestPath: agent.resolved.source.manifestPath ?? "<inline>",
+      fixedManifestPath: agent.manifest.manifestPath ?? "<inline>",
     });
     const routerDone = routerOverStreams(router, serverIn, serverOut);
 
@@ -173,7 +173,7 @@ echo = true
 [session]
 provider = "file"
 path = "./session.jsonl"
-[sandbox]
+[capabilities]
 filesystem = ["./"]
 network = []
 secrets = []

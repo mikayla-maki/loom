@@ -46,7 +46,7 @@ export async function serveOverStdio(agent: RunningAgent): Promise<void> {
   const stream = ndjsonStream(process.stdin, process.stdout);
   const router = new AcpRouter({
     agentFactory: async () => agent,
-    fixedManifestPath: agent.resolved.source.manifestPath,
+    fixedManifestPath: agent.manifest.manifestPath,
   });
   const sessionId = await router.bindSession(agent, stream);
   await router.run(stream, sessionId);
@@ -68,12 +68,17 @@ export class AcpRouter {
   constructor(private readonly binding: ServeAgentBinding) {}
 
   /** Bind a pre-booted agent to a freshly assigned sessionId. */
-  async bindSession(agent: RunningAgent, stream: MessageStream): Promise<string> {
+  async bindSession(
+    agent: RunningAgent,
+    stream: MessageStream,
+  ): Promise<string> {
     const sessionId = `s${this.nextId++}`;
     this.sessions.set(sessionId, agent);
     this.startUpdateForwarder(sessionId, agent, stream);
     // Wire the agent's permission requests to the connected client.
-    agent.setPermissionHandler(this.makeForwardingPermissionHandler(sessionId, stream));
+    agent.setPermissionHandler(
+      this.makeForwardingPermissionHandler(sessionId, stream),
+    );
     return sessionId;
   }
 
@@ -104,7 +109,11 @@ export class AcpRouter {
       }).catch((e) => {
         return { error: e };
       });
-      if (reply && typeof reply === "object" && "decision" in (reply as Record<string, unknown>)) {
+      if (
+        reply &&
+        typeof reply === "object" &&
+        "decision" in (reply as Record<string, unknown>)
+      ) {
         return reply as SessionRequestPermissionResult;
       }
       return { decision: "deny" };
@@ -118,7 +127,11 @@ export class AcpRouter {
       const msg = raw as JSONRPCRequest & JSONRPCResponse;
 
       // Inbound response to one of OUR outbound requests (e.g. permission).
-      if (typeof msg.id === "number" && (msg.result !== undefined || msg.error !== undefined) && !msg.method) {
+      if (
+        typeof msg.id === "number" &&
+        (msg.result !== undefined || msg.error !== undefined) &&
+        !msg.method
+      ) {
         const pending = this.pendingOutbound.get(msg.id);
         if (pending) {
           this.pendingOutbound.delete(msg.id);
@@ -164,18 +177,26 @@ export class AcpRouter {
           break;
         }
         case ACP_METHODS.sessionCancel: {
-          await this.handleSessionCancel((msg.params ?? {}) as SessionCancelParams);
+          await this.handleSessionCancel(
+            (msg.params ?? {}) as SessionCancelParams,
+          );
           this.respond(stream, id, {});
           break;
         }
         case ACP_METHODS.sessionClose: {
-          const sid = (msg.params as { sessionId?: string } | undefined)?.sessionId;
+          const sid = (msg.params as { sessionId?: string } | undefined)
+            ?.sessionId;
           if (sid) await this.closeSession(sid);
           this.respond(stream, id, {});
           break;
         }
         default:
-          this.respondError(stream, id, -32601, `Method not found: ${msg.method}`);
+          this.respondError(
+            stream,
+            id,
+            -32601,
+            `Method not found: ${msg.method}`,
+          );
       }
     } catch (e) {
       this.respondError(stream, id, -32000, (e as Error).message);
@@ -192,7 +213,7 @@ export class AcpRouter {
     const sessionId = `s${this.nextId++}`;
     this.sessions.set(sessionId, agent);
     this.startUpdateForwarder(sessionId, agent, stream);
-    return { sessionId, agentName: agent.resolved.source.name };
+    return { sessionId, agentName: agent.manifest.name };
   }
 
   private async handleSessionPrompt(
@@ -207,7 +228,9 @@ export class AcpRouter {
     return { stopReason, finalMessage: await lastAgentMessage(agent.session) };
   }
 
-  private async handleSessionCancel(params: SessionCancelParams): Promise<void> {
+  private async handleSessionCancel(
+    params: SessionCancelParams,
+  ): Promise<void> {
     const agent = this.sessions.get(params.sessionId);
     if (agent) await agent.cancel();
   }
@@ -232,7 +255,10 @@ export class AcpRouter {
         const note = {
           jsonrpc: "2.0",
           method: ACP_METHODS.sessionUpdate,
-          params: { sessionId, update: u } satisfies { sessionId: string; update: SessionUpdate },
+          params: { sessionId, update: u } satisfies {
+            sessionId: string;
+            update: SessionUpdate;
+          },
         };
         stream.write(JSON.stringify(note));
       }
@@ -248,7 +274,12 @@ export class AcpRouter {
     };
     stream.write(JSON.stringify(r));
   }
-  private respondError(stream: MessageStream, id: unknown, code: number, message: string): void {
+  private respondError(
+    stream: MessageStream,
+    id: unknown,
+    code: number,
+    message: string,
+  ): void {
     const r: JSONRPCResponse = {
       jsonrpc: "2.0",
       id: id as JSONRPCResponse["id"],

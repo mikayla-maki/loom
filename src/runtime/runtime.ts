@@ -14,12 +14,6 @@ import type {
   ToolDescriptor,
   ToolResult,
 } from "../types/interfaces.js";
-import type {
-  PermissionHandler,
-  PermissionRequest,
-  PermissionResult,
-} from "../types/permissions.js";
-import { denyAllPermissionHandler } from "../types/permissions.js";
 import type { SessionUpdate } from "../types/acp.js";
 
 import type { AgentState } from "./agent-state.js";
@@ -34,7 +28,6 @@ export interface RuntimeImplOptions {
   agentName: string;
   agentDescription?: string;
   abortSignal: AbortSignal;
-  permissionHandler?: PermissionHandler;
   /** Test hook: deterministic "now" used in system-prompt assembly. */
   now?: () => Date;
 }
@@ -42,12 +35,10 @@ export interface RuntimeImplOptions {
 export class RuntimeImpl implements Runtime {
   public readonly abortSignal: AbortSignal;
   private readonly opts: RuntimeImplOptions;
-  private readonly permissionHandler: PermissionHandler;
 
   constructor(opts: RuntimeImplOptions) {
     this.opts = opts;
     this.abortSignal = opts.abortSignal;
-    this.permissionHandler = opts.permissionHandler ?? denyAllPermissionHandler;
   }
 
   getEvents(from?: number, to?: number): Promise<SessionUpdate[]> {
@@ -92,9 +83,5 @@ export class RuntimeImpl implements Runtime {
   executeTool(call: ToolCall): Promise<ToolResult> {
     if (!call.id) call.id = randomUUID();
     return this.opts.state.toolTable.execute(call);
-  }
-
-  requestPermission(req: PermissionRequest): Promise<PermissionResult> {
-    return Promise.resolve(this.permissionHandler(req));
   }
 }

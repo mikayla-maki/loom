@@ -1,5 +1,0 @@
-#!/usr/bin/env node
-import { readFileSync } from "node:fs";
-const input = JSON.parse(readFileSync(0, "utf8"));
-const name = process.env.sample_user_name || process.env.SAMPLE_USER_NAME || "stranger";
-process.stdout.write(`${input.greeting}, ${name.toLowerCase()}`);

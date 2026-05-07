@@ -1,13 +1,27 @@
 /**
- * The four core interfaces.
+ * The core interfaces.
  *
- * Each one corresponds to a "resource" in the manifest model. The Loom
- * runtime wires implementations of these together.
+ * Loom is a manifest-driven agent runtime. It owns parsing, secrets,
+ * the system prompt, the turn loop, and skills. **Tools** are JS
+ * objects that a chain of **providers** constructs from manifest
+ * entries: each tool reference is `(name, config)`; loom asks each
+ * provider in order; the first non-null result wins.
+ *
+ * Tool capabilities are tool-defined: the shape is whatever the tool
+ * needs (paths for a filesystem tool, channels for Discord, buckets
+ * for S3). Loom doesn't interpret them. The optional `[sandbox.<name>]`
+ * ceiling lets users declare upper bounds; the tool's own
+ * `capabilitiesContain` (or a structural default) decides containment.
+ *
+ * Trust contract: tools are the same trust class as extensions — code
+ * the user installed. Loom doesn't sandbox tools at runtime; tools
+ * enforce their declared caps themselves. Tools that need real
+ * isolation (e.g. shell exec) ship their own sandbox.
  */
 
 import type { SessionUpdate, StopReason } from "./acp.js";
 import type { JSONSchema } from "./schema.js";
-import type { SkillManifest } from "./manifest.js";
+import type { AgentManifest, SkillManifest } from "./manifest.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Session — durable log + optional skill contributions.
@@ -46,7 +60,7 @@ export interface Session {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Tool — a sandboxed, schema-described executable.
+// Tool — a JS object that the model calls. Constructed by a provider.
 // ────────────────────────────────────────────────────────────────────────────
 
 export interface ToolDescriptor {
@@ -70,7 +84,57 @@ export interface ToolResult {
 }
 
 export interface Tool extends ToolDescriptor {
-  execute(input: unknown, secrets: Record<string, string>): Promise<ToolResult>;
+  /**
+   * Capability footprint this tool advertises. Shape is tool-specific:
+   * `{ paths: ["./"] }` for a filesystem tool, `{ buckets: [...] }` for
+   * S3, etc. Loom doesn't interpret the shape — it's a black box used
+   * for audit and (when `[sandbox.<name>]` is present) for the
+   * boot-time ceiling check.
+   *
+   * Tools self-police at execute time: they read their own capabilities
+   * field and decide what to allow. Loom does not enforce caps at runtime.
+   */
+  capabilities?: unknown;
+
+  /** Secret names this tool wants. Loom resolves the closure at boot. */
+  secrets?: SecretNeeds;
+
+  /**
+   * Optional containment check for the [sandbox.<name>] ceiling test.
+   * Returns true if `subset` is allowed given `superset` as the ceiling.
+   * When omitted, loom uses a structural default (deep-subset on plain
+   * objects/arrays, equality on primitives).
+   */
+  capabilitiesContain?(superset: unknown, subset: unknown): boolean;
+
+  execute(input: unknown, ctx: ToolContext): Promise<ToolResult>;
+}
+
+/**
+ * Per-call context. Built by the runtime at every dispatch.
+ */
+export interface ToolContext {
+  /** Per-tool secret slice; already filtered to this tool's allowlist. */
+  secrets: Record<string, string>;
+  /** Current turn's abort signal. Tools should observe it for long ops. */
+  abortSignal: AbortSignal;
+  /**
+   * Ask the SDK consumer for user consent. Returns `{ decision: "deny" }`
+   * if no handler is registered.
+   */
+  requestPermission(
+    req: import("./permissions.js").PermissionRequest,
+  ): Promise<import("./permissions.js").PermissionResult>;
+  /** Read-only enumeration of skills available to this agent. */
+  searchSkills(query?: string): Promise<SkillSummary[]>;
+}
+
+/** Single entry returned by `ctx.searchSkills()`. */
+export interface SkillSummary {
+  name: string;
+  description: string;
+  /** Tool names this skill brings into scope. */
+  toolNames: string[];
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -103,7 +167,7 @@ export interface Runtime {
    */
   systemPromptCore(): string;
 
-  /** All skills (manifest + session-contributed) with their tool names. */
+  /** All skills (from manifest + session contributions) with their tool names. */
   listSkills(): SkillDescriptor[];
 
   /** All tools available to the model. */
@@ -114,17 +178,6 @@ export interface Runtime {
 
   /** AbortSignal for the current turn — flips when the client cancels. */
   readonly abortSignal: AbortSignal;
-
-  /**
-   * Ask the SDK consumer for user consent. Returns the handler's reply,
-   * or `{ decision: "deny" }` if no handler is registered. Available to
-   * any in-process tool that wants a "are you sure?" rail before a
-   * sensitive action; reaches the connected ACP client via
-   * `session/request_permission` when applicable.
-   */
-  requestPermission(
-    req: import("./permissions.js").PermissionRequest,
-  ): Promise<import("./permissions.js").PermissionResult>;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -142,13 +195,6 @@ export interface Harness {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Extension factories.
-//
-// Each factory may declare the secrets its product requires. The runtime
-// resolves the union of declared secrets at boot, then injects each
-// factory's per-component subset via the `secrets` arg of `create()`.
-// Implementations should *not* read `process.env` directly — the runtime
-// is responsible for sourcing values (env, OS keychain, config files, an
-// SDK-supplied store) and gating them through the manifest.
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -162,9 +208,7 @@ export interface SecretNeeds {
 }
 
 export interface SessionFactory {
-  /** Bare-name the runtime resolves to find this extension. */
   readonly name: string;
-  /** Secrets this session needs. Resolved at boot, injected at create(). */
   readonly secrets?: SecretNeeds;
   create(
     config: Record<string, unknown>,
@@ -193,70 +237,77 @@ export interface ExtensionContext {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Provider — a pluggable resolver for tools and/or skills.
+// Provider — turns (name, config) tool references into Tool objects.
 //
-// The resolver consults provider instances *before* falling back to the
-// LocalRegistry / builtins. This is how a future MCP extension would
-// surface MCP-server tools as Loom tools without anything ever existing
-// on disk: at boot the provider connects to the server(s), and resolveTool
-// returns a synthetic ToolManifest plus a pre-built Tool that proxies to
-// the MCP server.
+// Loom maintains a chain of providers: SDK-supplied → extension-loaded →
+// native (always last). For each tool reference in the manifest (top-level
+// `[tools]` plus every skill's `requires:`), loom asks providers in order;
+// the first non-null result wins. If no provider claims a name, the run
+// fails at boot.
 //
-// Providers can also resolve skills (and skills can come bundled with
-// already-instantiated tools — useful when the provider's tools share a
-// connection or auth scope).
+// The native provider (in `src/extensions/provider/native.ts`) ships a
+// fixed map of builtin tools (`bash`, `read_file`, etc.). Extensions
+// register additional `(name, config) → Tool` builders the same way —
+// they're not privileged, just registered earlier.
 // ────────────────────────────────────────────────────────────────────────────
 
-import type { ToolManifest } from "./manifest.js";
-
-/** Result of provider resolution — either a path on disk, or a synthetic in-memory bundle. */
-export type ProviderToolResolution =
-  | { kind: "path"; path: string }
-  | { kind: "synthetic"; manifest: ToolManifest; tool: Tool };
-
-export type ProviderSkillResolution =
-  | { kind: "path"; path: string }
-  | {
-      kind: "synthetic";
-      manifest: SkillManifest;
-      /** Map of model-facing tool name → resolved tool. */
-      tools: Map<string, { manifest: ToolManifest; tool: Tool }>;
-    };
+/**
+ * Per-tool config value from a manifest entry. Loom doesn't interpret
+ * it; providers do. Common shapes:
+ *
+ *   "builtin"                       — string-shorthand
+ *   { mcp = true }                  — object with provider hint
+ *   { paths = ["./"] }              — tool-specific config
+ *   { capabilities = { ... } }      — explicit cap declaration
+ */
+export type ToolConfig = string | Record<string, unknown>;
 
 /**
- * A pluggable resolver for tools and/or skills. The four methods are all
- * required so the type narrows cleanly; impls return the documented "I
- * don't do this" value (`null` / `{}` / `void`) for what they don't
- * implement.
+ * Loom's runtime primitives, exposed to providers so they can wire tools
+ * to them. Methods are usable AFTER every provider's `init()` has
+ * returned.
  */
+export interface RuntimePrimitives {
+  requestPermission(
+    req: import("./permissions.js").PermissionRequest,
+  ): Promise<import("./permissions.js").PermissionResult>;
+  searchSkills(query?: string): Promise<SkillSummary[]>;
+}
+
+export interface ProviderInitArgs {
+  manifest: AgentManifest;
+  /** This provider's own `[extensions.<name>]` block, or `{}` for native. */
+  config: Record<string, unknown>;
+  secrets: Record<string, string>;
+  extensionContext: ExtensionContext;
+  /** Loom's runtime primitives. Stash and call later from tool execute. */
+  runtime: RuntimePrimitives;
+}
+
 export interface Provider {
-  /** Resolve a tool by model-facing name. Return null to pass. */
+  /**
+   * Optional setup. Called once at boot, in registration order. Providers
+   * should not call methods on `args.runtime` from within `init()` — the
+   * primitives become usable after every provider's init has returned.
+   */
+  init?(args: ProviderInitArgs): Promise<void> | void;
+
+  /**
+   * Try to construct a Tool for this `(name, config)` reference. Return
+   * null to pass the entry to the next provider in the chain.
+   */
   resolveTool(
     name: string,
-  ): Promise<ProviderToolResolution | null> | ProviderToolResolution | null;
+    config: ToolConfig,
+  ): Promise<Tool | null> | Tool | null;
 
-  /** Resolve a skill by name. Return null to pass. */
-  resolveSkill(
-    name: string,
-  ): Promise<ProviderSkillResolution | null> | ProviderSkillResolution | null;
-
-  /** Enumerate currently-available tools/skills (for audit / listing). */
-  list():
-    | Promise<{ skills?: string[]; tools?: string[] }>
-    | { skills?: string[]; tools?: string[] };
-
-  /** Cleanup. Called when the agent closes. */
+  /** Cleanup; called when the agent closes. */
   close(): Promise<void> | void;
 }
 
 export interface ProviderFactory {
-  /** Bare-name the runtime resolves to find this extension. */
   readonly name: string;
-  /** Secrets this provider needs. Resolved at boot, injected at create(). */
   readonly secrets?: SecretNeeds;
-  create(
-    config: Record<string, unknown>,
-    ctx: ExtensionContext,
-    secrets: Record<string, string>,
-  ): Promise<Provider> | Provider;
+  /** Construct a fresh provider instance. The instance's `init()` runs side effects. */
+  create(): Provider;
 }

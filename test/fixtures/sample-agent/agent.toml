@@ -1,6 +1,6 @@
 [agent]
 name = "sample-agent"
-description = "An end-to-end Loom v0 demo agent. Greets the user and shouts."
+description = "An end-to-end Loom demo agent."
 system_prompt = "./identity.md"
 
 [harness]
@@ -11,10 +11,15 @@ provider = "test"
 provider = "file"
 path = "./session.jsonl"
 
-[sandbox]
-filesystem = ["./"]
-network = []
-secrets = ["sample_user_name"]
+[capabilities]
+# Per-tool ceiling, opaque shape — each tool's caps must fit its entry.
+read_file = { paths = ["./"] }
+write_file = { paths = ["./"] }
+find = { paths = ["./"] }
 
-[skills]
-greeter = "../skills/greeter"
+[tools]
+# Default builtin set, configured for the project root.
+read_file = { paths = ["./"] }
+write_file = { paths = ["./"] }
+find = { paths = ["./"] }
+echo = {}

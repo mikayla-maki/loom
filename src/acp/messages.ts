@@ -38,10 +38,6 @@ export interface SessionPromptParams {
   /** ACP session id (the agent's RunningAgent identifier). */
   sessionId?: string;
   prompt: string;
-  /** v1 broker auth: token-and-broker invocation. */
-  token?: string;
-  /** v1: scope for sub-agent calls. */
-  scope?: string;
 }
 
 export interface SessionPromptResult {

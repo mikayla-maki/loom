@@ -96,7 +96,7 @@ async function cmdRun(args: string[]): Promise<number> {
     output: process.stdout,
   });
   process.stdout.write(
-    `\nloom: ready (${agent.resolved.source.name}). type a message; ctrl-c to quit.\n`,
+    `\nloom: ready (${agent.manifest.name}). type a message; ctrl-c to quit.\n`,
   );
 
   const ask = () =>

@@ -1,38 +1,16 @@
 /**
  * Manifest types — the shape of an agent definition, whether parsed from
- * disk (agent.toml + SKILL.md + tool.toml) or constructed in memory by an
- * SDK consumer.
+ * disk (agent.toml + SKILL.md) or constructed in memory by an SDK consumer.
  *
- * The manifest carries *unresolved* references (skill names, tool paths,
- * etc.). The resolver walks them and produces a `ResolvedAgentManifest`
- * with everything bound to concrete data.
+ * The manifest carries unresolved references: tool entries are
+ * `(name, config)` pairs that loom routes through the provider chain
+ * to produce `Tool` objects. There's no on-disk tool format — tools
+ * are JS code that an extension (or loom's native provider) registers.
  */
 
-// ─── Capabilities ────────────────────────────────────────────────────────────
+import type { ToolConfig } from "./interfaces.js";
 
-/**
- * Sandbox ceiling axes — the surface the agent's `[sandbox]` declaration
- * constrains. Absent axis = unconstrained on that axis (`*`). Empty array
- * = explicitly nothing.
- */
-export interface SandboxCeiling {
-  filesystem?: string[];
-  network?: string[];
-  secrets?: string[];
-}
-
-/**
- * Capabilities a tool declares about itself. Inherits the three sandbox
- * axes (used to validate that the union of tool needs ⊆ agent ceiling),
- * plus a `subagent` axis that's broker opt-in: a non-empty value tells the
- * runtime to wire this tool's spawn with `LOOM_INVOKE_*` env vars so it
- * can call subagents through `loom-invoke`.
- */
-export interface ToolCapabilities extends SandboxCeiling {
-  subagent?: string[] | "*";
-}
-
-// ─── System prompt ───────────────────────────────────────────────────────────
+// ─── System prompt ──────────────────────────────────────────────────────────
 
 /**
  * `[agent].system_prompt` — either an inline literal, or a path to read
@@ -42,24 +20,18 @@ export interface ToolCapabilities extends SandboxCeiling {
  */
 export type SystemPromptSpec = string | { path: string };
 
-// ─── Subagent reference ──────────────────────────────────────────────────────
+// ─── Capabilities ───────────────────────────────────────────────
 
-export type SubagentReference =
-  | { kind: "path"; path: string }
-  | { kind: "registry"; name: string }
-  | { kind: "acp"; url: string };
+/**
+ * Per-tool capability ceiling. Keyed by tool name; the value is whatever
+ * shape that tool's `capabilities` uses. Loom uses each tool's
+ * `capabilitiesContain` (or a structural default) to verify the tool's
+ * declared caps fit inside the matching ceiling entry. Tools with no
+ * matching entry have no extra ceiling check.
+ */
+export type Capabilities = Record<string, unknown>;
 
 // ─── Agent manifest (input shape) ───────────────────────────────────────
-//
-// The manifest is what the user provides — directly via `runAgent(spec)`
-// or indirectly via `parseAgentManifest("./agent.toml")`. Agent identity
-// fields (name / description / systemPrompt) live at the top level; the
-// parser flattens TOML's `[agent]` table onto the same shape so
-// file-based and inline forms produce identical objects.
-//
-// Skills, tools, and subagents may be expressed inline as nested objects
-// OR as string refs (paths / registry names / "builtin"). The resolver
-// dispatches on each.
 
 /**
  * Configuration form: `{ provider: "name", ...config }`. The runtime
@@ -92,37 +64,36 @@ export interface AgentManifest {
   /** Optional. Defaults to `{ provider: "memory" }` if absent. */
   session?: SessionSpec;
   /**
-   * Per-axis sandbox ceiling. Whole table absent OR axis absent =
-   * unconstrained (`*`). Empty array on an axis = explicitly nothing.
+   * Per-tool capability ceiling, keyed by tool name. Optional. When
+   * present, the tool's declared caps must fit inside the matching
+   * ceiling entry (using the tool's `capabilitiesContain` or the
+   * structural default).
    */
-  sandbox?: SandboxCeiling;
+  capabilities?: Capabilities;
   /**
-   * Top-level tools — model-facing name → path / registry name /
-   * "builtin" / inline tool manifest. Same value union as a skill's
-   * `requires:` field; resolved through the same machinery.
+   * Top-level tools — model-facing name → tool config. Loom routes each
+   * `(name, config)` pair through the provider chain. The native
+   * provider claims known builtin names; extension providers claim
+   * names they register.
    *
    * Semantics:
-   *   - field absent       → the runtime auto-loads a default builtin set
-   *                         (`bash`, `read_file`, `write_file`, `find`).
+   *   - field absent       → loom auto-loads the default builtin set
+   *                          (`bash`, `read_file`, `write_file`, `find`).
    *   - field present (any) → exactly what's listed; no defaults.
    *   - empty table        → no top-level tools at all.
    *
-   * Skills' `requires:` are *additive*: a skill that brings `bash` into
-   * scope is fine even if `bash` isn't listed here. A name appearing in
-   * both top-level `tools` AND a skill's `requires` is a hard error —
-   * silent overrides are footguns.
+   * Skills' `requires:` are *additive*: a skill that brings `bash`
+   * into scope is fine even if `bash` isn't listed here. A name
+   * appearing in BOTH top-level `tools` AND a skill's `requires` is a
+   * hard error — silent overrides are footguns.
    */
-  tools?: Record<string, string | ToolManifest>;
+  tools?: Record<string, ToolConfig>;
   /** Skill name → path / registry name / inline skill manifest. */
   skills?: Record<string, string | SkillManifest>;
   /**
    * Extensions: npm packages with a `loom.extension` field, loaded at boot.
    * Each entry's name is the package name; the value is the config object
    * passed to the package's `register()` function.
-   *
-   * For programmatic `Provider` instances, use `RunAgentOptions.providers`
-   * instead. Extensions are a plugin-loading mechanism, not a place to
-   * embed live runtime objects.
    */
   extensions?: Record<string, Record<string, unknown>>;
 }
@@ -133,39 +104,12 @@ export interface SkillManifest {
   description: string;
   /** Markdown body. Defaults to empty string. */
   body?: string;
-  /** Tool name → path / "builtin" / "builtin:<name>" / inline tool manifest. */
-  requires?: Record<string, string | ToolManifest>;
-  /** Subagent name → path / registry name / acp:// URL / structured reference. */
-  subagents?: Record<string, string | SubagentReference>;
+  /** Tool name → config. Same shape and routing as top-level `[tools]`. */
+  requires?: Record<string, ToolConfig>;
 
   // ── Disk-derived (parser-only fields) ──
   /** Absolute path to SKILL.md, when loaded from disk. */
   manifestPath?: string;
-  /** Skill directory, when loaded from disk. Used as the base for relative tool paths. */
+  /** Skill directory, when loaded from disk. */
   skillDir?: string;
-}
-
-export interface ToolManifest {
-  /** If present, must equal the parent map key. */
-  name?: string;
-  description: string;
-  schema: import("./schema.js").JSONSchema;
-  invocation: { command: string; args?: string[] };
-  secrets?: { required?: string[]; optional?: string[] };
-  capabilities?: ToolCapabilities;
-  /**
-   * Working directory for the spawned tool process. Defaults to the
-   * tool's `toolDir` (when loaded from disk) or `process.cwd()` (when
-   * declared inline).
-   */
-  cwd?: string;
-
-  // ── Disk-derived (parser-only fields) ──
-  /** Absolute path to tool.toml, when loaded from disk. */
-  manifestPath?: string;
-  /** Tool directory, when loaded from disk. */
-  toolDir?: string;
-  /** True iff the tool ships a `bin/` directory (auto-PATH'd). */
-  shipsBinary?: boolean;
-  binDir?: string;
 }

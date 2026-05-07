@@ -22,24 +22,23 @@ import { pathToFileURL } from "node:url";
 import { LoomError } from "../errors.js";
 import type {
   HarnessFactory,
-  Provider,
   ProviderFactory,
   SessionFactory,
 } from "../types/interfaces.js";
 
-import { registerHarness, registerProvider, registerSession } from "./index.js";
+import { registerHarness, registerSession } from "./index.js";
 
 const exec = promisify(execFile);
 
 export interface LoomExtensionApi {
-  /** Register a factory by name; the user activates it via the matching manifest table. */
+  /** Register a harness or session factory by name. */
   registerHarness(factory: HarnessFactory): void;
   registerSession(factory: SessionFactory): void;
-  registerProvider(factory: ProviderFactory): void;
   /**
-   * Auto-activate a Provider for the current agent. Pass a `ProviderFactory`
-   * (NOT an already-built instance) so the runtime can resolve the
-   * factory's declared secrets at boot and inject them at `create()` time.
+   * Auto-activate a Provider for the current agent. Pass a
+   * `ProviderFactory` (not an already-built instance) so the runtime
+   * can resolve the factory's declared secrets at boot and inject them
+   * into the provider's `init()` call.
    */
   addProvider(factory: ProviderFactory): void;
   readonly agentName: string;
@@ -124,7 +123,6 @@ export async function loadExtensionPackage(
   await register({
     registerHarness,
     registerSession,
-    registerProvider,
     addProvider: (f) => addedProviderFactories.push(f),
     agentName: loadCtx.agentName,
     manifestDir: loadCtx.agentManifestDir,

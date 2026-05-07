@@ -16,26 +16,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { runAgent } from "../src/sdk/run-agent.js";
-import { resolveAgent } from "../src/manifest/resolver.js";
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
-import type { AgentManifest } from "../src/types/manifest.js";
+import type { AgentManifest, Capabilities } from "../src/types/manifest.js";
 import type { TurnScript, TurnStep } from "../src/extensions/harness/test.js";
 import type { Runtime } from "../src/types/interfaces.js";
 
 function buildAgent(opts: {
   tools?: AgentManifest["tools"];
   skills?: AgentManifest["skills"];
-  filesystem?: string[];
+  capabilities?: Capabilities;
   systemPrompt?: string;
   harnessScript?:
     | TurnScript[]
     | ((rt: Runtime, turnIndex: number) => Promise<TurnStep[]> | TurnStep[]);
 }): AgentManifest {
-  const sandbox = {
-    filesystem: opts.filesystem ?? ["./"],
-    network: [],
-    secrets: [],
-  };
   return {
     name: "demo",
     systemPrompt: opts.systemPrompt ?? "be brief",
@@ -43,7 +37,7 @@ function buildAgent(opts: {
       provider: "test",
       ...(opts.harnessScript ? { script: opts.harnessScript } : {}),
     },
-    sandbox,
+    ...(opts.capabilities ? { capabilities: opts.capabilities } : {}),
     ...(opts.tools !== undefined ? { tools: opts.tools } : {}),
     ...(opts.skills ? { skills: opts.skills } : {}),
   };
@@ -51,54 +45,68 @@ function buildAgent(opts: {
 
 describe("top-level [tools]", () => {
   it("absent field auto-loads the default builtin set", async () => {
-    const r = await resolveAgent(buildAgent({}));
-    // No skills, but tools[] still has the defaults.
-    expect(r.skills).toHaveLength(0);
-    expect(r.tools.map((t) => t.manifest.name).sort()).toEqual([
-      "bash",
-      "find",
-      "read_file",
-      "write_file",
-    ]);
-    expect(r.tools.every((t) => t.introducedBy === "(top-level)")).toBe(true);
+    const agent = await runAgent(buildAgent({}), {});
+    try {
+      expect(agent.agentState.skills).toHaveLength(0);
+      const names = agent.agentState.toolTable
+        .list()
+        .map((t) => t.name)
+        .sort();
+      expect(names).toEqual(["bash", "find", "read_file", "write_file"]);
+    } finally {
+      await agent.close();
+    }
   });
 
   it("empty `{}` opts out of all top-level tools", async () => {
-    const r = await resolveAgent(buildAgent({ tools: {} }));
-    expect(r.tools).toHaveLength(0);
+    const agent = await runAgent(buildAgent({ tools: {} }), {});
+    try {
+      expect(agent.agentState.toolTable.list()).toHaveLength(0);
+    } finally {
+      await agent.close();
+    }
   });
 
   it("explicit list replaces the defaults exactly", async () => {
-    const r = await resolveAgent(buildAgent({ tools: { bash: "builtin" } }));
-    expect(r.tools.map((t) => t.manifest.name)).toEqual(["bash"]);
-    expect(r.tools[0]?.introducedBy).toBe("(top-level)");
+    const agent = await runAgent(
+      buildAgent({ tools: { bash: "builtin" } }),
+      {},
+    );
+    try {
+      const names = agent.agentState.toolTable.list().map((t) => t.name);
+      expect(names).toEqual(["bash"]);
+    } finally {
+      await agent.close();
+    }
   });
 
   it("top-level + skill is additive (skill brings extra tools alongside top-level)", async () => {
-    const r = await resolveAgent(
+    const agent = await runAgent(
       buildAgent({
         tools: { bash: "builtin" },
         skills: {
           extra: {
             description: "extra tool",
-            requires: { read_file: "builtin" },
+            requires: { read_file: { paths: ["./"] } },
           },
         },
       }),
+      {},
     );
-    expect(r.tools.map((t) => t.manifest.name).sort()).toEqual([
-      "bash",
-      "read_file",
-    ]);
-    const top = r.tools.find((t) => t.manifest.name === "bash");
-    const sk = r.tools.find((t) => t.manifest.name === "read_file");
-    expect(top?.introducedBy).toBe("(top-level)");
-    expect(sk?.introducedBy).toBe("extra");
+    try {
+      const names = agent.agentState.toolTable
+        .list()
+        .map((t) => t.name)
+        .sort();
+      expect(names).toEqual(["bash", "read_file"]);
+    } finally {
+      await agent.close();
+    }
   });
 
   it("name collision between top-level and a skill's requires is a hard error", async () => {
     await expect(
-      resolveAgent(
+      runAgent(
         buildAgent({
           tools: { bash: "builtin" },
           skills: {
@@ -108,33 +116,22 @@ describe("top-level [tools]", () => {
             },
           },
         }),
+        {},
       ),
     ).rejects.toThrow(/declared at the top level AND brought in by skill/);
   });
 
-  it("inline tool spec at top level resolves directly", async () => {
-    const r = await resolveAgent(
-      buildAgent({
-        tools: {
-          custom: {
-            description: "custom inline",
-            schema: { type: "object" },
-            invocation: { command: "echo" },
-            capabilities: { filesystem: [], network: [] },
-          },
-        },
-      }),
-    );
-    expect(r.tools.map((t) => t.manifest.name)).toEqual(["custom"]);
-    expect(r.tools[0]?.introducedBy).toBe("(top-level)");
-  });
-
-  it("default tool set requires filesystem = ['./'] in [sandbox]", async () => {
-    // No top-level [tools] declaration → defaults load → bash etc.
-    // declare filesystem='./'; an empty filesystem ceiling fails the
-    // capability check.
+  it("default tool set requires the per-tool ceiling to allow './'", async () => {
+    // No top-level [tools] declaration → defaults load → read_file/write_file/find
+    // declare paths=['./']; a tighter per-tool ceiling fails.
     await expect(
-      resolveAgent(buildAgent({ filesystem: [] })),
+      runAgent(
+        buildAgent({
+          // Per-tool ceiling that disallows the project root for read_file.
+          capabilities: { read_file: { paths: ["/nonexistent"] } },
+        }),
+        {},
+      ),
     ).rejects.toThrow(/exceed.*ceiling/i);
   });
 
@@ -182,8 +179,14 @@ describe("top-level [tools]", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-tlt-e2e-"));
     try {
       const target = path.join(root, "hello.txt");
+      // The default tools are configured for "./" — i.e., process.cwd().
+      // Override to root so the read/write paths are inside the ceiling.
       const agent = await runAgent(
         buildAgent({
+          tools: {
+            write_file: { paths: [root] },
+            read_file: { paths: [root] },
+          },
           harnessScript: [
             [
               {

@@ -1,16 +1,14 @@
 import { describe, expect, it } from "vitest";
-import * as path from "node:path";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 
 import { runAgent, StaticSecretsStore } from "../src/sdk/run-agent.js";
 import { SecretError } from "../src/errors.js";
-import type { AgentManifest } from "../src/types/manifest.js";
 import type {
   ExtensionContext,
   Harness,
   HarnessFactory,
+  Provider,
   Runtime,
+  Tool,
 } from "../src/types/interfaces.js";
 import type { StopReason } from "../src/types/acp.js";
 import { registerHarness } from "../src/extensions/index.js";
@@ -112,95 +110,90 @@ describe("secrets pipeline", () => {
   });
 
   it("a tool only sees its own declared secrets at execute time", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-secret-iso-"));
-    try {
-      // Two tool scripts, each printing its env for a fixed set of names.
-      const printScript = (binPath: string) =>
-        fs.writeFile(
-          binPath,
-          `#!/usr/bin/env node
-const want = ['A_TOKEN','B_TOKEN','SHARED'];
-const out = {};
-for (const k of want) out[k] = process.env[k] ?? null;
-process.stdout.write(JSON.stringify(out));
-`,
-          { mode: 0o755 },
-        );
-      const aPath = path.join(root, "tool-a");
-      const bPath = path.join(root, "tool-b");
-      await printScript(aPath);
-      await printScript(bPath);
+    // Two synthetic tools supplied by an in-process Provider. Each
+    // declares a different `secrets` allowlist; their `execute()` reads
+    // ctx.secrets and emits the slice as JSON content. The runtime
+    // filters bag → per-tool slice; this test asserts that filter.
+    const toolA: Tool = {
+      name: "tool_a",
+      description: "a",
+      inputSchema: { type: "object" },
+      secrets: { required: ["A_TOKEN", "SHARED"] },
+      async execute(_input, ctx) {
+        const want = ["A_TOKEN", "B_TOKEN", "SHARED"];
+        const out: Record<string, string | null> = {};
+        for (const k of want) out[k] = ctx.secrets[k] ?? null;
+        return { content: JSON.stringify(out) };
+      },
+    };
+    const toolB: Tool = {
+      name: "tool_b",
+      description: "b",
+      inputSchema: { type: "object" },
+      secrets: { required: ["B_TOKEN", "SHARED"] },
+      async execute(_input, ctx) {
+        const want = ["A_TOKEN", "B_TOKEN", "SHARED"];
+        const out: Record<string, string | null> = {};
+        for (const k of want) out[k] = ctx.secrets[k] ?? null;
+        return { content: JSON.stringify(out) };
+      },
+    };
+    const provider: Provider = {
+      resolveTool(name) {
+        if (name === "tool_a") return toolA;
+        if (name === "tool_b") return toolB;
+        return null;
+      },
+      close() {},
+    };
 
-      const agent = await runAgent(
-        {
-          name: "secret-iso",
-          tools: {},
-          harness: {
-            provider: "test",
-            script: [
-              [
-                { call: { tool: "tool_a", input: {} }, surface: false },
-                { call: { tool: "tool_b", input: {} }, surface: false },
-                { stop: "end_turn" },
-              ],
+    const agent = await runAgent(
+      {
+        name: "secret-iso",
+        tools: { tool_a: {}, tool_b: {} },
+        harness: {
+          provider: "test",
+          script: [
+            [
+              { call: { tool: "tool_a", input: {} }, surface: false },
+              { call: { tool: "tool_b", input: {} }, surface: false },
+              { stop: "end_turn" },
             ],
-          },
-          skills: {
-            s: {
-              description: "two tools, different secrets",
-              requires: {
-                tool_a: {
-                  description: "a",
-                  schema: { type: "object" },
-                  invocation: { command: aPath },
-                  secrets: { required: ["A_TOKEN", "SHARED"] },
-                },
-                tool_b: {
-                  description: "b",
-                  schema: { type: "object" },
-                  invocation: { command: bPath },
-                  secrets: { required: ["B_TOKEN", "SHARED"] },
-                },
-              },
-            },
-          },
+          ],
         },
-        {
-          secrets: new StaticSecretsStore({
-            A_TOKEN: "AAA",
-            B_TOKEN: "BBB",
-            SHARED: "SSS",
-          }),
-        },
-      );
-      try {
-        await agent.prompt("go");
-        const events = await agent.session.getEvents();
-        const tcus = events.filter(
-          (e) => e.sessionUpdate === "tool_call_update",
-        );
-        expect(tcus).toHaveLength(2);
-        const parse = (idx: number) => {
-          const e = tcus[idx];
-          if (!e || e.sessionUpdate !== "tool_call_update") return null;
-          const text =
-            e.content?.[0]?.type === "content" &&
-            e.content[0].content.type === "text"
-              ? e.content[0].content.text
-              : "";
-          return JSON.parse(text) as Record<string, string | null>;
-        };
-        const a = parse(0);
-        const b = parse(1);
-        // tool_a sees A_TOKEN + SHARED, NOT B_TOKEN.
-        expect(a).toEqual({ A_TOKEN: "AAA", B_TOKEN: null, SHARED: "SSS" });
-        // tool_b sees B_TOKEN + SHARED, NOT A_TOKEN.
-        expect(b).toEqual({ A_TOKEN: null, B_TOKEN: "BBB", SHARED: "SSS" });
-      } finally {
-        await agent.close();
-      }
+      },
+      {
+        providers: [provider],
+        secrets: new StaticSecretsStore({
+          A_TOKEN: "AAA",
+          B_TOKEN: "BBB",
+          SHARED: "SSS",
+        }),
+      },
+    );
+    try {
+      await agent.prompt("go");
+      const events = await agent.session.getEvents();
+      const tcus = events.filter((e) => e.sessionUpdate === "tool_call_update");
+      expect(tcus).toHaveLength(2);
+      const parse = (idx: number) => {
+        const e = tcus[idx];
+        if (!e || e.sessionUpdate !== "tool_call_update") return null;
+        const text =
+          e.content?.[0]?.type === "content" &&
+          e.content[0].content.type === "text"
+            ? e.content[0].content.text
+            : "";
+        return JSON.parse(text) as Record<string, string | null>;
+      };
+      const a = parse(0);
+      const b = parse(1);
+      // tool_a sees A_TOKEN + SHARED, NOT B_TOKEN.
+      expect(a).toEqual({ A_TOKEN: "AAA", B_TOKEN: null, SHARED: "SSS" });
+      // tool_b sees B_TOKEN + SHARED, NOT A_TOKEN.
+      expect(b).toEqual({ A_TOKEN: null, B_TOKEN: "BBB", SHARED: "SSS" });
     } finally {
-      await fs.rm(root, { recursive: true, force: true });
+      await agent.close();
     }
   });
 

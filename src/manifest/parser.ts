@@ -1,11 +1,10 @@
 /**
- * Parsers for `agent.toml`, `tool.toml`, and `SKILL.md`. Validation only
- * — dependency walking and capability checks live in the resolver.
+ * Parsers for `agent.toml` and `SKILL.md`. Validation only — capability
+ * checks and tool construction live in providers.
  *
- * Parsers produce typed `AgentManifest` / `SkillManifest` / `ToolManifest`
- * objects. The unified manifest type allows nested skills/tools/subagents
- * but parser output is always *flat* — TOML refs are strings, never
- * inline objects. Inline construction is the SDK consumer's path.
+ * The manifest model is `(name, config)` for tools: each entry's value
+ * is an opaque config blob (string or object) that loom hands to the
+ * provider chain. There's no on-disk tool format.
  */
 
 import * as fs from "node:fs/promises";
@@ -14,14 +13,12 @@ import TOML from "@iarna/toml";
 import matter from "gray-matter";
 
 import { ManifestError } from "../errors.js";
+import type { ToolConfig } from "../types/interfaces.js";
 import type {
   AgentManifest,
-  SandboxCeiling,
+  Capabilities,
   SkillManifest,
-  SubagentReference,
   SystemPromptSpec,
-  ToolCapabilities,
-  ToolManifest,
 } from "../types/manifest.js";
 
 // ─── agent.toml ────────────────────────────────────────────────────────────
@@ -46,8 +43,6 @@ export async function parseAgentManifest(
       `agent.toml at ${abs} is missing required [harness].provider`,
     );
   }
-  // [session] is optional. If absent, the resolver applies a default of
-  // `{ provider: "memory" }`. If present, `provider` is required.
   let session: AgentManifest["session"] | undefined;
   if (raw.session !== undefined) {
     const s = ensureObject(raw.session, "[session]", abs);
@@ -59,16 +54,14 @@ export async function parseAgentManifest(
     session = { ...(s as Record<string, unknown>), provider: s.provider };
   }
 
-  const sandbox =
-    raw.sandbox === undefined
+  const capabilities =
+    raw.capabilities === undefined
       ? undefined
-      : parseSandboxCeiling(raw.sandbox, abs);
-  // [tools] in file form is string-valued; SDK consumers can pass
-  // inline ToolManifest objects through the JS shape.
+      : parseCapabilities(raw.capabilities, abs);
   const tools =
     raw.tools === undefined
       ? undefined
-      : parseStringValueTable(raw.tools, "[tools]", abs);
+      : parseToolConfigTable(raw.tools, "[tools]", abs);
   const skills = parseStringValueTable(raw.skills, "[skills]", abs);
   const extensions = parseConfigTable(raw.extensions, "[extensions]", abs);
 
@@ -84,7 +77,7 @@ export async function parseAgentManifest(
       provider: harness.provider as string,
     },
     ...(session ? { session } : {}),
-    ...(sandbox ? { sandbox } : {}),
+    ...(capabilities ? { capabilities } : {}),
     ...(tools !== undefined ? { tools } : {}),
     skills,
     extensions,
@@ -104,95 +97,6 @@ function parseSystemPromptSpec(
   throw new ManifestError(
     `agent.toml at ${where}: [agent].system_prompt must be a string or a table { path = "..." } (got ${typeof v})`,
   );
-}
-
-// ─── tool.toml ─────────────────────────────────────────────────────────────
-
-export async function parseToolManifest(
-  toolDir: string,
-): Promise<ToolManifest> {
-  const dir = path.resolve(toolDir);
-  const manifestPath = path.join(dir, "tool.toml");
-  const raw = await readToml(manifestPath, "tool.toml");
-
-  const tool = ensureObject(raw.tool, "[tool]", manifestPath);
-  if (typeof tool.name !== "string" || !tool.name) {
-    throw new ManifestError(
-      `tool.toml at ${manifestPath} missing required [tool].name`,
-    );
-  }
-  if (typeof tool.description !== "string" || !tool.description) {
-    throw new ManifestError(
-      `tool.toml at ${manifestPath} missing required [tool].description`,
-    );
-  }
-
-  const schema = ensureObject(tool.schema, "[tool.schema]", manifestPath);
-  const invocation = ensureObject(
-    tool.invocation,
-    "[tool.invocation]",
-    manifestPath,
-  );
-  if (typeof invocation.command !== "string" || !invocation.command) {
-    throw new ManifestError(
-      `tool.toml at ${manifestPath} missing required [tool.invocation].command`,
-    );
-  }
-  let args: string[] = [];
-  if (invocation.args !== undefined) {
-    if (
-      !Array.isArray(invocation.args) ||
-      !invocation.args.every((a) => typeof a === "string")
-    ) {
-      throw new ManifestError(
-        `tool.toml at ${manifestPath}: [tool.invocation].args must be an array of strings`,
-      );
-    }
-    args = invocation.args as string[];
-  }
-
-  const secretsRaw = (tool.secrets ?? {}) as Record<string, unknown>;
-  const required = parseStringArray(
-    secretsRaw.required,
-    "[tool.secrets].required",
-    manifestPath,
-    true,
-  );
-  const optional = parseStringArray(
-    secretsRaw.optional,
-    "[tool.secrets].optional",
-    manifestPath,
-    true,
-  );
-  const capabilities = parseToolCapabilities(
-    tool.capabilities,
-    "[tool.capabilities]",
-    manifestPath,
-  );
-
-  const binDir = path.join(dir, "bin");
-  let shipsBinary = false;
-  try {
-    shipsBinary = (await fs.stat(binDir)).isDirectory();
-  } catch {
-    /* no bin/ */
-  }
-
-  return {
-    manifestPath,
-    toolDir: dir,
-    name: tool.name,
-    description: tool.description,
-    schema: schema as ToolManifest["schema"],
-    invocation: { command: invocation.command, args },
-    secrets: {
-      required,
-      ...(optional.length > 0 ? { optional } : {}),
-    },
-    capabilities,
-    shipsBinary,
-    ...(shipsBinary ? { binDir } : {}),
-  };
 }
 
 // ─── SKILL.md ──────────────────────────────────────────────────────────────
@@ -220,45 +124,17 @@ export async function parseSkillManifest(
     );
   }
 
-  const requires: Record<string, string> = {};
+  const requires: Record<string, ToolConfig> = {};
   if (data.requires != null) {
     if (typeof data.requires !== "object" || Array.isArray(data.requires)) {
       throw new ManifestError(
-        `SKILL.md at ${manifestPath}: 'requires' must be a mapping of tool name → path`,
+        `SKILL.md at ${manifestPath}: 'requires' must be a mapping of tool name → config`,
       );
     }
     for (const [k, v] of Object.entries(
       data.requires as Record<string, unknown>,
     )) {
-      if (typeof v !== "string") {
-        throw new ManifestError(
-          `SKILL.md at ${manifestPath}: requires.${k} must be a string, got ${typeof v}`,
-        );
-      }
-      requires[k] = v;
-    }
-  }
-
-  let subagents: Record<string, SubagentReference> | undefined;
-  if (data.subagents != null) {
-    if (typeof data.subagents === "string") {
-      // The string form means "load a separate subagents.toml at this
-      // path"; the resolver handles it under the synthetic '__file__' key.
-      subagents = { __file__: { kind: "path", path: data.subagents } };
-    } else if (
-      typeof data.subagents === "object" &&
-      !Array.isArray(data.subagents)
-    ) {
-      subagents = {};
-      for (const [k, v] of Object.entries(
-        data.subagents as Record<string, unknown>,
-      )) {
-        subagents[k] = parseSubagentEntry(v, k, manifestPath);
-      }
-    } else {
-      throw new ManifestError(
-        `SKILL.md at ${manifestPath}: 'subagents' must be a string (path) or mapping`,
-      );
+      requires[k] = parseToolConfigValue(v, manifestPath, k);
     }
   }
 
@@ -269,55 +145,7 @@ export async function parseSkillManifest(
     description,
     body: parsed.content,
     requires,
-    ...(subagents ? { subagents } : {}),
   };
-}
-
-export async function parseSubagentsFile(
-  filePath: string,
-): Promise<Record<string, SubagentReference>> {
-  const abs = path.resolve(filePath);
-  const raw = await readToml(abs, "subagents.toml");
-  const out: Record<string, SubagentReference> = {};
-  for (const [k, v] of Object.entries(raw)) {
-    out[k] = parseSubagentEntry(v, k, abs);
-  }
-  return out;
-}
-
-function parseSubagentEntry(
-  v: unknown,
-  key: string,
-  manifestPath: string,
-): SubagentReference {
-  if (typeof v === "string") {
-    if (
-      v.startsWith("acp://") ||
-      v.startsWith("acp+ws://") ||
-      v.startsWith("acp+unix://")
-    ) {
-      return { kind: "acp", url: v };
-    }
-    if (
-      v.startsWith("./") ||
-      v.startsWith("../") ||
-      v.startsWith("/") ||
-      v.endsWith(".toml")
-    ) {
-      return { kind: "path", path: v };
-    }
-    return { kind: "registry", name: v };
-  }
-  if (v && typeof v === "object" && !Array.isArray(v)) {
-    const obj = v as Record<string, unknown>;
-    if (typeof obj.path === "string") return { kind: "path", path: obj.path };
-    if (typeof obj.name === "string")
-      return { kind: "registry", name: obj.name };
-    if (typeof obj.acp === "string") return { kind: "acp", url: obj.acp };
-  }
-  throw new ManifestError(
-    `subagent ${key} at ${manifestPath}: expected string or { path | name | acp }`,
-  );
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -363,22 +191,6 @@ function ensureObject(
   return v as Record<string, unknown>;
 }
 
-function parseStringArray(
-  v: unknown,
-  label: string,
-  where: string,
-  allowMissing = false,
-): string[] {
-  if (v == null) {
-    if (allowMissing) return [];
-    throw new ManifestError(`${where}: ${label} is required`);
-  }
-  if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) {
-    throw new ManifestError(`${where}: ${label} must be an array of strings`);
-  }
-  return v as string[];
-}
-
 /** Tables of `name = "string"` (used for [skills]). */
 function parseStringValueTable(
   v: unknown,
@@ -421,59 +233,43 @@ function parseConfigTable(
 }
 
 /**
- * Parse the agent's `[sandbox]` ceiling. The three axes are filesystem,
- * network, and secrets; subagent permissions live on each skill's
- * `subagents` field, not here.
+ * Tables of `name = ToolConfig` (used for [tools] and skills' requires).
+ * Each value is `string | Record<string, unknown>` — loom doesn't
+ * interpret it; providers do.
  */
-function parseSandboxCeiling(v: unknown, where: string): SandboxCeiling {
-  const obj = ensureObject(v, "[sandbox]", where);
-  const out: SandboxCeiling = {};
-  if (obj.filesystem !== undefined) {
-    out.filesystem = parseStringArray(
-      obj.filesystem,
-      `[sandbox].filesystem`,
-      where,
-    );
-  }
-  if (obj.network !== undefined) {
-    out.network = parseStringArray(obj.network, `[sandbox].network`, where);
-  }
-  if (obj.secrets !== undefined) {
-    out.secrets = parseStringArray(obj.secrets, `[sandbox].secrets`, where);
+function parseToolConfigTable(
+  v: unknown,
+  label: string,
+  where: string,
+): Record<string, ToolConfig> {
+  const obj = ensureObject(v, label, where);
+  const out: Record<string, ToolConfig> = {};
+  for (const [k, val] of Object.entries(obj)) {
+    out[k] = parseToolConfigValue(val, where, `${label}.${k}`);
   }
   return out;
 }
 
-/**
- * Parse `[tool.capabilities]`. Tools may declare `subagent` (a list of
- * subagent names, or `*`) to opt into broker env-var injection at spawn
- * time — that's intent-of-use, not a ceiling.
- */
-function parseToolCapabilities(
+function parseToolConfigValue(
   v: unknown,
-  label: string,
   where: string,
-): ToolCapabilities {
-  const obj = ensureObject(v, label, where);
-  const out: ToolCapabilities = {};
-  if (obj.filesystem !== undefined) {
-    out.filesystem = parseStringArray(
-      obj.filesystem,
-      `${label}.filesystem`,
-      where,
-    );
+  label: string,
+): ToolConfig {
+  if (typeof v === "string") return v;
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    return v as Record<string, unknown>;
   }
-  if (obj.network !== undefined) {
-    out.network = parseStringArray(obj.network, `${label}.network`, where);
-  }
-  if (obj.secrets !== undefined) {
-    out.secrets = parseStringArray(obj.secrets, `${label}.secrets`, where);
-  }
-  if (obj.subagent !== undefined) {
-    out.subagent =
-      obj.subagent === "*"
-        ? "*"
-        : parseStringArray(obj.subagent, `${label}.subagent`, where);
-  }
-  return out;
+  throw new ManifestError(
+    `${where}: ${label} must be a string or a table, got ${typeof v}`,
+  );
+}
+
+/**
+ * Parse the agent's `[capabilities]` table — opaque per-tool ceilings.
+ * Loom doesn't validate the values; tools' `capabilitiesContain` does
+ * the comparison at boot.
+ */
+function parseCapabilities(v: unknown, where: string): Capabilities {
+  const obj = ensureObject(v, "[capabilities]", where);
+  return obj as Capabilities;
 }

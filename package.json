@@ -20,8 +20,7 @@
     }
   },
   "bin": {
-    "loom": "./dist/cli/main.js",
-    "loom-invoke": "./dist/cli/loom-invoke.js"
+    "loom": "./dist/cli/main.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

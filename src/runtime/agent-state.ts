@@ -1,6 +1,6 @@
 /**
  * AgentState — the runtime's read-only view of the agent's live skills,
- * sandbox ceiling, and tool table.
+ * capability ceiling, and tool table.
  *
  * Owned by `RunningAgentImpl`; the runtime instance per turn (`RuntimeImpl`)
  * borrows the same reference for system-prompt assembly and tool dispatch.
@@ -11,21 +11,21 @@
  * skills into scope, run a fresh `runAgent()` with an updated manifest.
  */
 
-import type { SandboxCeiling, SkillManifest } from "../types/manifest.js";
+import type { Capabilities, SkillManifest } from "../types/manifest.js";
 
 import type { ToolTable } from "./tool-table.js";
 
 export class AgentState {
   /** Read by RuntimeImpl every turn (when assembling the system prompt). */
   readonly skills: readonly SkillManifest[];
-  /** The agent's effective sandbox ceiling. */
-  readonly ceiling: SandboxCeiling;
+  /** The agent's effective per-tool capability ceiling. */
+  readonly ceiling: Capabilities;
   /** Name→Tool registry the runtime executes against. */
   readonly toolTable: ToolTable;
 
   constructor(opts: {
     skills: SkillManifest[];
-    ceiling: SandboxCeiling;
+    ceiling: Capabilities;
     toolTable: ToolTable;
   }) {
     this.skills = [...opts.skills];

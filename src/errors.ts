@@ -21,7 +21,7 @@ export class ManifestError extends LoomError {}
 /** Raised when a referenced extension / skill / tool can't be found. */
 export class ResolutionError extends LoomError {}
 
-/** Raised when tool capabilities exceed the agent's [sandbox] ceiling. */
+/** Raised when tool capabilities exceed the agent's [capabilities] ceiling. */
 export class CapabilityError extends LoomError {
   constructor(
     message: string,
