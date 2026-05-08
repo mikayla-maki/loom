@@ -19,6 +19,7 @@ import type {
   ExtensionContext,
   Harness,
   HarnessFactory,
+  RunParameters,
   Runtime,
   TurnResult,
 } from "../../types/interfaces.js";
@@ -67,7 +68,8 @@ export class OpenAIHarness implements Harness {
     private readonly maxTurnRequests: number,
   ) {}
 
-  async run(runtime: Runtime): Promise<TurnResult> {
+  async run(runtime: Runtime, _params?: RunParameters): Promise<TurnResult> {
+    // OpenAI harness doesn't yet honour params; accept and ignore.
     let requests = 0;
     while (true) {
       if (runtime.abortSignal.aborted) {

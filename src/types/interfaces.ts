@@ -259,13 +259,51 @@ export interface TurnResult {
   usage?: TurnUsage;
 }
 
+/**
+ * Per-turn parameters. The harness owns interpretation; loom passes the
+ * struct through unchanged. Fields are lab-aware where useful (e.g.
+ * Anthropic's native `effort` levels) and a free-form `thinking` slot
+ * lets callers hand the harness raw lab-specific config when they need
+ * something the typed fields don't cover.
+ */
+export interface RunParameters {
+  /**
+   * Whether to stream tokens. Most harnesses default to true; setting
+   * false here forces non-streaming for this turn.
+   */
+  stream?: boolean;
+  /**
+   * Reasoning intensity. Maps directly to Anthropic's
+   * `output_config.effort` (which has the same five levels). Other
+   * harnesses translate or ignore.
+   */
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  /**
+   * Raw lab-specific thinking/reasoning config. Anthropic accepts
+   * `{ type: "enabled", budget_tokens: … }`, `{ type: "disabled" }`, or
+   * `{ type: "adaptive" }`. Forwarded as-is. When both `effort` and
+   * `thinking` are set, the harness picks one (Anthropic prefers
+   * explicit `thinking`; effort falls through to a default budget).
+   */
+  thinking?: unknown;
+  /** Override the harness's default `max_tokens` for output. */
+  maxOutputTokens?: number;
+  /**
+   * Override the harness's default model id for this single call.
+   * Useful for routing ("this turn is light, use haiku").
+   */
+  model?: string;
+}
+
 export interface Harness {
   /**
    * Run a single turn to completion. The harness should pull events from the
    * runtime, call the model, dispatch tool calls, and return a TurnResult.
    * It SHOULD honor `runtime.abortSignal` and stop promptly when aborted.
+   *
+   * `params` is optional; harnesses that ignore it behave as before.
    */
-  run(runtime: Runtime): Promise<TurnResult>;
+  run(runtime: Runtime, params?: RunParameters): Promise<TurnResult>;
 
   /**
    * Optional: lab-aware capabilities the harness can implement when its

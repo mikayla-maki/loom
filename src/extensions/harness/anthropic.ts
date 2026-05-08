@@ -38,6 +38,7 @@ import type {
   ExtensionContext,
   Harness,
   HarnessFactory,
+  RunParameters,
   Runtime,
   SummariseArgs,
   TurnResult,
@@ -152,10 +153,17 @@ export class AnthropicHarness implements Harness {
       .join("");
   }
 
-  async run(runtime: Runtime): Promise<TurnResult> {
+  async run(runtime: Runtime, params?: RunParameters): Promise<TurnResult> {
     let requests = 0;
     // Reset cumulative usage for this turn.
     this.turnUsage = null;
+    // Resolve per-turn knobs once (some come from params, some from
+    // construction defaults).
+    const turnModel = params?.model ?? this.model;
+    const turnStream = params?.stream ?? this.stream;
+    const turnMaxTokens = params?.maxOutputTokens ?? this.maxTokens;
+    const turnEffort = params?.effort;
+    const turnThinking = params?.thinking;
     while (true) {
       if (runtime.abortSignal.aborted) {
         await runtime.update({
@@ -185,7 +193,7 @@ export class AnthropicHarness implements Harness {
       // we get back at the end is the assembled message — its text
       // blocks are NOT re-surfaced.
       let textAlreadyEmitted = false;
-      const onTextDelta = this.stream
+      const onTextDelta = turnStream
         ? async (delta: string) => {
             textAlreadyEmitted = true;
             await runtime.update({
@@ -203,6 +211,13 @@ export class AnthropicHarness implements Harness {
           tools,
           runtime.abortSignal,
           onTextDelta,
+          {
+            model: turnModel,
+            maxTokens: turnMaxTokens,
+            stream: turnStream,
+            effort: turnEffort,
+            thinking: turnThinking,
+          },
         );
       } catch (e) {
         await runtime.update({
@@ -470,17 +485,38 @@ export class AnthropicHarness implements Harness {
     tools: Array<{ name: string; description: string; input_schema: unknown }>,
     signal: AbortSignal,
     onTextDelta: ((delta: string) => Promise<void> | void) | undefined,
+    /**
+     * Per-call overrides for the body. When omitted, the harness's
+     * construction-time defaults apply.
+     */
+    overrides?: {
+      model?: string;
+      maxTokens?: number;
+      stream?: boolean;
+      effort?: RunParameters["effort"];
+      thinking?: unknown;
+    },
   ): Promise<AnthropicResponse> {
     const url = `${this.apiBase.replace(/\/$/, "")}/v1/messages`;
-    const useStreaming = this.stream && onTextDelta !== undefined;
-    const body = {
-      model: this.model,
+    const stream = overrides?.stream ?? this.stream;
+    const useStreaming = stream && onTextDelta !== undefined;
+    const body: Record<string, unknown> = {
+      model: overrides?.model ?? this.model,
       system,
       messages,
       tools,
-      max_tokens: this.maxTokens,
-      ...(useStreaming ? { stream: true } : {}),
+      max_tokens: overrides?.maxTokens ?? this.maxTokens,
     };
+    if (useStreaming) body.stream = true;
+    // Anthropic's effort dial. Both `effort` and `thinking` may be set;
+    // `thinking` wins when present (more specific config), and `effort`
+    // alone maps to `output_config.effort`.
+    if (overrides?.thinking !== undefined) {
+      body.thinking = overrides.thinking;
+    }
+    if (overrides?.effort) {
+      body.output_config = { effort: overrides.effort };
+    }
     const res = await fetch(url, {
       method: "POST",
       headers: {

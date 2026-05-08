@@ -31,6 +31,7 @@ import {
   type RunningAgent,
   type SessionUpdate,
   type AgentManifest,
+  type RunParameters,
 } from "loom";
 
 import { renderMarkdown, ansi } from "./markdown.js";
@@ -41,15 +42,17 @@ interface Args {
   compactAfter: number;
   plain: boolean;
   modelCompact: boolean;
+  effort: RunParameters["effort"] | undefined;
 }
 
 function parseArgs(argv: string[]): Args {
   const out: Args = {
-    model: "claude-3-5-sonnet-latest",
+    model: "claude-sonnet-4-5",
     noTools: false,
     compactAfter: 40,
     plain: !stdout.isTTY,
     modelCompact: false,
+    effort: undefined,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -60,7 +63,21 @@ function parseArgs(argv: string[]): Args {
       if (Number.isFinite(n) && n > 0) out.compactAfter = n;
     } else if (a === "--plain") out.plain = true;
     else if (a === "--model-compact") out.modelCompact = true;
-    else if (a === "--help" || a === "-h") {
+    else if (a === "--effort") {
+      const v = argv[++i];
+      if (
+        v === "low" ||
+        v === "medium" ||
+        v === "high" ||
+        v === "xhigh" ||
+        v === "max"
+      ) {
+        out.effort = v;
+      } else {
+        stderr.write(`unknown --effort value: ${v}\n`);
+        exit(2);
+      }
+    } else if (a === "--help" || a === "-h") {
       printHelp();
       exit(0);
     }
@@ -73,7 +90,8 @@ function printHelp(): void {
     `loom-sample-cli — interactive Loom testbed\n\n` +
       `Usage: loom-sample-cli [options]\n\n` +
       `Options:\n` +
-      `  --model <id>           Claude model id (default: claude-3-5-sonnet-latest)\n` +
+      `  --model <id>           Claude model id (default: claude-sonnet-4-5)\n` +
+      `  --effort <level>       low | medium | high | xhigh | max (default: model decides)\n` +
       `  --no-tools             disable the default builtin tools\n` +
       `  --compact-after <n>    compact when session exceeds <n> events (default: 40)\n` +
       `  --model-compact        use the model to write compaction summaries\n` +
@@ -175,7 +193,12 @@ async function main(): Promise<void> {
       continue;
     }
     try {
-      const result = await agent.prompt(text);
+      const params: RunParameters = {};
+      if (args.effort) params.effort = args.effort;
+      const result = await agent.prompt(
+        text,
+        Object.keys(params).length > 0 ? params : undefined,
+      );
       if (result.stopReason !== "end_turn") {
         stdout.write(
           `${ansi.dim}(stopped: ${result.stopReason})${ansi.reset}\n`,

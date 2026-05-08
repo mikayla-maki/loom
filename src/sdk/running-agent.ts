@@ -14,6 +14,7 @@ import type { SessionUpdate } from "../types/acp.js";
 import type {
   Harness,
   Provider,
+  RunParameters,
   Runtime,
   Session,
   SessionContext,
@@ -32,8 +33,12 @@ export interface RunningAgent {
    * Append a user message and run one turn to completion. Returns the
    * turn's stop reason plus (when the harness reports it) the
    * cumulative usage breakdown matching ACP RFD `PromptResponse.usage`.
+   *
+   * `params` is forwarded to the harness for this single turn (effort,
+   * streaming, lab-specific thinking config). The harness's defaults
+   * apply for any unset fields.
    */
-  prompt(text: string): Promise<TurnResult>;
+  prompt(text: string, params?: RunParameters): Promise<TurnResult>;
   cancel(): Promise<void>;
   updates(opts?: { capacity?: number }): AsyncIterableIterator<SessionUpdate>;
   readonly session: Session;
@@ -120,7 +125,7 @@ export class RunningAgentImpl implements RunningAgent {
     this.permissionHolder.current = handler ?? null;
   }
 
-  async prompt(text: string): Promise<TurnResult> {
+  async prompt(text: string, params?: RunParameters): Promise<TurnResult> {
     if (this.closed) throw new Error("Agent has been closed");
     if (this.inflight) {
       // Serialise turns: wait for the previous one to finish.
@@ -191,7 +196,7 @@ export class RunningAgentImpl implements RunningAgent {
 
     this.inflight = (async () => {
       try {
-        return await this.harness.run(runtime);
+        return await this.harness.run(runtime, params);
       } finally {
         this.currentAbortCtl = null;
         this.inflight = null;

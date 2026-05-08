@@ -27,6 +27,7 @@ import type {
   ExtensionContext,
   Harness,
   HarnessFactory,
+  RunParameters,
   Runtime,
   TurnResult,
 } from "../../types/interfaces.js";
@@ -60,7 +61,11 @@ export class TestHarness implements Harness {
 
   constructor(private readonly config: TestHarnessConfig) {}
 
-  async run(runtime: Runtime): Promise<TurnResult> {
+  /** Most-recent params seen by `run()`. Lets tests assert what loom forwarded. */
+  public lastParams: RunParameters | undefined;
+
+  async run(runtime: Runtime, params?: RunParameters): Promise<TurnResult> {
+    this.lastParams = params;
     if (this.config.echo) {
       return this.runEcho(runtime);
     }
