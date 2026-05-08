@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import * as path from "node:path";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+
 import {
   buildBashProfile,
   sandboxEngaged,
@@ -18,12 +22,12 @@ describe("sandboxEngaged", () => {
 });
 
 describe("buildBashProfile", () => {
-  it("throws when given a `*` grant (caller should have checked first)", () => {
-    expect(() => buildBashProfile("*")).toThrow(/no sandbox/);
+  it("throws when given a `*` grant (caller should have checked first)", async () => {
+    await expect(buildBashProfile("*")).rejects.toThrow(/no sandbox/);
   });
 
-  it("emits version + default-deny + bash-baseline rules", () => {
-    const profile = buildBashProfile({});
+  it("emits version + default-deny + bash-baseline rules", async () => {
+    const profile = await buildBashProfile({});
     expect(profile).toContain("(version 1)");
     expect(profile).toContain("(deny default)");
     expect(profile).toContain("(allow process-fork)");
@@ -35,53 +39,77 @@ describe("buildBashProfile", () => {
     expect(profile).toContain('(allow file-read* (subpath "/System"))');
   });
 
-  it("emits process-exec when subprocess is granted star", () => {
-    const profile = buildBashProfile({ subprocess: "*" });
+  it("emits process-exec when subprocess is granted star", async () => {
+    const profile = await buildBashProfile({ subprocess: "*" });
     expect(profile).toContain("(allow process-exec*)");
   });
 
-  it("emits per-path subpath rules for path allowlists", () => {
-    const profile = buildBashProfile({ paths: ["/proj", "/tmp/x"] });
-    expect(profile).toContain('(allow file-read*  (subpath "/proj"))');
-    expect(profile).toContain('(allow file-write* (subpath "/proj"))');
-    expect(profile).toContain('(allow file-read*  (subpath "/tmp/x"))');
-    expect(profile).toContain('(allow file-write* (subpath "/tmp/x"))');
+  it("emits per-path subpath rules for path allowlists", async () => {
+    // Use a real existing dir so canonicalPath returns a stable
+    // canonical form (and on macOS, /tmp/x doesn't exist so canonical
+    // path resolves the existing parent).
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sb-paths-"));
+    try {
+      const profile = await buildBashProfile({ paths: [dir, "/usr/bin"] });
+      // /usr/bin always exists and is itself canonical on macOS.
+      expect(profile).toContain('(allow file-read*  (subpath "/usr/bin"))');
+      expect(profile).toContain('(allow file-write* (subpath "/usr/bin"))');
+      // The tmp dir is canonicalized (e.g. /var/folders/… → /private/var/folders/…).
+      const canonical = await fs.realpath(dir);
+      expect(profile).toContain(`(allow file-read*  (subpath "${canonical}"))`);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 
-  it("emits unrestricted FS rules for paths = star", () => {
-    const profile = buildBashProfile({ paths: "*" });
+  it("emits unrestricted FS rules for paths = star", async () => {
+    const profile = await buildBashProfile({ paths: "*" });
     expect(profile).toContain("(allow file-read*)");
     expect(profile).toContain("(allow file-write*)");
   });
 
-  it("emits network rule only when network is granted star", () => {
-    expect(buildBashProfile({ network: "*" })).toContain("(allow network*)");
-    expect(buildBashProfile({})).not.toContain("(allow network*)");
+  it("emits network rule only when network is granted star", async () => {
+    expect(await buildBashProfile({ network: "*" })).toContain(
+      "(allow network*)",
+    );
+    expect(await buildBashProfile({})).not.toContain("(allow network*)");
     // Empty list = explicit deny; no rule emitted (default-deny covers it)
-    expect(buildBashProfile({ network: [] })).not.toContain("(allow network*)");
+    expect(await buildBashProfile({ network: [] })).not.toContain(
+      "(allow network*)",
+    );
   });
 
-  it("escapes embedded quotes and backslashes in path strings", () => {
-    const profile = buildBashProfile({ paths: ['/has"quote', "/has\\back"] });
+  it("escapes embedded quotes and backslashes in path strings", async () => {
+    // Non-existent paths fall through canonicalPath's ENOENT recursion
+    // and end up resolving the parent (root) and re-appending the
+    // basename verbatim, so escaping is exercised on the literal value.
+    const profile = await buildBashProfile({
+      paths: ['/has"quote', "/has\\back"],
+    });
     expect(profile).toContain('(subpath "/has\\"quote")');
     expect(profile).toContain('(subpath "/has\\\\back")');
   });
 
-  it("composes the canonical default grant correctly", () => {
-    // The DEFAULT_TOP_LEVEL_CAPABILITIES.bash shape — the practical
-    // out-of-the-box config users will run with.
-    const profile = buildBashProfile({ subprocess: "*", paths: ["./"] });
+  it("resolves `./` against the current process.cwd()", async () => {
+    // The default grant uses `paths: ["./"]`; the profile must embed
+    // the absolute, canonical cwd, not the literal string.
+    const profile = await buildBashProfile({ subprocess: "*", paths: ["./"] });
     expect(profile).toContain("(allow process-exec*)");
-    expect(profile).toContain('(allow file-read*  (subpath "./"))');
-    expect(profile).toContain('(allow file-write* (subpath "./"))');
-    // No network rule means default-deny applies → no network access.
+    const canonicalCwd = await fs.realpath(process.cwd());
+    expect(profile).toContain(
+      `(allow file-read*  (subpath "${canonicalCwd}"))`,
+    );
+    expect(profile).toContain(
+      `(allow file-write* (subpath "${canonicalCwd}"))`,
+    );
+    expect(profile).not.toContain('(subpath "./")');
     expect(profile).not.toContain("(allow network*)");
   });
 
-  it("includes the file-read root literal needed for cwd resolution", () => {
+  it("includes the file-read root literal needed for cwd resolution", async () => {
     // Without (allow file-read* (literal "/")) bash exits with SIGABRT
     // before running any user command. Regression guard.
-    const profile = buildBashProfile({});
+    const profile = await buildBashProfile({});
     expect(profile).toContain('(allow file-read* (literal "/"))');
   });
 });

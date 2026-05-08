@@ -120,7 +120,7 @@ async function main(): Promise<void> {
   const params: RunParameters = {};
   if (args.effort) params.effort = args.effort;
 
-  try {
+  try {``
     await runCli({
       agent,
       plain: args.plain,

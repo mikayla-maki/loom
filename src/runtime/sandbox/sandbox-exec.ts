@@ -26,6 +26,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import * as nodePath from "node:path";
 
 import type { CapabilitySet } from "../../types/manifest.js";
 
@@ -162,8 +163,15 @@ export function validateBashGrant(grant: CapabilitySet): void {
  * They do not grant user-data access; they are the standard "let
  * processes run at all" baseline that Apple's own Application
  * sandbox starts from.
+ *
+ * Async because path canonicalization (`fs.realpath`) is async; we
+ * have to follow symlinks before embedding paths in `(subpath ...)`
+ * rules — the kernel matches against the canonical path, not the
+ * symlink-laden form. macOS `/var → /private/var` is the canonical
+ * gotcha: a `(subpath "/var/...")` rule never fires because the
+ * kernel view is `/private/var/...`.
  */
-export function buildBashProfile(grant: CapabilitySet): string {
+export async function buildBashProfile(grant: CapabilitySet): Promise<string> {
   if (grant === "*") {
     throw new Error(
       'buildBashProfile: "*" grant means no sandbox; check sandboxEngaged() first',
@@ -207,7 +215,12 @@ export function buildBashProfile(grant: CapabilitySet): string {
   // (Allowlist subprocess support is future work — sandbox-exec can
   //  match exec by literal path, but the UX needs more thought.)
 
-  // paths — read+write for everything in the grant
+  // paths — read+write for everything in the grant. SBPL `(subpath ...)`
+  // matches against the kernel's canonical view of paths, so we have to
+  // resolve relative entries against process.cwd() AND follow symlinks.
+  // macOS bites us specifically on `/var → /private/var` and on tmpdir
+  // paths under `/var/folders/…` which kernel-side are
+  // `/private/var/folders/…`. canonicalPath() handles both.
   const p = grant.paths;
   if (p === "*") {
     lines.push("(allow file-read*)");
@@ -215,8 +228,9 @@ export function buildBashProfile(grant: CapabilitySet): string {
   } else if (Array.isArray(p)) {
     for (const root of p) {
       if (typeof root !== "string") continue;
-      lines.push(`(allow file-read*  (subpath "${escapeSbpl(root)}"))`);
-      lines.push(`(allow file-write* (subpath "${escapeSbpl(root)}"))`);
+      const abs = await canonicalPath(root);
+      lines.push(`(allow file-read*  (subpath "${escapeSbpl(abs)}"))`);
+      lines.push(`(allow file-write* (subpath "${escapeSbpl(abs)}"))`);
     }
   }
   // paths absent: denied by `(deny default)`. (No "smart default" at
@@ -240,6 +254,30 @@ function escapeSbpl(s: string): string {
 }
 
 /**
+ * Resolve `p` to an absolute path AND follow symlinks all the way down,
+ * so the result is the kernel's canonical view. Falls back to
+ * `path.resolve` when the path doesn't exist yet (the sandbox rule
+ * still works for paths created later, as long as they're not under a
+ * symlinked parent we couldn't observe).
+ *
+ * Recurses on the parent when realpath fails with ENOENT — so a grant
+ * for `<scratch>/logs` where `logs/` doesn't exist canonicalises
+ * `<scratch>` and re-appends `logs`.
+ */
+async function canonicalPath(p: string): Promise<string> {
+  const abs = nodePath.resolve(p);
+  try {
+    return await fs.realpath(abs);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") return abs;
+    const parent = nodePath.dirname(abs);
+    if (parent === abs) return abs; // hit root
+    const canonicalParent = await canonicalPath(parent);
+    return nodePath.join(canonicalParent, nodePath.basename(abs));
+  }
+}
+
+/**
  * Spawn arguments that engage sandbox-exec, when the platform supports
  * it and the grant is structured. Returns:
  *   - `{ binary, prefixArgs }` — caller spawns `binary` with
@@ -253,7 +291,7 @@ export async function maybeSandboxExecPrefix(
 ): Promise<{ binary: string; prefixArgs: string[] } | null> {
   if (!sandboxEngaged(grant)) return null;
   if (!(await hasSandboxExec())) return null;
-  const profile = buildBashProfile(grant);
+  const profile = await buildBashProfile(grant);
   return {
     binary: SANDBOX_EXEC_PATH,
     prefixArgs: ["-p", profile, "--"],
