@@ -1,4 +1,11 @@
 node_modules/
 dist/
+# Anything the agent or its session writes during a CLI run. The
+# tracked files are the package metadata, README, src/, and tsconfig
+# — everything else is a runtime artifact.
 *.jsonl
 *.txt
+*.py
+*.pl
+*.rb
+*.log

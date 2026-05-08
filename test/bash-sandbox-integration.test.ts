@@ -227,6 +227,64 @@ describe("bash sandbox: denials", () => {
   });
 });
 
+describe("bash sandbox: scripting language interpreters", () => {
+  // python3 on macOS is a shim that calls xcrun → needs /Applications.
+  // ruby has its own shim story. perl is a self-contained binary.
+  // These tests guard against the silent regression where the baseline
+  // profile is too tight and breaks tools the agent will reasonably reach for.
+  let scratch: string;
+  beforeAll(async () => {
+    scratch = await fs.mkdtemp(path.join(os.tmpdir(), "loom-bash-lang-"));
+  });
+  const grant = (root: string): CapabilitySet => ({
+    subprocess: "*",
+    paths: [root],
+  });
+
+  dit("python3 -c works under sandbox", async () => {
+    const r = await runBash(
+      grant(scratch),
+      `python3 -c 'print("hello python")'`,
+      scratch,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(r.content.trim()).toBe("hello python");
+  });
+
+  dit("perl -e works under sandbox", async () => {
+    const r = await runBash(
+      grant(scratch),
+      `perl -e 'print "hello perl\\n"'`,
+      scratch,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(r.content.trim()).toBe("hello perl");
+  });
+
+  dit("ruby -e works under sandbox (when installed)", async () => {
+    // Ruby may not be on every dev machine; tolerate missing.
+    const r = await runBash(
+      grant(scratch),
+      `command -v ruby >/dev/null && ruby -e 'puts "hello ruby"' || echo "missing"`,
+      scratch,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(r.content.trim()).toMatch(/^hello ruby$|^missing$/);
+  });
+
+  dit("python3 can read files in the granted cwd", async () => {
+    const target = path.join(scratch, "data.txt");
+    await fs.writeFile(target, "line1\nline2\nline3\n", "utf8");
+    const r = await runBash(
+      grant(scratch),
+      `python3 -c 'print(sum(1 for _ in open("data.txt")))'`,
+      scratch,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(r.content.trim()).toBe("3");
+  });
+});
+
 describe("bash sandbox: paths = star (unrestricted FS)", () => {
   dit("can read /etc/hosts when paths = '*'", async () => {
     const r = await runBash(

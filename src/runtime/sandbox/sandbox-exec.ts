@@ -157,6 +157,12 @@ export function validateBashGrant(grant: CapabilitySet): void {
  *     /private/etc (resolv.conf, hosts), /dev (terminal, /dev/null)
  *   - file-read on (literal "/") — bash stats / during cwd resolution
  *   - file-read on /private/tmp + /private/var/folders — TMPDIR contents
+ *   - file-read on /Applications — macOS installs developer tooling
+ *     here (Xcode.app, Xcode CLT shims). `python3` and other tools
+ *     that go through xcrun fail to dlopen libxcrun.dylib without
+ *     access here.
+ *   - file-read on /opt — Homebrew lives at /opt/homebrew on Apple
+ *     Silicon. User-installed CLI tools (rg, jq, deno, …) live there.
  *
  * The "allow defaults" set keeps bash itself working: without these,
  * even `/bin/bash -c echo` fails on dyld lookups or cwd resolution.
@@ -206,6 +212,12 @@ export async function buildBashProfile(grant: CapabilitySet): Promise<string> {
     '(allow file-write* (subpath "/dev"))', // /dev/null, /dev/tty, ...
     '(allow file-read* (subpath "/bin"))',
     '(allow file-read* (subpath "/sbin"))',
+    // Developer tooling paths. Without /Applications, xcrun can't
+    // load libxcrun.dylib from Xcode.app and `python3` (a shim that
+    // goes through xcrun) fails before it starts. /opt covers
+    // Homebrew on Apple Silicon.
+    '(allow file-read* (subpath "/Applications"))',
+    '(allow file-read* (subpath "/opt"))',
   ];
 
   // subprocess
