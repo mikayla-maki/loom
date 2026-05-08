@@ -37,6 +37,7 @@ REPL commands:
 |---|---|
 | `/quit` or `/exit` | leave the REPL |
 | `/events` | print the current session event count |
+| `/compact` | force a compaction pass right now (bypasses threshold) |
 | any other text | sent to the agent as a turn |
 
 `Ctrl-C` once cancels the in-flight turn; twice exits.
@@ -44,9 +45,11 @@ REPL commands:
 ## Flags
 
 ```
---model <id>            Claude model id (default: claude-3-5-sonnet-latest)
+--model <id>            Claude model id (default: claude-sonnet-4-5)
+--effort <level>        low | medium | high | xhigh | max
 --no-tools              disable the default builtin tools
 --compact-after <n>     compact when session exceeds <n> events (default: 40)
+--model-compact         use the model to write compaction summaries
 --plain                 disable ANSI styling
 ```
 
@@ -60,9 +63,17 @@ src/
 
 ## Why this exists
 
-To find the rough edges before they ossify. The first pass surfaced
-notes recorded in `../../internal-docs/session-notes.md` — chiefly
-that `Session` does not currently see the harness or system prompt,
-which makes model-driven compaction awkward. The heuristic compactor
-sidesteps this; a model-driven one would need a small `Session`
-interface change.
+Two demonstrations packed into ~350 LOC of TypeScript:
+
+1. **End-to-end exercise** of the public SDK — every primitive Loom
+   ships gets touched: harness, session, tools, `runAgent`,
+   `agent.updates()`, ACP-shaped `SessionUpdate` consumption,
+   per-turn `RunParameters`, the new `usage_update` event.
+2. **Composition** — the CLI does **not** hand `runAgent` a declarative
+   `{ provider: "anthropic", … }` config. It constructs the
+   `AnthropicHarness` and `CompactingSession` instances directly,
+   holds references, and passes them in. The `/compact` command
+   uses those held references to drive `session.compactNow(ctx)` —
+   bypassing the per-turn loop entirely. Loom is a library of
+   composable parts; `runAgent` is the convenience wrapper, not a
+   gatekeeper.

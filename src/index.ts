@@ -50,6 +50,13 @@ export type {
   TurnStep,
 } from "./extensions/harness/test.js";
 
+// Concrete harness classes — useful when an SDK consumer wants to wire
+// the harness instance themselves rather than going through the
+// `{ provider: "anthropic", … }` factory form.
+export { AnthropicHarness } from "./extensions/harness/anthropic.js";
+export { TestHarness } from "./extensions/harness/test.js";
+export { OpenAIHarness } from "./extensions/harness/openai.js";
+
 export {
   loadExtensionPackage,
   locateExtensionPackage,

@@ -28,10 +28,12 @@ import {
   runAgent,
   CompactingSession,
   modelCompactor,
+  AnthropicHarness,
   type RunningAgent,
   type SessionUpdate,
   type AgentManifest,
   type RunParameters,
+  type SessionContext,
 } from "loom";
 
 import { renderMarkdown, ansi } from "./markdown.js";
@@ -113,25 +115,37 @@ async function main(): Promise<void> {
     exit(2);
   }
 
+  // Construct the primitives ourselves rather than handing the manifest
+  // a `{ provider: "anthropic" }` config. This is the demonstration:
+  // loom is a library of composable parts. `runAgent` is convenient for
+  // wiring everything from a single declarative manifest, but you can
+  // also assemble pieces yourself and hand them in as instances. We
+  // hold direct references to use later for /compact.
+  const harness = new AnthropicHarness(
+    args.model,
+    process.env.ANTHROPIC_API_KEY,
+    "https://api.anthropic.com",
+    4096,
+    16,
+    true, // streaming
+  );
+  const session = new CompactingSession({
+    threshold: args.compactAfter,
+    keep: Math.max(4, Math.floor(args.compactAfter / 4)),
+    ...(args.modelCompact ? { compactor: modelCompactor() } : {}),
+  });
+
+  const systemPromptCore =
+    "You are a helpful assistant running inside a small terminal CLI. " +
+    "Keep replies focused and use markdown formatting (headings, lists, " +
+    "code fences) when it improves readability.";
+
   const manifest: AgentManifest = {
     name: "sample-cli",
     description: "A small interactive agent for poking at Loom.",
-    systemPrompt:
-      "You are a helpful assistant running inside a small terminal CLI. " +
-      "Keep replies focused and use markdown formatting (headings, lists, " +
-      "code fences) when it improves readability.",
-    harness: {
-      provider: "anthropic",
-      model: args.model,
-    },
-    // Inline session instance: heuristic compactor by default; opt into
-    // model-driven summarisation with --model-compact (which uses the
-    // SessionRuntime adapter loom binds at boot).
-    session: new CompactingSession({
-      threshold: args.compactAfter,
-      keep: Math.max(4, Math.floor(args.compactAfter / 4)),
-      ...(args.modelCompact ? { compactor: modelCompactor() } : {}),
-    }),
+    systemPrompt: systemPromptCore,
+    harness, // ← instance, not config
+    session, // ← instance
     ...(args.noTools ? { tools: {} } : {}),
   };
 
@@ -192,6 +206,31 @@ async function main(): Promise<void> {
       rl.prompt();
       continue;
     }
+    if (text === "/compact") {
+      // Drive compaction directly through our held session reference,
+      // bypassing the per-turn flow. Build a SessionContext from the
+      // pieces we already own — same shape loom would have built
+      // for `prepareTurn`. The model compactor (when --model-compact)
+      // closes over `harness` here.
+      const ctx: SessionContext = {
+        harness,
+        systemPromptCore,
+        agentName: manifest.name,
+        ...(manifest.description
+          ? { agentDescription: manifest.description }
+          : {}),
+      };
+      const result = await session.compactNow(ctx);
+      if (result) {
+        stdout.write(
+          `${ansi.dim}(compacted: ${result.before} → ${result.after} events)${ansi.reset}\n`,
+        );
+      } else {
+        stdout.write(`${ansi.dim}(nothing to compact)${ansi.reset}\n`);
+      }
+      rl.prompt();
+      continue;
+    }
     try {
       const params: RunParameters = {};
       if (args.effort) params.effort = args.effort;
@@ -221,7 +260,7 @@ function printBanner(_agent: RunningAgent, args: Args): void {
   const lines = [
     `${s.bold}${s.cyan}loom${s.reset} ${s.dim}sample cli${s.reset}`,
     `${s.dim}model:${s.reset} ${args.model}    ${s.dim}compact-after:${s.reset} ${args.compactAfter}`,
-    `${s.dim}commands:${s.reset} /quit    /events`,
+    `${s.dim}commands:${s.reset} /quit    /events    /compact`,
     "",
   ];
   stdout.write(lines.join("\n"));
