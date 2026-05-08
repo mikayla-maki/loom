@@ -208,7 +208,7 @@ export async function runAgent(
   const permissionHolder: { current: PermissionHandler | null } = {
     current: options.permissionHandler ?? null,
   };
-  const runtimeServices = new RuntimeServicesImpl(permissionHolder, ownAgent);
+  const runtimeServices = new RuntimeServicesImpl(permissionHolder);
   const runtime: RuntimePrimitives = runtimeServices;
 
   // ─── 6. Instantiate providers ───────────────────────────────────────
@@ -291,7 +291,7 @@ export async function runAgent(
     let claimed: Tool | null = null;
     for (const p of providers) {
       const result = await Promise.resolve(
-        p.instance.resolveTool(ref.name, ref.config),
+        p.instance.resolveTool(ref.name, ref.config, ownAgent),
       );
       if (result) {
         claimed = result;
@@ -344,9 +344,10 @@ export async function runAgent(
         abortSignal: runtimeServices.currentAbortSignal(),
         requestPermission: (req) => runtime.requestPermission(req),
         searchSkills: (q) => runtime.searchSkills(q),
-        agent: ownAgent,
-        spawnSubagent: (nameOrManifest) =>
-          spawnSubagentForTool(tool, ownAgent, nameOrManifest),
+        // The Agent ref handed to the tool. Same data as `ownAgent`
+        // but with a tool-scoped `spawnSubagent` closure — lookups by
+        // name resolve against THIS tool's `dependencies.subagents`.
+        agent: agentForTool(ownAgent, tool),
       }),
     },
   });
@@ -381,7 +382,6 @@ class RuntimeServicesImpl implements RuntimePrimitives {
 
   constructor(
     private readonly permissionHolder: { current: PermissionHandler | null },
-    public readonly agent: Agent,
   ) {}
 
   setSkills(skills: SkillSummary[]): void {
@@ -735,27 +735,63 @@ async function instantiateSession(
 }
 
 /**
- * Backing for `ctx.spawnSubagent()`. Looks the manifest up by name in
- * the calling tool's `dependencies.subagents`, or runs an inline
- * manifest. Auto-fills `parent` with the child's owning Agent.
+ * Build a tool-scoped Agent ref — same data as the caller's
+ * `ownAgent`, but with a `spawnSubagent` method whose lookup scope is
+ * THIS tool's `dependencies.subagents`. The runtime hands this to
+ * tools as `ctx.agent`; the same Agent ref also flows out as `parent`
+ * when the tool spawns a child via `ctx.agent.spawnSubagent(...)`.
  *
  * Recursion-friendly: the spawned `RunningAgent` is itself a fresh
- * call into `runAgent`, with its own provider chain and tool registry.
- * No fan-up of updates; no cascade-cancellation.
+ * call into `runAgent`, with its own provider chain and tool
+ * registry. No fan-up of updates; no cascade-cancellation.
  */
-async function spawnSubagentForTool(
-  tool: Tool,
-  parent: Agent,
+function agentForTool(base: Agent, tool: Tool): Agent {
+  const ref: Agent = {
+    ...base,
+    spawnSubagent: (nameOrManifest) =>
+      spawnSubagentInScope(
+        nameOrManifest,
+        tool.dependencies?.subagents ?? [],
+        `Tool '${tool.name}'`,
+        ref,
+      ),
+  };
+  return ref;
+}
+
+/**
+ * Build a session-scoped Agent ref — same data as `ownAgent`, but
+ * with a `spawnSubagent` whose lookup scope is THIS session's
+ * `dependencies.subagents`. RunningAgent hands this to session hooks
+ * (`prepareTurn`, `systemPromptSection`).
+ */
+export function agentForSession(base: Agent, session: Session): Agent {
+  const ref: Agent = {
+    ...base,
+    spawnSubagent: (nameOrManifest) =>
+      spawnSubagentInScope(
+        nameOrManifest,
+        session.dependencies?.subagents ?? [],
+        `Session '${base.agentName}'`,
+        ref,
+      ),
+  };
+  return ref;
+}
+
+async function spawnSubagentInScope(
   nameOrManifest: string | AgentManifest,
+  declared: AgentManifest[],
+  who: string,
+  parent: Agent,
 ): Promise<RunningAgent> {
   let submanifest: AgentManifest;
   if (typeof nameOrManifest === "string") {
-    const declared = tool.dependencies?.subagents ?? [];
     const found = declared.find((m) => m.name === nameOrManifest);
     if (!found) {
       const have = declared.map((m) => m.name).join(", ") || "(none)";
       throw new ResolutionError(
-        `Tool '${tool.name}' tried to spawn sub-agent '${nameOrManifest}', but its \`dependencies.subagents\` declares: ${have}. Lookups are scoped to the calling tool's own deps — there is no global registry. Either add the manifest to \`dependencies.subagents\` (so audit can see it) or pass the manifest object inline.`,
+        `${who} tried to spawn sub-agent '${nameOrManifest}', but its \`dependencies.subagents\` declares: ${have}. Lookups are scoped to the caller's own deps — there is no global registry. Either add the manifest to \`dependencies.subagents\` (so audit can see it) or pass the manifest object inline.`,
       );
     }
     submanifest = found;

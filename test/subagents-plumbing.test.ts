@@ -238,12 +238,21 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
         if (opts.spawn === "by-name") target = "child-by-name";
         else if (opts.spawn === "inline") target = childManifest;
         else target = "not-declared";
-        const sub = await ctx.spawnSubagent(target);
+        if (!ctx.agent.spawnSubagent) {
+          throw new Error("ctx.agent.spawnSubagent missing");
+        }
+        const sub = await ctx.agent.spawnSubagent(target);
         try {
           await sub.prompt("hello");
           const events = await sub.session.getEvents();
-          const msg = events.find((e) => e.sessionUpdate === "agent_message_chunk");
-          if (msg && msg.sessionUpdate === "agent_message_chunk" && msg.content.type === "text") {
+          const msg = events.find(
+            (e) => e.sessionUpdate === "agent_message_chunk",
+          );
+          if (
+            msg &&
+            msg.sessionUpdate === "agent_message_chunk" &&
+            msg.content.type === "text"
+          ) {
             opts.capture.childResult = msg.content.text;
           }
         } finally {
@@ -277,7 +286,9 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
         tools: { spawner: {} },
         harness: {
           provider: "test",
-          script: [[{ call: { tool: "spawner", input: {} } }, { stop: "end_turn" }]],
+          script: [
+            [{ call: { tool: "spawner", input: {} } }, { stop: "end_turn" }],
+          ],
         },
       },
       { providers: [provider] },
@@ -309,7 +320,9 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
         tools: { spawner: {} },
         harness: {
           provider: "test",
-          script: [[{ call: { tool: "spawner", input: {} } }, { stop: "end_turn" }]],
+          script: [
+            [{ call: { tool: "spawner", input: {} } }, { stop: "end_turn" }],
+          ],
         },
       },
       { providers: [provider] },
@@ -337,7 +350,9 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
         tools: { spawner: {} },
         harness: {
           provider: "test",
-          script: [[{ call: { tool: "spawner", input: {} } }, { stop: "end_turn" }]],
+          script: [
+            [{ call: { tool: "spawner", input: {} } }, { stop: "end_turn" }],
+          ],
         },
       },
       { providers: [provider] },
@@ -351,9 +366,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
       try {
         await agent.prompt("go");
         const events = await agent.session.getEvents();
-        const tu = events.find(
-          (e) => e.sessionUpdate === "tool_call_update",
-        );
+        const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
         if (tu && tu.sessionUpdate === "tool_call_update") {
           // If the tool surfaced the error in its result, read it; the
           // tool above re-throws (doesn't catch), so the harness's
@@ -376,18 +389,22 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
   });
 });
 
-describe("ProviderInitArgs.runtime.agent", () => {
-  it("is the owning agent and is readable from a provider that stashes it during init", async () => {
-    let stashed: Agent | undefined;
+describe("Provider.resolveTool receives the owning Agent", () => {
+  it("passes the owning agent to resolveTool so providers can capture it at construction", async () => {
+    let captured: Agent | undefined;
     const provider: Provider = {
-      init(args) {
-        // RuntimePrimitives.agent is supposed to be readable AFTER init
-        // returns (same lifecycle as the other primitives). For the
-        // purposes of this test we capture the ref now and assert
-        // properties on it later.
-        stashed = args.runtime.agent;
+      resolveTool: (name, _config, agent) => {
+        captured = agent;
+        if (name === "noop") {
+          return {
+            name: "noop",
+            description: "noop",
+            inputSchema: { type: "object" },
+            execute: async () => ({ content: "" }),
+          };
+        }
+        return null;
       },
-      resolveTool: () => null,
       close: () => {},
     };
 
@@ -395,15 +412,81 @@ describe("ProviderInitArgs.runtime.agent", () => {
       {
         name: "self-aware",
         systemPrompt: "x",
-        tools: {},
+        tools: { noop: {} },
         harness: { provider: "test" },
       },
       { providers: [provider] },
     );
     try {
-      expect(stashed).toBeDefined();
-      expect(stashed!.agentName).toBe("self-aware");
-      expect(stashed!.session).toBe(agent.session);
+      expect(captured).toBeDefined();
+      expect(captured?.agentName).toBe("self-aware");
+      expect(captured?.session).toBe(agent.session);
+      // The Agent passed to resolveTool is data-only; spawnSubagent is
+      // bound at the per-call ToolContext layer, not here.
+      expect(captured?.spawnSubagent).toBeUndefined();
+    } finally {
+      await agent.close();
+    }
+  });
+});
+
+describe("agent.spawnSubagent on session hooks", () => {
+  it("the session hook's Agent ref looks up sub-agents by name in the session's deps", async () => {
+    const subManifest: AgentManifest = {
+      name: "session-child",
+      systemPrompt: "x",
+      tools: {},
+      harness: {
+        provider: "test",
+        script: [[{ say: "from-session-child" }, { stop: "end_turn" }]],
+      },
+    };
+
+    let childResult = "";
+    const events: import("../src/types/acp.js").SessionUpdate[] = [];
+    const session = {
+      dependencies: { subagents: [subManifest] },
+      async append(u: import("../src/types/acp.js").SessionUpdate) {
+        events.push(u);
+      },
+      async getEvents(from = 0, to?: number) {
+        return events.slice(from, to);
+      },
+      async count() {
+        return events.length;
+      },
+      async prepareTurn(agent: Agent) {
+        if (!agent.spawnSubagent) throw new Error("missing spawnSubagent");
+        const sub = await agent.spawnSubagent("session-child");
+        try {
+          await sub.prompt("go");
+          const evs = await sub.session.getEvents();
+          const msg = evs.find(
+            (e) => e.sessionUpdate === "agent_message_chunk",
+          );
+          if (
+            msg &&
+            msg.sessionUpdate === "agent_message_chunk" &&
+            msg.content.type === "text"
+          ) {
+            childResult = msg.content.text;
+          }
+        } finally {
+          await sub.close();
+        }
+      },
+    } satisfies Session;
+
+    const agent = await runAgent({
+      name: "parent-with-session-spawn",
+      systemPrompt: "x",
+      tools: {},
+      harness: { provider: "test" },
+      session,
+    });
+    try {
+      await agent.prompt("hi");
+      expect(childResult).toBe("from-session-child");
     } finally {
       await agent.close();
     }

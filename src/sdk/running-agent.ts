@@ -26,7 +26,7 @@ import type { AgentManifest, Capabilities } from "../types/manifest.js";
 import { RuntimeImpl } from "../runtime/runtime.js";
 import type { AgentState } from "../runtime/agent-state.js";
 import type { UpdateSink } from "../runtime/update-sink.js";
-import type { RuntimeServicesImpl } from "./run-agent.js";
+import { agentForSession, type RuntimeServicesImpl } from "./run-agent.js";
 
 export interface RunningAgent {
   /**
@@ -146,8 +146,10 @@ export class RunningAgentImpl implements RunningAgent {
 
     // Build the per-turn `Agent` ref and run the session's hooks.
     // The session never holds onto the ref — it gets a fresh one each
-    // turn, passed to the methods that need it.
-    const agentRef: Agent = {
+    // turn, passed to the methods that need it. `agentForSession`
+    // attaches a `spawnSubagent` whose lookup scope is the session's
+    // own `dependencies.subagents`.
+    const baseAgent: Agent = {
       harness: this.harness,
       session: this.session,
       systemPromptCore: this.systemPrompt,
@@ -156,6 +158,7 @@ export class RunningAgentImpl implements RunningAgent {
         ? { agentDescription: this.manifest.description }
         : {}),
     };
+    const agentRef = agentForSession(baseAgent, this.session);
     if (this.session.prepareTurn) {
       try {
         await Promise.resolve(this.session.prepareTurn(agentRef));

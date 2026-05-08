@@ -96,7 +96,19 @@ export class SpawnSubagentTool implements Tool {
         isError: true,
       };
     }
-    const sub = await ctx.spawnSubagent(this.dependencies.subagents[0]!.name);
+    if (!ctx.agent.spawnSubagent) {
+      // Should be unreachable: the runtime always attaches
+      // spawnSubagent to ctx.agent. Defensive guard for direct
+      // callers that hand-build a ToolContext.
+      return {
+        content:
+          "spawn_subagent: ctx.agent has no spawnSubagent (was this tool dispatched outside a normal Loom runtime?)",
+        isError: true,
+      };
+    }
+    const sub = await ctx.agent.spawnSubagent(
+      this.dependencies.subagents[0]!.name,
+    );
     try {
       await sub.prompt(prompt);
       const text = await lastAgentMessage(sub.session);

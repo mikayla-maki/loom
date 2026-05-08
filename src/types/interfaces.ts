@@ -149,6 +149,36 @@ export interface Agent {
   agentName: string;
   /** Agent description, if the manifest set one. */
   agentDescription?: string;
+  /**
+   * Spawn a sub-agent.
+   *
+   * String form: looked up by `manifest.name` in the calling code's
+   * own `dependencies.subagents` (a tool's deps when called from
+   * `ctx.agent.spawnSubagent(...)`; a session's deps when called
+   * from a session hook). Throws `ResolutionError` if the name
+   * isn't declared — by design; the audit walk is the trust
+   * artifact, and silent fall-through to a global registry would
+   * defeat it.
+   *
+   * Manifest form: runs the supplied manifest inline. Use sparingly
+   * — callers that always spawn the same shape should declare it
+   * in `dependencies.subagents` so audit can see it.
+   *
+   * Either path auto-fills `parent` with this Agent. The child runs
+   * standalone (its own provider chain, its own tool registry); the
+   * parent's tools are NOT shared. Cancellation does not cascade —
+   * if you want the child to die when the parent's turn aborts,
+   * plumb an AbortSignal through.
+   *
+   * Optional only because Agent literals can be constructed without
+   * a deps scope (e.g. `RunAgentOptions.parent` from an SDK consumer
+   * who hand-built the ref, or the Agent threaded into
+   * `Provider.resolveTool` at boot before any tool exists). In
+   * runtime-supplied self-refs — `ctx.agent` inside a tool, the
+   * `agent` arg to `prepareTurn` / `systemPromptSection` — it's
+   * always present.
+   */
+  spawnSubagent?(nameOrManifest: string | AgentManifest): Promise<RunningAgent>;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -232,28 +262,13 @@ export interface ToolContext {
   ): Promise<import("./permissions.js").PermissionResult>;
   /** Read-only enumeration of skills available to this agent. */
   searchSkills(query?: string): Promise<SkillSummary[]>;
-  /** The owning agent (the agent this tool is part of). */
-  agent: Agent;
   /**
-   * Spawn a sub-agent.
-   *
-   * String form: looked up by `manifest.name` in this tool's
-   * `dependencies.subagents`. Throws `ResolutionError` if the name
-   * isn't declared — by design; the audit walk is the trust
-   * artifact, and silent fall-through to a global registry would
-   * defeat it.
-   *
-   * Manifest form: runs the supplied manifest inline. Use sparingly
-   * — tools that always spawn the same shape should declare it in
-   * `dependencies.subagents` so audit can see it.
-   *
-   * Either path auto-fills `parent: ctx.agent`. The child runs
-   * standalone (its own provider chain, its own tool registry); the
-   * parent's tools are NOT shared. Cancellation does not cascade —
-   * if you want the child to die when the parent's turn aborts, plumb
-   * `ctx.abortSignal` through.
+   * The owning agent (the agent this tool is part of). The runtime
+   * supplies an Agent whose `spawnSubagent` is bound to this tool's
+   * `dependencies.subagents` — so `ctx.agent.spawnSubagent("name")`
+   * looks up in the calling tool's own deps.
    */
-  spawnSubagent(nameOrManifest: string | AgentManifest): Promise<RunningAgent>;
+  agent: Agent;
 }
 
 /** Single entry returned by `ctx.searchSkills()`. */
@@ -494,20 +509,18 @@ export type ToolConfig = string | Record<string, unknown>;
  * Loom's runtime primitives, exposed to providers so they can wire tools
  * to them. Methods are usable AFTER every provider's `init()` has
  * returned.
+ *
+ * Note: providers don't get the owning `Agent` here. The Agent is
+ * passed directly to `resolveTool(name, config, agent)` so providers
+ * that want to capture it at tool-construction time can; providers
+ * that don't, ignore the arg. Tools always see the agent at dispatch
+ * via `ctx.agent`, regardless of what their provider did.
  */
 export interface RuntimePrimitives {
   requestPermission(
     req: import("./permissions.js").PermissionRequest,
   ): Promise<import("./permissions.js").PermissionResult>;
   searchSkills(query?: string): Promise<SkillSummary[]>;
-  /**
-   * The owning agent. A provider stashing this during `init()` and
-   * wiring it into its tools' `ToolContext` is the standard pattern
-   * (the native provider does it; extensions following the same
-   * convention get sub-agent spawning for free). Readable AFTER every
-   * provider's `init()` returns.
-   */
-  readonly agent: Agent;
 }
 
 export interface ProviderInitArgs {
@@ -531,10 +544,18 @@ export interface Provider {
   /**
    * Try to construct a Tool for this `(name, config)` reference. Return
    * null to pass the entry to the next provider in the chain.
+   *
+   * `agent` is the owning Agent (the one this provider is resolving
+   * tools for). Plain data — no `spawnSubagent` here, since the
+   * provider doesn't know which tool's scope it'd belong to. Use it
+   * for tool-construction-time wiring (capturing the harness ref,
+   * session ref, identity); tools see the agent at dispatch via
+   * `ctx.agent`, which DOES have a tool-scoped `spawnSubagent`.
    */
   resolveTool(
     name: string,
     config: ToolConfig,
+    agent: Agent,
   ): Promise<Tool | null> | Tool | null;
 
   /** Cleanup; called when the agent closes. */

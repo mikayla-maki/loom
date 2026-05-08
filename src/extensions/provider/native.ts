@@ -18,6 +18,7 @@ import { SearchSkillsTool } from "../../runtime/builtins/search_skills.js";
 import { SpawnSubagentTool } from "../../runtime/builtins/spawn_subagent.js";
 import { WriteFileTool } from "../../runtime/builtins/write_file.js";
 import type {
+  Agent,
   Provider,
   ProviderFactory,
   Tool,
@@ -37,7 +38,11 @@ const BUILTINS: Record<string, Builder> = {
 };
 
 class NativeProvider implements Provider {
-  resolveTool(name: string, config: ToolConfig): Tool | null {
+  // Native builtins don't read the agent at construction time — they
+  // see it on every call via `ctx.agent`. The arg is accepted for
+  // signature parity with extension providers.
+  resolveTool(name: string, config: ToolConfig, _agent: Agent): Tool | null {
+    void _agent;
     const builder = BUILTINS[name];
     return builder ? builder(config) : null;
   }

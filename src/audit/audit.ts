@@ -19,7 +19,7 @@ import type {
   SkillManifest,
   Capabilities,
 } from "../types/manifest.js";
-import type { Tool, ToolConfig } from "../types/interfaces.js";
+import type { Agent, Tool, ToolConfig } from "../types/interfaces.js";
 
 export interface SecretRequest {
   name: string;
@@ -151,11 +151,22 @@ async function auditAgentInner(
 
   // Run only the native provider. Extension providers stay un-audited.
   const native = buildNativeProvider();
+  // Synthetic Agent ref for native.resolveTool. Audit doesn't run the
+  // session/harness; the Agent's runtime fields are stubs that throw
+  // if anyone reads through them — and no native builtin does.
+  const auditAgentRef: Agent = {
+    harness: stubHarness(),
+    session: stubSession(),
+    systemPromptCore: "",
+    agentName: manifest.name,
+  };
   const tools: CapabilityTree["tools"] = [];
   const resolvedTools = new Map<string, Tool>();
   const unresolvedTools: CapabilityTree["unresolvedTools"] = [];
   for (const ref of refs) {
-    const t = await Promise.resolve(native.resolveTool(ref.name, ref.config));
+    const t = await Promise.resolve(
+      native.resolveTool(ref.name, ref.config, auditAgentRef),
+    );
     if (!t) {
       unresolvedTools.push({ name: ref.name, introducedBy: ref.origin });
       continue;
@@ -267,6 +278,26 @@ function collectSecrets(
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
+}
+
+function stubHarness(): import("../types/interfaces.js").Harness {
+  return {
+    run: async () => {
+      throw new Error(
+        "audit: harness.run() called — audit doesn't execute turns",
+      );
+    },
+  };
+}
+
+function stubSession(): import("../types/interfaces.js").Session {
+  return {
+    append: async () => {
+      throw new Error("audit: session.append() called");
+    },
+    getEvents: async () => [],
+    count: async () => 0,
+  };
 }
 
 async function loadSkillForAudit(
