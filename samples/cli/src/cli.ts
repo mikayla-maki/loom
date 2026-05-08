@@ -72,6 +72,14 @@ export interface CliOptions {
   onPrompt?: (text: string) => Promise<TurnResult>;
   /** Banner printed at startup. Multi-line strings are fine. */
   banner?: string;
+  /**
+   * On startup, replay the last N events of the session through the
+   * normal renderer so the user sees recent context when resuming.
+   * Default: 10 events. Set to 0 to disable. The replay is read-only
+   * — it pulls from `agent.session.pull` and renders, no events are
+   * generated.
+   */
+  historyLines?: number;
   /** Custom slash commands. `/quit`, `/exit`, `/help`, `/events` are built in. */
   commands?: SlashCommand[];
 }
@@ -90,6 +98,22 @@ export async function runCli(opts: CliOptions): Promise<void> {
     stdout.write(opts.banner + (opts.banner.endsWith("\n") ? "" : "\n"));
 
   const printer = startPrinter(agent, plain);
+
+  // Resume hint: replay the last N events of the session so the user
+  // sees the conversational tail when reopening a persisted session.
+  // No-ops on a fresh session.
+  const historyLines = opts.historyLines ?? 10;
+  if (historyLines > 0) {
+    const all = (await agent.session.pull?.([])) ?? [];
+    const tail = all.slice(-historyLines);
+    if (tail.length > 0) {
+      stdout.write(
+        `${s.dim}─── resumed: showing last ${tail.length} of ${all.length} events ───${s.reset}\n`,
+      );
+      printer.replay(tail);
+      stdout.write(`${s.dim}─── end of prior session ───${s.reset}\n\n`);
+    }
+  }
 
   // Built-in commands. Custom commands win on name collision.
   const builtins: SlashCommand[] = [
@@ -243,6 +267,12 @@ interface Printer {
   stop(): void;
   /** Latest usage observed via `usage_update`, or null. */
   getUsage(): { used: number; size: number } | null;
+  /**
+   * Render a sequence of historic events through the same handler used
+   * for the live stream. Used by the resume-on-reload banner; safe to
+   * call before/after live updates land.
+   */
+  replay(updates: Iterable<SessionUpdate>): void;
 }
 
 function startPrinter(agent: RunningAgent, plain: boolean): Printer {
@@ -251,6 +281,21 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
   let inAgentMessage = false;
   let lastUsage: { used: number; size: number } | null = null;
   const stopFlag = { current: false };
+  // Stable short id per toolCallId so paired call/result lines are
+  // easy to match visually even when the harness issues several
+  // calls in parallel. The model's underlying ids (Anthropic
+  // `toolu_01...`, OpenAI `call_...`) are too long to read at a
+  // glance; we just hand out 1, 2, 3, ... in order seen.
+  const idShorts = new Map<string, string>();
+  let nextShort = 1;
+  const shortOf = (toolCallId: string): string => {
+    let s = idShorts.get(toolCallId);
+    if (!s) {
+      s = `#${nextShort++}`;
+      idShorts.set(toolCallId, s);
+    }
+    return s;
+  };
 
   const flush = (final: boolean): void => {
     if (!buffer) return;
@@ -295,14 +340,26 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
       case "tool_call": {
         flush(true);
         inAgentMessage = false;
+        const tag = shortOf(u.toolCallId);
         const inputPreview = previewJson(u.input);
         stdout.write(
-          `${s.yellow}↪ ${u.title}${s.reset} ${s.dim}${inputPreview}${s.reset}\n`,
+          `${s.yellow}↪ ${tag} ${u.title}${s.reset} ${s.dim}${inputPreview}${s.reset}\n`,
         );
         break;
       }
       case "tool_call_update": {
         const status = u.status ?? "?";
+        // Skip non-final updates (status transitions like "in_progress")
+        // — the final completed/failed/cancelled is the one worth
+        // surfacing. Pending updates without a status are also skipped.
+        if (
+          status !== "completed" &&
+          status !== "failed" &&
+          status !== "cancelled"
+        ) {
+          break;
+        }
+        const tag = shortOf(u.toolCallId);
         const color = status === "failed" ? s.red : s.green;
         const result = (u.content ?? [])
           .map((c) =>
@@ -313,7 +370,7 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
           .join("");
         const summary = oneLine(result, 200);
         stdout.write(
-          `  ${color}${status}${s.reset}${summary ? ` ${s.dim}${summary}${s.reset}` : ""}\n`,
+          `  ${color}${tag} ${status}${s.reset}${summary ? ` ${s.dim}${summary}${s.reset}` : ""}\n`,
         );
         break;
       }
@@ -338,6 +395,25 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
       flush(true);
     },
     getUsage: () => lastUsage,
+    replay: (updates) => {
+      // Drop orphan tool_call_updates whose matching tool_call lies
+      // outside the replay window — otherwise the user sees a result
+      // line for a call they never saw issued.
+      const seenCallIds = new Set<string>();
+      for (const u of updates) {
+        if (u.sessionUpdate === "tool_call") {
+          seenCallIds.add(u.toolCallId);
+        } else if (
+          u.sessionUpdate === "tool_call_update" &&
+          !seenCallIds.has(u.toolCallId)
+        ) {
+          continue;
+        }
+        handleUpdate(u);
+      }
+      flush(true);
+      inAgentMessage = false;
+    },
   };
 }
 
