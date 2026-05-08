@@ -35,6 +35,11 @@ import { resolveSystemPrompt } from "../manifest/resolver.js";
 import { parseSkillManifest } from "../manifest/parser.js";
 import { assertCapabilities } from "../manifest/capabilities.js";
 import { AgentState } from "../runtime/agent-state.js";
+import {
+  pathForSkill,
+  renderVirtualSkillFile,
+  virtualSkillPath,
+} from "../runtime/skill-paths.js";
 import { ToolTable } from "../runtime/tool-table.js";
 import { UpdateSink } from "../runtime/update-sink.js";
 import {
@@ -285,6 +290,18 @@ export async function runAgent(
     }
   }
 
+  // ─── 9a. Augment read_file with skill awareness ───────────────
+  // Real on-disk skill dirs get appended to read_file's `paths` so
+  // the tool can read SKILL.md and bundled resources without the
+  // author having to manually allowlist each. Inline skills get
+  // synthesised SKILL.md bytes registered under their
+  // `loom-skills:<name>/SKILL.md` URI in the tool's virtual map.
+  augmentReadFileForSkills(refs, skills);
+  // The ceiling has to grow with the tool's effective paths, or the
+  // post-resolution `assertCapabilities` check will reject the
+  // skill-derived dirs we just added.
+  augmentReadFileCeilingForSkills(manifest, skills);
+
   // ─── 10. Resolve each ref through the provider chain ────────────
   const resolvedTools = new Map<string, Tool>();
   for (const ref of refs) {
@@ -321,7 +338,8 @@ export async function runAgent(
   );
   const allSecrets = { ...phase1Secrets, ...phase2Secrets };
 
-  // ─── 12. Validate [capabilities.<name>] ceilings ────────────────
+  // ─── 12. Validate [capabilities.<name>] ceilings ──────────────
+  // (read_file's ceiling was already extended with skill dirs in step 9a.)
   const ceiling: Capabilities = manifest.capabilities ?? {};
   assertCapabilities(resolvedTools, ceiling);
 
@@ -416,6 +434,101 @@ class RuntimeServicesImpl implements RuntimePrimitives {
 
 export type { RuntimeServicesImpl };
 
+/**
+ * Mutate the `read_file` ref's config (if present) so it knows about
+ * loaded skills:
+ *   - On-disk skills' `skillDir` is appended to `paths` so the tool
+ *     can read SKILL.md plus any bundled resources the body
+ *     references.
+ *   - Inline skills get an entry in `virtualSkills`, keyed by
+ *     `loom-skills:<name>/SKILL.md`, with the synthesised SKILL.md
+ *     bytes (frontmatter re-emitted so on-disk and inline are
+ *     byte-shaped the same way).
+ *
+ * No-op when there are no skills, or no read_file ref. (An agent
+ * can opt out of skill-via-read_file by simply not declaring
+ * read_file; loom won't be able to surface bundled resources in
+ * that case, but the catalog still lists what's there.)
+ */
+function augmentReadFileForSkills(
+  refs: Array<{ name: string; config: ToolConfig; origin: string }>,
+  skills: SkillManifest[],
+): void {
+  if (skills.length === 0) return;
+  const ref = refs.find((r) => r.name === "read_file");
+  if (!ref) return;
+  const skillDirs: string[] = [];
+  const virtualSkills: Record<string, string> = {};
+  for (const sk of skills) {
+    if (sk.skillDir) {
+      skillDirs.push(sk.skillDir);
+    } else if (sk.name) {
+      virtualSkills[virtualSkillPath(sk.name)] = renderVirtualSkillFile(sk);
+    }
+  }
+  // Normalise into the object form so we can splice the new fields
+  // in regardless of which shape the manifest used.
+  const cfg =
+    typeof ref.config === "string"
+      ? ({} as Record<string, unknown>)
+      : { ...(ref.config as Record<string, unknown>) };
+  if (skillDirs.length > 0) {
+    const existingPaths = readPathsFromConfig(cfg);
+    cfg.paths = [...existingPaths, ...skillDirs];
+    // If caps were nested under `capabilities.paths`, mirror the
+    // change there too so whichever shape the tool reads sees the
+    // same paths.
+    if (cfg.capabilities && typeof cfg.capabilities === "object") {
+      const caps = cfg.capabilities as Record<string, unknown>;
+      caps.paths = [...existingPaths, ...skillDirs];
+    }
+  }
+  if (Object.keys(virtualSkills).length > 0) {
+    cfg.virtualSkills = virtualSkills;
+  }
+  ref.config = cfg;
+}
+
+function readPathsFromConfig(cfg: Record<string, unknown>): string[] {
+  const top = cfg.paths;
+  if (Array.isArray(top) && top.every((x) => typeof x === "string")) {
+    return top as string[];
+  }
+  const caps = cfg.capabilities as { paths?: unknown } | undefined;
+  if (
+    caps &&
+    Array.isArray(caps.paths) &&
+    caps.paths.every((x) => typeof x === "string")
+  ) {
+    return caps.paths as string[];
+  }
+  return [];
+}
+
+/**
+ * Mirror the `read_file.paths` extension into the manifest's
+ * `[capabilities.read_file]` ceiling so `assertCapabilities`
+ * doesn't reject the skill dirs the tool now legitimately reads
+ * from. Only touches the entry when one is already declared — if
+ * the author didn't set a ceiling, we leave it absent (no ceiling =
+ * no check).
+ */
+function augmentReadFileCeilingForSkills(
+  manifest: AgentManifest,
+  skills: SkillManifest[],
+): void {
+  const dirs = skills
+    .map((s) => s.skillDir)
+    .filter((d): d is string => typeof d === "string" && d.length > 0);
+  if (dirs.length === 0) return;
+  if (!manifest.capabilities) return;
+  const entry = manifest.capabilities.read_file;
+  if (!entry || typeof entry !== "object") return;
+  const e = entry as { paths?: unknown };
+  const existing = Array.isArray(e.paths) ? (e.paths as string[]) : [];
+  e.paths = [...existing, ...dirs];
+}
+
 function buildSkillSummaries(skills: SkillManifest[]): SkillSummary[] {
   const out: SkillSummary[] = [];
   for (const skill of skills) {
@@ -424,6 +537,7 @@ function buildSkillSummaries(skills: SkillManifest[]): SkillSummary[] {
       name: skill.name,
       description: skill.description,
       toolNames: Object.keys(skill.requires ?? {}),
+      path: pathForSkill(skill),
     });
   }
   return out;

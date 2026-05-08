@@ -52,19 +52,23 @@ export function assembleSystemPrompt(inputs: SystemPromptInputs): string {
     );
   }
 
-  // 2. Capabilities (structural, runtime-owned). Skills only — top-level
-  // tools surface through the Tool Reference section below; they don't
-  // carry a body to render.
+  // 2. Skill catalog. Tier-1 of progressive disclosure: name +
+  // description + path. Bodies live on the side; the model fetches
+  // them with `read_file` (real fs path for on-disk skills,
+  // `loom-skills:<name>/SKILL.md` for inline). Top-level tools
+  // surface through the Tool Reference section below.
   if (inputs.skills.length > 0) {
-    const lines: string[] = ["# Available Skills"];
+    const lines: string[] = [
+      "# Available Skills",
+      "When a task matches a skill below, call `read_file` with the listed path to load its full SKILL.md before proceeding. Resolve any relative references in the loaded body against the skill's directory.",
+    ];
     for (const sk of inputs.skills) {
-      lines.push(`## ${sk.name}\n${sk.description}`);
+      const segs = [`## ${sk.name}`, sk.description];
+      segs.push(`Path: \`${sk.path}\``);
       if (sk.toolNames.length > 0) {
-        lines.push(`Tools: ${sk.toolNames.join(", ")}`);
+        segs.push(`Tools: ${sk.toolNames.join(", ")}`);
       }
-      if (sk.body.trim()) {
-        lines.push(sk.body.trim());
-      }
+      lines.push(segs.join("\n"));
     }
     parts.push(lines.join("\n\n"));
   }

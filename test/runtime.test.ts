@@ -166,6 +166,7 @@ describe("system prompt assembly", () => {
           description: "Greet the user",
           body: "Use greet() then uppercase().",
           toolNames: ["greet", "uppercase"],
+          path: "loom-skills:greeter/SKILL.md",
         },
       ],
       tools: [
@@ -178,6 +179,9 @@ describe("system prompt assembly", () => {
     expect(text).toContain("I am a helpful assistant.");
     expect(text).toContain("# Available Skills");
     expect(text).toContain("greet, uppercase");
+    // Catalog renders the path; body is not inlined anymore.
+    expect(text).toContain("loom-skills:greeter/SKILL.md");
+    expect(text).not.toContain("Use greet() then uppercase().");
     expect(text).toContain("# Tool Reference");
     expect(text).toContain("Current date: 2026-01-01");
   });

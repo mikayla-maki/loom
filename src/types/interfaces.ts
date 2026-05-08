@@ -277,6 +277,13 @@ export interface SkillSummary {
   description: string;
   /** Tool names this skill brings into scope. */
   toolNames: string[];
+  /**
+   * Path the model passes to `read_file` to fetch the skill's full
+   * SKILL.md. For on-disk skills this is a real fs path; for inline
+   * skills it's the synthetic `loom-skills:<name>/SKILL.md` URI that
+   * `read_file` resolves from memory.
+   */
+  path: string;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -289,6 +296,12 @@ export interface SkillDescriptor {
   body: string;
   /** The tool names this skill brings into scope. */
   toolNames: string[];
+  /**
+   * The path the model uses to fetch this skill's SKILL.md via
+   * `read_file`. Real fs path for on-disk skills, synthetic
+   * `loom-skills:<name>/SKILL.md` for inline skills.
+   */
+  path: string;
 }
 
 export interface Runtime {

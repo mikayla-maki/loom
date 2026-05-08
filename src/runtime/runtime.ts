@@ -19,6 +19,7 @@ import type { SessionUpdate } from "../types/acp.js";
 import type { AgentState } from "./agent-state.js";
 import { assembleSystemPrompt } from "./system-prompt.js";
 import type { UpdateSink } from "./update-sink.js";
+import { pathForSkill } from "./skill-paths.js";
 
 export interface RuntimeImplOptions {
   session: Session;
@@ -83,6 +84,7 @@ export class RuntimeImpl implements Runtime {
       description: s.description,
       body: s.body ?? "",
       toolNames: Object.keys(s.requires ?? {}),
+      path: pathForSkill(s),
     }));
   }
 
