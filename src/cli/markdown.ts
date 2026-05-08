@@ -47,7 +47,9 @@ export function renderMarkdown(src: string, opts: RenderOptions = {}): string {
       continue;
     }
     if (inFence) {
-      out.push(opts.plain ? `    ${raw}` : `${ANSI.dim}    ${raw}${ANSI.reset}`);
+      out.push(
+        opts.plain ? `    ${raw}` : `${ANSI.dim}    ${raw}${ANSI.reset}`,
+      );
       continue;
     }
     out.push(renderLine(raw, opts));
@@ -61,25 +63,26 @@ export function renderLine(line: string, opts: RenderOptions = {}): string {
   // Headings
   let m = /^(#{1,6})\s+(.*)$/.exec(line);
   if (m) {
-    const level = m[1].length;
-    const text = inlineMd(m[2], opts);
-    const color = level === 1 ? ANSI.magenta : level === 2 ? ANSI.cyan : ANSI.yellow;
+    const level = m[1]!.length;
+    const text = inlineMd(m[2]!, opts);
+    const color =
+      level === 1 ? ANSI.magenta : level === 2 ? ANSI.cyan : ANSI.yellow;
     return `${color}${ANSI.bold}${text}${ANSI.reset}`;
   }
   // Blockquote
   m = /^>\s?(.*)$/.exec(line);
   if (m) {
-    return `${ANSI.gray}│${ANSI.reset} ${inlineMd(m[1], opts)}`;
+    return `${ANSI.gray}│${ANSI.reset} ${inlineMd(m[1]!, opts)}`;
   }
   // Bullet list
   m = /^(\s*)[-*]\s+(.*)$/.exec(line);
   if (m) {
-    return `${m[1]}${ANSI.cyan}•${ANSI.reset} ${inlineMd(m[2], opts)}`;
+    return `${m[1]!}${ANSI.cyan}•${ANSI.reset} ${inlineMd(m[2]!, opts)}`;
   }
   // Numbered list — leave the prefix, render the body
   m = /^(\s*\d+\.\s+)(.*)$/.exec(line);
   if (m) {
-    return `${m[1]}${inlineMd(m[2], opts)}`;
+    return `${m[1]!}${inlineMd(m[2]!, opts)}`;
   }
   return inlineMd(line, opts);
 }
@@ -92,7 +95,10 @@ function inlineMd(s: string, opts: RenderOptions): string {
   s = s.replace(/\*\*([^*\n]+)\*\*/g, `${ANSI.bold}$1${ANSI.reset}`);
   s = s.replace(/__([^_\n]+)__/g, `${ANSI.bold}$1${ANSI.reset}`);
   // Italic: *…* or _…_  (avoid matching ** or __)
-  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, `$1${ANSI.italic}$2${ANSI.reset}`);
+  s = s.replace(
+    /(^|[^*])\*([^*\n]+)\*(?!\*)/g,
+    `$1${ANSI.italic}$2${ANSI.reset}`,
+  );
   s = s.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, `$1${ANSI.italic}$2${ANSI.reset}`);
   return s;
 }

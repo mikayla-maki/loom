@@ -17,6 +17,8 @@ import { TextRenderer } from "./renderer.js";
 import { auditAgent, formatCapabilityTree } from "../audit/audit.js";
 import { ttyPermissionHandler } from "./permissions.js";
 import { ttyMissingSecretHandler } from "./secret-prompt.js";
+import { runRepl } from "./repl.js";
+import { ansi } from "./markdown.js";
 import type { AuditFinding } from "../types/interfaces.js";
 
 /**
@@ -72,7 +74,7 @@ function printHelp(): void {
     `loom — manifest-driven agent meta-harness
 
 Usage:
-  loom run <agent.toml>                  Start an interactive REPL.
+  loom run <agent.toml> [opts]           Interactive REPL with the agent.
   loom prompt <agent.toml> [text]        One-shot prompt (stdin if [text] omitted).
   loom audit <agent.toml>                Print the static capability tree.
   loom acp serve <agent.toml>            Speak ACP over stdio.
@@ -83,9 +85,16 @@ Usage:
 
 Where <kind> ∈ { tool | agent }.
 
-Flags:
+Flags (run/prompt):
   --no-colors                             Disable ANSI colour output.
   --show-thoughts                         Render agent_thought_chunk updates.
+
+Flags (run only):
+  --no-resume                             Skip the history-replay banner at startup.
+  --history-lines <N>                     Replay last N events (default 10, 0 = off).
+
+In the REPL: tab to complete /commands. Built-ins:
+  /quit /exit /help /audit /events [N] /tools
 `,
   );
 }
@@ -97,52 +106,40 @@ async function cmdRun(args: string[]): Promise<number> {
     console.error("usage: loom run <agent.toml>");
     return 2;
   }
+  const plain = !!opts.flags["no-colors"];
   const agent = await runAgent(manifestPath, {
     permissionHandler: ttyPermissionHandler(),
     onMissingSecret: ttyMissingSecretHandler(),
-    onAuditFinding: stderrAuditPrinter(!!opts.flags["no-colors"]),
+    onAuditFinding: stderrAuditPrinter(plain),
   });
-  const renderer = new TextRenderer({
-    useColors: !opts.flags["no-colors"],
-    showThoughts: !!opts.flags["show-thoughts"],
-  });
-
-  // Background: stream updates.
-  const sub = agent.updates();
-  (async () => {
-    for await (const u of sub) renderer.render(u);
-  })();
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  process.stdout.write(
-    `\nloom: ready (${agent.manifest.name}). type a message; ctrl-c to quit.\n`,
-  );
-
-  const ask = () =>
-    new Promise<string | null>((resolve) => {
-      rl.question("> ", (answer) => resolve(answer));
-      rl.once("close", () => resolve(null));
-    });
-
+  // Decode --history-lines, with --no-resume as a shorthand for 0.
+  const historyLinesArg = opts.flags["history-lines"];
+  let historyLines = 10;
+  if (opts.flags["no-resume"]) historyLines = 0;
+  if (typeof historyLinesArg === "string") {
+    const n = parseInt(historyLinesArg, 10);
+    if (Number.isFinite(n) && n >= 0) historyLines = n;
+  }
   try {
-    while (true) {
-      const line = await ask();
-      if (line === null) break;
-      if (!line.trim()) continue;
-      try {
-        await agent.prompt(line);
-      } catch (e) {
-        console.error(`error: ${(e as Error).message}`);
-      }
-    }
+    await runRepl({
+      agent,
+      plain,
+      historyLines,
+      banner: buildRunBanner(agent.manifest.name, plain),
+    });
   } finally {
-    rl.close();
     await agent.close();
   }
   return 0;
+}
+
+function buildRunBanner(agentName: string, plain: boolean): string {
+  if (plain)
+    return `loom run — ${agentName}\n(/help for commands; ctrl-c to quit)\n`;
+  return (
+    `${ansi.bold}${ansi.cyan}loom${ansi.reset} ${ansi.dim}run —${ansi.reset} ${ansi.bold}${agentName}${ansi.reset}\n` +
+    `${ansi.dim}(${ansi.reset}/help${ansi.dim} for commands; ctrl-c to quit)${ansi.reset}\n`
+  );
 }
 
 async function cmdPrompt(args: string[]): Promise<number> {
