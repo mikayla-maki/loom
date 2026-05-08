@@ -158,7 +158,7 @@ export class BashTool implements Tool {
         findings.push({
           severity: "ok",
           message:
-            "bwrap available; structured grant will engage the Linux sandbox at runtime. (Sketch implementation; verify on your machine.)",
+            "bwrap available; structured grant will engage the Linux sandbox at runtime.",
         });
       } else {
         findings.push({

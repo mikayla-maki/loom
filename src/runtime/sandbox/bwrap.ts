@@ -7,11 +7,22 @@
  * namespace, mounts a minimal filesystem inside it, and execs the
  * target command — the OS-level isolation primitive on Linux.
  *
- * Status: SKETCH. The profile-builder logic below is correct in
- * principle but hasn't been exercised on a real Linux machine. The
- * bash tool's spawn site does NOT yet dispatch to this module; the
- * audit() reporter just notes whether bwrap is available. Wire-up
- * goes in `bash.ts` once verified end-to-end on Linux.
+ * Status: VERIFIED on Ubuntu 25.10 (OrbStack, aarch64) with the
+ * bash-bwrap-integration suite. bash.ts dispatches to this module
+ * on linux platforms; the audit() reporter surfaces bwrap presence
+ * as ok/error severity. Behaviour quirks worth knowing:
+ *
+ *   - The namespace root is `tmpfs`. Writes to sibling paths of a
+ *     bind mount (e.g. writing to `/parent/sibling.txt` when only
+ *     `/parent/granted/` is bind-mounted) succeed locally on the
+ *     tmpfs but evaporate when the bash process exits. Confusing
+ *     for users probing the boundary, but not a leak.
+ *   - DNS is blocked by `--unshare-net` (no resolver in the
+ *     namespace). Direct-IP connections also fail because the
+ *     namespace has no routable interfaces other than loopback.
+ *   - CAP_NET_RAW is dropped, so `ping` and similar fail with
+ *     'Operation not permitted' even though the binaries are
+ *     available.
  *
  * ─── bwrap argument shape ───────────────────────────────────────────
  *
@@ -49,7 +60,11 @@ import * as nodePath from "node:path";
 
 import type { CapabilitySet } from "../../types/manifest.js";
 
-const BWRAP_CANDIDATES = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
+const BWRAP_CANDIDATES = [
+  "/usr/bin/bwrap",
+  "/bin/bwrap",
+  "/usr/local/bin/bwrap",
+];
 
 let bwrapPath: string | null | undefined;
 
@@ -152,9 +167,7 @@ export function validateBashGrantLinux(grant: CapabilitySet): void {
  * Env: not handled here (bash.ts builds the env separately and
  * passes it via spawn options, same as on darwin).
  */
-export async function buildBwrapArgs(
-  grant: CapabilitySet,
-): Promise<string[]> {
+export async function buildBwrapArgs(grant: CapabilitySet): Promise<string[]> {
   if (grant === "*") {
     throw new Error(
       'buildBwrapArgs: "*" grant means no sandbox; check sandboxEngaged() first',
