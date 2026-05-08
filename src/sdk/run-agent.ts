@@ -48,6 +48,7 @@ import {
 } from "../runtime/secrets.js";
 import { ManifestError, ResolutionError, SecretError } from "../errors.js";
 import type {
+  Agent,
   ExtensionContext,
   Harness,
   Provider,
@@ -111,6 +112,20 @@ export interface RunAgentOptions {
   extensionLoadOptions?: LoadOptions;
   /** Test hook: deterministic 'now' for system-prompt assembly. */
   now?: () => Date;
+  /**
+   * Parent agent, when this `runAgent()` call is constructing a
+   * sub-agent. Forwarded to harness/session factories as their
+   * optional 4th `parent` arg, exposed to the child's tools as
+   * `ctx.agent` (the *child* agent) plus available for
+   * parent-derived providers (`fork-of-parent`, etc.) to read off
+   * `parent.harness` / `parent.session`.
+   *
+   * Top-level `runAgent` calls leave this undefined. SDK consumers
+   * spawning a sub-agent from inside a tool typically use
+   * `ctx.spawnSubagent(...)` rather than calling `runAgent` directly
+   * — the helper auto-fills `parent` with `ctx.agent`.
+   */
+  parent?: Agent;
 }
 
 export type OnMissingSecret = (req: {
@@ -158,28 +173,42 @@ export async function runAgent(
     options.onMissingSecret,
   );
 
-  // ─── 4. Harness + session ───────────────────────────────────────────
+  // ─── 4. Harness + session ─────────────────────────────────
   const harness = await instantiateHarness(
     manifest,
     extensionCtx,
     phase1Secrets,
+    options.parent,
   );
   const session = await instantiateSession(
     manifest,
     extensionCtx,
     phase1Secrets,
+    options.parent,
   );
   // Per-turn session hooks (`prepareTurn`, `systemPromptSection`)
-  // receive a `SessionContext` directly when they're called — nothing
-  // is bound at boot. RunningAgentImpl builds the context on each
-  // prompt() and passes it through.
+  // receive an `Agent` ref directly when they're called — nothing is
+  // bound at boot. RunningAgentImpl builds the ref on each prompt()
+  // and passes it through.
   const sessionSkills = await collectSessionSkills(session);
 
-  // ─── 5. Runtime services ────────────────────────────────────────────
+  // The owning `Agent` ref. Stable across turns; the harness/session
+  // refs in it are the same instances RunningAgent uses. We expose it
+  // via `RuntimePrimitives.agent` so providers can stash it during
+  // `init()` and wire it into their tools' contexts.
+  const ownAgent: Agent = {
+    harness,
+    session,
+    systemPromptCore: systemPrompt,
+    agentName: manifest.name,
+    ...(manifest.description ? { agentDescription: manifest.description } : {}),
+  };
+
+  // ─── 5. Runtime services ────────────────────────────────
   const permissionHolder: { current: PermissionHandler | null } = {
     current: options.permissionHandler ?? null,
   };
-  const runtimeServices = new RuntimeServicesImpl(permissionHolder);
+  const runtimeServices = new RuntimeServicesImpl(permissionHolder, ownAgent);
   const runtime: RuntimePrimitives = runtimeServices;
 
   // ─── 6. Instantiate providers ───────────────────────────────────────
@@ -310,11 +339,14 @@ export async function runAgent(
     })),
     secrets: allSecrets,
     contextFactory: {
-      build: () => ({
+      build: ({ tool }) => ({
         secrets: {}, // overridden by ToolTable per-call
         abortSignal: runtimeServices.currentAbortSignal(),
         requestPermission: (req) => runtime.requestPermission(req),
         searchSkills: (q) => runtime.searchSkills(q),
+        agent: ownAgent,
+        spawnSubagent: (nameOrManifest) =>
+          spawnSubagentForTool(tool, ownAgent, nameOrManifest),
       }),
     },
   });
@@ -341,7 +373,7 @@ export async function runAgent(
   });
 }
 
-// ─── runtime services (the RuntimePrimitives implementation) ───────────────
+// ─── runtime services (the RuntimePrimitives implementation) ───────────
 
 class RuntimeServicesImpl implements RuntimePrimitives {
   private skillSet: SkillSummary[] = [];
@@ -349,6 +381,7 @@ class RuntimeServicesImpl implements RuntimePrimitives {
 
   constructor(
     private readonly permissionHolder: { current: PermissionHandler | null },
+    public readonly agent: Agent,
   ) {}
 
   setSkills(skills: SkillSummary[]): void {
@@ -661,14 +694,20 @@ async function instantiateHarness(
   manifest: AgentManifest,
   ctx: ExtensionContext,
   phase1Secrets: Record<string, string>,
+  parent: Agent | undefined,
 ): Promise<Harness> {
   const spec = manifest.harness;
   if ("provider" in spec) {
     const factory = getHarnessFactory(spec.provider);
+    if (factory.requiresParent && !parent) {
+      throw new ResolutionError(
+        `Harness provider '${factory.name}' requires a parent agent and cannot be used at the top level. Construct it inside a tool/session that spawns this manifest as a sub-agent (e.g. via \`ctx.spawnSubagent(...)\` or \`runAgent(submanifest, { parent })\`).`,
+      );
+    }
     const { provider: _p, ...config } = spec;
     void _p;
     const sub = secretsFor(phase1Secrets, factory.secrets);
-    return await factory.create(config, ctx, sub);
+    return await factory.create(config, ctx, sub, parent);
   }
   return spec;
 }
@@ -677,16 +716,53 @@ async function instantiateSession(
   manifest: AgentManifest,
   ctx: ExtensionContext,
   phase1Secrets: Record<string, string>,
+  parent: Agent | undefined,
 ): Promise<Session> {
   const spec: SessionSpec = manifest.session ?? { ...DEFAULT_SESSION };
   if ("provider" in spec) {
     const factory = getSessionFactory(spec.provider);
+    if (factory.requiresParent && !parent) {
+      throw new ResolutionError(
+        `Session provider '${factory.name}' requires a parent agent and cannot be used at the top level. Construct it inside a tool/session that spawns this manifest as a sub-agent (e.g. via \`ctx.spawnSubagent(...)\` or \`runAgent(submanifest, { parent })\`).`,
+      );
+    }
     const { provider: _p, ...config } = spec;
     void _p;
     const sub = secretsFor(phase1Secrets, factory.secrets);
-    return await factory.create(config, ctx, sub);
+    return await factory.create(config, ctx, sub, parent);
   }
   return spec;
+}
+
+/**
+ * Backing for `ctx.spawnSubagent()`. Looks the manifest up by name in
+ * the calling tool's `dependencies.subagents`, or runs an inline
+ * manifest. Auto-fills `parent` with the child's owning Agent.
+ *
+ * Recursion-friendly: the spawned `RunningAgent` is itself a fresh
+ * call into `runAgent`, with its own provider chain and tool registry.
+ * No fan-up of updates; no cascade-cancellation.
+ */
+async function spawnSubagentForTool(
+  tool: Tool,
+  parent: Agent,
+  nameOrManifest: string | AgentManifest,
+): Promise<RunningAgent> {
+  let submanifest: AgentManifest;
+  if (typeof nameOrManifest === "string") {
+    const declared = tool.dependencies?.subagents ?? [];
+    const found = declared.find((m) => m.name === nameOrManifest);
+    if (!found) {
+      const have = declared.map((m) => m.name).join(", ") || "(none)";
+      throw new ResolutionError(
+        `Tool '${tool.name}' tried to spawn sub-agent '${nameOrManifest}', but its \`dependencies.subagents\` declares: ${have}. Lookups are scoped to the calling tool's own deps — there is no global registry. Either add the manifest to \`dependencies.subagents\` (so audit can see it) or pass the manifest object inline.`,
+      );
+    }
+    submanifest = found;
+  } else {
+    submanifest = nameOrManifest;
+  }
+  return runAgent(submanifest, { parent });
 }
 
 async function collectSessionSkills(

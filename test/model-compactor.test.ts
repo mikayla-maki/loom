@@ -7,9 +7,10 @@ import {
 import { runAgent } from "../src/sdk/run-agent.js";
 import { summarise, summariseViaRun } from "../src/sdk/session-utils.js";
 import type {
+  Agent,
   Harness,
   Runtime,
-  SessionContext,
+  Session,
 } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 
@@ -40,9 +41,10 @@ function fixedTextHarness(reply: string): Harness {
   };
 }
 
-function fakeCtx(harness: Harness): SessionContext {
+function fakeAgent(harness: Harness, session: Session): Agent {
   return {
     harness,
+    session,
     systemPromptCore: "test-core",
     agentName: "t",
   };
@@ -71,7 +73,7 @@ describe("modelCompactor + Session.prepareTurn", () => {
       compactor: modelCompactor(),
     });
     for (let i = 0; i < 8; i++) await session.append(userMsg(`m${i}`));
-    await session.prepareTurn(fakeCtx(harness));
+    await session.prepareTurn(fakeAgent(harness, session));
     expect(called).toBe(true);
     const out = await session.getEvents();
     const body = out[1];
@@ -94,7 +96,7 @@ describe("modelCompactor + Session.prepareTurn", () => {
       compactor: modelCompactor(),
     });
     for (let i = 0; i < 8; i++) await session.append(userMsg(`m${i}`));
-    await session.prepareTurn(fakeCtx(harness));
+    await session.prepareTurn(fakeAgent(harness, session));
     const out = await session.getEvents();
     const body = out[1];
     if (
@@ -134,19 +136,20 @@ describe("modelCompactor + Session.prepareTurn", () => {
     }
   });
 
-  it("runAgent passes a fresh SessionContext to prepareTurn each turn", async () => {
+  it("runAgent passes a fresh Agent ref to prepareTurn each turn", async () => {
     const seenHarnesses: Harness[] = [];
     const harness = fixedTextHarness("ack");
 
     const session = new CompactingSession({ threshold: 1000, keep: 2 });
     // Wrap prepareTurn so we can observe what loom passed in.
     const realPrepare = session.prepareTurn.bind(session);
-    session.prepareTurn = async (ctx) => {
-      seenHarnesses.push(ctx.harness);
-      expect(ctx.agentName).toBe("turn-test");
-      expect(ctx.agentDescription).toBe("for the test");
-      expect(ctx.systemPromptCore).toBeTypeOf("string");
-      await realPrepare(ctx);
+    session.prepareTurn = async (agent: Agent) => {
+      seenHarnesses.push(agent.harness);
+      expect(agent.session).toBe(session);
+      expect(agent.agentName).toBe("turn-test");
+      expect(agent.agentDescription).toBe("for the test");
+      expect(agent.systemPromptCore).toBeTypeOf("string");
+      await realPrepare(agent);
     };
 
     const agent = await runAgent({

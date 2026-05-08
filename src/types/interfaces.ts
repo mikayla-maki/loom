@@ -22,6 +22,7 @@
 import type { SessionUpdate, StopReason, TurnUsage } from "./acp.js";
 import type { JSONSchema } from "./schema.js";
 import type { AgentManifest, SkillManifest } from "./manifest.js";
+import type { RunningAgent } from "../sdk/running-agent.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Session — durable log + optional skill contributions.
@@ -54,22 +55,22 @@ export interface Session {
   /**
    * Optional per-turn hook. Loom calls this once per turn, after the
    * user's message has been appended and before the runtime is built.
-   * The session receives a fresh `SessionContext` carrying the harness
-   * and identity metadata.
+   * The session receives the owning `Agent` — the runtime triple
+   * (harness + session + identity).
    *
    * This is where a session does work that needs the harness:
-   *   - compaction (drive `summarise(ctx.harness, ...)` and rewrite the log)
+   *   - compaction (drive `summarise(agent.harness, ...)` and rewrite the log)
    *   - memory retrieval (set up state for `systemPromptSection`)
    *   - any per-turn reflection
    *
    * Loom is self-similar: a session that wants RLM-style sub-agents
-   * builds them with `runAgent({ harness: ctx.harness, ... })`, reusing
-   * the parent's harness (and its secrets/config) for free.
+   * builds them with `runAgent(submanifest, { parent: agent })`,
+   * reusing the parent's harness (and its secrets/config) for free.
    *
    * Sessions that don't need agent participation — plain durable logs —
    * omit this method.
    */
-  prepareTurn?(ctx: SessionContext): Promise<void> | void;
+  prepareTurn?(agent: Agent): Promise<void> | void;
 
   /**
    * Optional: contribute a section to the assembled system prompt.
@@ -81,11 +82,24 @@ export interface Session {
    * conversation history (recency favours fresh memories).
    *
    * Called once per turn, *after* `prepareTurn` (so any state set up
-   * there is visible). The same `SessionContext` is passed; sessions
-   * that need only identity (`ctx.systemPromptCore`) can read it here
+   * there is visible). The same `Agent` ref is passed; sessions that
+   * need only identity (`agent.systemPromptCore`) can read it here
    * without implementing `prepareTurn`.
    */
-  systemPromptSection?(ctx: SessionContext): string | Promise<string>;
+  systemPromptSection?(agent: Agent): string | Promise<string>;
+
+  /**
+   * Optional: sub-agents this session declares it may spawn. Trusted
+   * self-declaration; the point is auditability via `loom audit`, not
+   * runtime enforcement. A session that spawns a child it didn't
+   * declare is misbehaving — it's a trust violation by the session
+   * author, not a Loom bug.
+   *
+   * The session has access to its own `dependencies` field; to spawn
+   * by name it does the lookup itself and calls
+   * `runAgent(submanifest, { parent: agent })`.
+   */
+  dependencies?: { subagents?: AgentManifest[] };
 
   /** Optional: providers that manage many sessions. */
   list?(): Promise<SessionDescriptor[]>;
@@ -96,25 +110,39 @@ export interface Session {
 }
 
 /**
- * Handle passed to per-turn Session hooks. The session gets the actual
- * harness — not a wrapper — along with enough metadata to do
- * identity-aware things (memory, scoped retrieval).
+ * `Agent` — the runtime triple that defines an agent: its harness
+ * (compute), its session (memory), and its identity (system-prompt
+ * core, name, description). Plain data; no methods.
  *
- * Why the harness directly: Loom is self-similar. A session that wants
- * to summarise calls `summarise(ctx.harness, ...)`. A session that
- * wants RLM-style sub-agents constructs them with
- * `runAgent({ harness: ctx.harness, ... })`, reusing the parent's
- * secrets/config implicitly because the harness instance closes over
- * them.
+ * Three roles:
  *
- * Why it's passed at time of use rather than bound at boot: state held
- * across calls is footgun-y. The session has a method, that method
- * needs the context, so the context is an argument. No life-cycle
- * gymnastics.
+ *   1. **Self-ref.** A tool / session sees its own owning agent via
+ *      `ctx.agent` (tools) or the per-turn argument to `prepareTurn` /
+ *      `systemPromptSection` (sessions). Both let the holder reach the
+ *      live harness and session.
+ *
+ *   2. **Parent ref.** When spawning a sub-agent, the caller passes
+ *      its own `Agent` as `runAgent(submanifest, { parent }).` Child
+ *      `HarnessFactory` / `SessionFactory.create()` receive it as
+ *      their optional 4th argument; most factories ignore it. The
+ *      parent-derived ones (`fork-of-parent`, `small-model-of-parent`)
+ *      build new state from it.
+ *
+ *   3. **Audit closure.** A static walk of the dependency tree visits
+ *      every `Tool.dependencies.subagents` and
+ *      `Session.dependencies.subagents`, recursively, with the parent
+ *      `Agent` available conceptually at each step.
+ *
+ * Why pass the harness/session directly rather than wrapping: Loom is
+ * self-similar. A session that wants to summarise calls
+ * `summarise(agent.harness, ...)`. A child harness that needs the
+ * parent's API key reads it off `parent.harness` directly.
  */
-export interface SessionContext {
-  /** The agent's harness, exposed as-is. */
+export interface Agent {
+  /** The agent's harness — the compute layer. */
   harness: Harness;
+  /** The agent's session — the memory layer. */
+  session: Session;
   /** The unassembled `[agent].system_prompt` content — the identity layer. */
   systemPromptCore: string;
   /** Agent name (from manifest). */
@@ -171,6 +199,19 @@ export interface Tool extends ToolDescriptor {
    */
   capabilitiesContain?(superset: unknown, subset: unknown): boolean;
 
+  /**
+   * Optional: sub-agents this tool declares it may spawn. Trusted
+   * self-declaration; the point is auditability via `loom audit`, not
+   * runtime enforcement. A tool that spawns a child it didn't declare
+   * is misbehaving — trust violation by the tool author, not a Loom
+   * bug.
+   *
+   * `ctx.spawnSubagent(name)` looks up by `manifest.name` in this
+   * field; passing a manifest inline bypasses the lookup. Either path
+   * auto-fills `parent` with the tool's own `ctx.agent`.
+   */
+  dependencies?: { subagents?: AgentManifest[] };
+
   execute(input: unknown, ctx: ToolContext): Promise<ToolResult>;
 }
 
@@ -191,6 +232,28 @@ export interface ToolContext {
   ): Promise<import("./permissions.js").PermissionResult>;
   /** Read-only enumeration of skills available to this agent. */
   searchSkills(query?: string): Promise<SkillSummary[]>;
+  /** The owning agent (the agent this tool is part of). */
+  agent: Agent;
+  /**
+   * Spawn a sub-agent.
+   *
+   * String form: looked up by `manifest.name` in this tool's
+   * `dependencies.subagents`. Throws `ResolutionError` if the name
+   * isn't declared — by design; the audit walk is the trust
+   * artifact, and silent fall-through to a global registry would
+   * defeat it.
+   *
+   * Manifest form: runs the supplied manifest inline. Use sparingly
+   * — tools that always spawn the same shape should declare it in
+   * `dependencies.subagents` so audit can see it.
+   *
+   * Either path auto-fills `parent: ctx.agent`. The child runs
+   * standalone (its own provider chain, its own tool registry); the
+   * parent's tools are NOT shared. Cancellation does not cascade —
+   * if you want the child to die when the parent's turn aborts, plumb
+   * `ctx.abortSignal` through.
+   */
+  spawnSubagent(nameOrManifest: string | AgentManifest): Promise<RunningAgent>;
 }
 
 /** Single entry returned by `ctx.searchSkills()`. */
@@ -357,20 +420,38 @@ export interface SecretNeeds {
 export interface SessionFactory {
   readonly name: string;
   readonly secrets?: SecretNeeds;
+  /**
+   * If true, this factory cannot run at the top level: it needs a
+   * parent agent (e.g. `fork-of-parent` reads parent events to seed
+   * its own log). Loom enforces this at boot — a top-level manifest
+   * that selects such a factory fails with a clear error before
+   * `create()` runs.
+   */
+  readonly requiresParent?: boolean;
   create(
     config: Record<string, unknown>,
     ctx: ExtensionContext,
     secrets: Record<string, string>,
+    parent?: Agent,
   ): Promise<Session> | Session;
 }
 
 export interface HarnessFactory {
   readonly name: string;
   readonly secrets?: SecretNeeds;
+  /**
+   * If true, this factory cannot run at the top level: it needs a
+   * parent agent (e.g. `small-model-of-parent` reuses the parent's
+   * API key + a configured smaller model). Loom enforces this at
+   * boot — a top-level manifest that selects such a factory fails
+   * with a clear error before `create()` runs.
+   */
+  readonly requiresParent?: boolean;
   create(
     config: Record<string, unknown>,
     ctx: ExtensionContext,
     secrets: Record<string, string>,
+    parent?: Agent,
   ): Promise<Harness> | Harness;
 }
 
@@ -419,6 +500,14 @@ export interface RuntimePrimitives {
     req: import("./permissions.js").PermissionRequest,
   ): Promise<import("./permissions.js").PermissionResult>;
   searchSkills(query?: string): Promise<SkillSummary[]>;
+  /**
+   * The owning agent. A provider stashing this during `init()` and
+   * wiring it into its tools' `ToolContext` is the standard pattern
+   * (the native provider does it; extensions following the same
+   * convention get sub-agent spawning for free). Readable AFTER every
+   * provider's `init()` returns.
+   */
+  readonly agent: Agent;
 }
 
 export interface ProviderInitArgs {

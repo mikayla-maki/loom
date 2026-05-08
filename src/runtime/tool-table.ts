@@ -33,10 +33,12 @@ export interface ToolEntry {
 /**
  * Builds a fresh `ToolContext` per `execute()` call. The runtime
  * supplies this; it captures the runtime primitives the tool's context
- * methods route to.
+ * methods route to. The `tool` is the entry being dispatched —
+ * lookups like `ctx.spawnSubagent(name)` read off
+ * `tool.dependencies.subagents`.
  */
 export interface ToolContextFactory {
-  build(args: { allowedSecrets: Set<string> }): ToolContext;
+  build(args: { allowedSecrets: Set<string>; tool: Tool }): ToolContext;
 }
 
 export class ToolTable {
@@ -107,6 +109,7 @@ export class ToolTable {
     const filteredSecrets = filterSecrets(this.secrets, entry.allowedSecrets);
     const ctx = this.contextFactory.build({
       allowedSecrets: entry.allowedSecrets,
+      tool: entry.tool,
     });
     ctx.secrets = filteredSecrets;
     try {

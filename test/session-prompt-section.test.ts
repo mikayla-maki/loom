@@ -2,17 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
 import type {
+  Agent,
   Harness,
   Runtime,
   Session,
-  SessionContext,
 } from "../src/types/interfaces.js";
 import type { SessionUpdate, StopReason } from "../src/types/acp.js";
 
 /**
  * The Session can contribute a section to the assembled system prompt.
- * Loom calls `systemPromptSection(ctx)` per turn, after `prepareTurn`,
- * passing a fresh `SessionContext` — nothing is bound at boot.
+ * Loom calls `systemPromptSection(agent)` per turn, after
+ * `prepareTurn`, passing a fresh `Agent` ref — nothing is bound at
+ * boot.
  */
 
 describe("Session.systemPromptSection", () => {
@@ -26,7 +27,7 @@ describe("Session.systemPromptSection", () => {
       },
     };
 
-    const seenContexts: SessionContext[] = [];
+    const seenAgents: Agent[] = [];
     const session: Session = {
       events: [] as SessionUpdate[],
       async append(u: SessionUpdate) {
@@ -41,8 +42,8 @@ describe("Session.systemPromptSection", () => {
       async count() {
         return (this as unknown as { events: SessionUpdate[] }).events.length;
       },
-      systemPromptSection(ctx: SessionContext) {
-        seenContexts.push(ctx);
+      systemPromptSection(agent: Agent) {
+        seenAgents.push(agent);
         return "Recently retrieved memories: user prefers terse replies.";
       },
     } as unknown as Session;
@@ -55,9 +56,10 @@ describe("Session.systemPromptSection", () => {
     });
     try {
       await agent.prompt("anything");
-      expect(seenContexts).toHaveLength(1);
-      expect(seenContexts[0]?.harness).toBe(harness);
-      expect(seenContexts[0]?.agentName).toBe("section-test");
+      expect(seenAgents).toHaveLength(1);
+      expect(seenAgents[0]?.harness).toBe(harness);
+      expect(seenAgents[0]?.session).toBe(session);
+      expect(seenAgents[0]?.agentName).toBe("section-test");
       expect(capturedSystemPrompt).not.toBeNull();
       expect(capturedSystemPrompt!).toContain("# Session");
       expect(capturedSystemPrompt!).toContain("user prefers terse replies");
@@ -66,7 +68,7 @@ describe("Session.systemPromptSection", () => {
     }
   });
 
-  it("is called per turn with a fresh context", async () => {
+  it("is called per turn with a fresh Agent ref", async () => {
     let calls = 0;
     const harness: Harness = {
       async run(rt: Runtime) {

@@ -12,12 +12,12 @@
 
 import type { SessionUpdate } from "../types/acp.js";
 import type {
+  Agent,
   Harness,
   Provider,
   RunParameters,
   Runtime,
   Session,
-  SessionContext,
   TurnResult,
 } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
@@ -144,11 +144,12 @@ export class RunningAgentImpl implements RunningAgent {
     // runtimeServices object, which we update here.
     this.runtimeServices.setAbortSignal(ctl.signal);
 
-    // Build the per-turn SessionContext and run the session's hooks.
-    // The session never holds onto the context — it gets a fresh one
-    // each turn, passed to the methods that need it.
-    const sessionCtx: SessionContext = {
+    // Build the per-turn `Agent` ref and run the session's hooks.
+    // The session never holds onto the ref — it gets a fresh one each
+    // turn, passed to the methods that need it.
+    const agentRef: Agent = {
       harness: this.harness,
+      session: this.session,
       systemPromptCore: this.systemPrompt,
       agentName: this.manifest.name,
       ...(this.manifest.description
@@ -157,7 +158,7 @@ export class RunningAgentImpl implements RunningAgent {
     };
     if (this.session.prepareTurn) {
       try {
-        await Promise.resolve(this.session.prepareTurn(sessionCtx));
+        await Promise.resolve(this.session.prepareTurn(agentRef));
       } catch (e) {
         // A failing prepareTurn shouldn't kill the turn; surface it as
         // an agent_thought_chunk for visibility and continue.
@@ -172,7 +173,7 @@ export class RunningAgentImpl implements RunningAgent {
     if (this.session.systemPromptSection) {
       try {
         sessionSection = await Promise.resolve(
-          this.session.systemPromptSection(sessionCtx),
+          this.session.systemPromptSection(agentRef),
         );
       } catch {
         // A failing section shouldn't kill the turn; we just skip it.

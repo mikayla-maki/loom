@@ -151,6 +151,7 @@ describe("CompactingSession", () => {
     // Fake a context-fresh: no compaction expected.
     await s.prepareTurn({
       harness: { run: async () => ({ stopReason: "end_turn" }) },
+      session: s,
       systemPromptCore: "",
       agentName: "t",
     });
@@ -163,6 +164,7 @@ describe("CompactingSession", () => {
     });
     await s.prepareTurn({
       harness: { run: async () => ({ stopReason: "end_turn" }) },
+      session: s,
       systemPromptCore: "",
       agentName: "t",
     });

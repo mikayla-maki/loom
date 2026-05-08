@@ -16,8 +16,7 @@
  * Compaction policy:
  *   Default is a deterministic heuristic — no model call. To use the
  *   model, pass `compactor: modelCompactor()`; the model-driven path
- *   uses the per-turn SessionContext's harness via
- *   `summarise(harness, ...)`.
+ *   uses the per-turn `Agent`'s harness via `summarise(harness, ...)`.
  *
  * Tool-call pairing:
  *   The harness's wire format pairs `tool_call` with a later
@@ -26,17 +25,18 @@
  *   its update inside the compaction range.
  *
  * No bound state:
- *   The compacting session does not store the SessionContext between
- *   calls. Loom hands it to `prepareTurn` each turn, which forwards it
- *   to the compactor. Tests and standalone use can pass `null` (or
- *   omit the context) and get heuristic-only behaviour.
+ *   The compacting session does not store the `Agent` between calls.
+ *   Loom hands it to `prepareTurn` each turn, which extracts the
+ *   harness for the compactor. Tests and standalone use can call
+ *   `compactNow()` with a harness directly (or `null` for
+ *   heuristic-only behaviour).
  */
 
 import type {
+  Agent,
   ExtensionContext,
   Harness,
   Session,
-  SessionContext,
   SessionFactory,
 } from "../../types/interfaces.js";
 import type { SessionUpdate } from "../../types/acp.js";
@@ -149,9 +149,9 @@ export class CompactingSession implements Session {
    * data) or the event-count threshold is met (fallback when usage
    * data isn't available yet).
    */
-  async prepareTurn(ctx: SessionContext): Promise<void> {
+  async prepareTurn(agent: Agent): Promise<void> {
     if (this.shouldCompact()) {
-      await this.runCompaction(ctx.harness, false);
+      await this.runCompaction(agent.harness, false);
     }
   }
 
