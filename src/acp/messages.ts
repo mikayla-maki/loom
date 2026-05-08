@@ -42,6 +42,11 @@ export interface SessionPromptParams {
 
 export interface SessionPromptResult {
   stopReason: StopReason;
+  /**
+   * Cumulative token usage for this turn, when the harness reports it.
+   * Mirrors the draft ACP RFD's `PromptResponse.usage` shape.
+   */
+  usage?: import("../types/acp.js").TurnUsage;
   /** Convenience: the final agent text message of the turn (best-effort). */
   finalMessage?: string;
 }

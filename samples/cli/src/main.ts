@@ -127,10 +127,9 @@ async function main(): Promise<void> {
     exit(1);
   }
 
-  // The CompactingSession received a SessionRuntime via bindRuntime
-  // during runAgent(); when --model-compact is set the modelCompactor
-  // closes over it and drives a model turn for summarisation. See
-  // internal-docs/session-notes.md for the design discussion.
+  // The CompactingSession receives a per-turn SessionContext during
+  // runAgent(); when --model-compact is set the modelCompactor uses it
+  // to drive a model turn for summarisation.
 
   printBanner(agent, args);
 
@@ -141,9 +140,7 @@ async function main(): Promise<void> {
   const rl = readline.createInterface({
     input: stdin,
     output: stdout,
-    prompt: args.plain
-      ? "you> "
-      : `${ansi.bold}${ansi.green}you›${ansi.reset} `,
+    prompt: buildPrompt(printer.getUsage(), args),
     terminal: stdout.isTTY,
   });
 
@@ -178,13 +175,17 @@ async function main(): Promise<void> {
       continue;
     }
     try {
-      const stop = await agent.prompt(text);
-      if (stop !== "end_turn") {
-        stdout.write(`${ansi.dim}(stopped: ${stop})${ansi.reset}\n`);
+      const result = await agent.prompt(text);
+      if (result.stopReason !== "end_turn") {
+        stdout.write(
+          `${ansi.dim}(stopped: ${result.stopReason})${ansi.reset}\n`,
+        );
       }
     } catch (e) {
       stderr.write(`${ansi.red}error:${ansi.reset} ${(e as Error).message}\n`);
     }
+    // Update the prompt prefix with the latest context percentage.
+    rl.setPrompt(buildPrompt(printer.getUsage(), args));
     rl.prompt();
   }
 
@@ -205,6 +206,8 @@ function printBanner(_agent: RunningAgent, args: Args): void {
 
 interface Printer {
   stop(): void;
+  /** Latest usage observed via `usage_update`, or null. */
+  getUsage(): { used: number; size: number } | null;
 }
 
 /**
@@ -212,12 +215,14 @@ interface Printer {
  *
  * Each agent_message_chunk is buffered until we hit a logical break
  * (newline, end-of-turn) and rendered as markdown. Tool calls render as
- * a one-line summary; results render dimmed.
+ * a one-line summary; results render dimmed. `usage_update` events are
+ * stashed for the prompt prefix.
  */
 function startPrinter(agent: RunningAgent, args: Args): Printer {
   const s = ansiStyle(args.plain);
   let buffer = "";
   let inAgentMessage = false;
+  let lastUsage: { used: number; size: number } | null = null;
   const stopFlag = { current: false };
 
   const flush = (final: boolean): void => {
@@ -294,6 +299,11 @@ function startPrinter(agent: RunningAgent, args: Args): Printer {
         inAgentMessage = false;
         break;
       }
+      case "usage_update": {
+        // Track for the prompt prefix; don't render mid-turn.
+        lastUsage = { used: u.used, size: u.size };
+        break;
+      }
       case "user_message_chunk":
       case "plan":
         // user message we already echoed; plans aren't surfaced.
@@ -306,7 +316,30 @@ function startPrinter(agent: RunningAgent, args: Args): Printer {
       stopFlag.current = true;
       flush(true);
     },
+    getUsage: () => lastUsage,
   };
+}
+
+/**
+ * Build the readline prompt prefix. Includes a context-percentage pip
+ * (green/yellow/red) when usage data is available; falls back to the
+ * plain `you›` prefix otherwise.
+ */
+function buildPrompt(
+  usage: { used: number; size: number } | null,
+  args: Args,
+): string {
+  const s = ansiStyle(args.plain);
+  const base = `${s.bold}${s.green}you›${s.reset} `;
+  if (!usage || usage.size <= 0) {
+    return args.plain ? "you> " : base;
+  }
+  const pct = Math.round((usage.used / usage.size) * 100);
+  const color = pct >= 90 ? s.red : pct >= 75 ? s.yellow : s.green;
+  const pip = args.plain
+    ? `[${pct}%] you> `
+    : `${color}[${pct}%]${s.reset} ${base}`;
+  return pip;
 }
 
 function previewJson(v: unknown): string {

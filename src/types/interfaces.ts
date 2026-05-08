@@ -19,7 +19,7 @@
  * isolation (e.g. shell exec) ship their own sandbox.
  */
 
-import type { SessionUpdate, StopReason } from "./acp.js";
+import type { SessionUpdate, StopReason, TurnUsage } from "./acp.js";
 import type { JSONSchema } from "./schema.js";
 import type { AgentManifest, SkillManifest } from "./manifest.js";
 
@@ -248,13 +248,24 @@ export interface Runtime {
 // Harness — owns the loop for a single turn.
 // ────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Result of a single turn. Carries the stop reason and (optional) per-turn
+ * cumulative usage from any harness that tracks it. Sessions and clients
+ * read both off `RunningAgent.prompt()`.
+ */
+export interface TurnResult {
+  stopReason: StopReason;
+  /** Cumulative usage for this turn. Absent on harnesses that don't track. */
+  usage?: TurnUsage;
+}
+
 export interface Harness {
   /**
    * Run a single turn to completion. The harness should pull events from the
-   * runtime, call the model, dispatch tool calls, and return a StopReason.
+   * runtime, call the model, dispatch tool calls, and return a TurnResult.
    * It SHOULD honor `runtime.abortSignal` and stop promptly when aborted.
    */
-  run(runtime: Runtime): Promise<StopReason>;
+  run(runtime: Runtime): Promise<TurnResult>;
 
   /**
    * Optional: lab-aware capabilities the harness can implement when its

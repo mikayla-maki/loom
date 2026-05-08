@@ -10,13 +10,14 @@
  *   - close() releases resources (sessions, providers, sink subscribers).
  */
 
-import type { SessionUpdate, StopReason } from "../types/acp.js";
+import type { SessionUpdate } from "../types/acp.js";
 import type {
   Harness,
   Provider,
   Runtime,
   Session,
   SessionContext,
+  TurnResult,
 } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
 import type { AgentManifest, Capabilities } from "../types/manifest.js";
@@ -27,7 +28,12 @@ import type { UpdateSink } from "../runtime/update-sink.js";
 import type { RuntimeServicesImpl } from "./run-agent.js";
 
 export interface RunningAgent {
-  prompt(text: string): Promise<StopReason>;
+  /**
+   * Append a user message and run one turn to completion. Returns the
+   * turn's stop reason plus (when the harness reports it) the
+   * cumulative usage breakdown matching ACP RFD `PromptResponse.usage`.
+   */
+  prompt(text: string): Promise<TurnResult>;
   cancel(): Promise<void>;
   updates(opts?: { capacity?: number }): AsyncIterableIterator<SessionUpdate>;
   readonly session: Session;
@@ -88,7 +94,7 @@ export class RunningAgentImpl implements RunningAgent {
   private readonly now: (() => Date) | undefined;
 
   private currentAbortCtl: AbortController | null = null;
-  private inflight: Promise<StopReason> | null = null;
+  private inflight: Promise<TurnResult> | null = null;
   private closed = false;
 
   constructor(opts: RunningAgentImplOptions) {
@@ -114,7 +120,7 @@ export class RunningAgentImpl implements RunningAgent {
     this.permissionHolder.current = handler ?? null;
   }
 
-  async prompt(text: string): Promise<StopReason> {
+  async prompt(text: string): Promise<TurnResult> {
     if (this.closed) throw new Error("Agent has been closed");
     if (this.inflight) {
       // Serialise turns: wait for the previous one to finish.

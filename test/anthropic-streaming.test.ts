@@ -34,10 +34,23 @@ function eventStream(events: Array<Record<string, unknown>>): Stream {
 const realFetch = global.fetch;
 let capturedRequest: { url: string; body: unknown } | null = null;
 
+/** Default model-info stub returns a 200000-token context window. */
+function modelInfoResponse(modelId: string): Response {
+  return new Response(JSON.stringify({ id: modelId, context_window: 200000 }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 function stubFetch(events: Array<Record<string, unknown>>): void {
   global.fetch = (async (url: string | URL, init?: RequestInit) => {
+    const u = String(url);
+    if (u.includes("/v1/models/")) {
+      const modelId = u.split("/v1/models/")[1] ?? "unknown";
+      return modelInfoResponse(modelId);
+    }
     capturedRequest = {
-      url: String(url),
+      url: u,
       body: init?.body ? JSON.parse(String(init.body)) : null,
     };
     const s = eventStream(events);
@@ -58,16 +71,36 @@ describe("AnthropicHarness streaming", () => {
 
   it("surfaces text deltas as they arrive", async () => {
     stubFetch([
-      { type: "message_start", message: { id: "msg_1", role: "assistant" } },
+      {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          role: "assistant",
+          model: "x",
+          usage: { input_tokens: 25, output_tokens: 1 },
+        },
+      },
       {
         type: "content_block_start",
         index: 0,
         content_block: { type: "text", text: "" },
       },
-      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello" } },
-      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ", world" } },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Hello" },
+      },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: ", world" },
+      },
       { type: "content_block_stop", index: 0 },
-      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 14 },
+      },
       { type: "message_stop" },
     ]);
 
@@ -80,8 +113,10 @@ describe("AnthropicHarness streaming", () => {
       { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
     );
     try {
-      const stop = await agent.prompt("hi");
-      expect(stop).toBe("end_turn");
+      const result = await agent.prompt("hi");
+      expect(result.stopReason).toBe("end_turn");
+      // Per-turn cumulative usage rides back on the prompt() result.
+      expect(result.usage).toMatchObject({ inputTokens: 25, outputTokens: 14 });
       const events = await agent.session.getEvents();
       const chunks = events.filter(
         (e): e is SessionUpdate & { sessionUpdate: "agent_message_chunk" } =>
@@ -94,6 +129,14 @@ describe("AnthropicHarness streaming", () => {
       );
       expect(texts).toEqual(["Hello", ", world"]);
       expect(capturedRequest?.body).toMatchObject({ stream: true });
+      // A usage_update SessionUpdate should have been emitted with the
+      // post-response context size and the model's window from /v1/models/x.
+      const usage = events.find((e) => e.sessionUpdate === "usage_update");
+      expect(usage).toBeDefined();
+      if (usage && usage.sessionUpdate === "usage_update") {
+        expect(usage.used).toBe(25 + 14); // input + output
+        expect(usage.size).toBe(200000);
+      }
     } finally {
       await agent.close();
     }
@@ -105,7 +148,12 @@ describe("AnthropicHarness streaming", () => {
       {
         type: "content_block_start",
         index: 0,
-        content_block: { type: "tool_use", id: "toolu_1", name: "echo", input: {} },
+        content_block: {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "echo",
+          input: {},
+        },
       },
       {
         type: "content_block_delta",
@@ -127,11 +175,19 @@ describe("AnthropicHarness streaming", () => {
     // need the stub to provide a second valid stream that ends the turn.
     let calls = 0;
     global.fetch = (async (_url: string | URL, _init?: RequestInit) => {
+      const u = String(_url);
+      if (u.includes("/v1/models/")) {
+        const modelId = u.split("/v1/models/")[1] ?? "unknown";
+        return modelInfoResponse(modelId);
+      }
       calls++;
       const events: Array<Record<string, unknown>> =
         calls === 1
           ? [
-              { type: "message_start", message: { id: "m1", role: "assistant" } },
+              {
+                type: "message_start",
+                message: { id: "m1", role: "assistant" },
+              },
               {
                 type: "content_block_start",
                 index: 0,
@@ -157,7 +213,10 @@ describe("AnthropicHarness streaming", () => {
               { type: "message_stop" },
             ]
           : [
-              { type: "message_start", message: { id: "m2", role: "assistant" } },
+              {
+                type: "message_start",
+                message: { id: "m2", role: "assistant" },
+              },
               {
                 type: "content_block_start",
                 index: 0,
@@ -188,8 +247,8 @@ describe("AnthropicHarness streaming", () => {
       { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
     );
     try {
-      const stop = await agent.prompt("call echo");
-      expect(stop).toBe("end_turn");
+      const result = await agent.prompt("call echo");
+      expect(result.stopReason).toBe("end_turn");
       const events = await agent.session.getEvents();
       const calls = events.filter(
         (e): e is SessionUpdate & { sessionUpdate: "tool_call" } =>
@@ -205,16 +264,23 @@ describe("AnthropicHarness streaming", () => {
 
   it("falls back to non-streaming when stream=false", async () => {
     global.fetch = (async (_url: string | URL, init?: RequestInit) => {
+      const u = String(_url);
+      if (u.includes("/v1/models/")) {
+        const modelId = u.split("/v1/models/")[1] ?? "unknown";
+        return modelInfoResponse(modelId);
+      }
       capturedRequest = {
-        url: String(_url),
+        url: u,
         body: init?.body ? JSON.parse(String(init.body)) : null,
       };
       return new Response(
         JSON.stringify({
           id: "msg_1",
           role: "assistant",
+          model: "x",
           content: [{ type: "text", text: "non-streamed" }],
           stop_reason: "end_turn",
+          usage: { input_tokens: 100, output_tokens: 5 },
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -229,17 +295,31 @@ describe("AnthropicHarness streaming", () => {
       { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
     );
     try {
-      await agent.prompt("hi");
+      const result = await agent.prompt("hi");
       // Body should NOT have stream: true.
       expect(capturedRequest?.body).not.toMatchObject({ stream: true });
+      // Usage flows through the non-streaming path too.
+      expect(result.usage).toMatchObject({
+        inputTokens: 100,
+        outputTokens: 5,
+      });
       const events = await agent.session.getEvents();
       const text = events.find(
         (e) => e.sessionUpdate === "agent_message_chunk",
       );
-      if (text?.sessionUpdate === "agent_message_chunk" && text.content.type === "text") {
+      if (
+        text?.sessionUpdate === "agent_message_chunk" &&
+        text.content.type === "text"
+      ) {
         expect(text.content.text).toBe("non-streamed");
       } else {
         throw new Error("expected agent text");
+      }
+      const usage = events.find((e) => e.sessionUpdate === "usage_update");
+      expect(usage).toBeDefined();
+      if (usage && usage.sessionUpdate === "usage_update") {
+        expect(usage.used).toBe(105);
+        expect(usage.size).toBe(200000);
       }
     } finally {
       await agent.close();

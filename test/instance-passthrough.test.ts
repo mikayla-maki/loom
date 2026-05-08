@@ -21,14 +21,14 @@ describe("manifest accepts instances directly", () => {
   it("a Harness instance bypasses the registry lookup", async () => {
     let runs = 0;
     const harness: Harness = {
-      async run(rt: Runtime): Promise<StopReason> {
+      async run(rt: Runtime) {
         runs++;
         await rt.update({
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "hi from instance" },
         });
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return { stopReason: "end_turn" as const };
       },
     };
 
@@ -38,8 +38,8 @@ describe("manifest accepts instances directly", () => {
       harness, // ← raw instance, not { provider: "test" }
     });
     try {
-      const stop = await agent.prompt("anything");
-      expect(stop).toBe("end_turn");
+      const result = await agent.prompt("anything");
+      expect(result.stopReason).toBe("end_turn");
       expect(runs).toBe(1);
       const events = await agent.session.getEvents();
       const said = events.find(

@@ -224,8 +224,13 @@ export class AcpRouter {
     if (!sid) throw new Error("session/prompt requires sessionId");
     const agent = this.sessions.get(sid);
     if (!agent) throw new Error(`unknown sessionId: ${sid}`);
-    const stopReason = await agent.prompt(params.prompt);
-    return { stopReason, finalMessage: await lastAgentMessage(agent.session) };
+    const result = await agent.prompt(params.prompt);
+    const out: SessionPromptResult = {
+      stopReason: result.stopReason,
+      finalMessage: await lastAgentMessage(agent.session),
+    };
+    if (result.usage) out.usage = result.usage;
+    return out;
   }
 
   private async handleSessionCancel(

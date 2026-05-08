@@ -58,8 +58,18 @@ export interface Compactor {
 }
 
 export interface CompactingSessionOptions {
-  /** Compact when the in-memory log reaches this many events. Default 40. */
+  /**
+   * Compact when the in-memory log reaches this many events. Default 40.
+   * Used as a fallback when no `usage_update` event has landed (e.g.
+   * harnesses that don't track tokens, or first turn before a response).
+   */
   threshold?: number;
+  /**
+   * Compact when the most recent `usage_update.used` value is at or
+   * above this many tokens. Takes priority over `threshold` when usage
+   * data is available. Optional — omit for event-count-only behaviour.
+   */
+  tokenThreshold?: number;
   /** Most recent `keep` events that survive verbatim. Default 10. */
   keep?: number;
   /** Replace the heuristic summarizer with a custom one. */
@@ -74,7 +84,15 @@ export interface CompactingSessionOptions {
 export class CompactingSession implements Session {
   private events: SessionUpdate[] = [];
   private compacting = false;
+  /**
+   * The most recent `used` and `size` from a `usage_update` event. Held
+   * in memory only — `usage_update` events are NOT appended to the
+   * durable log. The data is metadata, not conversation history.
+   */
+  private lastUsed: number | null = null;
+  private lastSize: number | null = null;
   private readonly threshold: number;
+  private readonly tokenThreshold: number | null;
   private readonly keep: number;
   private readonly compactor: Compactor;
   private readonly onCompact?: (info: {
@@ -84,6 +102,7 @@ export class CompactingSession implements Session {
 
   constructor(opts: CompactingSessionOptions = {}) {
     this.threshold = opts.threshold ?? 40;
+    this.tokenThreshold = opts.tokenThreshold ?? null;
     this.keep = opts.keep ?? 10;
     this.compactor = opts.compactor ?? heuristicCompactor;
     if (opts.onCompact) this.onCompact = opts.onCompact;
@@ -94,7 +113,23 @@ export class CompactingSession implements Session {
   }
 
   async append(update: SessionUpdate): Promise<void> {
+    if (update.sessionUpdate === "usage_update") {
+      // Track in memory; don't pollute the durable log with metadata.
+      this.lastUsed = update.used;
+      this.lastSize = update.size;
+      return;
+    }
     this.events.push(update);
+  }
+
+  /** Most recent `used` value seen on a `usage_update`, or null. */
+  get tokensInContext(): number | null {
+    return this.lastUsed;
+  }
+
+  /** Most recent `size` value seen on a `usage_update`, or null. */
+  get contextWindow(): number | null {
+    return this.lastSize;
   }
 
   async getEvents(from = 0, to?: number): Promise<SessionUpdate[]> {
@@ -107,13 +142,23 @@ export class CompactingSession implements Session {
 
   /**
    * Per-turn hook. Loom calls this after the user message has been
-   * appended and before the runtime is built. We compact here when the
-   * log has reached the threshold — with the live context in hand, so
-   * a model-driven compactor can call `summarise(ctx.harness, …)`.
+   * appended and before the runtime is built. We compact here when
+   * either the token-threshold is met (priority when we have usage
+   * data) or the event-count threshold is met (fallback when usage
+   * data isn't available yet).
    */
   async prepareTurn(ctx: SessionContext): Promise<void> {
-    if (this.events.length < this.threshold) return;
-    await this.runCompaction(ctx, false);
+    if (this.shouldCompact()) {
+      await this.runCompaction(ctx, false);
+    }
+  }
+
+  private shouldCompact(): boolean {
+    if (this.tokenThreshold !== null && this.lastUsed !== null) {
+      // Token-aware path: trip when the last reading is at the bar.
+      return this.lastUsed >= this.tokenThreshold;
+    }
+    return this.events.length >= this.threshold;
   }
 
   /**
@@ -258,6 +303,7 @@ function summarizeOne(e: SessionUpdate): string {
     }
     case "plan":
     case "stop":
+    case "usage_update":
       return "";
   }
 }

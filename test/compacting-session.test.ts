@@ -104,6 +104,71 @@ describe("CompactingSession", () => {
     expect(adjustForToolPairs(events, 10)).toBe(10);
   });
 
+  it("holds last usage in memory and filters from the durable log", async () => {
+    const s = new CompactingSession({ threshold: 1000, keep: 2 });
+    await s.append(userMsg("hi"));
+    await s.append({
+      sessionUpdate: "usage_update",
+      used: 1234,
+      size: 200000,
+    });
+    await s.append(agentMsg("there"));
+    await s.append({
+      sessionUpdate: "usage_update",
+      used: 1500,
+      size: 200000,
+    });
+    // count() reflects only the durable log — usage_update doesn't count.
+    expect(await s.count()).toBe(2);
+    const events = await s.getEvents();
+    expect(
+      events.find((e) => e.sessionUpdate === "usage_update"),
+    ).toBeUndefined();
+    // Most-recent usage values are exposed via getters.
+    expect(s.tokensInContext).toBe(1500);
+    expect(s.contextWindow).toBe(200000);
+  });
+
+  it("compacts on tokenThreshold when usage data is present", async () => {
+    const compactions: { before: number; after: number }[] = [];
+    const s = new CompactingSession({
+      threshold: 1000, // event-count threshold; not reached
+      tokenThreshold: 500,
+      keep: 2,
+      onCompact: (info) => compactions.push(info),
+    });
+    // Append a few events and a usage_update under the bar — no compaction.
+    await s.append(userMsg("a"));
+    await s.append(agentMsg("b"));
+    await s.append(userMsg("c"));
+    await s.append(agentMsg("d"));
+    await s.append(userMsg("e"));
+    await s.append({
+      sessionUpdate: "usage_update",
+      used: 100,
+      size: 200000,
+    });
+    // Fake a context-fresh: no compaction expected.
+    await s.prepareTurn({
+      harness: { run: async () => ({ stopReason: "end_turn" }) },
+      systemPromptCore: "",
+      agentName: "t",
+    });
+    expect(compactions).toHaveLength(0);
+    // Now report a usage that crosses the bar — compaction trips.
+    await s.append({
+      sessionUpdate: "usage_update",
+      used: 600,
+      size: 200000,
+    });
+    await s.prepareTurn({
+      harness: { run: async () => ({ stopReason: "end_turn" }) },
+      systemPromptCore: "",
+      agentName: "t",
+    });
+    expect(compactions).toHaveLength(1);
+  });
+
   it("force compactNow works regardless of threshold", async () => {
     const s = new CompactingSession({ threshold: 1000, keep: 2 });
     for (let i = 0; i < 8; i++) await s.append(userMsg(`m${i}`));

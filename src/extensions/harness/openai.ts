@@ -20,6 +20,7 @@ import type {
   Harness,
   HarnessFactory,
   Runtime,
+  TurnResult,
 } from "../../types/interfaces.js";
 import type {
   SessionUpdate,
@@ -66,7 +67,7 @@ export class OpenAIHarness implements Harness {
     private readonly maxTurnRequests: number,
   ) {}
 
-  async run(runtime: Runtime): Promise<StopReason> {
+  async run(runtime: Runtime): Promise<TurnResult> {
     let requests = 0;
     while (true) {
       if (runtime.abortSignal.aborted) {
@@ -74,14 +75,14 @@ export class OpenAIHarness implements Harness {
           sessionUpdate: "stop",
           stopReason: "cancelled",
         });
-        return "cancelled";
+        return { stopReason: "cancelled" };
       }
       if (requests >= this.maxTurnRequests) {
         await runtime.update({
           sessionUpdate: "stop",
           stopReason: "max_turn_requests",
         });
-        return "max_turn_requests";
+        return { stopReason: "max_turn_requests" };
       }
       requests += 1;
 
@@ -111,13 +112,13 @@ export class OpenAIHarness implements Harness {
           },
         });
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
-        return "error";
+        return { stopReason: "error" };
       }
 
       const choice = response.choices[0];
       if (!choice) {
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
-        return "error";
+        return { stopReason: "error" };
       }
 
       const msg = choice.message;
@@ -150,12 +151,12 @@ export class OpenAIHarness implements Harness {
           sessionUpdate: "stop",
           stopReason: "max_tokens",
         });
-        return "max_tokens";
+        return { stopReason: "max_tokens" };
       }
 
       if (toolCalls.length === 0) {
         await runtime.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return { stopReason: "end_turn" };
       }
 
       await Promise.all(
@@ -240,6 +241,7 @@ export class OpenAIHarness implements Harness {
         case "agent_thought_chunk":
         case "stop":
         case "plan":
+        case "usage_update":
           break;
       }
     }

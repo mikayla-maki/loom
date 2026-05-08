@@ -60,9 +60,43 @@ export type SessionUpdate =
       entries: Array<{ content: string; priority?: string; status?: string }>;
     }
   | {
+      /**
+       * Context-window state for this session, pushed by the harness
+       * after each API request. Modeled after the draft ACP RFD
+       * (Session Usage and Context Status). Clients render a context
+       * indicator from `used / size`; sessions decide whether to
+       * compact based on `used`.
+       *
+       * Fields are camelCase even though the RFD currently uses
+       * snake_case — the rest of our SessionUpdate variants use
+       * camelCase, and the RFD will likely normalise.
+       */
+      sessionUpdate: "usage_update";
+      /** Tokens currently in context. */
+      used: number;
+      /** Model's context window in tokens. */
+      size: number;
+      /** Cumulative session cost. Optional — not all harnesses track. */
+      cost?: { amount: number; currency: string };
+    }
+  | {
       sessionUpdate: "stop";
       stopReason: StopReason;
     };
+
+/**
+ * Per-turn cumulative token breakdown returned alongside `StopReason`.
+ * Modeled after the draft ACP RFD's `PromptResponse.usage` shape.
+ * Cumulative across the session — the harness adds to running totals on
+ * each API request.
+ */
+export interface TurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  thoughtTokens?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+}
 
 /** Why a turn ended. */
 export type StopReason =

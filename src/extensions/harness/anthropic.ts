@@ -32,6 +32,7 @@ import type {
   SessionUpdate,
   StopReason,
   ToolCallStatus,
+  TurnUsage,
 } from "../../types/acp.js";
 import type {
   ExtensionContext,
@@ -39,6 +40,7 @@ import type {
   HarnessFactory,
   Runtime,
   SummariseArgs,
+  TurnResult,
 } from "../../types/interfaces.js";
 
 interface AnthropicConfig {
@@ -64,6 +66,13 @@ type AnthropicContentBlock =
       is_error?: boolean;
     };
 
+interface AnthropicUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
 interface AnthropicResponse {
   id: string;
   role: "assistant";
@@ -74,9 +83,38 @@ interface AnthropicResponse {
     | "max_tokens"
     | "stop_sequence"
     | string;
+  /** Model name as reported by the API. May be more specific than the
+   *  configured value (e.g. dated alias resolves to a concrete version). */
+  model?: string;
+  usage?: AnthropicUsage;
+}
+
+/**
+ * Subset of the `/v1/models/{id}` response we consume. Anthropic
+ * documents `context_window` and `max_output_tokens`; we read the first.
+ */
+interface AnthropicModelInfo {
+  id: string;
+  context_window?: number;
+  max_output_tokens?: number;
 }
 
 export class AnthropicHarness implements Harness {
+  /**
+   * Lazy cache of `/v1/models/{id}` responses, keyed by model id. We
+   * fetch on first usage emission and reuse for the lifetime of the
+   * harness instance. A failure caches `null`, so we don't retry every
+   * turn.
+   */
+  private modelInfoCache = new Map<string, AnthropicModelInfo | null>();
+  private modelInfoInflight = new Map<
+    string,
+    Promise<AnthropicModelInfo | null>
+  >();
+
+  /** Cumulative usage across the current turn. Reset at each `run()` start. */
+  private turnUsage: TurnUsage | null = null;
+
   constructor(
     private readonly model: string,
     private readonly apiKey: string,
@@ -114,22 +152,24 @@ export class AnthropicHarness implements Harness {
       .join("");
   }
 
-  async run(runtime: Runtime): Promise<StopReason> {
+  async run(runtime: Runtime): Promise<TurnResult> {
     let requests = 0;
+    // Reset cumulative usage for this turn.
+    this.turnUsage = null;
     while (true) {
       if (runtime.abortSignal.aborted) {
         await runtime.update({
           sessionUpdate: "stop",
           stopReason: "cancelled",
         });
-        return "cancelled";
+        return this.finishTurn("cancelled");
       }
       if (requests >= this.maxTurnRequests) {
         await runtime.update({
           sessionUpdate: "stop",
           stopReason: "max_turn_requests",
         });
-        return "max_turn_requests";
+        return this.finishTurn("max_turn_requests");
       }
       requests += 1;
 
@@ -173,7 +213,19 @@ export class AnthropicHarness implements Harness {
           },
         });
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
-        return "error";
+        return this.finishTurn("error");
+      }
+
+      // Update cumulative turn usage and emit a usage_update event.
+      // We do this BEFORE dispatching tools so the indicator reflects
+      // the true post-response state.
+      if (response.usage) {
+        this.accumulateUsage(response.usage);
+        await this.emitUsageUpdate(
+          runtime,
+          response.usage,
+          response.model ?? this.model,
+        );
       }
 
       // Surface text blocks that didn't arrive via streaming, and
@@ -202,12 +254,12 @@ export class AnthropicHarness implements Harness {
           sessionUpdate: "stop",
           stopReason: "max_tokens",
         });
-        return "max_tokens";
+        return this.finishTurn("max_tokens");
       }
 
       if (toolUses.length === 0) {
         await runtime.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return this.finishTurn("end_turn");
       }
 
       // Dispatch tools in parallel.
@@ -236,6 +288,91 @@ export class AnthropicHarness implements Harness {
       );
       // Loop continues; next call will rebuild messages including tool_results.
     }
+  }
+
+  /** Wrap a stop reason with the turn's accumulated usage (if any). */
+  private finishTurn(stopReason: StopReason): TurnResult {
+    if (this.turnUsage) {
+      return { stopReason, usage: this.turnUsage };
+    }
+    return { stopReason };
+  }
+
+  /** Add a per-request usage payload into this turn's cumulative tally. */
+  private accumulateUsage(u: AnthropicUsage): void {
+    if (!this.turnUsage) {
+      this.turnUsage = { inputTokens: 0, outputTokens: 0 };
+    }
+    this.turnUsage.inputTokens += u.input_tokens;
+    this.turnUsage.outputTokens += u.output_tokens;
+    if (u.cache_read_input_tokens !== undefined) {
+      this.turnUsage.cachedReadTokens =
+        (this.turnUsage.cachedReadTokens ?? 0) + u.cache_read_input_tokens;
+    }
+    if (u.cache_creation_input_tokens !== undefined) {
+      this.turnUsage.cachedWriteTokens =
+        (this.turnUsage.cachedWriteTokens ?? 0) + u.cache_creation_input_tokens;
+    }
+  }
+
+  /**
+   * Emit a `usage_update` SessionUpdate. `used` is the most-recent
+   * request's input + output (a near-perfect reading of "tokens
+   * currently in context"). `size` comes from the lazy model-info
+   * fetch; if unavailable, we fall back to a sentinel of 0 and clients
+   * render "used" alone (the indicator degrades gracefully).
+   */
+  private async emitUsageUpdate(
+    runtime: Runtime,
+    u: AnthropicUsage,
+    modelId: string,
+  ): Promise<void> {
+    const used = u.input_tokens + u.output_tokens;
+    const info = await this.fetchModelInfo(modelId, runtime.abortSignal);
+    const size = info?.context_window ?? 0;
+    await runtime.update({
+      sessionUpdate: "usage_update",
+      used,
+      size,
+    });
+  }
+
+  /**
+   * Lazily fetch and cache `/v1/models/{id}`. Returns null on failure;
+   * the failure is also cached so we don't retry on every turn.
+   */
+  private async fetchModelInfo(
+    modelId: string,
+    signal: AbortSignal,
+  ): Promise<AnthropicModelInfo | null> {
+    if (this.modelInfoCache.has(modelId)) {
+      return this.modelInfoCache.get(modelId) ?? null;
+    }
+    const inflight = this.modelInfoInflight.get(modelId);
+    if (inflight) return await inflight;
+
+    const promise = (async (): Promise<AnthropicModelInfo | null> => {
+      try {
+        const url = `${this.apiBase.replace(/\/$/, "")}/v1/models/${encodeURIComponent(modelId)}`;
+        const res = await fetch(url, {
+          method: "GET",
+          headers: {
+            "x-api-key": this.apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          signal,
+        });
+        if (!res.ok) return null;
+        return (await res.json()) as AnthropicModelInfo;
+      } catch {
+        return null;
+      }
+    })();
+    this.modelInfoInflight.set(modelId, promise);
+    const result = await promise;
+    this.modelInfoInflight.delete(modelId);
+    this.modelInfoCache.set(modelId, result);
+    return result;
   }
 
   private eventsToMessages(events: SessionUpdate[]): AnthropicMessage[] {
@@ -320,6 +457,7 @@ export class AnthropicHarness implements Harness {
         }
         case "stop":
         case "plan":
+        case "usage_update":
           break;
       }
     }
@@ -391,10 +529,15 @@ export class AnthropicHarness implements Harness {
     let buffer = "";
 
     let id = "";
+    let model: string | undefined;
     const blocks: AnthropicContentBlock[] = [];
     // Per-index buffers for partial tool_use input JSON.
     const toolInputBufs = new Map<number, string>();
     let stopReason: AnthropicResponse["stop_reason"] = "end_turn";
+    // Usage accumulates across the SSE: message_start carries
+    // input_tokens (and an initial output_tokens), message_delta carries
+    // an updated output_tokens. We hold the latest snapshot.
+    let usage: AnthropicUsage | undefined;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -426,6 +569,9 @@ export class AnthropicHarness implements Harness {
         if (t === "message_start") {
           const m = (o.message ?? {}) as Record<string, unknown>;
           if (typeof m.id === "string") id = m.id;
+          if (typeof m.model === "string") model = m.model;
+          const u = m.usage as Record<string, unknown> | undefined;
+          if (u) usage = parseAnthropicUsage(u);
         } else if (t === "content_block_start") {
           const idx = typeof o.index === "number" ? o.index : -1;
           const cb = (o.content_block ?? {}) as Record<string, unknown>;
@@ -475,6 +621,9 @@ export class AnthropicHarness implements Harness {
           if (typeof d.stop_reason === "string") {
             stopReason = d.stop_reason;
           }
+          // The cumulative output_tokens lives on `message_delta.usage`.
+          const u = o.usage as Record<string, unknown> | undefined;
+          if (u) usage = mergeAnthropicUsage(usage, parseAnthropicUsage(u));
         } else if (t === "message_stop") {
           // nothing further to read
         } else if (t === "ping") {
@@ -491,8 +640,63 @@ export class AnthropicHarness implements Harness {
     // Filter out any holes (defensive — content_block_start should
     // always run before its deltas).
     const content = blocks.filter((b): b is AnthropicContentBlock => !!b);
-    return { id, role: "assistant", content, stop_reason: stopReason };
+    const result: AnthropicResponse = {
+      id,
+      role: "assistant",
+      content,
+      stop_reason: stopReason,
+    };
+    if (model !== undefined) result.model = model;
+    if (usage !== undefined) result.usage = usage;
+    return result;
   }
+}
+
+/** Read the subset of fields we care about off an Anthropic usage payload. */
+function parseAnthropicUsage(u: Record<string, unknown>): AnthropicUsage {
+  const out: AnthropicUsage = {
+    input_tokens: typeof u.input_tokens === "number" ? u.input_tokens : 0,
+    output_tokens: typeof u.output_tokens === "number" ? u.output_tokens : 0,
+  };
+  if (typeof u.cache_read_input_tokens === "number") {
+    out.cache_read_input_tokens = u.cache_read_input_tokens;
+  }
+  if (typeof u.cache_creation_input_tokens === "number") {
+    out.cache_creation_input_tokens = u.cache_creation_input_tokens;
+  }
+  return out;
+}
+
+/**
+ * Merge a fresh usage snapshot into an existing one. Output tokens
+ * arrive cumulative on `message_delta`, so we overwrite when present
+ * rather than summing. Input tokens come once on `message_start` and
+ * don't change.
+ */
+function mergeAnthropicUsage(
+  prev: AnthropicUsage | undefined,
+  next: AnthropicUsage,
+): AnthropicUsage {
+  if (!prev) return next;
+  const merged: AnthropicUsage = {
+    input_tokens: prev.input_tokens || next.input_tokens,
+    output_tokens: next.output_tokens || prev.output_tokens,
+  };
+  if (
+    next.cache_read_input_tokens !== undefined ||
+    prev.cache_read_input_tokens !== undefined
+  ) {
+    merged.cache_read_input_tokens =
+      next.cache_read_input_tokens ?? prev.cache_read_input_tokens;
+  }
+  if (
+    next.cache_creation_input_tokens !== undefined ||
+    prev.cache_creation_input_tokens !== undefined
+  ) {
+    merged.cache_creation_input_tokens =
+      next.cache_creation_input_tokens ?? prev.cache_creation_input_tokens;
+  }
+  return merged;
 }
 
 export const anthropicHarnessFactory: HarnessFactory = {

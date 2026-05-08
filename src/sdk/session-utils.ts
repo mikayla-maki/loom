@@ -1,7 +1,8 @@
 /**
  * Session-side utilities.
  *
- * Sessions get the agent's harness via `bindContext()` and may want to
+ * Sessions get the agent's harness via the per-turn `SessionContext`
+ * (passed to `prepareTurn` / `systemPromptSection`) and may want to
  * drive a one-shot model call (compaction, periodic reflection, memory
  * retrieval). Two functions live here:
  *

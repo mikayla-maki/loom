@@ -19,10 +19,10 @@ describe("Session.systemPromptSection", () => {
   it("contributes a section that lands in the assembled system prompt", async () => {
     let capturedSystemPrompt: string | null = null;
     const harness: Harness = {
-      async run(rt: Runtime): Promise<StopReason> {
+      async run(rt: Runtime) {
         capturedSystemPrompt = rt.systemPrompt();
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return { stopReason: "end_turn" as const };
       },
     };
 
@@ -69,11 +69,11 @@ describe("Session.systemPromptSection", () => {
   it("is called per turn with a fresh context", async () => {
     let calls = 0;
     const harness: Harness = {
-      async run(rt: Runtime): Promise<StopReason> {
+      async run(rt: Runtime) {
         // Read once so the section is realised.
         rt.systemPrompt();
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return { stopReason: "end_turn" as const };
       },
     };
 
@@ -116,13 +116,13 @@ describe("Session.systemPromptSection", () => {
   it("a thrown systemPromptSection doesn't kill the turn", async () => {
     let ran = false;
     const harness: Harness = {
-      async run(rt: Runtime): Promise<StopReason> {
+      async run(rt: Runtime) {
         ran = true;
         const sp = rt.systemPrompt();
         // Section should be empty (the throw was caught and dropped).
         expect(sp).not.toContain("# Session");
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return { stopReason: "end_turn" as const };
       },
     };
     const session: Session = {

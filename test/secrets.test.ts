@@ -37,9 +37,9 @@ const captureFactory: HarnessFactory = {
     const id = String(_ctx.agentName);
     capturedByHarness.set(id, { ...secrets });
     return {
-      async run(rt: Runtime): Promise<StopReason> {
+      async run(rt: Runtime) {
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return { stopReason: "end_turn" as const };
       },
     };
   },
@@ -205,7 +205,7 @@ describe("secrets pipeline", () => {
       async run(rt) {
         ran = true;
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return "end_turn";
+        return { stopReason: "end_turn" as const };
       },
     };
     const agent = await runAgent(

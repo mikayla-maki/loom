@@ -51,8 +51,8 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
       },
     );
     try {
-      const stop = await agent.prompt("Hi there!");
-      expect(stop).toBe("end_turn");
+      const result = await agent.prompt("Hi there!");
+      expect(result.stopReason).toBe("end_turn");
       const events = await agent.session.getEvents();
       const messages = events
         .filter((e) => e.sessionUpdate === "agent_message_chunk")
@@ -120,10 +120,10 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
       const p = agent.prompt("go");
       // Cancel after a beat.
       setTimeout(() => agent.cancel(), 5);
-      const reason = await p;
+      const result = await p;
       // Either the harness yields cancelled, or the script completes before the
       // signal lands. Both are valid; just ensure cancel() completes cleanly.
-      expect(["cancelled", "end_turn"]).toContain(reason);
+      expect(["cancelled", "end_turn"]).toContain(result.stopReason);
     } finally {
       await agent.close();
     }

@@ -28,6 +28,7 @@ import type {
   Harness,
   HarnessFactory,
   Runtime,
+  TurnResult,
 } from "../../types/interfaces.js";
 import type { SessionUpdate, StopReason } from "../../types/acp.js";
 
@@ -40,10 +41,17 @@ export type TurnStep =
     }
   | { stop: StopReason };
 
-export type TurnScript = TurnStep[] | ((runtime: Runtime) => Promise<TurnStep[]> | TurnStep[]);
+export type TurnScript =
+  | TurnStep[]
+  | ((runtime: Runtime) => Promise<TurnStep[]> | TurnStep[]);
 
 export interface TestHarnessConfig {
-  script?: TurnScript[] | ((runtime: Runtime, turnIndex: number) => Promise<TurnStep[]> | TurnStep[]);
+  script?:
+    | TurnScript[]
+    | ((
+        runtime: Runtime,
+        turnIndex: number,
+      ) => Promise<TurnStep[]> | TurnStep[]);
   echo?: boolean;
 }
 
@@ -52,7 +60,7 @@ export class TestHarness implements Harness {
 
   constructor(private readonly config: TestHarnessConfig) {}
 
-  async run(runtime: Runtime): Promise<StopReason> {
+  async run(runtime: Runtime): Promise<TurnResult> {
     if (this.config.echo) {
       return this.runEcho(runtime);
     }
@@ -81,7 +89,7 @@ export class TestHarness implements Harness {
     return turn;
   }
 
-  private async runEcho(runtime: Runtime): Promise<StopReason> {
+  private async runEcho(runtime: Runtime): Promise<TurnResult> {
     const events = await runtime.getEvents();
     const lastUser = [...events]
       .reverse()
@@ -89,16 +97,21 @@ export class TestHarness implements Harness {
       | (SessionUpdate & { sessionUpdate: "user_message_chunk" })
       | undefined;
     const text =
-      lastUser && lastUser.content.type === "text" ? lastUser.content.text : "(no user message)";
+      lastUser && lastUser.content.type === "text"
+        ? lastUser.content.text
+        : "(no user message)";
     await runtime.update({
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: `echo: ${text}` },
     });
     await runtime.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-    return "end_turn";
+    return { stopReason: "end_turn" };
   }
 
-  private async executeSteps(runtime: Runtime, steps: TurnStep[]): Promise<StopReason> {
+  private async executeSteps(
+    runtime: Runtime,
+    steps: TurnStep[],
+  ): Promise<TurnResult> {
     let stopReason: StopReason = "end_turn";
     for (const step of steps) {
       if (runtime.abortSignal.aborted) {
@@ -133,7 +146,12 @@ export class TestHarness implements Harness {
           sessionUpdate: "tool_call_update",
           toolCallId: id,
           status: result.isError ? "failed" : "completed",
-          content: [{ type: "content", content: { type: "text", text: result.content } }],
+          content: [
+            {
+              type: "content",
+              content: { type: "text", text: result.content },
+            },
+          ],
         });
         if (step.surface !== false) {
           await runtime.update({
@@ -146,13 +164,17 @@ export class TestHarness implements Harness {
       }
     }
     await runtime.update({ sessionUpdate: "stop", stopReason });
-    return stopReason;
+    return { stopReason };
   }
 }
 
 export const testHarnessFactory: HarnessFactory = {
   name: "test",
-  create(config: Record<string, unknown>, _ctx: ExtensionContext, _secrets: Record<string, string>): Harness {
+  create(
+    config: Record<string, unknown>,
+    _ctx: ExtensionContext,
+    _secrets: Record<string, string>,
+  ): Harness {
     return new TestHarness(config as TestHarnessConfig);
   },
 };

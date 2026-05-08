@@ -11,7 +11,7 @@ import type {
   Runtime,
   SessionContext,
 } from "../src/types/interfaces.js";
-import type { SessionUpdate, StopReason } from "../src/types/acp.js";
+import type { SessionUpdate } from "../src/types/acp.js";
 
 function userMsg(text: string): SessionUpdate {
   return {
@@ -29,13 +29,13 @@ function agentMsg(text: string): SessionUpdate {
 /** Tiny harness that emits a fixed reply and ends the turn. */
 function fixedTextHarness(reply: string): Harness {
   return {
-    async run(rt: Runtime): Promise<StopReason> {
+    async run(rt: Runtime) {
       await rt.update({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: reply },
       });
       await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-      return "end_turn";
+      return { stopReason: "end_turn" as const };
     },
   };
 }
