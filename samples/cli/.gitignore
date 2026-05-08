@@ -1,0 +1,32 @@
+node_modules/
+dist/
+
+# Anything the agent or its session writes during a CLI run. The
+# tracked files are the package metadata, README, src/, and tsconfig
+# — everything else is a runtime artifact.
+*.jsonl
+*.txt
+*.py
+*.pl
+*.rb
+*.sh
+*.log
+*.db
+*.sql
+*.tar
+*.tar.gz
+*.zip
+*.md
+!README.md
+*.js
+*.ts
+!src/**/*.ts
+
+# Subdirectories the agent likes to create
+test-git-repo/
+test-repo/
+demo-project/
+new-project/
+demo/
+playground/
+scratch/
