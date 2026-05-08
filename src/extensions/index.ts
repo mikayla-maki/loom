@@ -19,6 +19,7 @@ import { anthropicHarnessFactory } from "./harness/anthropic.js";
 import { openaiHarnessFactory } from "./harness/openai.js";
 import { testHarnessFactory } from "./harness/test.js";
 
+import { compactingSessionFactory } from "./session/compacting.js";
 import { fileSessionFactory } from "./session/file.js";
 import { memorySessionFactory } from "./session/memory.js";
 
@@ -64,6 +65,7 @@ registerHarness(anthropicHarnessFactory);
 registerHarness(openaiHarnessFactory);
 registerSession(memorySessionFactory);
 registerSession(fileSessionFactory);
+registerSession(compactingSessionFactory);
 
 export {
   testHarnessFactory,
@@ -71,4 +73,5 @@ export {
   openaiHarnessFactory,
   memorySessionFactory,
   fileSessionFactory,
+  compactingSessionFactory,
 };

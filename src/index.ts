@@ -27,7 +27,18 @@ export {
   openaiHarnessFactory,
   memorySessionFactory,
   fileSessionFactory,
+  compactingSessionFactory,
 } from "./extensions/index.js";
+
+export {
+  CompactingSession,
+  heuristicCompactor,
+  adjustForToolPairs,
+} from "./extensions/session/compacting.js";
+export type {
+  Compactor,
+  CompactingSessionOptions,
+} from "./extensions/session/compacting.js";
 
 export type {
   TestHarnessConfig,
