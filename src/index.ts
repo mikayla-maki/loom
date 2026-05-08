@@ -34,10 +34,15 @@ export {
 
 export {
   CompactingSession,
+  ChainedSession,
+  compactingMemorySession,
+  compactingFileSession,
   heuristicCompactor,
   modelCompactor,
   adjustForToolPairs,
 } from "./extensions/session/compacting.js";
+export { MemorySession } from "./extensions/session/memory.js";
+export { FileSession } from "./extensions/session/file.js";
 export type {
   Compactor,
   CompactingSessionOptions,

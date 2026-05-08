@@ -25,6 +25,7 @@ import { stdout, stderr, exit } from "node:process";
 import {
   runAgent,
   CompactingSession,
+  MemorySession,
   modelCompactor,
   AnthropicHarness,
   type AgentManifest,
@@ -33,6 +34,96 @@ import {
 
 import { runCli, type SlashCommand } from "./cli.js";
 import { ansi } from "./markdown.js";
+
+// ─── main: assemble + run ──────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    stderr.write(
+      `${args.plain ? "" : ansi.red}error:${args.plain ? "" : ansi.reset} ANTHROPIC_API_KEY is not set.\n` +
+        `Set it in your shell, e.g.:\n  export ANTHROPIC_API_KEY=sk-ant-...\n`,
+    );
+    exit(2);
+  }
+
+  // Construct the primitives ourselves rather than handing the manifest
+  // a `{ provider: "anthropic" }` config. We hold direct references so
+  // the `/compact` slash command can drive `session.compactNow(harness)`.
+  const harness = new AnthropicHarness(
+    args.model,
+    process.env.ANTHROPIC_API_KEY,
+    "https://api.anthropic.com",
+    4096,
+    16,
+    true, // streaming
+  );
+  const session = new CompactingSession(new MemorySession(), {
+    threshold: args.compactAfter,
+    keep: Math.max(4, Math.floor(args.compactAfter / 4)),
+    ...(args.modelCompact ? { compactor: modelCompactor() } : {}),
+  });
+
+  const manifest: AgentManifest = {
+    name: "sample-cli",
+    description: "A small interactive agent for poking at Loom.",
+    systemPrompt:
+      "You are a helpful assistant running inside a small terminal CLI. " +
+      "Keep replies focused and use markdown formatting (headings, lists, " +
+      "code fences) when it improves readability.",
+    harness, // ← instance, not config
+    session, // ← instance
+    ...(args.noTools ? { tools: {} } : {}),
+  };
+
+  const agent = await runAgent(manifest);
+
+  // Custom slash command. The CLI ships /quit, /exit, /help, /events
+  // built-in; everything else is the client's to add. /compact is the
+  // demonstration: it closes over the harness + session refs we own
+  // here and drives `compactNow()` directly.
+  const compactCommand: SlashCommand = {
+    name: "compact",
+    description: "force a compaction pass right now",
+    handler: async () => {
+      const result = await session.compactNow(harness);
+      if (result) {
+        stdout.write(
+          `${ansi.dim}(compacted: ${result.before} → ${result.after} events)${ansi.reset}\n`,
+        );
+      } else {
+        stdout.write(`${ansi.dim}(nothing to compact)${ansi.reset}\n`);
+      }
+    },
+  };
+
+  const params: RunParameters = {};
+  if (args.effort) params.effort = args.effort;
+
+  try {
+    await runCli({
+      agent,
+      plain: args.plain,
+      banner: buildBanner(args),
+      commands: [compactCommand],
+      // Wire the prompt path explicitly. The CLI hands us each line
+      // of user input; we drive `agent.prompt` ourselves. Same as
+      // the default, just spelled out so it's clear that prompting
+      // is one function call.
+      onPrompt: (text) => agent.prompt(text, params),
+    });
+  } finally {
+    await agent.close();
+  }
+}
+
+main().catch((e) => {
+  stderr.write(`${(e as Error).stack ?? e}\n`);
+  exit(1);
+});
+
+// ─── helpers (arg parsing, help text, banner) ───────────────────────────────
 
 interface Args {
   model: string;
@@ -100,88 +191,6 @@ function printHelp(): void {
   );
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
-
-  if (!process.env.ANTHROPIC_API_KEY) {
-    stderr.write(
-      `${args.plain ? "" : ansi.red}error:${args.plain ? "" : ansi.reset} ANTHROPIC_API_KEY is not set.\n` +
-        `Set it in your shell, e.g.:\n  export ANTHROPIC_API_KEY=sk-ant-...\n`,
-    );
-    exit(2);
-  }
-
-  // Construct the primitives ourselves rather than handing the manifest
-  // a `{ provider: "anthropic" }` config. We hold direct references so
-  // the `/compact` slash command can drive `session.compactNow(ctx)`
-  // with a context built from these same pieces.
-  const harness = new AnthropicHarness(
-    args.model,
-    process.env.ANTHROPIC_API_KEY,
-    "https://api.anthropic.com",
-    4096,
-    16,
-    true, // streaming
-  );
-  const session = new CompactingSession({
-    threshold: args.compactAfter,
-    keep: Math.max(4, Math.floor(args.compactAfter / 4)),
-    ...(args.modelCompact ? { compactor: modelCompactor() } : {}),
-  });
-
-  const systemPromptCore =
-    "You are a helpful assistant running inside a small terminal CLI. " +
-    "Keep replies focused and use markdown formatting (headings, lists, " +
-    "code fences) when it improves readability.";
-
-  const manifest: AgentManifest = {
-    name: "sample-cli",
-    description: "A small interactive agent for poking at Loom.",
-    systemPrompt: systemPromptCore,
-    harness, // ← instance, not config
-    session, // ← instance
-    ...(args.noTools ? { tools: {} } : {}),
-  };
-
-  const agent = await runAgent(manifest);
-
-  // Custom slash commands. The CLI ships /quit, /exit, /help, /events
-  // built-in; everything else is the client's to add. /compact is the
-  // demonstration: it closes over the harness + session refs we own
-  // here and drives `compactNow(ctx)` directly.
-  const compactCommand: SlashCommand = {
-    name: "compact",
-    description: "force a compaction pass right now",
-    handler: async () => {
-      const result = await session.compactNow(harness);
-      if (result) {
-        stdout.write(
-          `${ansi.dim}(compacted: ${result.before} → ${result.after} events)${ansi.reset}\n`,
-        );
-      } else {
-        stdout.write(`${ansi.dim}(nothing to compact)${ansi.reset}\n`);
-      }
-    },
-  };
-
-  const params: RunParameters = {};
-  if (args.effort) params.effort = args.effort;
-
-  const banner = buildBanner(args);
-
-  try {
-    await runCli({
-      agent,
-      plain: args.plain,
-      banner,
-      runParameters: Object.keys(params).length > 0 ? params : undefined,
-      commands: [compactCommand],
-    });
-  } finally {
-    await agent.close();
-  }
-}
-
 function buildBanner(args: Args): string {
   if (args.plain) {
     return (
@@ -196,8 +205,3 @@ function buildBanner(args: Args): string {
     `${ansi.dim}commands:${ansi.reset} /quit  /exit  /help  /events  /compact\n`
   );
 }
-
-main().catch((e) => {
-  stderr.write(`${(e as Error).stack ?? e}\n`);
-  exit(1);
-});

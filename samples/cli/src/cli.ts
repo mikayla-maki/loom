@@ -19,6 +19,7 @@ import type {
   RunningAgent,
   RunParameters,
   SessionUpdate,
+  TurnResult,
 } from "loom";
 
 import { renderMarkdown, ansi } from "./markdown.js";
@@ -52,8 +53,23 @@ export interface CliOptions {
   /**
    * Per-turn run parameters applied to every prompt (effort, thinking,
    * etc.). Clients can also expose a `/effort` command and rotate it.
+   *
+   * Ignored if `onPrompt` is supplied — the consumer drives the
+   * prompt call themselves.
    */
   runParameters?: RunParameters;
+  /**
+   * Optional override for the prompt path. Called with the user's
+   * raw input text whenever they hit enter on a non-slash line.
+   * Returns a `TurnResult` (same shape as `agent.prompt`) so the
+   * REPL can render the stop reason uniformly. Default when
+   * undefined: `(text) => agent.prompt(text, runParameters)`.
+   *
+   * Useful for pre/post-processing the prompt, switching models
+   * mid-session based on input, recording prompts to a separate
+   * log, etc.
+   */
+  onPrompt?: (text: string) => Promise<TurnResult>;
   /** Banner printed at startup. Multi-line strings are fine. */
   banner?: string;
   /** Custom slash commands. `/quit`, `/exit`, `/help`, `/events` are built in. */
@@ -70,7 +86,8 @@ export async function runCli(opts: CliOptions): Promise<void> {
   const s = ansiStyle(plain);
   const agent = opts.agent;
 
-  if (opts.banner) stdout.write(opts.banner + (opts.banner.endsWith("\n") ? "" : "\n"));
+  if (opts.banner)
+    stdout.write(opts.banner + (opts.banner.endsWith("\n") ? "" : "\n"));
 
   const printer = startPrinter(agent, plain);
 
@@ -100,7 +117,9 @@ export async function runCli(opts: CliOptions): Promise<void> {
         for (const c of all) {
           if (seen.has(c.name)) continue;
           seen.add(c.name);
-          lines.push(`  ${s.dim}/${c.name.padEnd(10)}${s.reset} ${c.description}`);
+          lines.push(
+            `  ${s.dim}/${c.name.padEnd(10)}${s.reset} ${c.description}`,
+          );
         }
         stdout.write(lines.join("\n") + "\n");
       },
@@ -109,8 +128,10 @@ export async function runCli(opts: CliOptions): Promise<void> {
       name: "events",
       description: "print the current session event count",
       handler: async () => {
-        const events = await agent.session.getEvents();
-        stdout.write(`${s.dim}(${events.length} events in session)${s.reset}\n`);
+        const events = (await agent.session.pull?.([])) ?? [];
+        stdout.write(
+          `${s.dim}(${events.length} events in session)${s.reset}\n`,
+        );
       },
     },
   ];
@@ -171,11 +192,15 @@ export async function runCli(opts: CliOptions): Promise<void> {
     // Slash commands.
     if (text.startsWith("/")) {
       const space = text.indexOf(" ");
-      const name = (space < 0 ? text.slice(1) : text.slice(1, space)).toLowerCase();
+      const name = (
+        space < 0 ? text.slice(1) : text.slice(1, space)
+      ).toLowerCase();
       const rest = space < 0 ? "" : text.slice(space + 1).trim();
       const cmd = commandTable.get(name);
       if (!cmd) {
-        stdout.write(`${s.dim}unknown command: /${name} (try /help)${s.reset}\n`);
+        stdout.write(
+          `${s.dim}unknown command: /${name} (try /help)${s.reset}\n`,
+        );
       } else {
         try {
           await cmd.handler(rest);
@@ -191,7 +216,9 @@ export async function runCli(opts: CliOptions): Promise<void> {
     // Normal turn.
     try {
       inFlight = true;
-      const result = await agent.prompt(text, opts.runParameters);
+      const result = opts.onPrompt
+        ? await opts.onPrompt(text)
+        : await agent.prompt(text, opts.runParameters);
       if (result.stopReason !== "end_turn") {
         stdout.write(`${s.dim}(stopped: ${result.stopReason})${s.reset}\n`);
       }
@@ -334,9 +361,7 @@ function buildPrompt(
   }
   const pct = Math.round((usage.used / usage.size) * 100);
   const color = pct >= 90 ? s.red : pct >= 75 ? s.yellow : s.green;
-  return plain
-    ? `[${pct}%] you> `
-    : `${color}[${pct}%]${s.reset} ${base}`;
+  return plain ? `[${pct}%] you> ` : `${color}[${pct}%]${s.reset} ${base}`;
 }
 
 function previewJson(v: unknown): string {
