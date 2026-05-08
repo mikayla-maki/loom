@@ -126,6 +126,23 @@ export class AnthropicHarness implements Harness {
   ) {}
 
   /**
+   * Build a sibling harness with the same credentials/config but a
+   * different model id. Used by parent-derived harness factories
+   * (e.g. `small-model-of-parent`) that want to reuse the parent's
+   * API key + transport but route to a cheaper or faster model.
+   */
+  withModel(modelId: string): AnthropicHarness {
+    return new AnthropicHarness(
+      modelId,
+      this.apiKey,
+      this.apiBase,
+      this.maxTokens,
+      this.maxTurnRequests,
+      this.stream,
+    );
+  }
+
+  /**
    * Native summarisation. Anthropic doesn't expose a dedicated
    * summarise endpoint, but the Messages API with no tools and a
    * single combined prompt is exactly the same shape and skips the

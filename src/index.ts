@@ -25,9 +25,11 @@ export {
   testHarnessFactory,
   anthropicHarnessFactory,
   openaiHarnessFactory,
+  smallModelOfParentHarnessFactory,
   memorySessionFactory,
   fileSessionFactory,
   compactingSessionFactory,
+  forkOfParentSessionFactory,
 } from "./extensions/index.js";
 
 export {

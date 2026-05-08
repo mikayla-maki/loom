@@ -15,6 +15,7 @@ import { EchoTool } from "../../runtime/builtins/echo.js";
 import { FindTool } from "../../runtime/builtins/find.js";
 import { ReadFileTool } from "../../runtime/builtins/read_file.js";
 import { SearchSkillsTool } from "../../runtime/builtins/search_skills.js";
+import { SpawnSubagentTool } from "../../runtime/builtins/spawn_subagent.js";
 import { WriteFileTool } from "../../runtime/builtins/write_file.js";
 import type {
   Provider,
@@ -32,6 +33,7 @@ const BUILTINS: Record<string, Builder> = {
   read_file: (c) => new ReadFileTool(c),
   write_file: (c) => new WriteFileTool(c),
   search_skills: (c) => new SearchSkillsTool(c),
+  spawn_subagent: (c) => new SpawnSubagentTool(c),
 };
 
 class NativeProvider implements Provider {

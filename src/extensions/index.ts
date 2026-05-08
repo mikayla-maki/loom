@@ -17,11 +17,13 @@ import type { HarnessFactory, SessionFactory } from "../types/interfaces.js";
 
 import { anthropicHarnessFactory } from "./harness/anthropic.js";
 import { openaiHarnessFactory } from "./harness/openai.js";
+import { smallModelOfParentHarnessFactory } from "./harness/parent-derived.js";
 import { testHarnessFactory } from "./harness/test.js";
 
 import { compactingSessionFactory } from "./session/compacting.js";
 import { fileSessionFactory } from "./session/file.js";
 import { memorySessionFactory } from "./session/memory.js";
+import { forkOfParentSessionFactory } from "./session/parent-derived.js";
 
 const harnessRegistry = new Map<string, HarnessFactory>();
 const sessionRegistry = new Map<string, SessionFactory>();
@@ -63,15 +65,19 @@ export function listSessions(): string[] {
 registerHarness(testHarnessFactory);
 registerHarness(anthropicHarnessFactory);
 registerHarness(openaiHarnessFactory);
+registerHarness(smallModelOfParentHarnessFactory);
 registerSession(memorySessionFactory);
 registerSession(fileSessionFactory);
 registerSession(compactingSessionFactory);
+registerSession(forkOfParentSessionFactory);
 
 export {
   testHarnessFactory,
   anthropicHarnessFactory,
   openaiHarnessFactory,
+  smallModelOfParentHarnessFactory,
   memorySessionFactory,
   fileSessionFactory,
   compactingSessionFactory,
+  forkOfParentSessionFactory,
 };

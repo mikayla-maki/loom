@@ -34,12 +34,19 @@ export interface CapabilityTree {
   ceiling: Capabilities;
   /**
    * Each tool the native provider could resolve, with its declared
-   * capability footprint and the source that introduced it.
+   * capability footprint, the source that introduced it, and any
+   * sub-agent trees reachable through `tool.dependencies.subagents`.
    */
   tools: Array<{
     name: string;
     capabilities: unknown;
     introducedBy: string;
+    /**
+     * Sub-agent trees this tool declares it may spawn. Empty when
+     * the tool has no declared sub-agents. Each entry is the audit
+     * tree of the corresponding `AgentManifest`, recursively.
+     */
+    subagents: CapabilityTree[];
   }>;
   /**
    * Every secret name a component of this agent declares it needs. Built
@@ -48,6 +55,18 @@ export interface CapabilityTree {
    * doesn't load extensions — see the comment in `collectSecrets`.
    */
   secrets: SecretRequest[];
+  /**
+   * Sub-agent trees this manifest's session declares it may spawn
+   * via `Session.dependencies.subagents`. Empty when none.
+   */
+  sessionSubagents: CapabilityTree[];
+  /**
+   * Tool refs the manifest brought in (top-level + skills) that
+   * couldn't be resolved by the native provider — e.g. extension
+   * tools, since audit doesn't load `[extensions]`. Useful for
+   * diagnostics and for spotting gaps in sub-manifest closures.
+   */
+  unresolvedTools: Array<{ name: string; introducedBy: string }>;
 }
 
 const DEFAULT_TOP_LEVEL_TOOLS: Record<string, ToolConfig> = {
@@ -62,12 +81,38 @@ const TOP_LEVEL = "(top-level)";
 export async function auditAgent(
   source: string | AgentManifest,
 ): Promise<CapabilityTree> {
+  return auditAgentInner(source, new Set());
+}
+
+async function auditAgentInner(
+  source: string | AgentManifest,
+  seenManifests: Set<string>,
+): Promise<CapabilityTree> {
   const manifest =
     typeof source === "string" ? await parseAgentManifest(source) : source;
   const manifestPath =
     typeof source === "string"
       ? source
       : (source.manifestPath ?? `<inline:${source.name}>`);
+
+  // Cycle detection. A sub-manifest that references back to one of its
+  // ancestors short-circuits with an empty tree (the parent already
+  // recorded its capabilities). The seen set is keyed by manifestPath
+  // when available, otherwise by name.
+  const cycleKey = manifest.manifestPath ?? `<inline:${manifest.name}>`;
+  if (seenManifests.has(cycleKey)) {
+    return {
+      manifestPath,
+      name: manifest.name,
+      ceiling: {},
+      tools: [],
+      secrets: [],
+      sessionSubagents: [],
+      unresolvedTools: [{ name: "(cycle)", introducedBy: cycleKey }],
+    };
+  }
+  const nextSeen = new Set(seenManifests);
+  nextSeen.add(cycleKey);
 
   const baseDir = manifest.manifestPath
     ? path.dirname(manifest.manifestPath)
@@ -108,19 +153,42 @@ export async function auditAgent(
   const native = buildNativeProvider();
   const tools: CapabilityTree["tools"] = [];
   const resolvedTools = new Map<string, Tool>();
+  const unresolvedTools: CapabilityTree["unresolvedTools"] = [];
   for (const ref of refs) {
     const t = await Promise.resolve(native.resolveTool(ref.name, ref.config));
-    if (!t) continue; // not a native tool — audit silently skips
+    if (!t) {
+      unresolvedTools.push({ name: ref.name, introducedBy: ref.origin });
+      continue;
+    }
     resolvedTools.set(ref.name, t);
+    // Recurse into the tool's declared sub-agents.
+    const subagents: CapabilityTree[] = [];
+    for (const sub of t.dependencies?.subagents ?? []) {
+      subagents.push(await auditAgentInner(sub, nextSeen));
+    }
     tools.push({
       name: ref.name,
       capabilities: t.capabilities ?? {},
       introducedBy: ref.origin,
+      subagents,
     });
   }
   await native.close();
 
   const secrets = collectSecrets(manifest, resolvedTools);
+
+  // Recurse into the manifest's session deps. Audit doesn't instantiate
+  // sessions (factories may have side effects), but session
+  // instances passed inline carry their declared `dependencies`
+  // directly. For the common factory-form case this is empty; the
+  // tree still reports it for parity.
+  const sessionSubagents: CapabilityTree[] = [];
+  if (manifest.session && !("provider" in manifest.session)) {
+    const sess = manifest.session;
+    for (const sub of sess.dependencies?.subagents ?? []) {
+      sessionSubagents.push(await auditAgentInner(sub, nextSeen));
+    }
+  }
 
   return {
     manifestPath,
@@ -128,6 +196,8 @@ export async function auditAgent(
     ceiling: manifest.capabilities ?? {},
     tools,
     secrets,
+    sessionSubagents,
+    unresolvedTools,
   };
 }
 
@@ -256,6 +326,22 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
       lines.push(
         `${pad}    - ${t.name} (from ${t.introducedBy}): ${JSON.stringify(t.capabilities)}`,
       );
+      for (const sub of t.subagents) {
+        lines.push(`${pad}      sub-agent:`);
+        lines.push(formatCapabilityTree(sub, indent + 4));
+      }
+    }
+  }
+  if (tree.unresolvedTools.length > 0) {
+    lines.push(`${pad}  unresolved tools (audit doesn't load extensions):`);
+    for (const u of tree.unresolvedTools) {
+      lines.push(`${pad}    - ${u.name} (from ${u.introducedBy})`);
+    }
+  }
+  if (tree.sessionSubagents.length > 0) {
+    lines.push(`${pad}  session sub-agents:`);
+    for (const sub of tree.sessionSubagents) {
+      lines.push(formatCapabilityTree(sub, indent + 2));
     }
   }
   if (tree.secrets.length > 0) {
