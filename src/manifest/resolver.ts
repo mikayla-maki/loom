@@ -1,13 +1,9 @@
 /**
  * Manifest "resolution" — what's left of it.
  *
- * Most of what this module used to do (walking [skills], resolving tool
- * refs, applying the capability check) moved into other layers —
- * skills are walked by `runAgent`, tools are constructed by providers,
- * and the capability check lives in `manifest/capabilities.ts`. Loom's
- * job in here is now just `resolveSystemPrompt`.
- *
- * What stays here: the `resolveSystemPrompt` helper.
+ * Tools are constructed by providers; the capability check lives in
+ * `manifest/capabilities.ts`. Loom's job in here is now just
+ * `resolveSystemPrompt`.
  */
 
 import * as fs from "node:fs/promises";

@@ -1,10 +1,9 @@
 /**
- * Local registry — bare-name resolution against ~/.loom/{skills,tools,agents}.
+ * Local registry — bare-name resolution against ~/.loom/{tools,agents}.
  *
- * v1 layout (from the design doc):
+ * Layout:
  *   ~/.loom/
  *   ├── extensions/
- *   ├── skills/
  *   ├── tools/
  *   └── agents/
  *
@@ -18,7 +17,7 @@ import * as os from "node:os";
 
 /** Bare-name lookup hook: kind + name → path on disk, or null. */
 export type RegistryLookup = (
-  kind: "skill" | "tool" | "agent",
+  kind: "tool" | "agent",
   name: string,
 ) => string | null | Promise<string | null>;
 
@@ -40,7 +39,7 @@ export class LocalRegistry {
     const bare = at < 0 ? name : name.slice(0, at);
     const dir = path.join(this.root, kindDir(kind), bare);
     if (await isDir(dir)) {
-      // For agents: return the agent.toml path; for skills/tools: the directory.
+      // For agents: return the agent.toml path; for tools: the directory.
       if (kind === "agent") {
         const manifest = path.join(dir, "agent.toml");
         if (await fileExists(manifest)) return manifest;
@@ -53,7 +52,7 @@ export class LocalRegistry {
 
   /** Install (copy or symlink) a path into the registry. */
   async install(
-    kind: "skill" | "tool" | "agent",
+    kind: "tool" | "agent",
     sourcePath: string,
     options: { name?: string; symlink?: boolean } = {},
   ): Promise<string> {
@@ -79,8 +78,8 @@ export class LocalRegistry {
   }
 }
 
-function kindDir(kind: "skill" | "tool" | "agent"): string {
-  return kind === "skill" ? "skills" : kind === "tool" ? "tools" : "agents";
+function kindDir(kind: "tool" | "agent"): string {
+  return kind === "tool" ? "tools" : "agents";
 }
 
 async function isDir(p: string): Promise<boolean> {
@@ -101,18 +100,13 @@ async function fileExists(p: string): Promise<boolean> {
 }
 
 async function inferName(
-  kind: "skill" | "tool" | "agent",
+  kind: "tool" | "agent",
   src: string,
 ): Promise<string | null> {
   try {
     if (kind === "tool") {
       const text = await fs.readFile(path.join(src, "tool.toml"), "utf8");
       const m = /\bname\s*=\s*"([^"]+)"/.exec(text);
-      return m && m[1] ? m[1] : null;
-    }
-    if (kind === "skill") {
-      const text = await fs.readFile(path.join(src, "SKILL.md"), "utf8");
-      const m = /^name:\s*(\S+)/m.exec(text);
       return m && m[1] ? m[1] : null;
     }
     if (kind === "agent") {

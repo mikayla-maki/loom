@@ -5,9 +5,7 @@
  *   - field absent          → default builtin set auto-loads
  *   - field empty `{}`      → no top-level tools at all
  *   - field with entries    → exactly those, no defaults
- *   - collision with skill's `requires` → hard error
  *   - top-level tools surface in audit with introducedBy === "(top-level)"
- *   - system prompt does NOT inline a "core skill" body any more
  */
 
 import { describe, expect, it } from "vitest";
@@ -23,7 +21,6 @@ import type { Runtime } from "../src/types/interfaces.js";
 
 function buildAgent(opts: {
   tools?: AgentManifest["tools"];
-  skills?: AgentManifest["skills"];
   capabilities?: Capabilities;
   systemPrompt?: string;
   harnessScript?:
@@ -39,7 +36,6 @@ function buildAgent(opts: {
     },
     ...(opts.capabilities ? { capabilities: opts.capabilities } : {}),
     ...(opts.tools !== undefined ? { tools: opts.tools } : {}),
-    ...(opts.skills ? { skills: opts.skills } : {}),
   };
 }
 
@@ -47,7 +43,6 @@ describe("top-level [tools]", () => {
   it("absent field auto-loads the default builtin set", async () => {
     const agent = await runAgent(buildAgent({}), {});
     try {
-      expect(agent.agentState.skills).toHaveLength(0);
       const names = agent.agentState.toolTable
         .list()
         .map((t) => t.name)
@@ -80,47 +75,6 @@ describe("top-level [tools]", () => {
     }
   });
 
-  it("top-level + skill is additive (skill brings extra tools alongside top-level)", async () => {
-    const agent = await runAgent(
-      buildAgent({
-        tools: { bash: "builtin" },
-        skills: {
-          extra: {
-            description: "extra tool",
-            requires: { read_file: { paths: ["./"] } },
-          },
-        },
-      }),
-      {},
-    );
-    try {
-      const names = agent.agentState.toolTable
-        .list()
-        .map((t) => t.name)
-        .sort();
-      expect(names).toEqual(["bash", "read_file"]);
-    } finally {
-      await agent.close();
-    }
-  });
-
-  it("name collision between top-level and a skill's requires is a hard error", async () => {
-    await expect(
-      runAgent(
-        buildAgent({
-          tools: { bash: "builtin" },
-          skills: {
-            shell: {
-              description: "shell access",
-              requires: { bash: "builtin" },
-            },
-          },
-        }),
-        {},
-      ),
-    ).rejects.toThrow(/declared at the top level AND brought in by skill/);
-  });
-
   it("default tool set requires the per-tool ceiling to allow './'", async () => {
     // No top-level [tools] declaration → defaults load → read_file/write_file/find
     // declare paths=['./']; a tighter per-tool ceiling fails.
@@ -144,7 +98,7 @@ describe("top-level [tools]", () => {
     expect(printed).toMatch(/from \(top-level\)/);
   });
 
-  it("system prompt no longer inlines a core-skill body; default tools surface only via Tool Reference", async () => {
+  it("system prompt: tools surface via Tool Reference", async () => {
     let captured = "";
     const agent = await runAgent(
       buildAgent({
@@ -162,17 +116,12 @@ describe("top-level [tools]", () => {
       await agent.close();
     }
     expect(captured).toContain("You are a focused engineer.");
-    // The core-skill body's old text must not appear (no inline section).
-    expect(captured).not.toContain("Core file & shell tools");
-    expect(captured).not.toMatch(/##\s+core\b/);
-    // Tools still listed in the Tool Reference section.
+    // Tools listed in the Tool Reference section.
     expect(captured).toContain("# Tool Reference");
     expect(captured).toMatch(/`bash`/);
     expect(captured).toMatch(/`read_file`/);
     expect(captured).toMatch(/`write_file`/);
     expect(captured).toMatch(/`find`/);
-    // No # Available Skills section since this agent declared no skills.
-    expect(captured).not.toContain("# Available Skills");
   });
 
   it("end-to-end: agent uses default tools (write_file then read_file)", async () => {

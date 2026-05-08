@@ -2,9 +2,9 @@
  * Static capability audit — instantiates the native provider against an
  * agent manifest and prints what it would expose. No LLM is ever invoked,
  * and no extension providers are loaded; audit is conservative and
- * deterministic. Extension-supplied tools and skills don't appear in the
- * tree (they'd require running provider init, which can have side
- * effects like opening MCP connections).
+ * deterministic. Extension-supplied tools don't appear in the tree
+ * (they'd require running provider init, which can have side effects
+ * like opening MCP connections).
  */
 
 import * as path from "node:path";
@@ -12,13 +12,8 @@ import * as path from "node:path";
 import { resolveSystemPrompt } from "../manifest/resolver.js";
 import { getHarnessFactory, getSessionFactory } from "../extensions/index.js";
 import { buildNativeProvider } from "../extensions/provider/native.js";
-import { parseAgentManifest, parseSkillManifest } from "../manifest/parser.js";
-import { LocalRegistry } from "../registry/registry.js";
-import type {
-  AgentManifest,
-  SkillManifest,
-  Capabilities,
-} from "../types/manifest.js";
+import { parseAgentManifest } from "../manifest/parser.js";
+import type { AgentManifest, Capabilities } from "../types/manifest.js";
 import type { Agent, Tool, ToolConfig } from "../types/interfaces.js";
 
 export interface SecretRequest {
@@ -61,7 +56,7 @@ export interface CapabilityTree {
    */
   sessionSubagents: CapabilityTree[];
   /**
-   * Tool refs the manifest brought in (top-level + skills) that
+   * Tool refs the manifest brought in (top-level `[tools]`) that
    * couldn't be resolved by the native provider — e.g. extension
    * tools, since audit doesn't load `[extensions]`. Useful for
    * diagnostics and for spotting gaps in sub-manifest closures.
@@ -120,33 +115,11 @@ async function auditAgentInner(
   // Resolve system prompt for parity with runAgent (validates path-form).
   void (await resolveSystemPrompt(manifest, baseDir));
 
-  // Walk skills the same way runAgent does (no provider init needed).
-  const registry = new LocalRegistry();
-  const skills: SkillManifest[] = [];
-  for (const [skillKey, skillRef] of Object.entries(manifest.skills ?? {})) {
-    const skill = await loadSkillForAudit(
-      skillKey,
-      skillRef,
-      baseDir,
-      registry,
-    );
-    skills.push(skill);
-  }
-
   // Build the same tool-ref list runAgent builds.
   const refs: Array<{ name: string; config: ToolConfig; origin: string }> = [];
-  const seen = new Map<string, string>();
   const topLevel = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
   for (const [name, config] of Object.entries(topLevel)) {
     refs.push({ name, config, origin: TOP_LEVEL });
-    seen.set(name, TOP_LEVEL);
-  }
-  for (const skill of skills) {
-    for (const [name, config] of Object.entries(skill.requires ?? {})) {
-      if (seen.has(name)) continue; // collisions surface in runAgent; audit is best-effort
-      refs.push({ name, config, origin: skill.name ?? "(unnamed-skill)" });
-      seen.set(name, skill.name ?? "(unnamed-skill)");
-    }
   }
 
   // Run only the native provider. Extension providers stay un-audited.
@@ -298,44 +271,6 @@ function stubSession(): import("../types/interfaces.js").Session {
     getEvents: async () => [],
     count: async () => 0,
   };
-}
-
-async function loadSkillForAudit(
-  skillKey: string,
-  ref: string | SkillManifest,
-  baseDir: string,
-  registry: LocalRegistry,
-): Promise<SkillManifest> {
-  if (typeof ref !== "string") {
-    return { ...ref, name: skillKey, body: ref.body ?? "" };
-  }
-  const fs = await import("node:fs/promises");
-  const isPathLike = (s: string) =>
-    s.startsWith("./") ||
-    s.startsWith("../") ||
-    s.startsWith("/") ||
-    s.startsWith("~");
-  let dir: string;
-  if (isPathLike(ref)) {
-    dir = path.resolve(baseDir, ref);
-  } else {
-    const r = await registry.lookup("skill", ref);
-    if (!r) {
-      // Skip skills audit can't resolve (e.g. extension-supplied).
-      return { name: skillKey, description: "(unresolved)", body: "" };
-    }
-    dir = r;
-  }
-  try {
-    const stat = await fs.stat(dir);
-    if (!stat.isDirectory()) {
-      return { name: skillKey, description: "(unresolved)", body: "" };
-    }
-  } catch {
-    return { name: skillKey, description: "(unresolved)", body: "" };
-  }
-  const skill = await parseSkillManifest(dir);
-  return { ...skill, name: skillKey };
 }
 
 /** Pretty-print a CapabilityTree as a tree of strings (for CLI use). */

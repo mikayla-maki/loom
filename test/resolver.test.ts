@@ -19,7 +19,6 @@ describe("manifest walk via runAgent", () => {
       {},
     );
     try {
-      expect(agent.agentState.skills).toHaveLength(0);
       const tools = agent.agentState.toolTable.list().map((t) => t.name);
       expect(tools.sort()).toEqual(["echo", "find", "read_file", "write_file"]);
       // Per-tool ceiling matches each tool's declared paths.
@@ -38,29 +37,10 @@ describe("manifest walk via runAgent", () => {
     };
     const agent = await runAgent(spec, {});
     try {
-      expect(agent.agentState.skills).toHaveLength(0);
       expect(agent.agentState.toolTable.list()).toHaveLength(0);
     } finally {
       await agent.close();
     }
-  });
-
-  it("top-level [tools] is a hard error when colliding with a skill's requires", async () => {
-    const spec: AgentManifest = {
-      name: "collision",
-      systemPrompt: "x",
-      tools: { bash: "builtin" },
-      harness: { provider: "test" },
-      skills: {
-        s: {
-          description: "also brings bash",
-          requires: { bash: "builtin" },
-        },
-      },
-    };
-    await expect(runAgent(spec, {})).rejects.toThrow(
-      /declared at the top level AND brought in by skill/,
-    );
   });
 
   it("rejects when a tool's caps exceed the per-tool sandbox ceiling", async () => {
@@ -91,7 +71,6 @@ describe("manifest walk via runAgent", () => {
       systemPrompt: "Be concise. Use only tools provided.",
       tools: {},
       harness: { provider: "test" },
-      skills: {},
     };
     const sp = await resolveSystemPrompt(spec, process.cwd());
     expect(sp).toBe("Be concise. Use only tools provided.");
@@ -119,7 +98,6 @@ system_prompt = "./core.md"
 provider = "test"
 [session]
 provider = "memory"
-[skills]
 `,
       );
       const { parseAgentManifest } = await import("../src/manifest/parser.js");
@@ -130,29 +108,6 @@ provider = "memory"
       expect(sp).toMatch(/be brief/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("resolves builtin tools brought in by a skill's requires", async () => {
-    const spec: AgentManifest = {
-      name: "x",
-      systemPrompt: "x",
-      tools: {},
-      harness: { provider: "test" },
-      skills: {
-        s: {
-          description: "bash access",
-          requires: { bash: "builtin" },
-        },
-      },
-    };
-    const agent = await runAgent(spec, {});
-    try {
-      expect(agent.agentState.toolTable.list().map((t) => t.name)).toEqual([
-        "bash",
-      ]);
-    } finally {
-      await agent.close();
     }
   });
 });

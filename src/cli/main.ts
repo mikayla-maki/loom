@@ -55,12 +55,12 @@ Usage:
   loom prompt <agent.toml> [text]        One-shot prompt (stdin if [text] omitted).
   loom audit <agent.toml>                Print the static capability tree.
   loom acp serve <agent.toml>            Speak ACP over stdio.
-  loom install <kind> <path> [--name N]  Install a skill/tool/agent into ~/.loom.
-  loom list <kind>                       List installed skills/tools/agents.
+  loom install <kind> <path> [--name N]  Install a tool/agent into ~/.loom.
+  loom list <kind>                       List installed tools/agents.
   loom extensions list                   List Loom extension npm packages on disk.
   loom extensions info <name>            Show resolved metadata for an extension package.
 
-Where <kind> ∈ { skill | tool | agent }.
+Where <kind> ∈ { tool | agent }.
 
 Flags:
   --no-colors                             Disable ANSI colour output.
@@ -239,11 +239,11 @@ async function cmdInstall(args: string[]): Promise<number> {
   const src = opts._[1];
   if (!kind || !src) {
     console.error(
-      "usage: loom install <skill|tool|agent> <path> [--name <name>] [--symlink]",
+      "usage: loom install <tool|agent> <path> [--name <name>] [--symlink]",
     );
     return 2;
   }
-  if (kind !== "skill" && kind !== "tool" && kind !== "agent") {
+  if (kind !== "tool" && kind !== "agent") {
     console.error(`unknown kind: ${kind}`);
     return 2;
   }
@@ -259,18 +259,15 @@ async function cmdInstall(args: string[]): Promise<number> {
 
 async function cmdList(args: string[]): Promise<number> {
   const kind = args[0];
-  if (kind !== "skill" && kind !== "tool" && kind !== "agent") {
-    console.error("usage: loom list <skill|tool|agent>");
+  if (kind !== "tool" && kind !== "agent") {
+    console.error("usage: loom list <tool|agent>");
     return 2;
   }
   const fs = await import("node:fs/promises");
   const path = await import("node:path");
   const os = await import("node:os");
   const home = process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom");
-  const dir = path.join(
-    home,
-    kind === "skill" ? "skills" : kind === "tool" ? "tools" : "agents",
-  );
+  const dir = path.join(home, kind === "tool" ? "tools" : "agents");
   let entries: string[] = [];
   try {
     entries = (await fs.readdir(dir, { withFileTypes: true }))

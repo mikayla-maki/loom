@@ -8,7 +8,7 @@ export * as errors from "./errors.js";
 
 export { resolveSystemPrompt } from "./manifest/resolver.js";
 
-export { parseAgentManifest, parseSkillManifest } from "./manifest/parser.js";
+export { parseAgentManifest } from "./manifest/parser.js";
 
 export {
   assertCapabilities,

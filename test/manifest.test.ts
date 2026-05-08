@@ -29,8 +29,6 @@ describe("agent.toml parser", () => {
       find: { paths: ["./"] },
       echo: {},
     });
-    // No skills declared in the new sample agent.
-    expect(m.skills).toEqual({});
   });
 
   it("rejects manifests missing required sections", async () => {
@@ -128,7 +126,6 @@ system_prompt = "You are a friendly demo agent."
 provider = "test"
 [session]
 provider = "memory"
-[skills]
 `,
         "utf8",
       );
@@ -154,7 +151,6 @@ system_prompt = "./prompt.md"
 provider = "test"
 [session]
 provider = "memory"
-[skills]
 `,
         "utf8",
       );

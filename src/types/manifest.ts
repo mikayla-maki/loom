@@ -81,35 +81,12 @@ export interface AgentManifest {
    *                          (`bash`, `read_file`, `write_file`, `find`).
    *   - field present (any) → exactly what's listed; no defaults.
    *   - empty table        → no top-level tools at all.
-   *
-   * Skills' `requires:` are *additive*: a skill that brings `bash`
-   * into scope is fine even if `bash` isn't listed here. A name
-   * appearing in BOTH top-level `tools` AND a skill's `requires` is a
-   * hard error — silent overrides are footguns.
    */
   tools?: Record<string, ToolConfig>;
-  /** Skill name → path / registry name / inline skill manifest. */
-  skills?: Record<string, string | SkillManifest>;
   /**
    * Extensions: npm packages with a `loom.extension` field, loaded at boot.
    * Each entry's name is the package name; the value is the config object
    * passed to the package's `register()` function.
    */
   extensions?: Record<string, Record<string, unknown>>;
-}
-
-export interface SkillManifest {
-  /** If present, must equal the parent map key. */
-  name?: string;
-  description: string;
-  /** Markdown body. Defaults to empty string. */
-  body?: string;
-  /** Tool name → config. Same shape and routing as top-level `[tools]`. */
-  requires?: Record<string, ToolConfig>;
-
-  // ── Disk-derived (parser-only fields) ──
-  /** Absolute path to SKILL.md, when loaded from disk. */
-  manifestPath?: string;
-  /** Skill directory, when loaded from disk. */
-  skillDir?: string;
 }

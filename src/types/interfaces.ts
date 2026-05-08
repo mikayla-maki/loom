@@ -2,10 +2,10 @@
  * The core interfaces.
  *
  * Loom is a manifest-driven agent runtime. It owns parsing, secrets,
- * the system prompt, the turn loop, and skills. **Tools** are JS
- * objects that a chain of **providers** constructs from manifest
- * entries: each tool reference is `(name, config)`; loom asks each
- * provider in order; the first non-null result wins.
+ * the system prompt, and the turn loop. **Tools** are JS objects
+ * that a chain of **providers** constructs from manifest entries:
+ * each tool reference is `(name, config)`; loom asks each provider
+ * in order; the first non-null result wins.
  *
  * Tool capabilities are tool-defined: the shape is whatever the tool
  * needs (paths for a filesystem tool, channels for Discord, buckets
@@ -21,11 +21,11 @@
 
 import type { SessionUpdate, StopReason, TurnUsage } from "./acp.js";
 import type { JSONSchema } from "./schema.js";
-import type { AgentManifest, SkillManifest } from "./manifest.js";
+import type { AgentManifest } from "./manifest.js";
 import type { RunningAgent } from "../sdk/running-agent.js";
 
-// ────────────────────────────────────────────────────────────────────────────
-// Session — durable log + optional skill contributions.
+// ──────────────────────────────────────────────────────────────────────────
+// Session — durable log + memory hooks.
 // ────────────────────────────────────────────────────────────────────────────
 
 export interface SessionDescriptor {
@@ -44,13 +44,6 @@ export interface Session {
 
   /** Number of stored events. */
   count(): Promise<number>;
-
-  /**
-   * Optional: skills this session contributes (memory architecture). The
-   * default is to contribute none. Sessions that need agent participation
-   * (e.g. compaction prompts) ship the relevant skills here.
-   */
-  skills?(): Promise<SkillManifest[]> | SkillManifest[];
 
   /**
    * Optional per-turn hook. Loom calls this once per turn, after the
@@ -260,8 +253,6 @@ export interface ToolContext {
   requestPermission(
     req: import("./permissions.js").PermissionRequest,
   ): Promise<import("./permissions.js").PermissionResult>;
-  /** Read-only enumeration of skills available to this agent. */
-  searchSkills(query?: string): Promise<SkillSummary[]>;
   /**
    * The owning agent (the agent this tool is part of). The runtime
    * supplies an Agent whose `spawnSubagent` is bound to this tool's
@@ -271,38 +262,9 @@ export interface ToolContext {
   agent: Agent;
 }
 
-/** Single entry returned by `ctx.searchSkills()`. */
-export interface SkillSummary {
-  name: string;
-  description: string;
-  /** Tool names this skill brings into scope. */
-  toolNames: string[];
-  /**
-   * Path the model passes to `read_file` to fetch the skill's full
-   * SKILL.md. For on-disk skills this is a real fs path; for inline
-   * skills it's the synthetic `loom-skills:<name>/SKILL.md` URI that
-   * `read_file` resolves from memory.
-   */
-  path: string;
-}
-
-// ────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────
 // Runtime — what the Harness calls during a turn.
-// ────────────────────────────────────────────────────────────────────────────
-
-export interface SkillDescriptor {
-  name: string;
-  description: string;
-  body: string;
-  /** The tool names this skill brings into scope. */
-  toolNames: string[];
-  /**
-   * The path the model uses to fetch this skill's SKILL.md via
-   * `read_file`. Real fs path for on-disk skills, synthetic
-   * `loom-skills:<name>/SKILL.md` for inline skills.
-   */
-  path: string;
-}
+// ──────────────────────────────────────────────────────────────────────────
 
 export interface Runtime {
   /** Read the durable session log. */
@@ -318,12 +280,9 @@ export interface Runtime {
    * Just the manifest-owned core (the `[agent].system_prompt` field after
    * path resolution) — exposed so a Harness extension that needs to roll
    * its own assembly (provider-specific formatting, prompt-caching tricks)
-   * can read components separately and reuse `listSkills()` / `listTools()`.
+   * can read it separately and reuse `listTools()`.
    */
   systemPromptCore(): string;
-
-  /** All skills (from manifest + session contributions) with their tool names. */
-  listSkills(): SkillDescriptor[];
 
   /** All tools available to the model. */
   listTools(): ToolDescriptor[];
@@ -496,10 +455,9 @@ export interface ExtensionContext {
 // Provider — turns (name, config) tool references into Tool objects.
 //
 // Loom maintains a chain of providers: SDK-supplied → extension-loaded →
-// native (always last). For each tool reference in the manifest (top-level
-// `[tools]` plus every skill's `requires:`), loom asks providers in order;
-// the first non-null result wins. If no provider claims a name, the run
-// fails at boot.
+// native (always last). For each tool reference in the manifest's
+// top-level `[tools]`, loom asks providers in order; the first non-null
+// result wins. If no provider claims a name, the run fails at boot.
 //
 // The native provider (in `src/extensions/provider/native.ts`) ships a
 // fixed map of builtin tools (`bash`, `read_file`, etc.). Extensions
@@ -533,7 +491,6 @@ export interface RuntimePrimitives {
   requestPermission(
     req: import("./permissions.js").PermissionRequest,
   ): Promise<import("./permissions.js").PermissionResult>;
-  searchSkills(query?: string): Promise<SkillSummary[]>;
 }
 
 export interface ProviderInitArgs {

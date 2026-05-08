@@ -227,7 +227,7 @@ describe("extension package loader", () => {
 });
 
 describe("agent.toml [extensions] activation end-to-end", () => {
-  it("extensions listed in [extensions] are loaded before tool/skill resolution", async () => {
+  it("extensions listed in [extensions] are loaded before tool resolution", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-e2e-"));
     try {
       const agentDir = path.join(root, "agent");

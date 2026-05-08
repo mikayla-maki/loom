@@ -20,18 +20,16 @@ function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
     description: "An end-to-end Loom v0 demo agent.",
     systemPrompt:
       "You are the Loom sample agent — greet the user and shout the result.",
-    // No `tools` field → defaults load (bash/read_file/write_file/find);
-    // we reference `echo` via a skill below for the tool-call tests.
+    tools: {
+      bash: {},
+      read_file: { paths: ["./"] },
+      write_file: { paths: ["./"] },
+      find: { paths: ["./"] },
+      echo: {},
+    },
     harness: {
       provider: "test",
       ...(harnessScript ? { script: harnessScript } : {}),
-    },
-    skills: {
-      greeter: {
-        description: "Greet the user and shout the result.",
-        body: "Use `echo` to greet.",
-        requires: { echo: {} },
-      },
     },
   };
 }
@@ -157,18 +155,9 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
 });
 
 describe("system prompt assembly", () => {
-  it("includes the manifest-owned core, skills, and a Context block", () => {
+  it("includes the manifest-owned core, the tool reference, and a Context block", () => {
     const text = assembleSystemPrompt({
       core: "I am a helpful assistant.",
-      skills: [
-        {
-          name: "greeter",
-          description: "Greet the user",
-          body: "Use greet() then uppercase().",
-          toolNames: ["greet", "uppercase"],
-          path: "loom-skills:greeter/SKILL.md",
-        },
-      ],
       tools: [
         { name: "greet", description: "Greet", inputSchema: {} },
         { name: "uppercase", description: "Shout", inputSchema: {} },
@@ -177,12 +166,11 @@ describe("system prompt assembly", () => {
       now: new Date("2026-01-01T00:00:00Z"),
     });
     expect(text).toContain("I am a helpful assistant.");
-    expect(text).toContain("# Available Skills");
-    expect(text).toContain("greet, uppercase");
-    // Catalog renders the path; body is not inlined anymore.
-    expect(text).toContain("loom-skills:greeter/SKILL.md");
-    expect(text).not.toContain("Use greet() then uppercase().");
     expect(text).toContain("# Tool Reference");
+    expect(text).toContain("`greet`");
+    expect(text).toContain("`uppercase`");
     expect(text).toContain("Current date: 2026-01-01");
+    // Skills are gone — no skill catalog section.
+    expect(text).not.toContain("# Available Skills");
   });
 });

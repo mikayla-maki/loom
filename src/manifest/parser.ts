@@ -1,6 +1,6 @@
 /**
- * Parsers for `agent.toml` and `SKILL.md`. Validation only — capability
- * checks and tool construction live in providers.
+ * Parser for `agent.toml`. Validation only — capability checks and
+ * tool construction live in providers.
  *
  * The manifest model is `(name, config)` for tools: each entry's value
  * is an opaque config blob (string or object) that loom hands to the
@@ -10,14 +10,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import TOML from "@iarna/toml";
-import matter from "gray-matter";
 
 import { ManifestError } from "../errors.js";
 import type { ToolConfig } from "../types/interfaces.js";
 import type {
   AgentManifest,
   Capabilities,
-  SkillManifest,
   SystemPromptSpec,
 } from "../types/manifest.js";
 
@@ -62,7 +60,6 @@ export async function parseAgentManifest(
     raw.tools === undefined
       ? undefined
       : parseToolConfigTable(raw.tools, "[tools]", abs);
-  const skills = parseStringValueTable(raw.skills, "[skills]", abs);
   const extensions = parseConfigTable(raw.extensions, "[extensions]", abs);
 
   return {
@@ -79,7 +76,6 @@ export async function parseAgentManifest(
     ...(session ? { session } : {}),
     ...(capabilities ? { capabilities } : {}),
     ...(tools !== undefined ? { tools } : {}),
-    skills,
     extensions,
   };
 }
@@ -97,55 +93,6 @@ function parseSystemPromptSpec(
   throw new ManifestError(
     `agent.toml at ${where}: [agent].system_prompt must be a string or a table { path = "..." } (got ${typeof v})`,
   );
-}
-
-// ─── SKILL.md ──────────────────────────────────────────────────────────────
-
-export async function parseSkillManifest(
-  skillDir: string,
-): Promise<SkillManifest> {
-  const dir = path.resolve(skillDir);
-  const manifestPath = path.join(dir, "SKILL.md");
-  const text = await readFileOrThrow(manifestPath, "SKILL.md");
-  const parsed = matter(text);
-  const data = parsed.data as Record<string, unknown>;
-
-  const name = typeof data.name === "string" ? data.name : null;
-  const description =
-    typeof data.description === "string" ? data.description : null;
-  if (!name) {
-    throw new ManifestError(
-      `SKILL.md at ${manifestPath} missing required frontmatter 'name'`,
-    );
-  }
-  if (!description) {
-    throw new ManifestError(
-      `SKILL.md at ${manifestPath} missing required frontmatter 'description'`,
-    );
-  }
-
-  const requires: Record<string, ToolConfig> = {};
-  if (data.requires != null) {
-    if (typeof data.requires !== "object" || Array.isArray(data.requires)) {
-      throw new ManifestError(
-        `SKILL.md at ${manifestPath}: 'requires' must be a mapping of tool name → config`,
-      );
-    }
-    for (const [k, v] of Object.entries(
-      data.requires as Record<string, unknown>,
-    )) {
-      requires[k] = parseToolConfigValue(v, manifestPath, k);
-    }
-  }
-
-  return {
-    manifestPath,
-    skillDir: dir,
-    name,
-    description,
-    body: parsed.content,
-    requires,
-  };
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -191,25 +138,6 @@ function ensureObject(
   return v as Record<string, unknown>;
 }
 
-/** Tables of `name = "string"` (used for [skills]). */
-function parseStringValueTable(
-  v: unknown,
-  label: string,
-  where: string,
-): Record<string, string> {
-  const obj = ensureObject(v, label, where);
-  const out: Record<string, string> = {};
-  for (const [k, val] of Object.entries(obj)) {
-    if (typeof val !== "string") {
-      throw new ManifestError(
-        `${where}: ${label}.${k} must be a string, got ${typeof val}`,
-      );
-    }
-    out[k] = val;
-  }
-  return out;
-}
-
 /** Tables of `name = { ...config }` (used for [extensions]). */
 function parseConfigTable(
   v: unknown,
@@ -233,9 +161,9 @@ function parseConfigTable(
 }
 
 /**
- * Tables of `name = ToolConfig` (used for [tools] and skills' requires).
- * Each value is `string | Record<string, unknown>` — loom doesn't
- * interpret it; providers do.
+ * Tables of `name = ToolConfig` (used for [tools]). Each value is
+ * `string | Record<string, unknown>` — loom doesn't interpret it;
+ * providers do.
  */
 function parseToolConfigTable(
   v: unknown,

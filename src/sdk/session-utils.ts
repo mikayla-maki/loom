@@ -1,7 +1,7 @@
 /**
  * Session-side utilities.
  *
- * Sessions get the agent's harness via the per-turn `SessionContext`
+ * Sessions get the agent's harness via the per-turn `Agent` ref
  * (passed to `prepareTurn` / `systemPromptSection`) and may want to
  * drive a one-shot model call (compaction, periodic reflection, memory
  * retrieval). Two functions live here:
@@ -15,7 +15,7 @@
  *     what most session code should call.
  *
  * The synthetic runtime exposes the supplied events and prompt; lists
- * no tools and no skills (so the model can't dispatch); collects
+ * no tools (so the model can't dispatch); collects
  * agent_message_chunks; drops everything else (we don't fan
  * compaction-internals out to the live UpdateSink).
  */
@@ -24,7 +24,6 @@ import type { SessionUpdate, StopReason } from "../types/acp.js";
 import type {
   Harness,
   Runtime,
-  SkillDescriptor,
   SummariseArgs,
   ToolCall,
   ToolDescriptor,
@@ -122,10 +121,6 @@ class SyntheticRuntime implements Runtime {
 
   systemPromptCore(): string {
     return this.opts.systemPrompt;
-  }
-
-  listSkills(): SkillDescriptor[] {
-    return [];
   }
 
   listTools(): ToolDescriptor[] {

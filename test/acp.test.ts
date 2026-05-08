@@ -46,7 +46,11 @@ describe("ACP round-trip (in-process streams)", () => {
         provider: "test",
         script: [[{ say: "hi from agent" }, { stop: "end_turn" }]],
       },
-      capabilities: { filesystem: [], network: [], secrets: ["sample_user_name"] },
+      capabilities: {
+        filesystem: [],
+        network: [],
+        secrets: ["sample_user_name"],
+      },
     };
     const agent = await runAgent(spec, {
       secrets: new StaticSecretsStore({ sample_user_name: "ACP" }),
@@ -177,7 +181,6 @@ path = "./session.jsonl"
 filesystem = ["./"]
 network = []
 secrets = []
-[skills]
 `,
       );
 

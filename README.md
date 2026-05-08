@@ -11,17 +11,26 @@ The central abstraction is the **provider chain**: each tool reference
 in the manifest is a `(name, config)` pair, and loom asks each
 provider in turn whether it claims the name. The native provider
 claims the builtins (`bash`, `read_file`, etc.); extension providers
-claim domain-specific tools (S3, Discord, MCP). Skills are loom's
-concern; capabilities are tool-defined; sandboxing is each tool's own
-responsibility (or its provider's, when the tool needs real isolation).
+claim domain-specific tools (S3, Discord, MCP). Capabilities are
+tool-defined; sandboxing is each tool's own responsibility (or its
+provider's, when the tool needs real isolation).
+
+Loom does NOT model skills. "Skills" — the bundled instruction +
+tool-requirement + sub-agent format Anthropic's docs describe — are
+a client-level concept that compiles down to Loom primitives (tools
+and sub-agents). A future `loom-skills` library will adapt the
+Anthropic SKILL.md format and ship as a session-factory extension;
+Loom proper stays focused on the runtime.
 
 ## Status
 
-- **Single `AgentManifest` type** — file-parsed (`agent.toml` +
-  `SKILL.md`) or constructed in-memory.
+- **Single `AgentManifest` type** — parsed from `agent.toml` or
+  constructed in-memory.
 - **Tools are JS objects.** Each builtin lives in
   `src/runtime/builtins/`. There's no on-disk tool format; extensions
   ship tools as code in npm packages.
+- **Sub-agents** are first-class: `Agent.spawnSubagent`,
+  `dependencies.subagents`, audit recursion, parent-derived providers.
 - **Per-tool capability declarations** — each tool advertises its own
   capability shape (e.g. `read_file` uses `{ paths: [...] }`). Loom
   doesn't interpret the shape; tools self-police at execute time.
@@ -29,25 +38,27 @@ responsibility (or its provider's, when the tool needs real isolation).
   same shape. When present, each tool's declared caps must fit inside
   the matching entry, using the tool's own `capabilitiesContain` (or a
   structural deep-subset default).
-- **Session extensions:** `file` (JSONL append log) and `memory` (in-process,
-  the default if `[session]` is absent).
+- **Session extensions:** `file` (JSONL append log), `memory`
+  (in-process, the default if `[session]` is absent), `compacting`,
+  `fork-of-parent`.
 - **Harness extensions:** `test` (deterministic, scripted), `anthropic`
-  (Messages API), `openai` (Chat Completions).
+  (Messages API), `openai` (Chat Completions),
+  `small-model-of-parent`.
 - **Builtin tools:** `bash`, `echo`, `read_file`, `write_file`, `find`,
-  `search_skills`.
+  `spawn_subagent` (opt-in).
 - **CLI:** `loom run`, `loom prompt`, `loom audit`, `loom acp serve`,
   `loom install`, `loom list`, `loom extensions`.
-- **`LocalRegistry`** at `~/.loom/skills/` for bare-name skill
-  resolution (tools come from code, not disk).
+- **`LocalRegistry`** at `~/.loom/{tools,agents}/` for bare-name
+  resolution.
 - **ACP wire protocol** (server + client + `connectAcpUrl` for `acp://`
   and `acp+unix://` URLs).
 
 ### Architecture
 
 Loom owns: manifest parsing, secrets, system-prompt assembly,
-`[capabilities]` validation, the turn loop, and skills (loading SKILL.md,
-resolving the `requires:` map). Providers own: building Tool objects
-from `(name, config)` references, and any state those tools need.
+`[capabilities]` validation, and the turn loop. Providers own:
+building Tool objects from `(name, config)` references, and any state
+those tools need.
 
 The trust model is the install boundary. Tools and extension providers
 are code the user installed (the loom package itself for builtins; an
@@ -57,8 +68,8 @@ tools that need real isolation own their sandbox setup (e.g. a future
 a sandbox.
 
 What is intentionally not yet implemented: OS-level sandbox
-enforcement, subagent invocation (one agent calling another), and tool
-or skill distribution beyond the per-project `[extensions]` mechanism.
+enforcement, the `loom-skills` library, and tool / agent distribution
+beyond the per-project `[extensions]` mechanism.
 
 ## Install / develop
 
@@ -104,7 +115,7 @@ await runAgent({
 });
 ```
 
-## Top-level `[tools]` and skills
+## Top-level `[tools]`
 
 ```toml
 [agent]
@@ -126,30 +137,7 @@ read_file = { paths = ["./src", "./test"] }
 ```
 
 The `tools` value is `string | Record<string, unknown>` — loom doesn't
-interpret it; the claiming provider does. Top-level tools are
-*additive* with skills' `requires:` — a skill that brings `bash` is
-fine even if `bash` isn't listed at the top level. A name appearing in
-BOTH is a hard error (no silent shadowing).
-
-Skills and tools can also be declared inline in the JS shape:
-
-```ts
-await runAgent({
-  name: "delegator",
-  harness: { provider: "test", script: [/* ... */] },
-  tools: { bash: {} },
-  skills: {
-    research: {
-      description: "Web research.",
-      body: "...",
-      requires: { fetch: { hosts: ["api.example.com"] } },
-    },
-  },
-});
-```
-
-Map keys (`research`, `fetch`) are the canonical names. Skills can mix
-string refs (path or registry name) with inline manifests.
+interpret it; the claiming provider does.
 
 ## File-based agents
 
@@ -196,7 +184,7 @@ node dist/cli/main.js prompt test/fixtures/sample-agent/agent.toml "hi"
   present, each tool's declared caps must fit inside the matching
   entry, checked at boot via the tool's `capabilitiesContain` (or a
   structural deep-subset default). Use it as a defense-in-depth rail
-  against a skill bringing a tool with looser caps than you intended.
+  against an extension bringing a tool with looser caps than you intended.
 
 
 

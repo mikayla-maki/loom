@@ -8,15 +8,13 @@
  *   4. Build runtime primitives (the methods that flow into ToolContext).
  *   5. Instantiate providers: SDK-supplied → extension-loaded → native (last).
  *      Call optional `provider.init()` on each.
- *   6. Walk `[skills]`: load SKILL.md for path/registry refs, normalize inline.
- *   7. Build the flat tool-ref list: top-level `[tools]` (with default builtin
- *      set when absent) + every skill's `requires:`. Detect top-level/skill
- *      collisions (hard error).
- *   8. For each `(name, config)` ref, walk providers in order; first non-null
- *      result wins. Throw if no provider claims the name.
- *   9. Phase-2 secrets (per-tool secret needs from resolved Tools).
- *  10. Validate `[capabilities.<name>]` ceilings against each tool's declared caps.
- *  11. Build ToolTable + AgentState + RunningAgent.
+ *   6. Build the flat tool-ref list from top-level `[tools]` (with the
+ *      default builtin set when the field is absent).
+ *   7. For each `(name, config)` ref, walk providers in order; first
+ *      non-null result wins. Throw if no provider claims the name.
+ *   8. Phase-2 secrets (per-tool secret needs from resolved Tools).
+ *   9. Validate `[capabilities.<name>]` ceilings against each tool's declared caps.
+ *  10. Build ToolTable + AgentState + RunningAgent.
  *
  * Tools are JS objects, fully constructed by providers. Loom doesn't
  * sandbox tools at runtime; tools enforce their own declared caps.
@@ -30,16 +28,9 @@ import {
   type LoadOptions,
 } from "../extensions/loader.js";
 import { nativeProviderFactory } from "../extensions/provider/native.js";
-import { LocalRegistry } from "../registry/registry.js";
 import { resolveSystemPrompt } from "../manifest/resolver.js";
-import { parseSkillManifest } from "../manifest/parser.js";
 import { assertCapabilities } from "../manifest/capabilities.js";
 import { AgentState } from "../runtime/agent-state.js";
-import {
-  pathForSkill,
-  renderVirtualSkillFile,
-  virtualSkillPath,
-} from "../runtime/skill-paths.js";
 import { ToolTable } from "../runtime/tool-table.js";
 import { UpdateSink } from "../runtime/update-sink.js";
 import {
@@ -51,7 +42,7 @@ import {
   XDGSecretsStore,
   type SecretsStore,
 } from "../runtime/secrets.js";
-import { ManifestError, ResolutionError, SecretError } from "../errors.js";
+import { ResolutionError, SecretError } from "../errors.js";
 import type {
   Agent,
   ExtensionContext,
@@ -62,7 +53,6 @@ import type {
   RuntimePrimitives,
   SecretNeeds,
   Session,
-  SkillSummary,
   Tool,
   ToolConfig,
 } from "../types/interfaces.js";
@@ -75,7 +65,6 @@ import type {
   AgentManifest,
   Capabilities,
   SessionSpec,
-  SkillManifest,
 } from "../types/manifest.js";
 
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
@@ -195,12 +184,11 @@ export async function runAgent(
   // receive an `Agent` ref directly when they're called — nothing is
   // bound at boot. RunningAgentImpl builds the ref on each prompt()
   // and passes it through.
-  const sessionSkills = await collectSessionSkills(session);
 
   // The owning `Agent` ref. Stable across turns; the harness/session
-  // refs in it are the same instances RunningAgent uses. We expose it
-  // via `RuntimePrimitives.agent` so providers can stash it during
-  // `init()` and wire it into their tools' contexts.
+  // refs in it are the same instances RunningAgent uses. Tools see a
+  // tool-scoped variant via `ctx.agent`; providers receive this
+  // ref directly via `resolveTool(name, config, agent)`.
   const ownAgent: Agent = {
     harness,
     session,
@@ -259,50 +247,14 @@ export async function runAgent(
     await Promise.resolve(p.instance.init(initArgs));
   }
 
-  // ─── 8. Walk [skills] ───────────────────────────────────────────────
-  const registry = new LocalRegistry();
-  const skills: SkillManifest[] = [...sessionSkills];
-  for (const [skillKey, skillRef] of Object.entries(manifest.skills ?? {})) {
-    const skill = await loadSkill(skillKey, skillRef, baseDir, registry);
-    skills.push(skill);
-  }
-
-  // ─── 9. Build flat tool-ref list ────────────────────────────────────
-  // Top-level [tools] (with defaults if absent) + every skill's requires.
-  // Detect top-level/skill collisions (hard error).
+  // ─── 8. Build flat tool-ref list ───────────────────────────
   const topLevelSpec = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
   const refs: Array<{ name: string; config: ToolConfig; origin: string }> = [];
-  const seenNames = new Map<string, string>(); // name → origin
   for (const [name, config] of Object.entries(topLevelSpec)) {
     refs.push({ name, config, origin: TOP_LEVEL_INTRODUCER });
-    seenNames.set(name, TOP_LEVEL_INTRODUCER);
-  }
-  for (const skill of skills) {
-    for (const [name, config] of Object.entries(skill.requires ?? {})) {
-      const prior = seenNames.get(name);
-      if (prior !== undefined) {
-        throw new ResolutionError(
-          `Tool '${name}' is declared at the top level AND brought in by skill '${skill.name}'. Top-level [tools] is additive; remove the top-level entry or rename one of them to avoid the collision.`,
-        );
-      }
-      refs.push({ name, config, origin: skill.name ?? "(unnamed-skill)" });
-      seenNames.set(name, skill.name ?? "(unnamed-skill)");
-    }
   }
 
-  // ─── 9a. Augment read_file with skill awareness ───────────────
-  // Real on-disk skill dirs get appended to read_file's `paths` so
-  // the tool can read SKILL.md and bundled resources without the
-  // author having to manually allowlist each. Inline skills get
-  // synthesised SKILL.md bytes registered under their
-  // `loom-skills:<name>/SKILL.md` URI in the tool's virtual map.
-  augmentReadFileForSkills(refs, skills);
-  // The ceiling has to grow with the tool's effective paths, or the
-  // post-resolution `assertCapabilities` check will reject the
-  // skill-derived dirs we just added.
-  augmentReadFileCeilingForSkills(manifest, skills);
-
-  // ─── 10. Resolve each ref through the provider chain ────────────
+  // ─── 9. Resolve each ref through the provider chain ────────────
   const resolvedTools = new Map<string, Tool>();
   for (const ref of refs) {
     let claimed: Tool | null = null;
@@ -328,7 +280,7 @@ export async function runAgent(
     resolvedTools.set(ref.name, claimed);
   }
 
-  // ─── 11. Phase-2 secrets ────────────────────────────────────────────
+  // ─── 10. Phase-2 secrets ──────────────────────────────────
   const toolNeeds = collectToolSecretNeeds(resolvedTools);
   const phase2Secrets = await loadSecretsBundle(
     store,
@@ -338,15 +290,11 @@ export async function runAgent(
   );
   const allSecrets = { ...phase1Secrets, ...phase2Secrets };
 
-  // ─── 12. Validate [capabilities.<name>] ceilings ──────────────
-  // (read_file's ceiling was already extended with skill dirs in step 9a.)
+  // ─── 11. Validate [capabilities.<name>] ceilings ──────────────
   const ceiling: Capabilities = manifest.capabilities ?? {};
   assertCapabilities(resolvedTools, ceiling);
 
-  // ─── 13. Build skill summaries (for ctx.searchSkills) ───────────────
-  runtimeServices.setSkills(buildSkillSummaries(skills));
-
-  // ─── 14. Build ToolTable + AgentState ───────────────────────────────
+  // ─── 12. Build ToolTable + AgentState ─────────────────────
   const toolTable = new ToolTable({
     tools: [...resolvedTools.values()].map((tool) => ({
       tool,
@@ -361,7 +309,6 @@ export async function runAgent(
         secrets: {}, // overridden by ToolTable per-call
         abortSignal: runtimeServices.currentAbortSignal(),
         requestPermission: (req) => runtime.requestPermission(req),
-        searchSkills: (q) => runtime.searchSkills(q),
         // The Agent ref handed to the tool. Same data as `ownAgent`
         // but with a tool-scoped `spawnSubagent` closure — lookups by
         // name resolve against THIS tool's `dependencies.subagents`.
@@ -371,7 +318,6 @@ export async function runAgent(
   });
 
   const state = new AgentState({
-    skills,
     ceiling,
     toolTable,
   });
@@ -395,16 +341,11 @@ export async function runAgent(
 // ─── runtime services (the RuntimePrimitives implementation) ───────────
 
 class RuntimeServicesImpl implements RuntimePrimitives {
-  private skillSet: SkillSummary[] = [];
   private abortSignal: AbortSignal = new AbortController().signal;
 
   constructor(
     private readonly permissionHolder: { current: PermissionHandler | null },
   ) {}
-
-  setSkills(skills: SkillSummary[]): void {
-    this.skillSet = skills;
-  }
 
   /** Called by RunningAgent at the start of each turn. */
   setAbortSignal(signal: AbortSignal): void {
@@ -420,193 +361,9 @@ class RuntimeServicesImpl implements RuntimePrimitives {
     if (!handler) return Promise.resolve({ decision: "deny" });
     return Promise.resolve(handler(req));
   }
-
-  async searchSkills(query?: string): Promise<SkillSummary[]> {
-    if (!query) return this.skillSet;
-    const q = query.toLowerCase();
-    return this.skillSet.filter(
-      (s) =>
-        s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q),
-    );
-  }
 }
 
 export type { RuntimeServicesImpl };
-
-/**
- * Mutate the `read_file` ref's config (if present) so it knows about
- * loaded skills:
- *   - On-disk skills' `skillDir` is appended to `paths` so the tool
- *     can read SKILL.md plus any bundled resources the body
- *     references.
- *   - Inline skills get an entry in `virtualSkills`, keyed by
- *     `loom-skills:<name>/SKILL.md`, with the synthesised SKILL.md
- *     bytes (frontmatter re-emitted so on-disk and inline are
- *     byte-shaped the same way).
- *
- * No-op when there are no skills, or no read_file ref. (An agent
- * can opt out of skill-via-read_file by simply not declaring
- * read_file; loom won't be able to surface bundled resources in
- * that case, but the catalog still lists what's there.)
- */
-function augmentReadFileForSkills(
-  refs: Array<{ name: string; config: ToolConfig; origin: string }>,
-  skills: SkillManifest[],
-): void {
-  if (skills.length === 0) return;
-  const ref = refs.find((r) => r.name === "read_file");
-  if (!ref) return;
-  const skillDirs: string[] = [];
-  const virtualSkills: Record<string, string> = {};
-  for (const sk of skills) {
-    if (sk.skillDir) {
-      skillDirs.push(sk.skillDir);
-    } else if (sk.name) {
-      virtualSkills[virtualSkillPath(sk.name)] = renderVirtualSkillFile(sk);
-    }
-  }
-  // Normalise into the object form so we can splice the new fields
-  // in regardless of which shape the manifest used.
-  const cfg =
-    typeof ref.config === "string"
-      ? ({} as Record<string, unknown>)
-      : { ...(ref.config as Record<string, unknown>) };
-  if (skillDirs.length > 0) {
-    const existingPaths = readPathsFromConfig(cfg);
-    cfg.paths = [...existingPaths, ...skillDirs];
-    // If caps were nested under `capabilities.paths`, mirror the
-    // change there too so whichever shape the tool reads sees the
-    // same paths.
-    if (cfg.capabilities && typeof cfg.capabilities === "object") {
-      const caps = cfg.capabilities as Record<string, unknown>;
-      caps.paths = [...existingPaths, ...skillDirs];
-    }
-  }
-  if (Object.keys(virtualSkills).length > 0) {
-    cfg.virtualSkills = virtualSkills;
-  }
-  ref.config = cfg;
-}
-
-function readPathsFromConfig(cfg: Record<string, unknown>): string[] {
-  const top = cfg.paths;
-  if (Array.isArray(top) && top.every((x) => typeof x === "string")) {
-    return top as string[];
-  }
-  const caps = cfg.capabilities as { paths?: unknown } | undefined;
-  if (
-    caps &&
-    Array.isArray(caps.paths) &&
-    caps.paths.every((x) => typeof x === "string")
-  ) {
-    return caps.paths as string[];
-  }
-  return [];
-}
-
-/**
- * Mirror the `read_file.paths` extension into the manifest's
- * `[capabilities.read_file]` ceiling so `assertCapabilities`
- * doesn't reject the skill dirs the tool now legitimately reads
- * from. Only touches the entry when one is already declared — if
- * the author didn't set a ceiling, we leave it absent (no ceiling =
- * no check).
- */
-function augmentReadFileCeilingForSkills(
-  manifest: AgentManifest,
-  skills: SkillManifest[],
-): void {
-  const dirs = skills
-    .map((s) => s.skillDir)
-    .filter((d): d is string => typeof d === "string" && d.length > 0);
-  if (dirs.length === 0) return;
-  if (!manifest.capabilities) return;
-  const entry = manifest.capabilities.read_file;
-  if (!entry || typeof entry !== "object") return;
-  const e = entry as { paths?: unknown };
-  const existing = Array.isArray(e.paths) ? (e.paths as string[]) : [];
-  e.paths = [...existing, ...dirs];
-}
-
-function buildSkillSummaries(skills: SkillManifest[]): SkillSummary[] {
-  const out: SkillSummary[] = [];
-  for (const skill of skills) {
-    if (!skill.name) continue;
-    out.push({
-      name: skill.name,
-      description: skill.description,
-      toolNames: Object.keys(skill.requires ?? {}),
-      path: pathForSkill(skill),
-    });
-  }
-  return out;
-}
-
-// ─── skill loading ───────────────────────────────────────────────────────
-
-async function loadSkill(
-  skillKey: string,
-  ref: string | SkillManifest,
-  baseDir: string,
-  registry: LocalRegistry,
-): Promise<SkillManifest> {
-  if (typeof ref !== "string") {
-    return normalizeInlineSkill(skillKey, ref);
-  }
-  const dir = await resolveSkillPath(ref, baseDir, registry);
-  const skill = await parseSkillManifest(dir);
-  if (skill.name !== undefined && skill.name !== skillKey) {
-    throw new ManifestError(
-      `Skill at '${dir}' has name '${skill.name}'; the agent.toml [skills] key '${skillKey}' must agree.`,
-    );
-  }
-  return { ...skill, name: skillKey };
-}
-
-function normalizeInlineSkill(
-  skillKey: string,
-  spec: SkillManifest,
-): SkillManifest {
-  if (spec.name !== undefined && spec.name !== skillKey) {
-    throw new ManifestError(
-      `Inline skill '${skillKey}' has name '${spec.name}'; the map key and the explicit name must agree (or omit the name).`,
-    );
-  }
-  return { ...spec, name: skillKey, body: spec.body ?? "" };
-}
-
-async function resolveSkillPath(
-  ref: string,
-  baseDir: string,
-  registry: LocalRegistry,
-): Promise<string> {
-  const fs = await import("node:fs/promises");
-  if (isPathLike(ref)) {
-    const p = path.resolve(baseDir, ref);
-    try {
-      if ((await fs.stat(p)).isDirectory()) return p;
-    } catch {
-      /* fall through */
-    }
-    throw new ResolutionError(
-      `Skill path does not exist or is not a directory: ${p}`,
-    );
-  }
-  const r = await registry.lookup("skill", ref);
-  if (r) return r;
-  throw new ResolutionError(`Cannot resolve skill '${ref}' from ${baseDir}`);
-}
-
-function isPathLike(s: string): boolean {
-  return (
-    s.startsWith("./") ||
-    s.startsWith("../") ||
-    s.startsWith("/") ||
-    s.startsWith("~") ||
-    /^[A-Za-z]:[\\/]/.test(s)
-  );
-}
 
 // ─── secrets pipeline ────────────────────────────────────────────────────
 
@@ -913,14 +670,6 @@ async function spawnSubagentInScope(
     submanifest = nameOrManifest;
   }
   return runAgent(submanifest, { parent });
-}
-
-async function collectSessionSkills(
-  session: Session,
-): Promise<SkillManifest[]> {
-  if (!session.skills) return [];
-  const r = session.skills();
-  return Array.isArray(r) ? r : await r;
 }
 
 // ─── extensions ──────────────────────────────────────────────────────────

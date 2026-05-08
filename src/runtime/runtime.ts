@@ -9,7 +9,6 @@ import { randomUUID } from "node:crypto";
 import type {
   Runtime,
   Session,
-  SkillDescriptor,
   ToolCall,
   ToolDescriptor,
   ToolResult,
@@ -19,7 +18,6 @@ import type { SessionUpdate } from "../types/acp.js";
 import type { AgentState } from "./agent-state.js";
 import { assembleSystemPrompt } from "./system-prompt.js";
 import type { UpdateSink } from "./update-sink.js";
-import { pathForSkill } from "./skill-paths.js";
 
 export interface RuntimeImplOptions {
   session: Session;
@@ -61,7 +59,6 @@ export class RuntimeImpl implements Runtime {
   systemPrompt(): string {
     return assembleSystemPrompt({
       core: this.opts.systemPromptCore,
-      skills: this.listSkills(),
       tools: this.listTools(),
       agentName: this.opts.agentName,
       ...(this.opts.agentDescription
@@ -76,16 +73,6 @@ export class RuntimeImpl implements Runtime {
 
   systemPromptCore(): string {
     return this.opts.systemPromptCore;
-  }
-
-  listSkills(): SkillDescriptor[] {
-    return this.opts.state.skills.map((s) => ({
-      name: s.name ?? "",
-      description: s.description,
-      body: s.body ?? "",
-      toolNames: Object.keys(s.requires ?? {}),
-      path: pathForSkill(s),
-    }));
   }
 
   listTools(): ToolDescriptor[] {
