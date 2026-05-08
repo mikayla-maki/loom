@@ -34,6 +34,7 @@
 
 import type {
   ExtensionContext,
+  Harness,
   Session,
   SessionContext,
   SessionFactory,
@@ -47,13 +48,14 @@ export interface Compactor {
    * return any sequence of well-formed updates; loom will splice the
    * result in front of the kept tail.
    *
-   * `ctx` is the per-turn SessionContext that triggered compaction, or
-   * `null` when compaction was forced standalone (e.g. from a test
-   * calling `compactNow()` directly).
+   * `harness` is the harness available for model-driven compaction (the
+   * parent agent's harness when called via `prepareTurn`, or whatever
+   * the caller passed to `compactNow`). May be null — compactors that
+   * need a model fall back to a heuristic in that case.
    */
   (
     oldEvents: SessionUpdate[],
-    ctx: SessionContext | null,
+    harness: Harness | null,
   ): Promise<SessionUpdate[]> | SessionUpdate[];
 }
 
@@ -149,7 +151,7 @@ export class CompactingSession implements Session {
    */
   async prepareTurn(ctx: SessionContext): Promise<void> {
     if (this.shouldCompact()) {
-      await this.runCompaction(ctx, false);
+      await this.runCompaction(ctx.harness, false);
     }
   }
 
@@ -164,17 +166,17 @@ export class CompactingSession implements Session {
   /**
    * Force a compaction pass regardless of the threshold. Useful for
    * tests and for sessions that want to expose a manual compaction
-   * trigger. Pass a SessionContext if the chosen compactor needs one
-   * (the model compactor falls back to heuristic on null).
+   * trigger. Pass a harness if the chosen compactor needs one (the
+   * model compactor falls back to heuristic on null).
    */
   async compactNow(
-    ctx: SessionContext | null = null,
+    harness: Harness | null = null,
   ): Promise<{ before: number; after: number } | null> {
-    return this.runCompaction(ctx, true);
+    return this.runCompaction(harness, true);
   }
 
   private async runCompaction(
-    ctx: SessionContext | null,
+    harness: Harness | null,
     force: boolean,
   ): Promise<{ before: number; after: number } | null> {
     if (this.compacting) return null;
@@ -187,7 +189,7 @@ export class CompactingSession implements Session {
     this.compacting = true;
     try {
       const slice = this.events.slice(0, cutoff);
-      const replacement = await Promise.resolve(this.compactor(slice, ctx));
+      const replacement = await Promise.resolve(this.compactor(slice, harness));
       this.events = [...replacement, ...this.events.slice(cutoff)];
     } finally {
       this.compacting = false;
@@ -251,7 +253,7 @@ export function adjustForToolPairs(
  * (so the model sees it as conversation), the agent acknowledges with a
  * one-line-per-event recap.
  */
-export const heuristicCompactor: Compactor = (events, _ctx = null) => {
+export const heuristicCompactor: Compactor = (events, _harness = null) => {
   const lines: string[] = [];
   for (const e of events) {
     const line = summarizeOne(e);
@@ -330,9 +332,15 @@ export interface ModelCompactorOptions {
    */
   instruction?: string;
   /**
-   * If the bound runtime is unavailable (no harness, or `bindRuntime`
-   * was never called), fall back to this compactor instead of failing.
-   * Defaults to `heuristicCompactor`.
+   * Optional system prompt for the summarisation turn. Default is
+   * empty — we want a neutral summary, not one staying in the parent
+   * agent's persona. Override when you need domain-specific framing.
+   */
+  systemPrompt?: string;
+  /**
+   * If no harness is available (compaction triggered standalone with
+   * `compactNow()` and no harness arg), fall back to this compactor
+   * instead of failing. Defaults to `heuristicCompactor`.
    */
   fallback?: Compactor;
 }
@@ -344,27 +352,24 @@ const DEFAULT_MODEL_INSTRUCTION =
   "that came up, and any unfinished work. Plain prose. No headings.";
 
 /**
- * Build a Compactor that uses the bound harness to summarise the slice
- * (via `summarise(harness, ...)` — native if the harness implements
- * it, fallback via `summariseViaRun` otherwise) and splices the result
- * into the log as a synthetic user→agent pair.
+ * Build a Compactor that drives the supplied harness to summarise the
+ * slice (via `summarise(harness, ...)` — native if the harness
+ * implements it, fallback via `summariseViaRun` otherwise) and splices
+ * the result into the log as a synthetic user→agent pair.
  *
- * If no context is bound (the session was constructed standalone with
- * no harness behind it), falls back to a heuristic compactor.
+ * If no harness is supplied (the compactor was called with `null`),
+ * falls back to a heuristic compactor.
  */
 export function modelCompactor(opts: ModelCompactorOptions = {}): Compactor {
   const instruction = opts.instruction ?? DEFAULT_MODEL_INSTRUCTION;
+  const systemPrompt = opts.systemPrompt ?? "";
   const fallback = opts.fallback ?? heuristicCompactor;
-  return async (events, ctx) => {
-    if (!ctx) return fallback(events, ctx);
+  return async (events, harness) => {
+    if (!harness) return fallback(events, harness);
     const summary = (
-      await summarise(ctx.harness, {
-        events,
-        instruction,
-        systemPrompt: ctx.systemPromptCore,
-      })
+      await summarise(harness, { events, instruction, systemPrompt })
     ).trim();
-    if (!summary) return fallback(events, ctx);
+    if (!summary) return fallback(events, harness);
     return [
       {
         sessionUpdate: "user_message_chunk",

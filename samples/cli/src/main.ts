@@ -29,7 +29,6 @@ import {
   AnthropicHarness,
   type AgentManifest,
   type RunParameters,
-  type SessionContext,
 } from "loom";
 
 import { runCli, type SlashCommand } from "./cli.js";
@@ -154,15 +153,7 @@ async function main(): Promise<void> {
     name: "compact",
     description: "force a compaction pass right now",
     handler: async () => {
-      const ctx: SessionContext = {
-        harness,
-        systemPromptCore,
-        agentName: manifest.name,
-        ...(manifest.description
-          ? { agentDescription: manifest.description }
-          : {}),
-      };
-      const result = await session.compactNow(ctx);
+      const result = await session.compactNow(harness);
       if (result) {
         stdout.write(
           `${ansi.dim}(compacted: ${result.before} → ${result.after} events)${ansi.reset}\n`,

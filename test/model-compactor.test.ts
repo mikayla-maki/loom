@@ -59,7 +59,9 @@ describe("modelCompactor + Session.prepareTurn", () => {
         called = true;
         expect(args.events.length).toBeGreaterThan(0);
         expect(args.instruction).toMatch(/summari[sz]ing/i);
-        expect(args.systemPrompt).toBe("test-core");
+        // modelCompactor uses an empty systemPrompt by default — we want
+        // a neutral summary, not one in the parent agent's persona.
+        expect(args.systemPrompt).toBe("");
         return "everything is fine, carry on";
       },
     };
