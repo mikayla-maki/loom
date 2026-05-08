@@ -46,9 +46,10 @@ import {
   XDGSecretsStore,
   type SecretsStore,
 } from "../runtime/secrets.js";
-import { ResolutionError, SecretError } from "../errors.js";
+import { CapabilityError, ResolutionError, SecretError } from "../errors.js";
 import type {
   Agent,
+  AuditFinding,
   ExtensionContext,
   Harness,
   Provider,
@@ -125,6 +126,30 @@ export interface RunAgentOptions {
   providers?: Provider[];
   /** Capability-expansion / consent gate. Defaults to deny-all. */
   permissionHandler?: PermissionHandler;
+  /**
+   * Hook for non-error environment-audit findings (severity "ok" or
+   * "warning") collected from each tool's `Tool.audit()` at boot.
+   * Errors throw a `CapabilityError` and never reach this callback;
+   * warnings/oks are surfaced here so SDK consumers can log them,
+   * show them in their UI, etc. CLI clients typically print warnings
+   * to stderr; embedded callers might ignore them.
+   *
+   * When the option is omitted, warnings are silently dropped (only
+   * errors block boot). Run `loom audit` for the full picture.
+   */
+  onAuditFinding?: (
+    finding: AuditFinding & { tool: string },
+  ) => void | Promise<void>;
+  /**
+   * Skip the runtime environment audit. The static manifest checks
+   * (assertRequires, assertKnownKinds, assertSecretAllowlist) still
+   * run; this only disables the per-tool `Tool.audit()` step that
+   * surfaces things like "sandbox-exec is missing".
+   *
+   * Off by default. Set true if you want the SDK to never make IO
+   * calls (`fs.access`, etc.) at boot, e.g. in test fixtures.
+   */
+  skipRuntimeAudit?: boolean;
   /** Extension-package search-path overrides (used in tests). */
   extensionLoadOptions?: LoadOptions;
   /** Test hook: deterministic 'now' for system-prompt assembly. */
@@ -344,6 +369,16 @@ export async function runAgent(
   assertRequires(resolvedTools, effectiveCapabilities);
   assertSecretAllowlist(resolvedTools, manifest.secrets);
 
+  // ─── 11b. Runtime environment audit ───────────────────────
+  // Each tool's `audit()` reports environment-readiness preconditions
+  // (e.g. "bwrap not installed"). Error-severity findings throw at boot;
+  // warnings flow to options.onAuditFinding for the SDK consumer to
+  // surface (or ignore). Static manifest issues are caught above; this
+  // catches things only knowable at runtime.
+  if (!options.skipRuntimeAudit) {
+    await runRuntimeAudit(resolvedTools, options.onAuditFinding);
+  }
+
   // ─── 12. Build ToolTable + AgentState ─────────────────────
   const toolTable = new ToolTable({
     tools: [...resolvedTools.values()].map((tool) => ({
@@ -388,7 +423,61 @@ export async function runAgent(
   });
 }
 
-// ─── runtime services (the RuntimePrimitives implementation) ───────────
+/**
+ * Run each tool's `Tool.audit()`, throw on `error` severity, surface
+ * `ok` / `warning` via the optional callback. Aggregates errors
+ * across all tools so the user sees every issue at once instead of
+ * fixing one and discovering the next.
+ */
+async function runRuntimeAudit(
+  tools: Map<string, Tool>,
+  onFinding: RunAgentOptions["onAuditFinding"],
+): Promise<void> {
+  const errors: Array<{ tool: string; finding: AuditFinding }> = [];
+  for (const [name, tool] of tools) {
+    if (typeof tool.audit !== "function") continue;
+    let findings: AuditFinding[] = [];
+    try {
+      const result = await Promise.resolve(tool.audit());
+      if (Array.isArray(result)) findings = result;
+    } catch (e) {
+      findings = [
+        {
+          severity: "error",
+          message: `tool.audit() threw: ${(e as Error).message}`,
+        },
+      ];
+    }
+    for (const finding of findings) {
+      if (finding.severity === "error") {
+        errors.push({ tool: name, finding });
+        continue;
+      }
+      if (onFinding) {
+        await Promise.resolve(onFinding({ tool: name, ...finding }));
+      }
+    }
+  }
+  if (errors.length > 0) {
+    const summary = errors
+      .map((e) => {
+        const r = e.finding.remediation
+          ? `\n    → ${e.finding.remediation}`
+          : "";
+        return `  ✗ ${e.tool}: ${e.finding.message}${r}`;
+      })
+      .join("\n");
+    throw new CapabilityError(
+      `Runtime environment audit failed for ${errors.length} tool${
+        errors.length === 1 ? "" : "s"
+      }:\n${summary}`,
+      Object.fromEntries(errors.map((e) => [e.tool, e.finding.message])),
+      {},
+    );
+  }
+}
+
+// ─── runtime services (the RuntimePrimitives implementation) ───────
 
 class RuntimeServicesImpl implements RuntimePrimitives {
   private abortSignal: AbortSignal = new AbortController().signal;

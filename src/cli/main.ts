@@ -17,6 +17,27 @@ import { TextRenderer } from "./renderer.js";
 import { auditAgent, formatCapabilityTree } from "../audit/audit.js";
 import { ttyPermissionHandler } from "./permissions.js";
 import { ttyMissingSecretHandler } from "./secret-prompt.js";
+import type { AuditFinding } from "../types/interfaces.js";
+
+/**
+ * Runtime audit findings from `Tool.audit()` get printed to stderr
+ * with severity-colored icons. Errors don't reach this hook — they
+ * throw at boot — so we only see ok / warning here.
+ */
+function stderrAuditPrinter(plain: boolean) {
+  const dim = plain ? "" : "\x1b[2m";
+  const yellow = plain ? "" : "\x1b[33m";
+  const reset = plain ? "" : "\x1b[0m";
+  return (f: AuditFinding & { tool: string }): void => {
+    if (f.severity === "warning") {
+      process.stderr.write(`${yellow}⚠${reset} ${f.tool}: ${f.message}\n`);
+      if (f.remediation) {
+        process.stderr.write(`  ${dim}→ ${f.remediation}${reset}\n`);
+      }
+    }
+    // ok findings are silent at the CLI; visible via `loom audit`.
+  };
+}
 
 async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
@@ -79,6 +100,7 @@ async function cmdRun(args: string[]): Promise<number> {
   const agent = await runAgent(manifestPath, {
     permissionHandler: ttyPermissionHandler(),
     onMissingSecret: ttyMissingSecretHandler(),
+    onAuditFinding: stderrAuditPrinter(!!opts.flags["no-colors"]),
   });
   const renderer = new TextRenderer({
     useColors: !opts.flags["no-colors"],
@@ -141,6 +163,7 @@ async function cmdPrompt(args: string[]): Promise<number> {
   const agent = await runAgent(manifestPath, {
     permissionHandler: ttyPermissionHandler(),
     onMissingSecret: ttyMissingSecretHandler(),
+    onAuditFinding: stderrAuditPrinter(!!opts.flags["no-colors"]),
   });
   const renderer = new TextRenderer({
     useColors: !opts.flags["no-colors"],
