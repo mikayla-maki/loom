@@ -46,11 +46,8 @@ describe("ACP round-trip (in-process streams)", () => {
         provider: "test",
         script: [[{ say: "hi from agent" }, { stop: "end_turn" }]],
       },
-      capabilities: {
-        filesystem: [],
-        network: [],
-        secrets: ["sample_user_name"],
-      },
+      // No tools, no caps needed.
+      capabilities: {},
     };
     const agent = await runAgent(spec, {
       secrets: new StaticSecretsStore({ sample_user_name: "ACP" }),
@@ -169,6 +166,7 @@ describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
         `[agent]
 name = "acp-sample"
 system_prompt = "./identity.md"
+secrets = []
 [tools]
 
 [harness]
@@ -177,10 +175,6 @@ echo = true
 [session]
 provider = "file"
 path = "./session.jsonl"
-[capabilities]
-filesystem = ["./"]
-network = []
-secrets = []
 `,
       );
 

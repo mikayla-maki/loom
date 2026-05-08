@@ -1,8 +1,14 @@
 /**
  * `find` — list files in a directory tree matching a glob pattern.
  *
- * Capabilities:
- *   { paths: string[] }   — directory roots the search is allowed under.
+ * Capability kinds:
+ *   optional: ["paths"]
+ *
+ * Star/list/absent semantics:
+ *   paths absent  → smart default `["./"]` (project root)
+ *   paths = "*"   → unrestricted
+ *   paths = []    → explicit no-access (every call fails)
+ *   paths = [...] → allowlist of absolute path roots
  *
  * Glob: `*` matches any non-/ chars; `**` matches any depth.
  */
@@ -16,9 +22,10 @@ import type {
   ToolContext,
   ToolResult,
 } from "../../types/interfaces.js";
+import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
-import { isUnderAny, normalizePaths, pathCapsContain } from "./_path.js";
+import { describePaths, pathAllowed, paths, resolvedPaths } from "./_path.js";
 
 const SCHEMA: JSONSchema = {
   type: "object",
@@ -36,23 +43,20 @@ const SCHEMA: JSONSchema = {
 
 const SKIP = new Set(["node_modules", ".git", "dist", ".cache", ".turbo"]);
 
-export interface FindCaps {
-  paths: string[];
-}
-
 export class FindTool implements Tool {
   public readonly name = "find";
-  public readonly description =
-    "List files matching a glob pattern, restricted to configured roots.";
+  public readonly description: string;
   public readonly inputSchema = SCHEMA;
-  public readonly capabilities: FindCaps;
+  public readonly optional = ["paths"];
+  public readonly capabilities: CapabilitySet;
+  private readonly granted: "*" | string[];
+  private readonly fromDefault: boolean;
 
-  constructor(config: ToolConfig) {
-    this.capabilities = parseCaps(config);
-  }
-
-  capabilitiesContain(superset: unknown, subset: unknown): boolean {
-    return pathCapsContain(superset, subset);
+  constructor(_config: ToolConfig, capabilities: CapabilitySet | undefined) {
+    this.capabilities = capabilities ?? {};
+    this.fromDefault = paths(this.capabilities) === null;
+    this.granted = resolvedPaths(this.capabilities);
+    this.description = `List files matching a glob pattern (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
   async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
@@ -68,9 +72,9 @@ export class FindTool implements Tool {
     const root = path.resolve(requestedRoot);
     const limit = typeof i.limit === "number" && i.limit > 0 ? i.limit : 200;
 
-    if (!isUnderAny(root, this.capabilities.paths)) {
+    if (!pathAllowed(root, this.granted)) {
       return {
-        content: `find: root '${requestedRoot}' is outside the configured paths (${this.capabilities.paths.join(", ") || "none"})`,
+        content: `find: root '${requestedRoot}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,
       };
     }
@@ -142,11 +146,4 @@ function globToRegex(g: string): RegExp {
   }
   out += "$";
   return new RegExp(out);
-}
-
-function parseCaps(config: ToolConfig): FindCaps {
-  if (typeof config === "string") return { paths: [] };
-  const c = config as { paths?: unknown; capabilities?: { paths?: unknown } };
-  const raw = (c.capabilities?.paths ?? c.paths) as unknown;
-  return { paths: normalizePaths(raw) };
 }

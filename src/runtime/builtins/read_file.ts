@@ -1,12 +1,14 @@
 /**
- * `read_file` — read a UTF-8 file, restricted to configured paths.
+ * `read_file` — read a UTF-8 file, restricted to the granted paths.
  *
- * Capabilities:
- *   { paths: string[] }   — file path roots the tool will read from.
+ * Capability kinds:
+ *   optional: ["paths"]
  *
- * Self-policing: at execute time, the requested file path is resolved
- * absolutely; if it isn't under any configured root, the call returns an
- * `isError` result. Tools enforce their own caps because loom doesn't.
+ * Star/list/absent semantics:
+ *   paths absent  → smart default `["./"]` (project root)
+ *   paths = "*"   → unrestricted
+ *   paths = []    → explicit no-access (every call fails)
+ *   paths = [...] → allowlist of absolute path roots
  */
 
 import * as fs from "node:fs/promises";
@@ -18,9 +20,10 @@ import type {
   ToolContext,
   ToolResult,
 } from "../../types/interfaces.js";
+import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
-import { isUnderAny, normalizePaths, pathCapsContain } from "./_path.js";
+import { describePaths, pathAllowed, paths, resolvedPaths } from "./_path.js";
 
 const SCHEMA: JSONSchema = {
   type: "object",
@@ -30,23 +33,20 @@ const SCHEMA: JSONSchema = {
   },
 };
 
-export interface ReadFileCaps {
-  paths: string[];
-}
-
 export class ReadFileTool implements Tool {
   public readonly name = "read_file";
-  public readonly description =
-    "Read a UTF-8 file from disk (restricted to configured paths).";
+  public readonly description: string;
   public readonly inputSchema = SCHEMA;
-  public readonly capabilities: ReadFileCaps;
+  public readonly optional = ["paths"];
+  public readonly capabilities: CapabilitySet;
+  private readonly granted: "*" | string[];
+  private readonly fromDefault: boolean;
 
-  constructor(config: ToolConfig) {
-    this.capabilities = parseCaps(config);
-  }
-
-  capabilitiesContain(superset: unknown, subset: unknown): boolean {
-    return pathCapsContain(superset, subset);
+  constructor(_config: ToolConfig, capabilities: CapabilitySet | undefined) {
+    this.capabilities = capabilities ?? {};
+    this.fromDefault = paths(this.capabilities) === null;
+    this.granted = resolvedPaths(this.capabilities);
+    this.description = `Read a UTF-8 file from disk (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
   async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
@@ -55,9 +55,9 @@ export class ReadFileTool implements Tool {
       return { content: "read_file: 'path' is required", isError: true };
     }
     const target = path.resolve(requested);
-    if (!isUnderAny(target, this.capabilities.paths)) {
+    if (!pathAllowed(target, this.granted)) {
       return {
-        content: `read_file: '${requested}' is outside the configured paths (${this.capabilities.paths.join(", ") || "none"})`,
+        content: `read_file: '${requested}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,
       };
     }
@@ -68,11 +68,4 @@ export class ReadFileTool implements Tool {
       return { content: `read_file: ${(e as Error).message}`, isError: true };
     }
   }
-}
-
-function parseCaps(config: ToolConfig): ReadFileCaps {
-  if (typeof config === "string") return { paths: [] };
-  const c = config as { paths?: unknown; capabilities?: { paths?: unknown } };
-  const raw = (c.capabilities?.paths ?? c.paths) as unknown;
-  return { paths: normalizePaths(raw) };
 }

@@ -8,6 +8,7 @@ import type {
   ToolContext,
   ToolResult,
 } from "../../types/interfaces.js";
+import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 const SCHEMA: JSONSchema = {
@@ -21,9 +22,10 @@ export class EchoTool implements Tool {
   public readonly description =
     "Return the provided text. Useful for tests and trivial responses.";
   public readonly inputSchema = SCHEMA;
+  // No requires — echo does no IO. Capabilities ignored.
 
-  constructor(_config: ToolConfig) {
-    /* no config */
+  constructor(_config: ToolConfig, _capabilities: CapabilitySet | undefined) {
+    /* no config, no caps */
   }
 
   async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {

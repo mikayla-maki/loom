@@ -65,9 +65,10 @@ describe("spawn_subagent builtin tool", () => {
   });
 
   it("declares its sub-manifest in dependencies.subagents (so audit walks it)", () => {
-    const tool = new SpawnSubagentTool({
-      manifest: childManifest,
-    } as unknown as Record<string, unknown>);
+    const tool = new SpawnSubagentTool(
+      { manifest: childManifest } as unknown as Record<string, unknown>,
+      undefined,
+    );
     expect(tool.dependencies.subagents).toHaveLength(1);
     expect(tool.dependencies.subagents[0]?.name).toBe("child-builtin");
   });

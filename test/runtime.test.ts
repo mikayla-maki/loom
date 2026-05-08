@@ -21,11 +21,18 @@ function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
     systemPrompt:
       "You are the Loom sample agent — greet the user and shout the result.",
     tools: {
-      bash: {},
+      bash: "builtin",
+      read_file: "builtin",
+      write_file: "builtin",
+      find: "builtin",
+      echo: "builtin",
+    },
+    capabilities: {
+      bash: { subprocess: "*", paths: ["./"] },
       read_file: { paths: ["./"] },
       write_file: { paths: ["./"] },
       find: { paths: ["./"] },
-      echo: {},
+      echo: "*",
     },
     harness: {
       provider: "test",

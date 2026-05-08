@@ -3,8 +3,13 @@
  *
  * Each builtin is a JS class in `src/runtime/builtins/`. The provider
  * holds a name → constructor map and dispatches on `resolveTool(name,
- * config)`. Returns null for names it doesn't know — the next provider
- * in the chain (if any) gets a turn.
+ * config, agent, capabilities)`. Returns null for names it doesn't
+ * know — the next provider in the chain (if any) gets a turn.
+ *
+ * Builtin constructors take `(config, capabilities)`. Capabilities are
+ * the tool's grant from `manifest.capabilities[name]` (or undefined when
+ * the manifest declares none); each tool stores it on `this.capabilities`
+ * for self-policing and derives its description / input schema from it.
  *
  * No on-disk format. No process-tool framework. No path/registry
  * resolution. Just JS objects.
@@ -23,26 +28,35 @@ import type {
   Tool,
   ToolConfig,
 } from "../../types/interfaces.js";
+import type { CapabilitySet } from "../../types/manifest.js";
 
-type Builder = (config: ToolConfig) => Tool;
+type Builder = (
+  config: ToolConfig,
+  capabilities: CapabilitySet | undefined,
+) => Tool;
 
 const BUILTINS: Record<string, Builder> = {
-  bash: (c) => new BashTool(c),
-  echo: (c) => new EchoTool(c),
-  find: (c) => new FindTool(c),
-  read_file: (c) => new ReadFileTool(c),
-  write_file: (c) => new WriteFileTool(c),
-  spawn_subagent: (c) => new SpawnSubagentTool(c),
+  bash: (c, caps) => new BashTool(c, caps),
+  echo: (c, caps) => new EchoTool(c, caps),
+  find: (c, caps) => new FindTool(c, caps),
+  read_file: (c, caps) => new ReadFileTool(c, caps),
+  write_file: (c, caps) => new WriteFileTool(c, caps),
+  spawn_subagent: (c, caps) => new SpawnSubagentTool(c, caps),
 };
 
 class NativeProvider implements Provider {
   // Native builtins don't read the agent at construction time — they
   // see it on every call via `ctx.agent`. The arg is accepted for
   // signature parity with extension providers.
-  resolveTool(name: string, config: ToolConfig, _agent: Agent): Tool | null {
+  resolveTool(
+    name: string,
+    config: ToolConfig,
+    _agent: Agent,
+    capabilities: CapabilitySet | undefined,
+  ): Tool | null {
     void _agent;
     const builder = BUILTINS[name];
-    return builder ? builder(config) : null;
+    return builder ? builder(config, capabilities) : null;
   }
   close(): void {
     /* nothing to clean up */

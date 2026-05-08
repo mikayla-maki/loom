@@ -16,6 +16,9 @@ import type { ToolConfig } from "../types/interfaces.js";
 import type {
   AgentManifest,
   Capabilities,
+  CapabilitySet,
+  CapabilityValue,
+  SecretAllowlist,
   SystemPromptSpec,
 } from "../types/manifest.js";
 
@@ -34,6 +37,7 @@ export async function parseAgentManifest(
     );
   }
   const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
+  const secrets = parseSecretAllowlist(agent.secrets, abs);
 
   const harness = ensureObject(raw.harness, "[harness]", abs);
   if (typeof harness.provider !== "string" || !harness.provider) {
@@ -69,6 +73,7 @@ export async function parseAgentManifest(
       ? { description: agent.description }
       : {}),
     ...(systemPrompt !== undefined ? { systemPrompt } : {}),
+    ...(secrets !== undefined ? { secrets } : {}),
     harness: {
       ...(harness as Record<string, unknown>),
       provider: harness.provider as string,
@@ -193,11 +198,80 @@ function parseToolConfigValue(
 }
 
 /**
- * Parse the agent's `[capabilities]` table — opaque per-tool ceilings.
- * Loom doesn't validate the values; tools' `capabilitiesContain` does
- * the comparison at boot.
+ * Parse the agent's `[capabilities]` table — per-tool grants. Each
+ * value is `"*"` (whole tool unrestricted) or a per-kind map. Inside a
+ * per-kind map, each value is `"*"` (kind unrestricted), an allowlist
+ * array, or a structured object — Loom does not interpret the kind
+ * argument shape; that's a tool concern.
  */
 function parseCapabilities(v: unknown, where: string): Capabilities {
-  const obj = ensureObject(v, "[capabilities]", where);
-  return obj as Capabilities;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [capabilities] must be a table`,
+    );
+  }
+  const obj = v as Record<string, unknown>;
+  const out: Capabilities = {};
+  for (const [k, val] of Object.entries(obj)) {
+    out[k] = parseCapabilitySet(val, where, `[capabilities].${k}`);
+  }
+  return out;
+}
+
+function parseCapabilitySet(
+  v: unknown,
+  where: string,
+  label: string,
+): CapabilitySet {
+  if (v === "*") return "*";
+  if (v === null) return {};
+  if (typeof v === "object" && !Array.isArray(v)) {
+    const obj = v as Record<string, unknown>;
+    const out: Record<string, CapabilityValue> = {};
+    for (const [k, val] of Object.entries(obj)) {
+      out[k] = parseCapabilityValue(val, where, `${label}.${k}`);
+    }
+    return out;
+  }
+  throw new ManifestError(
+    `agent.toml at ${where}: ${label} must be "*" or a table of kind grants, got ${typeof v}`,
+  );
+}
+
+function parseCapabilityValue(
+  v: unknown,
+  where: string,
+  label: string,
+): CapabilityValue {
+  if (v === "*") return "*";
+  if (Array.isArray(v)) return v as unknown[];
+  if (v !== null && typeof v === "object") {
+    return v as Record<string, unknown>;
+  }
+  throw new ManifestError(
+    `agent.toml at ${where}: ${label} must be "*", an array, or a table; got ${typeof v}`,
+  );
+}
+
+/**
+ * Parse `[agent].secrets` — the secret allowlist. Same star-or-list
+ * semantics as capabilities.
+ */
+function parseSecretAllowlist(
+  v: unknown,
+  where: string,
+): SecretAllowlist | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (v === "*") return "*";
+  if (Array.isArray(v)) {
+    if (!v.every((x) => typeof x === "string")) {
+      throw new ManifestError(
+        `agent.toml at ${where}: [agent].secrets must be "*" or an array of strings`,
+      );
+    }
+    return v as string[];
+  }
+  throw new ManifestError(
+    `agent.toml at ${where}: [agent].secrets must be "*" or an array of strings, got ${typeof v}`,
+  );
 }

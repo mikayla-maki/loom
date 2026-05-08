@@ -64,7 +64,11 @@ describe("top-level [tools]", () => {
 
   it("explicit list replaces the defaults exactly", async () => {
     const agent = await runAgent(
-      buildAgent({ tools: { bash: "builtin" } }),
+      buildAgent({
+        tools: { bash: "builtin" },
+        // bash requires `subprocess`; grant it.
+        capabilities: { bash: { subprocess: "*" } },
+      }),
       {},
     );
     try {
@@ -75,18 +79,41 @@ describe("top-level [tools]", () => {
     }
   });
 
-  it("default tool set requires the per-tool ceiling to allow './'", async () => {
-    // No top-level [tools] declaration → defaults load → read_file/write_file/find
-    // declare paths=['./']; a tighter per-tool ceiling fails.
+  it("explicit [tools] without [capabilities] gets nothing-but-smart-defaults", async () => {
+    // When [tools] is declared explicitly, no default cap bundle
+    // applies. Tools with no `requires` (read_file is `optional`,
+    // not `requires`) construct fine and rely on smart defaults.
+    const agent = await runAgent(
+      buildAgent({
+        tools: { read_file: "builtin", echo: "builtin" },
+        // No [capabilities] section at all.
+      }),
+      {},
+    );
+    try {
+      const names = agent.agentState.toolTable.list().map((t) => t.name);
+      expect(names.sort()).toEqual(["echo", "read_file"]);
+      // read_file should describe its smart default in the description.
+      const rf = agent.agentState.toolTable
+        .list()
+        .find((t) => t.name === "read_file");
+      expect(rf?.description).toMatch(/smart default/);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("explicit [tools] with bash but no `subprocess` grant fails boot", async () => {
+    // bash has `requires: ["subprocess"]`; without a grant, boot fails.
     await expect(
       runAgent(
         buildAgent({
-          // Per-tool ceiling that disallows the project root for read_file.
-          capabilities: { read_file: { paths: ["/nonexistent"] } },
+          tools: { bash: "builtin" },
+          capabilities: { bash: {} },
         }),
         {},
       ),
-    ).rejects.toThrow(/exceed.*ceiling/i);
+    ).rejects.toThrow(/missing required.*subprocess/);
   });
 
   it("audit: top-level tools show with introducedBy === '(top-level)' and render in output", async () => {
@@ -129,10 +156,14 @@ describe("top-level [tools]", () => {
     try {
       const target = path.join(root, "hello.txt");
       // The default tools are configured for "./" — i.e., process.cwd().
-      // Override to root so the read/write paths are inside the ceiling.
+      // Override to root via [capabilities] so read/write are inside the grant.
       const agent = await runAgent(
         buildAgent({
           tools: {
+            write_file: "builtin",
+            read_file: "builtin",
+          },
+          capabilities: {
             write_file: { paths: [root] },
             read_file: { paths: [root] },
           },

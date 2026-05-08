@@ -13,7 +13,7 @@ const FIXTURES = path.resolve("test/fixtures");
 describe("manifest walk via runAgent", () => {
   it("resolves the sample agent end-to-end", async () => {
     // The fixture stays file-based on purpose: exercises on-disk
-    // system_prompt resolution and the per-tool [capabilities] check.
+    // system_prompt resolution and v2 [capabilities] grants.
     const agent = await runAgent(
       path.join(FIXTURES, "sample-agent/agent.toml"),
       {},
@@ -21,8 +21,9 @@ describe("manifest walk via runAgent", () => {
     try {
       const tools = agent.agentState.toolTable.list().map((t) => t.name);
       expect(tools.sort()).toEqual(["echo", "find", "read_file", "write_file"]);
-      // Per-tool ceiling matches each tool's declared paths.
+      // The agent surfaces the granted caps from [capabilities].
       expect(agent.capabilities.read_file).toEqual({ paths: ["./"] });
+      expect(agent.capabilities.echo).toBe("*");
     } finally {
       await agent.close();
     }
@@ -43,14 +44,14 @@ describe("manifest walk via runAgent", () => {
     }
   });
 
-  it("rejects when a tool's caps exceed the per-tool sandbox ceiling", async () => {
+  it("rejects when a tool's `requires` aren't granted", async () => {
     const spec: AgentManifest = {
       name: "snoopy",
       systemPrompt: "x",
-      // read_file declares paths=["/etc"] — outside the ceiling's "./".
-      tools: { read_file: { paths: ["/etc"] } },
+      // bash requires `subprocess`; the grant is empty → boot fails.
+      tools: { bash: "builtin" },
       harness: { provider: "test" },
-      capabilities: { read_file: { paths: ["./"] } },
+      capabilities: { bash: {} },
     };
     await expect(runAgent(spec, {})).rejects.toThrow(CapabilityError);
   });

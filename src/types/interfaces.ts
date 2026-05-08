@@ -227,27 +227,46 @@ export interface ToolResult {
 
 export interface Tool extends ToolDescriptor {
   /**
-   * Capability footprint this tool advertises. Shape is tool-specific:
-   * `{ paths: ["./"] }` for a filesystem tool, `{ buckets: [...] }` for
-   * S3, etc. Loom doesn't interpret the shape — it's a black box used
-   * for audit and (when `[sandbox.<name>]` is present) for the
-   * boot-time ceiling check.
+   * Capability KINDS this tool MUST be granted to function. Static —
+   * declared once on the class, independent of runtime state. The boot
+   * guard checks every required kind is present in the manifest's
+   * `[capabilities.<name>]` grant (or that the grant is `"*"`); a tool
+   * with an unsatisfied requirement fails to construct.
    *
-   * Tools self-police at execute time: they read their own capabilities
-   * field and decide what to allow. Loom does not enforce caps at runtime.
+   * Examples:
+   *   bash:        requires = ["subprocess"]
+   *   read_file:   requires = ["paths"]
+   *   s3:          requires = ["buckets"]
+   *   echo:        requires = [] / undefined
    */
-  capabilities?: unknown;
+  requires?: string[];
+
+  /**
+   * Capability KINDS this tool MAY use if granted. Optional kinds
+   * inform `loom audit` and (in the case of bash) sandbox profile
+   * derivation, but boot doesn't fail when they're absent. Tools that
+   * read an optional kind at execute time should fall back gracefully
+   * when the manifest didn't grant it.
+   *
+   *   bash:  optional = ["paths", "network", "env"]
+   */
+  optional?: string[];
+
+  /**
+   * Granted capability set, derived at construction from
+   * `manifest.capabilities[<this tool's name>]`. Tools self-police at
+   * execute time by reading this field and rejecting calls that
+   * exceed it; tools also derive their model-facing `description` and
+   * `inputSchema` from this (so a tool's surface is partially
+   * determined by what it was granted).
+   *
+   * `"*"` means whole-tool unrestricted. A per-kind map grants only
+   * the listed kinds; absent kinds are denied. `{}` grants nothing.
+   */
+  capabilities?: import("./manifest.js").CapabilitySet;
 
   /** Secret names this tool wants. Loom resolves the closure at boot. */
   secrets?: SecretNeeds;
-
-  /**
-   * Optional containment check for the [sandbox.<name>] ceiling test.
-   * Returns true if `subset` is allowed given `superset` as the ceiling.
-   * When omitted, loom uses a structural default (deep-subset on plain
-   * objects/arrays, equality on primitives).
-   */
-  capabilitiesContain?(superset: unknown, subset: unknown): boolean;
 
   /**
    * Optional: sub-agents this tool declares it may spawn. Trusted
@@ -503,12 +522,15 @@ export interface ExtensionContext {
 
 /**
  * Per-tool config value from a manifest entry. Loom doesn't interpret
- * it; providers do. Common shapes:
+ * it; providers do. Capabilities do NOT live here — they ride a
+ * separate channel (the manifest's `[capabilities]` table) and arrive
+ * at the tool's constructor as a separate argument. Tool config is
+ * for runtime defaults: provider hint, region, timeouts, server URL.
  *
- *   "builtin"                       — string-shorthand
- *   { mcp = true }                  — object with provider hint
- *   { paths = ["./"] }              — tool-specific config
- *   { capabilities = { ... } }      — explicit cap declaration
+ * Common shapes:
+ *   "builtin"                              — string-shorthand
+ *   { provider = "mcp", server = "..." }   — provider hint + config
+ *   { region = "us-west-2", retries = 3 }  — tool-specific defaults
  */
 export type ToolConfig = string | Record<string, unknown>;
 
@@ -557,11 +579,19 @@ export interface Provider {
    * for tool-construction-time wiring (capturing the harness ref,
    * session ref, identity); tools see the agent at dispatch via
    * `ctx.agent`, which DOES have a tool-scoped `spawnSubagent`.
+   *
+   * `capabilities` is the manifest's `[capabilities.<name>]` grant for
+   * this tool, or `undefined` when the manifest has no entry. Providers
+   * forward it to the tool constructor; tools store it for self-policing
+   * and derive description / input schema from it. `"*"` means
+   * whole-tool unrestricted; an object is a per-kind map; absent kinds
+   * are denied.
    */
   resolveTool(
     name: string,
     config: ToolConfig,
     agent: Agent,
+    capabilities: import("./manifest.js").CapabilitySet | undefined,
   ): Promise<Tool | null> | Tool | null;
 
   /** Cleanup; called when the agent closes. */

@@ -7,8 +7,6 @@ const FIXTURES = path.resolve("test/fixtures");
 
 describe("auditAgent", () => {
   it("produces a static capability tree for the sample agent", async () => {
-    // The new sample-agent fixture has no skills — just the default
-    // builtin tool set, configured for the project root.
     const tree = await auditAgent(
       path.join(FIXTURES, "sample-agent/agent.toml"),
     );
@@ -19,18 +17,24 @@ describe("auditAgent", () => {
       "read_file",
       "write_file",
     ]);
-    // read_file/write_file/find expose `{ paths: [...] }` capabilities.
+    // FS tools have `optional: ["paths"]` and the fixture grants `paths`.
     const readEntry = tree.tools.find((t) => t.name === "read_file");
-    expect(readEntry?.capabilities).toMatchObject({ paths: expect.any(Array) });
-    expect(
-      Array.isArray((readEntry?.capabilities as { paths?: unknown }).paths),
-    ).toBe(true);
-    // The sample agent declares its sandbox ceiling per-tool.
-    expect(tree.ceiling.read_file).toBeDefined();
+    expect(readEntry?.optional).toContain("paths");
+    expect(readEntry?.requires).toEqual([]); // no required kinds
+    expect(readEntry?.granted).toEqual({ paths: ["./"] });
+    expect(readEntry?.missing).toEqual([]);
+    // echo got the whole-tool `"*"` grant.
+    const echoEntry = tree.tools.find((t) => t.name === "echo");
+    expect(echoEntry?.granted).toBe("*");
+    // The agent's grant table is exposed under `grants`.
+    expect(tree.grants.read_file).toEqual({ paths: ["./"] });
+    // [agent].secrets allowlist surfaces in the tree.
+    expect(tree.secretAllowlist).toEqual(["sample_user_name"]);
 
     const printed = formatCapabilityTree(tree);
     expect(printed).toContain("sample-agent");
     expect(printed).toContain("read_file");
     expect(printed).toContain("write_file");
+    expect(printed).toContain("capabilities granted");
   });
 });

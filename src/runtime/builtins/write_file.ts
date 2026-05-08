@@ -1,8 +1,14 @@
 /**
- * `write_file` — write a UTF-8 file, restricted to configured paths.
+ * `write_file` — write a UTF-8 file, restricted to the granted paths.
  *
- * Capabilities:
- *   { paths: string[] }   — path roots the tool will write under.
+ * Capability kinds:
+ *   optional: ["paths"]
+ *
+ * Star/list/absent semantics:
+ *   paths absent  → smart default `["./"]` (project root)
+ *   paths = "*"   → unrestricted
+ *   paths = []    → explicit no-access (every call fails)
+ *   paths = [...] → allowlist of absolute path roots
  */
 
 import * as fs from "node:fs/promises";
@@ -14,9 +20,10 @@ import type {
   ToolContext,
   ToolResult,
 } from "../../types/interfaces.js";
+import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
-import { isUnderAny, normalizePaths, pathCapsContain } from "./_path.js";
+import { describePaths, pathAllowed, paths, resolvedPaths } from "./_path.js";
 
 const SCHEMA: JSONSchema = {
   type: "object",
@@ -35,23 +42,20 @@ const SCHEMA: JSONSchema = {
   },
 };
 
-export interface WriteFileCaps {
-  paths: string[];
-}
-
 export class WriteFileTool implements Tool {
   public readonly name = "write_file";
-  public readonly description =
-    "Write a UTF-8 file (restricted to configured paths).";
+  public readonly description: string;
   public readonly inputSchema = SCHEMA;
-  public readonly capabilities: WriteFileCaps;
+  public readonly optional = ["paths"];
+  public readonly capabilities: CapabilitySet;
+  private readonly granted: "*" | string[];
+  private readonly fromDefault: boolean;
 
-  constructor(config: ToolConfig) {
-    this.capabilities = parseCaps(config);
-  }
-
-  capabilitiesContain(superset: unknown, subset: unknown): boolean {
-    return pathCapsContain(superset, subset);
+  constructor(_config: ToolConfig, capabilities: CapabilitySet | undefined) {
+    this.capabilities = capabilities ?? {};
+    this.fromDefault = paths(this.capabilities) === null;
+    this.granted = resolvedPaths(this.capabilities);
+    this.description = `Write a UTF-8 file (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
   async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
@@ -71,9 +75,9 @@ export class WriteFileTool implements Tool {
       };
     }
     const target = path.resolve(i.path);
-    if (!isUnderAny(target, this.capabilities.paths)) {
+    if (!pathAllowed(target, this.granted)) {
       return {
-        content: `write_file: '${i.path}' is outside the configured paths (${this.capabilities.paths.join(", ") || "none"})`,
+        content: `write_file: '${i.path}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,
       };
     }
@@ -93,11 +97,4 @@ export class WriteFileTool implements Tool {
       return { content: `write_file: ${(e as Error).message}`, isError: true };
     }
   }
-}
-
-function parseCaps(config: ToolConfig): WriteFileCaps {
-  if (typeof config === "string") return { paths: [] };
-  const c = config as { paths?: unknown; capabilities?: { paths?: unknown } };
-  const raw = (c.capabilities?.paths ?? c.paths) as unknown;
-  return { paths: normalizePaths(raw) };
 }

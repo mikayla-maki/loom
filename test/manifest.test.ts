@@ -17,17 +17,20 @@ describe("agent.toml parser", () => {
     if ("provider" in m.harness) expect(m.harness.provider).toBe("test");
     if (m.session && "provider" in m.session)
       expect(m.session.provider).toBe("file");
-    // [capabilities] is now per-tool: each value is whatever shape that tool
-    // expects (here `{ paths: ["./"] }`).
+    // [agent].secrets allowlist parsed.
+    expect(m.secrets).toEqual(["sample_user_name"]);
+    // v2 [capabilities]: per-tool grants. `"*"` for echo (whole-tool
+    // unrestricted), per-kind maps for FS tools.
     expect(m.capabilities?.read_file).toEqual({ paths: ["./"] });
     expect(m.capabilities?.write_file).toEqual({ paths: ["./"] });
     expect(m.capabilities?.find).toEqual({ paths: ["./"] });
-    // [tools] now lists the default builtin set, configured for the project root.
-    expect(m.tools).toMatchObject({
-      read_file: { paths: ["./"] },
-      write_file: { paths: ["./"] },
-      find: { paths: ["./"] },
-      echo: {},
+    expect(m.capabilities?.echo).toBe("*");
+    // [tools] is wiring-only — no caps mixed in.
+    expect(m.tools).toEqual({
+      read_file: "builtin",
+      write_file: "builtin",
+      find: "builtin",
+      echo: "builtin",
     });
   });
 

@@ -5,6 +5,14 @@
  * deterministic. Extension-supplied tools don't appear in the tree
  * (they'd require running provider init, which can have side effects
  * like opening MCP connections).
+ *
+ * The tree shows three axes per agent:
+ *   - GRANTS: per-tool capability grants from `[capabilities]`
+ *   - REQUIRES: every kind each native-resolved tool declares it needs
+ *     (regardless of whether it's granted; surfaces missing grants)
+ *   - SECRETS: every secret name any component declares it needs
+ *     (regardless of the [agent].secrets allowlist; surfaces secrets
+ *     that would be denied at boot)
  */
 
 import * as path from "node:path";
@@ -13,28 +21,49 @@ import { resolveSystemPrompt } from "../manifest/resolver.js";
 import { getHarnessFactory, getSessionFactory } from "../extensions/index.js";
 import { buildNativeProvider } from "../extensions/provider/native.js";
 import { parseAgentManifest } from "../manifest/parser.js";
-import type { AgentManifest, Capabilities } from "../types/manifest.js";
+import type {
+  AgentManifest,
+  Capabilities,
+  CapabilitySet,
+  SecretAllowlist,
+} from "../types/manifest.js";
 import type { Agent, Tool, ToolConfig } from "../types/interfaces.js";
 
 export interface SecretRequest {
   name: string;
   required: boolean;
   requestedBy: string[];
+  /** Whether the manifest's [agent].secrets allowlist permits this name. */
+  permittedByAllowlist: boolean;
 }
 
 export interface CapabilityTree {
   manifestPath: string;
   name: string;
-  /** The agent's `[capabilities]` ceiling (per-tool, opaque). */
-  ceiling: Capabilities;
+  /** The agent's `[capabilities]` table — per-tool grants. */
+  grants: Capabilities;
+  /** The agent's `[agent].secrets` allowlist (or undefined when unset). */
+  secretAllowlist?: SecretAllowlist;
   /**
    * Each tool the native provider could resolve, with its declared
-   * capability footprint, the source that introduced it, and any
-   * sub-agent trees reachable through `tool.dependencies.subagents`.
+   * capability requires/optionals, the granted set, the source that
+   * introduced it, and any sub-agent trees reachable through
+   * `tool.dependencies.subagents`.
    */
   tools: Array<{
     name: string;
-    capabilities: unknown;
+    /** Static `Tool.requires`. Empty when the tool needs nothing. */
+    requires: string[];
+    /** Static `Tool.optional`. Empty when the tool advertises no optional kinds. */
+    optional: string[];
+    /** The granted set the tool was constructed with (may be `"*"` or a per-kind map). */
+    granted: CapabilitySet | undefined;
+    /**
+     * Required kinds NOT present in the grant. Empty when the grant
+     * satisfies every requirement; non-empty means the agent would
+     * fail to boot.
+     */
+    missing: string[];
     introducedBy: string;
     /**
      * Sub-agent trees this tool declares it may spawn. Empty when
@@ -66,6 +95,13 @@ export interface CapabilityTree {
 
 const DEFAULT_TOP_LEVEL_TOOLS: Record<string, ToolConfig> = {
   bash: {},
+  read_file: {},
+  write_file: {},
+  find: {},
+};
+
+const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
+  bash: { subprocess: "*", paths: ["./"] },
   read_file: { paths: ["./"] },
   write_file: { paths: ["./"] },
   find: { paths: ["./"] },
@@ -99,7 +135,7 @@ async function auditAgentInner(
     return {
       manifestPath,
       name: manifest.name,
-      ceiling: {},
+      grants: {},
       tools: [],
       secrets: [],
       sessionSubagents: [],
@@ -121,6 +157,13 @@ async function auditAgentInner(
   for (const [name, config] of Object.entries(topLevel)) {
     refs.push({ name, config, origin: TOP_LEVEL });
   }
+  // Mirror runAgent's effective-capabilities computation: when both
+  // [tools] and [capabilities] are absent, the default cap bundle
+  // applies; otherwise [capabilities] (or empty) is the source of truth.
+  const effectiveGrants: Capabilities =
+    manifest.tools === undefined && manifest.capabilities === undefined
+      ? DEFAULT_TOP_LEVEL_CAPABILITIES
+      : (manifest.capabilities ?? {});
 
   // Run only the native provider. Extension providers stay un-audited.
   const native = buildNativeProvider();
@@ -137,8 +180,9 @@ async function auditAgentInner(
   const resolvedTools = new Map<string, Tool>();
   const unresolvedTools: CapabilityTree["unresolvedTools"] = [];
   for (const ref of refs) {
+    const grant = effectiveGrants[ref.name];
     const t = await Promise.resolve(
-      native.resolveTool(ref.name, ref.config, auditAgentRef),
+      native.resolveTool(ref.name, ref.config, auditAgentRef, grant),
     );
     if (!t) {
       unresolvedTools.push({ name: ref.name, introducedBy: ref.origin });
@@ -150,16 +194,22 @@ async function auditAgentInner(
     for (const sub of t.dependencies?.subagents ?? []) {
       subagents.push(await auditAgentInner(sub, nextSeen));
     }
+    const requires = [...(t.requires ?? [])];
+    const optional = [...(t.optional ?? [])];
+    const missing = computeMissing(requires, grant);
     tools.push({
       name: ref.name,
-      capabilities: t.capabilities ?? {},
+      requires,
+      optional,
+      granted: grant,
+      missing,
       introducedBy: ref.origin,
       subagents,
     });
   }
   await native.close();
 
-  const secrets = collectSecrets(manifest, resolvedTools);
+  const secrets = collectSecrets(manifest, resolvedTools, manifest.secrets);
 
   // Recurse into the manifest's session deps. Audit doesn't instantiate
   // sessions (factories may have side effects), but session
@@ -177,12 +227,29 @@ async function auditAgentInner(
   return {
     manifestPath,
     name: manifest.name,
-    ceiling: manifest.capabilities ?? {},
+    grants: effectiveGrants,
+    ...(manifest.secrets !== undefined
+      ? { secretAllowlist: manifest.secrets }
+      : {}),
     tools,
     secrets,
     sessionSubagents,
     unresolvedTools,
   };
+}
+
+/** Required kinds not present in the grant (drives boot pass/fail). */
+function computeMissing(
+  requires: string[],
+  grant: CapabilitySet | undefined,
+): string[] {
+  if (grant === "*") return [];
+  if (grant === undefined) return [...requires];
+  const missing: string[] = [];
+  for (const k of requires) {
+    if (!Object.prototype.hasOwnProperty.call(grant, k)) missing.push(k);
+  }
+  return missing;
 }
 
 /**
@@ -199,6 +266,7 @@ async function auditAgentInner(
 function collectSecrets(
   manifest: AgentManifest,
   tools: Map<string, Tool>,
+  allowlist: SecretAllowlist | undefined,
 ): SecretRequest[] {
   const required = new Map<string, Set<string>>();
   const optional = new Map<string, Set<string>>();
@@ -242,12 +310,27 @@ function collectSecrets(
 
   for (const k of required.keys()) optional.delete(k);
 
+  const isPermitted = (n: string): boolean => {
+    if (allowlist === undefined || allowlist === "*") return true;
+    return allowlist.includes(n);
+  };
+
   const out: SecretRequest[] = [];
   for (const [name, by] of required) {
-    out.push({ name, required: true, requestedBy: [...by].sort() });
+    out.push({
+      name,
+      required: true,
+      requestedBy: [...by].sort(),
+      permittedByAllowlist: isPermitted(name),
+    });
   }
   for (const [name, by] of optional) {
-    out.push({ name, required: false, requestedBy: [...by].sort() });
+    out.push({
+      name,
+      required: false,
+      requestedBy: [...by].sort(),
+      permittedByAllowlist: isPermitted(name),
+    });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
@@ -277,20 +360,43 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
   const pad = "  ".repeat(indent);
   const lines: string[] = [];
   lines.push(`${pad}${tree.name}  (${tree.manifestPath})`);
-  if (Object.keys(tree.ceiling).length > 0) {
-    lines.push(`${pad}  ceiling:`);
-    for (const [k, v] of Object.entries(tree.ceiling)) {
-      lines.push(`${pad}    - ${k}: ${JSON.stringify(v)}`);
+  // Grants
+  const grantKeys = Object.keys(tree.grants);
+  if (grantKeys.length > 0) {
+    lines.push(`${pad}  capabilities granted:`);
+    for (const [k, v] of Object.entries(tree.grants)) {
+      lines.push(`${pad}    - ${k}: ${formatGrant(v)}`);
     }
   } else {
-    lines.push(`${pad}  ceiling: (none — every tool's caps stand)`);
+    lines.push(`${pad}  capabilities granted: (none)`);
+  }
+  // Secret allowlist
+  if (tree.secretAllowlist !== undefined) {
+    const txt =
+      tree.secretAllowlist === "*"
+        ? "* (any name)"
+        : tree.secretAllowlist.length === 0
+          ? "[] (no secrets allowed)"
+          : `[${tree.secretAllowlist.map((s) => JSON.stringify(s)).join(", ")}]`;
+    lines.push(`${pad}  [agent].secrets allowlist: ${txt}`);
   }
   if (tree.tools.length > 0) {
     lines.push(`${pad}  tools:`);
     for (const t of tree.tools) {
+      const reqStr =
+        t.requires.length > 0
+          ? ` requires ${t.requires.map((r) => `'${r}'`).join(", ")}`
+          : "";
+      const optStr =
+        t.optional.length > 0
+          ? ` optional ${t.optional.map((r) => `'${r}'`).join(", ")}`
+          : "";
+      const missingStr =
+        t.missing.length > 0 ? `  ⚠ MISSING: ${t.missing.join(", ")}` : "";
       lines.push(
-        `${pad}    - ${t.name} (from ${t.introducedBy}): ${JSON.stringify(t.capabilities)}`,
+        `${pad}    - ${t.name} (from ${t.introducedBy}):${reqStr}${optStr}${missingStr}`,
       );
+      lines.push(`${pad}      granted: ${formatGrant(t.granted)}`);
       for (const sub of t.subagents) {
         lines.push(`${pad}      sub-agent:`);
         lines.push(formatCapabilityTree(sub, indent + 4));
@@ -313,10 +419,19 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
     lines.push(`${pad}  secrets:`);
     for (const s of tree.secrets) {
       const tag = s.required ? "required" : "optional";
+      const block = s.permittedByAllowlist
+        ? ""
+        : "  ⚠ DENIED by [agent].secrets";
       lines.push(
-        `${pad}    - ${s.name} [${tag}] (needed by ${s.requestedBy.join(", ")})`,
+        `${pad}    - ${s.name} [${tag}] (needed by ${s.requestedBy.join(", ")})${block}`,
       );
     }
   }
   return lines.join("\n");
+}
+
+function formatGrant(v: CapabilitySet | undefined): string {
+  if (v === undefined) return "(none)";
+  if (v === "*") return "*";
+  return JSON.stringify(v);
 }

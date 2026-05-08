@@ -150,19 +150,21 @@ describe("Provider extension — dynamic tool resolution", () => {
     }
   });
 
-  it("provider-supplied tool capabilities still get checked against the [capabilities] ceiling", async () => {
-    const dangerTool: Tool = {
+  it("provider-supplied tool with unmet `requires` fails boot", async () => {
+    // Tool declares it needs the `network` kind; the manifest's
+    // [capabilities] grant doesn't include it → boot fails.
+    const netTool: Tool = {
       name: "danger.net",
       description: "x",
       inputSchema: { type: "object" },
-      capabilities: { hosts: ["evil.com"] },
+      requires: ["network"],
       async execute() {
         return { content: "noop" };
       },
     };
     const provider: Provider = {
       resolveTool(name) {
-        if (name === "danger.net") return dangerTool;
+        if (name === "danger.net") return netTool;
         return null;
       },
       close: () => {},
@@ -173,14 +175,50 @@ describe("Provider extension — dynamic tool resolution", () => {
       systemPrompt: "x",
       tools: { "danger.net": {} },
       harness: { provider: "test" },
-      // Per-tool ceiling: danger.net may only reach `safe.com`. The
-      // tool's declared `evil.com` exceeds it → boot fails.
-      capabilities: { "danger.net": { hosts: ["safe.com"] } },
+      capabilities: { "danger.net": {} }, // empty grant, network missing
     };
     await expect(
       runAgent(spec, {
         providers: [provider],
       }),
-    ).rejects.toThrow(/exceed|ceiling/i);
+    ).rejects.toThrow(/missing required.*network/);
+  });
+
+  it("provider-supplied tool gets its grant via the 4th resolveTool arg", async () => {
+    // The provider should receive the manifest's grant and forward it
+    // to the tool, which stores it on `this.capabilities` for self-policing.
+    let receivedCapabilities: unknown = null;
+    const tool: Tool = {
+      name: "observed",
+      description: "x",
+      inputSchema: { type: "object" },
+      optional: ["foo"],
+      async execute() {
+        return { content: "" };
+      },
+    };
+    const provider: Provider = {
+      resolveTool(name, _config, _agent, capabilities) {
+        if (name === "observed") {
+          receivedCapabilities = capabilities;
+          return tool;
+        }
+        return null;
+      },
+      close: () => {},
+    };
+    const spec: AgentManifest = {
+      name: "n",
+      systemPrompt: "x",
+      tools: { observed: {} },
+      harness: { provider: "test" },
+      capabilities: { observed: { foo: ["a", "b"] } },
+    };
+    const agent = await runAgent(spec, { providers: [provider] });
+    try {
+      expect(receivedCapabilities).toEqual({ foo: ["a", "b"] });
+    } finally {
+      await agent.close();
+    }
   });
 });

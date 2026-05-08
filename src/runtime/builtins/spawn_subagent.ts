@@ -26,7 +26,7 @@ import type {
   ToolContext,
   ToolResult,
 } from "../../types/interfaces.js";
-import type { AgentManifest } from "../../types/manifest.js";
+import type { AgentManifest, CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 import { lastAgentMessage } from "../extract-message.js";
 
@@ -57,7 +57,8 @@ export class SpawnSubagentTool implements Tool {
   public readonly inputSchema = SCHEMA;
   public readonly dependencies: { subagents: AgentManifest[] };
 
-  constructor(config: ToolConfig) {
+  constructor(config: ToolConfig, _capabilities: CapabilitySet | undefined) {
+    void _capabilities;
     if (typeof config === "string" || config === null) {
       throw new Error(
         "spawn_subagent requires an object config carrying the sub-manifest (either as the config itself or under `config.manifest`).",

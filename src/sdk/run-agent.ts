@@ -29,7 +29,11 @@ import {
 } from "../extensions/loader.js";
 import { nativeProviderFactory } from "../extensions/provider/native.js";
 import { resolveSystemPrompt } from "../manifest/resolver.js";
-import { assertCapabilities } from "../manifest/capabilities.js";
+import {
+  assertKnownKinds,
+  assertRequires,
+  assertSecretAllowlist,
+} from "../manifest/capabilities.js";
 import { AgentState } from "../runtime/agent-state.js";
 import { ToolTable } from "../runtime/tool-table.js";
 import { UpdateSink } from "../runtime/update-sink.js";
@@ -61,11 +65,7 @@ import type {
   PermissionRequest,
   PermissionResult,
 } from "../types/permissions.js";
-import type {
-  AgentManifest,
-  Capabilities,
-  SessionSpec,
-} from "../types/manifest.js";
+import type { AgentManifest, SessionSpec } from "../types/manifest.js";
 
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 
@@ -74,11 +74,34 @@ export const LOOM_VERSION = "0.1.0";
 const DEFAULT_SESSION = { provider: "memory" } as const;
 
 /**
- * Default top-level tool set when `[tools]` is omitted from the manifest.
- * Each entry resolves through the native provider with empty config.
+ * Default top-level tool set when `[tools]` is omitted from the
+ * manifest. Each entry resolves through the native provider with
+ * empty config; the parallel default capability grants below give
+ * each tool a sensible default scope (`./` for FS tools, full env
+ * for bash so commands can resolve).
  */
 const DEFAULT_TOP_LEVEL_TOOLS: Record<string, ToolConfig> = {
   bash: {},
+  read_file: {},
+  write_file: {},
+  find: {},
+};
+
+/**
+ * Default per-tool capabilities granted alongside the default tool set.
+ * Used only when both `[tools]` and `[capabilities]` are absent. When
+ * the manifest declares `[tools]` explicitly, no defaults apply on
+ * either axis — the manifest is the source of truth.
+ *
+ * Note: bash gets `subprocess: "*"` and `paths: ["./"]` but no `env`
+ * grant, which means bash falls back to its SAFE_DEFAULT_ENV_NAMES
+ * list (PATH, HOME, locale, terminal info — no credentials).
+ */
+const DEFAULT_TOP_LEVEL_CAPABILITIES: Record<
+  string,
+  import("../types/manifest.js").CapabilitySet
+> = {
+  bash: { subprocess: "*", paths: ["./"] },
   read_file: { paths: ["./"] },
   write_file: { paths: ["./"] },
   find: { paths: ["./"] },
@@ -253,6 +276,13 @@ export async function runAgent(
   // ChainedSession aggregate their children's tools internally before
   // we see the result here.
   const topLevelSpec = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
+  // When the manifest declares neither [tools] nor [capabilities], use
+  // the default-tool capability bundle. When it declares [tools], the
+  // manifest's [capabilities] table (or empty) is the source of truth.
+  const effectiveCapabilities: import("../types/manifest.js").Capabilities =
+    manifest.tools === undefined && manifest.capabilities === undefined
+      ? DEFAULT_TOP_LEVEL_CAPABILITIES
+      : (manifest.capabilities ?? {});
   const refs: Array<{ name: string; config: ToolConfig; origin: string }> = [];
   for (const [name, config] of Object.entries(topLevelSpec)) {
     refs.push({ name, config, origin: TOP_LEVEL_INTRODUCER });
@@ -267,12 +297,14 @@ export async function runAgent(
   }
 
   // ─── 9. Resolve each ref through the provider chain ────────────
+  // ─── 9. Resolve each ref through the provider chain ────
   const resolvedTools = new Map<string, Tool>();
   for (const ref of refs) {
     let claimed: Tool | null = null;
+    const grant = effectiveCapabilities[ref.name];
     for (const p of providers) {
       const result = await Promise.resolve(
-        p.instance.resolveTool(ref.name, ref.config, ownAgent),
+        p.instance.resolveTool(ref.name, ref.config, ownAgent, grant),
       );
       if (result) {
         claimed = result;
@@ -302,9 +334,15 @@ export async function runAgent(
   );
   const allSecrets = { ...phase1Secrets, ...phase2Secrets };
 
-  // ─── 11. Validate [capabilities.<name>] ceilings ──────────────
-  const ceiling: Capabilities = manifest.capabilities ?? {};
-  assertCapabilities(resolvedTools, ceiling);
+  // ─── 11. Validate capability grants + secret allowlist ───────────
+  // Three boot guards on the manifest grants:
+  //   (a) every kind in a structured grant is one the tool declares
+  //       it understands (catches typos / phantom-constraint footguns)
+  //   (b) every tool's `requires` kinds are present in its grant
+  //   (c) every tool's secret needs fit in [agent].secrets (when set)
+  assertKnownKinds(resolvedTools, effectiveCapabilities);
+  assertRequires(resolvedTools, effectiveCapabilities);
+  assertSecretAllowlist(resolvedTools, manifest.secrets);
 
   // ─── 12. Build ToolTable + AgentState ─────────────────────
   const toolTable = new ToolTable({
@@ -330,14 +368,14 @@ export async function runAgent(
   });
 
   const state = new AgentState({
-    ceiling,
+    grants: effectiveCapabilities,
     toolTable,
   });
 
   return new RunningAgentImpl({
     manifest,
     systemPrompt,
-    capabilities: ceiling,
+    capabilities: effectiveCapabilities,
     session,
     harness,
     state,

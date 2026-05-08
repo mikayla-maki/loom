@@ -11,8 +11,14 @@ export { resolveSystemPrompt } from "./manifest/resolver.js";
 export { parseAgentManifest } from "./manifest/parser.js";
 
 export {
-  assertCapabilities,
+  assertKnownKinds,
+  assertRequires,
+  assertSecretAllowlist,
   defaultContains,
+  grantFor,
+  isStarSet,
+  kindGranted,
+  valueFor,
 } from "./manifest/capabilities.js";
 
 export {

@@ -2,6 +2,9 @@
 name = "sample-agent"
 description = "An end-to-end Loom demo agent."
 system_prompt = "./identity.md"
+# Secret allowlist for tools in this agent. Mirrors capabilities
+# semantics: absent / "*" → no ceiling; an array is the closure.
+secrets = ["sample_user_name"]
 
 [harness]
 provider = "test"
@@ -11,15 +14,19 @@ provider = "test"
 provider = "file"
 path = "./session.jsonl"
 
-[capabilities]
-# Per-tool ceiling, opaque shape — each tool's caps must fit its entry.
-read_file = { paths = ["./"] }
-write_file = { paths = ["./"] }
-find = { paths = ["./"] }
-
 [tools]
-# Default builtin set, configured for the project root.
-read_file = { paths = ["./"] }
+# Tool wiring (which provider claims the name + non-cap config). No
+# capability data here — the parallel [capabilities] table is the
+# source of truth for grants.
+read_file  = "builtin"
+write_file = "builtin"
+find       = "builtin"
+echo       = "builtin"
+
+[capabilities]
+# Per-tool grants. "*" → unrestricted; absent kind → tool's smart
+# default; explicit array → allowlist.
+read_file  = { paths = ["./"] }
 write_file = { paths = ["./"] }
-find = { paths = ["./"] }
-echo = {}
+find       = { paths = ["./"] }
+echo       = "*"

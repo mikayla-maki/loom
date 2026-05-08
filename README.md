@@ -31,13 +31,18 @@ Loom proper stays focused on the runtime.
   ship tools as code in npm packages.
 - **Sub-agents** are first-class: `Agent.spawnSubagent`,
   `dependencies.subagents`, audit recursion, parent-derived providers.
-- **Per-tool capability declarations** — each tool advertises its own
-  capability shape (e.g. `read_file` uses `{ paths: [...] }`). Loom
-  doesn't interpret the shape; tools self-police at execute time.
-- **Optional `[capabilities]` ceiling** — a per-tool upper bound on the
-  same shape. When present, each tool's declared caps must fit inside
-  the matching entry, using the tool's own `capabilitiesContain` (or a
-  structural deep-subset default).
+- **Capabilities v2** — `[capabilities]` is the single source of truth
+  for what each tool may do. Per-tool grants are `"*"` (whole-tool
+  unrestricted), `{}` (nothing), or a per-kind map
+  (`{ paths = ["./"], subprocess = "*" }`). Each tool declares
+  `requires` (kinds it must have) and `optional` (kinds it may use);
+  the boot guard checks every required kind is granted. Tools also
+  derive their model-facing description and input schema from the
+  grant — same JSON drives validation, self-policing, and the
+  agent's mental model.
+- **`[agent].secrets` allowlist** — mirrors capability star/list
+  semantics. Absent or `"*"` = no ceiling; an array = the closure of
+  secret names tools may resolve.
 - **Session extensions:** `file` (JSONL append log), `memory`
   (in-process, the default if `[session]` is absent), `compacting`,
   `fork-of-parent`.
@@ -59,6 +64,21 @@ Loom owns: manifest parsing, secrets, system-prompt assembly,
 `[capabilities]` validation, and the turn loop. Providers own:
 building Tool objects from `(name, config)` references, and any state
 those tools need.
+
+A Loom agent is composed along three orthogonal axes:
+
+1. **Installation.** `[extensions]` declares npm packages that
+   register providers, harnesses, and sessions. The native provider
+   ships with Loom.
+2. **Wiring.** `[tools]` maps a model-facing name to a
+   `(provider, config)` pair. The config is the tool's runtime
+   defaults (region, timeouts, server URL) — NOT capability data.
+3. **Grant.** `[capabilities]` says what each named tool may do, in a
+   tool-defined kind vocabulary (`paths`, `subprocess`, `network`,
+   `buckets`, ...). The grant flows to the tool at construction time;
+   the tool self-polices and exposes a partially curried surface based
+   on what it was granted (multi-bucket grant → enum in input schema;
+   single-bucket grant → bucket bound, only key in schema).
 
 The trust model is the install boundary. Tools and extension providers
 are code the user installed (the loom package itself for builtins; an
@@ -98,11 +118,14 @@ await agent.close();
 Defaults applied:
 
 - `session` → `{ provider: "memory" }` (in-process log; events lost on close)
-- `capabilities` (top-level ceiling) → absent (no boot-time check; each
-  tool's declared caps stand)
 - `tools` → the default builtin set (`bash`, `read_file`, `write_file`,
-  `find`) auto-loads when the field is absent, configured for the
-  project root. Declare an explicit `tools` table (even empty) to opt out.
+  `find`) auto-loads when the field is absent, with a parallel default
+  capability bundle (FS tools → `paths = ["./"]`; bash →
+  `subprocess = "*", paths = ["./"]` and SAFE_DEFAULT env). Declare an
+  explicit `tools` table (even empty) to opt out.
+- `capabilities` → absent. When `[tools]` is also absent, the default
+  cap bundle applies; when `[tools]` is declared, no defaults apply
+  and tools that have `requires` must be granted explicitly.
 
 Tighten any of those when you want to:
 
@@ -155,16 +178,19 @@ provider = "test"
 provider = "file"
 path = "./session.jsonl"
 
-[capabilities]
-# Optional per-tool ceiling. Each tool's declared caps must fit inside
-# its matching entry (using the tool's `capabilitiesContain`).
-read_file = { paths = ["./"] }
-write_file = { paths = ["./"] }
-
 [tools]
-read_file = { paths = ["./"] }
+# Wiring: which provider claims the name + non-cap config. Caps live
+# in [capabilities] below; do not duplicate.
+read_file  = "builtin"
+write_file = "builtin"
+bash       = "builtin"
+
+[capabilities]
+# v2 grants. "*" = unrestricted. Absent kind = tool's smart default.
+# Empty {} = nothing granted (tools with requires fail boot).
+read_file  = { paths = ["./"] }
 write_file = { paths = ["./"] }
-bash = {}
+bash       = { subprocess = "*", paths = ["./"], env = ["PATH", "HOME"] }
 ```
 
 ```sh
@@ -172,19 +198,40 @@ node dist/cli/main.js audit  test/fixtures/sample-agent/agent.toml
 node dist/cli/main.js prompt test/fixtures/sample-agent/agent.toml "hi"
 ```
 
-## Capability semantics
+## Capability semantics (v2)
 
-- Each tool defines its own capability shape. `read_file`'s caps are
-  `{ paths: string[] }`; an MCP-supplied `discord.send` might use
-  `{ channels: string[] }`. Loom doesn't interpret the shape.
-- Tools self-police at execute time. `read_file` rejects requests for
-  paths outside its configured roots. The runtime doesn't enforce caps
-  — the tool author does, in their own code.
-- `[capabilities]` (optional, top-level) is a per-tool ceiling. When
-  present, each tool's declared caps must fit inside the matching
-  entry, checked at boot via the tool's `capabilitiesContain` (or a
-  structural deep-subset default). Use it as a defense-in-depth rail
-  against an extension bringing a tool with looser caps than you intended.
+A capability grant is one of:
+
+- `"*"` — whole-tool unrestricted (every kind allowed; sandbox
+  engagement opts out).
+- `{}` — nothing granted. Tools with non-empty `requires` fail boot.
+- `{ kind = value }` — per-kind grant. Each value is `"*"` (kind
+  unrestricted), an allowlist array, or a structured object
+  (kind-defined). Absent kinds are denied (or fall to the tool's
+  smart default, when one is defined).
+
+Tool authors declare:
+
+- `requires: string[]` — kinds the tool MUST have to function. Boot
+  guard fails when missing.
+- `optional: string[]` — kinds the tool MAY use if granted. Inform
+  audit + (for bash) sandbox-profile derivation; absence is fine.
+
+Kinds are tool-defined (open vocabulary). Examples in tree:
+
+| Kind         | Used by              | Star/list/absent semantics                                    |
+|--------------|----------------------|---------------------------------------------------------------|
+| `paths`      | `read_file`/`write_file`/`find`/`bash` | `"*"` any FS; `["./"]` allowlist; absent → smart default `["./"]` |
+| `subprocess` | `bash`               | `"*"` allow exec; absent → deny (boot fails: bash requires it) |
+| `network`    | `bash`               | `"*"` allow; `[]` deny; absent → deny                         |
+| `env`        | `bash`               | `"*"` full process.env; `["PATH", "AWS_*"]` exact + prefix; absent → SAFE_DEFAULT subset |
+
+Tools self-police on every call by reading `this.capabilities`, and
+derive their description/input schema from the grant — a
+single-bucket S3 grant binds the bucket; a multi-bucket grant exposes
+an `enum`; an unrestricted grant opens the full surface. The same
+JSON drives the model's mental model, the runtime check, and (for
+bash, in a follow-up) the OS-level sandbox profile.
 
 
 

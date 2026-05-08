@@ -1,41 +1,86 @@
 import { describe, expect, it } from "vitest";
 import {
-  assertCapabilities,
+  assertKnownKinds,
+  assertRequires,
+  assertSecretAllowlist,
   defaultContains,
+  grantFor,
+  isStarSet,
+  kindGranted,
+  valueFor,
 } from "../src/manifest/capabilities.js";
-import { CapabilityError } from "../src/errors.js";
+import { CapabilityError, SecretError } from "../src/errors.js";
 import type { Tool } from "../src/types/interfaces.js";
+import type { CapabilitySet } from "../src/types/manifest.js";
 
 /**
- * Synthetic Tool builder for these tests — we only care about the
- * `capabilities` (and optional `capabilitiesContain`) fields, plus the
- * structural surface `assertCapabilities` reads.
+ * Synthetic Tool builder. We only care about the v2 fields:
+ *   `requires`, `optional`, `capabilities`, `secrets`.
  */
-function makeTool(
-  name: string,
-  capabilities: unknown,
-  override?: Tool["capabilitiesContain"],
-): Tool {
+function makeTool(opts: {
+  name: string;
+  requires?: string[];
+  optional?: string[];
+  capabilities?: CapabilitySet;
+  secrets?: { required?: string[]; optional?: string[] };
+}): Tool {
   return {
-    name,
-    description: `synthetic ${name}`,
+    name: opts.name,
+    description: `synthetic ${opts.name}`,
     inputSchema: { type: "object" },
-    capabilities,
-    ...(override ? { capabilitiesContain: override } : {}),
+    ...(opts.requires ? { requires: opts.requires } : {}),
+    ...(opts.optional ? { optional: opts.optional } : {}),
+    ...(opts.capabilities !== undefined
+      ? { capabilities: opts.capabilities }
+      : {}),
+    ...(opts.secrets ? { secrets: opts.secrets } : {}),
     async execute() {
       return { content: "" };
     },
   };
 }
 
-describe("defaultContains", () => {
-  it("treats undefined superset as unconstrained (contains anything)", () => {
-    expect(defaultContains(undefined, { foo: ["x"] })).toBe(true);
-    expect(defaultContains(undefined, "anything")).toBe(true);
+describe("grant lookup helpers", () => {
+  it("grantFor returns the manifest entry or undefined", () => {
+    expect(grantFor({ a: { paths: ["/x"] } }, "a")).toEqual({
+      paths: ["/x"],
+    });
+    expect(grantFor({ a: { paths: ["/x"] } }, "missing")).toBeUndefined();
+    expect(grantFor(undefined, "a")).toBeUndefined();
   });
 
-  it("treats undefined subset as trivially contained", () => {
+  it("isStarSet detects whole-tool star grants", () => {
+    expect(isStarSet("*")).toBe(true);
+    expect(isStarSet({ paths: "*" })).toBe(false);
+    expect(isStarSet(undefined)).toBe(false);
+  });
+
+  it("kindGranted treats `*` as authorising every kind", () => {
+    expect(kindGranted("*", "anything")).toBe(true);
+    expect(kindGranted({ paths: ["/x"] }, "paths")).toBe(true);
+    expect(kindGranted({ paths: ["/x"] }, "network")).toBe(false);
+    expect(kindGranted(undefined, "paths")).toBe(false);
+  });
+
+  it("valueFor returns the kind-level value, with `*` propagating", () => {
+    expect(valueFor("*", "paths")).toBe("*");
+    expect(valueFor({ paths: ["/x"] }, "paths")).toEqual(["/x"]);
+    expect(valueFor({ paths: "*" }, "paths")).toBe("*");
+    expect(valueFor({ paths: ["/x"] }, "network")).toBeUndefined();
+    expect(valueFor(undefined, "paths")).toBeUndefined();
+  });
+});
+
+describe("defaultContains (audit subset)", () => {
+  it("treats undefined superset/subset as trivially compatible", () => {
+    expect(defaultContains(undefined, { foo: ["x"] })).toBe(true);
     expect(defaultContains({ paths: ["./"] }, undefined)).toBe(true);
+  });
+
+  it("`*` superset contains anything; `*` subset only contained by `*`", () => {
+    expect(defaultContains("*", { paths: ["/x"] })).toBe(true);
+    expect(defaultContains("*", "*")).toBe(true);
+    expect(defaultContains({ paths: "*" }, "*")).toBe(false);
   });
 
   it("array containment: every subset item must appear in superset", () => {
@@ -56,104 +101,210 @@ describe("defaultContains", () => {
     ).toBe(false);
   });
 
-  it("primitive containment is deep-equal", () => {
+  it("primitive containment is deep-equal; type mismatches fail", () => {
     expect(defaultContains("foo", "foo")).toBe(true);
     expect(defaultContains("foo", "bar")).toBe(false);
-    expect(defaultContains(5, 5)).toBe(true);
-    expect(defaultContains(true, false)).toBe(false);
-  });
-
-  it("type mismatch (array vs object) fails", () => {
     expect(defaultContains(["a"], { a: 1 })).toBe(false);
-    expect(defaultContains({ a: 1 }, ["a"])).toBe(false);
   });
 });
 
-describe("assertCapabilities", () => {
-  it("passes when no sandbox entry matches the tool name", () => {
+describe("assertRequires", () => {
+  it("passes when a tool has no `requires`", () => {
+    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
+    // No grant → still passes; nothing required.
+    expect(() => assertRequires(tools, undefined)).not.toThrow();
+    expect(() => assertRequires(tools, {})).not.toThrow();
+  });
+
+  it("passes when every required kind is granted", () => {
     const tools = new Map<string, Tool>([
-      ["t", makeTool("t", { paths: ["/etc"] })],
+      ["bash", makeTool({ name: "bash", requires: ["subprocess"] })],
     ]);
-    expect(() => assertCapabilities(tools, {})).not.toThrow();
     expect(() =>
-      assertCapabilities(tools, { other_tool: { paths: ["./"] } }),
+      assertRequires(tools, { bash: { subprocess: "*" } }),
     ).not.toThrow();
   });
 
-  it("passes when the tool's caps fit inside its ceiling entry", () => {
-    // defaultContains is structural string-equality on array items, so
-    // these test inputs are pre-normalized to literal-equal strings.
+  it("`*` whole-tool grant satisfies every requires", () => {
     const tools = new Map<string, Tool>([
-      ["read_file", makeTool("read_file", { paths: ["/proj"] })],
+      ["bash", makeTool({ name: "bash", requires: ["subprocess", "net"] })],
     ]);
-    expect(() =>
-      assertCapabilities(tools, {
-        read_file: { paths: ["/proj", "/extra"] },
-      }),
-    ).not.toThrow();
+    expect(() => assertRequires(tools, { bash: "*" })).not.toThrow();
   });
 
-  it("throws CapabilityError when caps exceed the ceiling", () => {
+  it("throws when a required kind is missing from the grant", () => {
     const tools = new Map<string, Tool>([
-      ["read_file", makeTool("read_file", { paths: ["/etc"] })],
+      ["bash", makeTool({ name: "bash", requires: ["subprocess"] })],
     ]);
-    expect(() =>
-      assertCapabilities(tools, { read_file: { paths: ["/proj"] } }),
-    ).toThrow(CapabilityError);
+    expect(() => assertRequires(tools, {})).toThrow(CapabilityError);
+    expect(() => assertRequires(tools, { bash: {} })).toThrow(CapabilityError);
   });
 
-  it("tools with no declared capabilities pass unconditionally", () => {
+  it("aggregates multiple violations across tools into one error", () => {
     const tools = new Map<string, Tool>([
-      [
-        "echo",
-        {
-          name: "echo",
-          description: "echo",
-          inputSchema: { type: "object" },
-          async execute() {
-            return { content: "" };
-          },
-        },
-      ],
-    ]);
-    // Even with a ceiling entry, no declared caps → nothing to check.
-    expect(() =>
-      assertCapabilities(tools, { echo: { paths: ["./"] } }),
-    ).not.toThrow();
-  });
-
-  it("Tool.capabilitiesContain overrides the structural default", () => {
-    // A tool that always rejects, regardless of structural shape.
-    const reject = makeTool("strict", { paths: ["/proj"] }, () => false);
-    const tools = new Map<string, Tool>([["strict", reject]]);
-    expect(() =>
-      assertCapabilities(tools, { strict: { paths: ["/proj"] } }),
-    ).toThrow(CapabilityError);
-
-    // A tool that always accepts, even when defaultContains would reject.
-    const lax = makeTool("lax", { paths: ["/etc"] }, () => true);
-    const tools2 = new Map<string, Tool>([["lax", lax]]);
-    expect(() =>
-      assertCapabilities(tools2, { lax: { paths: ["/proj"] } }),
-    ).not.toThrow();
-  });
-
-  it("aggregates multiple violations into one error", () => {
-    const tools = new Map<string, Tool>([
-      ["a", makeTool("a", { paths: ["/etc"] })],
-      ["b", makeTool("b", { paths: ["/var"] })],
+      ["a", makeTool({ name: "a", requires: ["x"] })],
+      ["b", makeTool({ name: "b", requires: ["y", "z"] })],
     ]);
     let caught: unknown;
     try {
-      assertCapabilities(tools, {
-        a: { paths: ["/proj"] },
-        b: { paths: ["/proj"] },
-      });
+      assertRequires(tools, { a: {}, b: { y: "*" } });
     } catch (e) {
       caught = e;
     }
     expect(caught).toBeInstanceOf(CapabilityError);
     expect(String(caught)).toContain("a");
+    expect(String(caught)).toContain("'x'");
     expect(String(caught)).toContain("b");
+    expect(String(caught)).toContain("'z'");
+  });
+});
+
+describe("assertKnownKinds", () => {
+  it("absent capabilities passes trivially", () => {
+    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
+    expect(() => assertKnownKinds(tools, undefined)).not.toThrow();
+  });
+
+  it("`*` whole-tool grants are exempt from kind-checking", () => {
+    const tools = new Map<string, Tool>([
+      ["bash", makeTool({ name: "bash", requires: ["subprocess"] })],
+    ]);
+    // "*" doesn't list any kinds, so there's nothing to typo-check.
+    expect(() => assertKnownKinds(tools, { bash: "*" })).not.toThrow();
+  });
+
+  it("empty grant `{}` passes (no keys to check)", () => {
+    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
+    expect(() => assertKnownKinds(tools, { echo: {} })).not.toThrow();
+  });
+
+  it("passes when every granted kind is declared (in requires or optional)", () => {
+    const tools = new Map<string, Tool>([
+      [
+        "bash",
+        makeTool({
+          name: "bash",
+          requires: ["subprocess"],
+          optional: ["paths", "network"],
+        }),
+      ],
+    ]);
+    expect(() =>
+      assertKnownKinds(tools, {
+        bash: { subprocess: "*", paths: ["./"], network: "*" },
+      }),
+    ).not.toThrow();
+  });
+
+  it("throws when a granted kind isn't in requires or optional (typo)", () => {
+    const tools = new Map<string, Tool>([
+      ["read_file", makeTool({ name: "read_file", optional: ["paths"] })],
+    ]);
+    // `pahts` (typo) would silently do nothing under v1; v2 catches it.
+    let caught: unknown;
+    try {
+      assertKnownKinds(tools, {
+        read_file: { pahts: ["./"] },
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CapabilityError);
+    expect(String(caught)).toContain("read_file");
+    expect(String(caught)).toContain("'pahts'");
+    expect(String(caught)).toContain("'paths'");
+  });
+
+  it("throws when a tool with no declared kinds receives a structured grant", () => {
+    // The footgun the user pointed at: `echo` doesn't read caps, but
+    // the user grants `{ paths: ["./"] }` thinking it constrains the
+    // tool. The check rejects this so the user notices.
+    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
+    expect(() => assertKnownKinds(tools, { echo: { paths: ["./"] } })).toThrow(
+      CapabilityError,
+    );
+  });
+
+  it("aggregates violations across multiple tools", () => {
+    const tools = new Map<string, Tool>([
+      ["a", makeTool({ name: "a", optional: ["x"] })],
+      ["b", makeTool({ name: "b", optional: ["y"] })],
+    ]);
+    let caught: unknown;
+    try {
+      assertKnownKinds(tools, {
+        a: { z: "*" },
+        b: { wat: "*" },
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CapabilityError);
+    expect(String(caught)).toContain("'z'");
+    expect(String(caught)).toContain("'wat'");
+  });
+});
+
+describe("assertSecretAllowlist", () => {
+  it("absent allowlist passes any secret needs", () => {
+    const tools = new Map<string, Tool>([
+      [
+        "s3",
+        makeTool({
+          name: "s3",
+          secrets: { required: ["AWS_ACCESS_KEY_ID"] },
+        }),
+      ],
+    ]);
+    expect(() => assertSecretAllowlist(tools, undefined)).not.toThrow();
+    expect(() => assertSecretAllowlist(tools, "*")).not.toThrow();
+  });
+
+  it("allowlist passes when every needed name is in it", () => {
+    const tools = new Map<string, Tool>([
+      [
+        "s3",
+        makeTool({
+          name: "s3",
+          secrets: {
+            required: ["AWS_ACCESS_KEY_ID"],
+            optional: ["AWS_REGION"],
+          },
+        }),
+      ],
+    ]);
+    expect(() =>
+      assertSecretAllowlist(tools, ["AWS_ACCESS_KEY_ID", "AWS_REGION"]),
+    ).not.toThrow();
+  });
+
+  it("throws when a tool wants a secret outside the allowlist", () => {
+    const tools = new Map<string, Tool>([
+      [
+        "s3",
+        makeTool({
+          name: "s3",
+          secrets: {
+            required: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+          },
+        }),
+      ],
+    ]);
+    expect(() => assertSecretAllowlist(tools, ["AWS_ACCESS_KEY_ID"])).toThrow(
+      SecretError,
+    );
+  });
+
+  it("empty allowlist denies any tool that wants a secret", () => {
+    const tools = new Map<string, Tool>([
+      [
+        "fetch",
+        makeTool({
+          name: "fetch",
+          secrets: { optional: ["BEARER_TOKEN"] },
+        }),
+      ],
+    ]);
+    expect(() => assertSecretAllowlist(tools, [])).toThrow(SecretError);
   });
 });
