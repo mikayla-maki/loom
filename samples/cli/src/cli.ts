@@ -22,7 +22,8 @@ import type {
   TurnResult,
 } from "loom";
 
-import { renderMarkdown, ansi } from "./markdown.js";
+import { ansi } from "./markdown.js";
+import { StreamingMarkdownRenderer } from "./streaming-markdown.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -277,7 +278,10 @@ interface Printer {
 
 function startPrinter(agent: RunningAgent, plain: boolean): Printer {
   const s = ansiStyle(plain);
-  let buffer = "";
+  // Streaming markdown renderer — emits ANSI codes as soon as it sees
+  // delimiters, so tokens reach the terminal immediately rather than
+  // being held until the next newline.
+  let md = new StreamingMarkdownRenderer({ plain });
   let inAgentMessage = false;
   let lastUsage: { used: number; size: number } | null = null;
   const stopFlag = { current: false };
@@ -297,19 +301,18 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
     return s;
   };
 
-  const flush = (final: boolean): void => {
-    if (!buffer) return;
-    if (final) {
-      stdout.write(renderMarkdown(buffer, { plain }));
+  /**
+   * End the current streaming-markdown segment (e.g. between an
+   * agent_message and a tool_call). Flushes any open ANSI styles and
+   * writes a trailing newline if the agent was mid-message. Resets
+   * the renderer for the next segment.
+   */
+  const finishMessage = (): void => {
+    if (inAgentMessage) {
+      stdout.write(md.flush());
       stdout.write("\n");
-      buffer = "";
-      return;
-    }
-    const idx = buffer.lastIndexOf("\n");
-    if (idx >= 0) {
-      const ready = buffer.slice(0, idx + 1);
-      buffer = buffer.slice(idx + 1);
-      stdout.write(renderMarkdown(ready, { plain }));
+      inAgentMessage = false;
+      md = new StreamingMarkdownRenderer({ plain });
     }
   };
 
@@ -328,8 +331,10 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
           inAgentMessage = true;
           stdout.write(`\n${s.bold}${s.magenta}agent›${s.reset} `);
         }
-        buffer += u.content.text;
-        flush(false);
+        // Streamed character-by-character via the markdown tokenizer.
+        // Bold/italic/code styling appears as soon as the closing
+        // delimiter is recognised; everything else streams in real time.
+        stdout.write(md.feed(u.content.text));
         break;
       }
       case "agent_thought_chunk": {
@@ -338,8 +343,7 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
         break;
       }
       case "tool_call": {
-        flush(true);
-        inAgentMessage = false;
+        finishMessage();
         const tag = shortOf(u.toolCallId);
         const inputPreview = previewJson(u.input);
         stdout.write(
@@ -375,8 +379,7 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
         break;
       }
       case "stop": {
-        flush(true);
-        inAgentMessage = false;
+        finishMessage();
         break;
       }
       case "usage_update": {
@@ -392,7 +395,7 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
   return {
     stop: () => {
       stopFlag.current = true;
-      flush(true);
+      finishMessage();
     },
     getUsage: () => lastUsage,
     replay: (updates) => {
@@ -411,8 +414,7 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
         }
         handleUpdate(u);
       }
-      flush(true);
-      inAgentMessage = false;
+      finishMessage();
     },
   };
 }

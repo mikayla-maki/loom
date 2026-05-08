@@ -1,5 +1,6 @@
 node_modules/
 dist/
+
 # Anything the agent or its session writes during a CLI run. The
 # tracked files are the package metadata, README, src/, and tsconfig
 # — everything else is a runtime artifact.
@@ -8,4 +9,17 @@ dist/
 *.py
 *.pl
 *.rb
+*.sh
 *.log
+*.db
+*.sql
+*.tar
+*.tar.gz
+*.zip
+
+# Subdirectories the agent likes to create
+test-git-repo/
+demo-project/
+demo/
+playground/
+scratch/
