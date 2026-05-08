@@ -26,6 +26,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as nodePath from "node:path";
 
 import type { CapabilitySet } from "../../types/manifest.js";
@@ -163,6 +164,13 @@ export function validateBashGrant(grant: CapabilitySet): void {
  *     access here.
  *   - file-read on /opt — Homebrew lives at /opt/homebrew on Apple
  *     Silicon. User-installed CLI tools (rg, jq, deno, …) live there.
+ *   - file-read on ~/.gitconfig and ~/.config/git — git refuses to
+ *     run any command (even `git init`) without being able to read
+ *     the user's global config. Restricted to the specific git
+ *     paths only; other dotfiles (~/.zshrc, ~/.aws, ~/.ssh, etc.)
+ *     remain inaccessible. Read-only on purpose: the agent can use
+ *     `git -c key=value` or local config to override per-repo, but
+ *     it shouldn't mutate the user's global git state.
  *
  * The "allow defaults" set keeps bash itself working: without these,
  * even `/bin/bash -c echo` fails on dyld lookups or cwd resolution.
@@ -219,6 +227,20 @@ export async function buildBashProfile(grant: CapabilitySet): Promise<string> {
     '(allow file-read* (subpath "/Applications"))',
     '(allow file-read* (subpath "/opt"))',
   ];
+
+  // User-state read-only carve-outs. Strictly tool-config paths the
+  // agent legitimately needs; NOT a general home-dir grant.
+  const home = os.homedir();
+  if (home) {
+    // Git refuses to run without reading global config; ~/.gitconfig
+    // and ~/.config/git are user identity, not secrets.
+    lines.push(
+      `(allow file-read* (literal "${escapeSbpl(nodePath.join(home, ".gitconfig"))}"))`,
+    );
+    lines.push(
+      `(allow file-read* (subpath "${escapeSbpl(nodePath.join(home, ".config", "git"))}"))`,
+    );
+  }
 
   // subprocess
   if (grant.subprocess === "*") {

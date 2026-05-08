@@ -285,6 +285,51 @@ describe("bash sandbox: scripting language interpreters", () => {
   });
 });
 
+describe("bash sandbox: git", () => {
+  // Git reads ~/.gitconfig at startup. Without that path in the
+  // baseline, every git command fails with "unable to access
+  // /Users/.../.gitconfig: Operation not permitted". Regression
+  // guard for the carve-out.
+  let scratch: string;
+  beforeAll(async () => {
+    scratch = await fs.mkdtemp(path.join(os.tmpdir(), "loom-bash-git-"));
+  });
+  const grant = (root: string): CapabilitySet => ({
+    subprocess: "*",
+    paths: [root],
+  });
+
+  dit("git --version runs without config errors", async () => {
+    const r = await runBash(grant(scratch), "git --version", scratch);
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/git version/);
+    // No warning about ~/.gitconfig or ~/.config/git/ignore.
+    expect(r.content).not.toMatch(/Operation not permitted/);
+    expect(r.content).not.toMatch(/unable to access/);
+  });
+
+  dit("git init + commit roundtrip works inside the granted dir", async () => {
+    // Use a subdirectory so we don't pollute the scratch root for other tests.
+    const repo = path.join(scratch, "repo");
+    await fs.mkdir(repo, { recursive: true });
+    const r = await runBash(
+      grant(scratch),
+      [
+        "git init -q",
+        "echo hi > a.txt",
+        "git add a.txt",
+        // -c user.* lets the test pass even when ~/.gitconfig has no
+        // identity set (CI machines, fresh user accounts, ...).
+        "git -c user.name=test -c user.email=test@example.com commit -q -m init",
+        "git log --oneline",
+      ].join(" && "),
+      repo,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/init/);
+  });
+});
+
 describe("bash sandbox: paths = star (unrestricted FS)", () => {
   dit("can read /etc/hosts when paths = '*'", async () => {
     const r = await runBash(
