@@ -1,0 +1,22 @@
+{
+  "name": "loom-sample-cli",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Sample CLI agent — exercises the loom SDK end-to-end.",
+  "type": "module",
+  "bin": {
+    "loom-sample-cli": "./dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "loom": "file:../.."
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "typescript": "^5.6.0"
+  }
+}
