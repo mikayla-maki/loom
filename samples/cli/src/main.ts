@@ -1,42 +1,39 @@
 #!/usr/bin/env node
 /**
- * loom-sample-cli — the testbed CLI agent.
+ * loom-sample-cli — entrypoint.
  *
- * A minimal interactive agent that exercises the full Loom stack via the
- * public SDK:
- *   - Inline AgentManifest construction (no agent.toml on disk).
- *   - Anthropic harness for the model loop.
- *   - Compacting session for long-running conversations.
- *   - Markdown rendering of agent output and tool-call summaries.
+ * Assembles the agent runtime (harness + session + tools) and hands a
+ * `RunningAgent` to the CLI module. Nothing in here knows about
+ * readline, ANSI codes, or update streams — that all lives in
+ * `cli.ts`. The split is deliberate: it shows that Loom is a library
+ * of composable parts, and that a client is just glue around the
+ * `RunningAgent` API.
  *
- * Usage: ANTHROPIC_API_KEY=... loom-sample-cli
+ * Usage: ANTHROPIC_API_KEY=... loom-sample-cli [flags]
  *
  * Flags:
  *   --model <id>           override the Claude model id
+ *   --effort <level>       low | medium | high | xhigh | max
  *   --no-tools             disable the default builtin tool set
  *   --compact-after <n>    compact when the session exceeds <n> events
+ *   --model-compact        use the model to write compaction summaries
  *   --plain                disable ANSI styling
- *
- * The CLI itself owns no agent primitives; it wires harness + session +
- * tools (all from loom) together with a small REPL loop.
  */
 
-import * as readline from "node:readline";
-import { stdin, stdout, stderr, exit } from "node:process";
+import { stdout, stderr, exit } from "node:process";
 
 import {
   runAgent,
   CompactingSession,
   modelCompactor,
   AnthropicHarness,
-  type RunningAgent,
-  type SessionUpdate,
   type AgentManifest,
   type RunParameters,
   type SessionContext,
 } from "loom";
 
-import { renderMarkdown, ansi } from "./markdown.js";
+import { runCli, type SlashCommand } from "./cli.js";
+import { ansi } from "./markdown.js";
 
 interface Args {
   model: string;
@@ -109,18 +106,16 @@ async function main(): Promise<void> {
 
   if (!process.env.ANTHROPIC_API_KEY) {
     stderr.write(
-      `${ansiStyle(args.plain).red}error:${ansiStyle(args.plain).reset} ANTHROPIC_API_KEY is not set.\n` +
+      `${args.plain ? "" : ansi.red}error:${args.plain ? "" : ansi.reset} ANTHROPIC_API_KEY is not set.\n` +
         `Set it in your shell, e.g.:\n  export ANTHROPIC_API_KEY=sk-ant-...\n`,
     );
     exit(2);
   }
 
   // Construct the primitives ourselves rather than handing the manifest
-  // a `{ provider: "anthropic" }` config. This is the demonstration:
-  // loom is a library of composable parts. `runAgent` is convenient for
-  // wiring everything from a single declarative manifest, but you can
-  // also assemble pieces yourself and hand them in as instances. We
-  // hold direct references to use later for /compact.
+  // a `{ provider: "anthropic" }` config. We hold direct references so
+  // the `/compact` slash command can drive `session.compactNow(ctx)`
+  // with a context built from these same pieces.
   const harness = new AnthropicHarness(
     args.model,
     process.env.ANTHROPIC_API_KEY,
@@ -149,69 +144,16 @@ async function main(): Promise<void> {
     ...(args.noTools ? { tools: {} } : {}),
   };
 
-  let agent: RunningAgent;
-  try {
-    agent = await runAgent(manifest);
-  } catch (e) {
-    stderr.write(
-      `${ansiStyle(args.plain).red}failed to start agent:${ansiStyle(args.plain).reset}\n${(e as Error).message}\n`,
-    );
-    exit(1);
-  }
+  const agent = await runAgent(manifest);
 
-  // The CompactingSession receives a per-turn SessionContext during
-  // runAgent(); when --model-compact is set the modelCompactor uses it
-  // to drive a model turn for summarisation.
-
-  printBanner(agent, args);
-
-  // Subscribe to updates; render them as they arrive.
-  const printer = startPrinter(agent, args);
-
-  // REPL.
-  const rl = readline.createInterface({
-    input: stdin,
-    output: stdout,
-    prompt: buildPrompt(printer.getUsage(), args),
-    terminal: stdout.isTTY,
-  });
-
-  let cancelling = false;
-  rl.on("SIGINT", () => {
-    if (cancelling) {
-      stderr.write("\n(force quit)\n");
-      exit(130);
-    }
-    cancelling = true;
-    stderr.write("\n(cancelling turn… ctrl-c again to exit)\n");
-    void agent.cancel().finally(() => {
-      cancelling = false;
-      rl.prompt();
-    });
-  });
-
-  rl.prompt();
-  for await (const line of rl) {
-    const text = line.trim();
-    if (!text) {
-      rl.prompt();
-      continue;
-    }
-    if (text === "/quit" || text === "/exit") break;
-    if (text === "/events") {
-      const events = await agent.session.getEvents();
-      stdout.write(
-        `${ansi.dim}(${events.length} events in session)${ansi.reset}\n`,
-      );
-      rl.prompt();
-      continue;
-    }
-    if (text === "/compact") {
-      // Drive compaction directly through our held session reference,
-      // bypassing the per-turn flow. Build a SessionContext from the
-      // pieces we already own — same shape loom would have built
-      // for `prepareTurn`. The model compactor (when --model-compact)
-      // closes over `harness` here.
+  // Custom slash commands. The CLI ships /quit, /exit, /help, /events
+  // built-in; everything else is the client's to add. /compact is the
+  // demonstration: it closes over the harness + session refs we own
+  // here and drives `compactNow(ctx)` directly.
+  const compactCommand: SlashCommand = {
+    name: "compact",
+    description: "force a compaction pass right now",
+    handler: async () => {
       const ctx: SessionContext = {
         harness,
         systemPromptCore,
@@ -228,236 +170,40 @@ async function main(): Promise<void> {
       } else {
         stdout.write(`${ansi.dim}(nothing to compact)${ansi.reset}\n`);
       }
-      rl.prompt();
-      continue;
-    }
-    try {
-      const params: RunParameters = {};
-      if (args.effort) params.effort = args.effort;
-      const result = await agent.prompt(
-        text,
-        Object.keys(params).length > 0 ? params : undefined,
-      );
-      if (result.stopReason !== "end_turn") {
-        stdout.write(
-          `${ansi.dim}(stopped: ${result.stopReason})${ansi.reset}\n`,
-        );
-      }
-    } catch (e) {
-      stderr.write(`${ansi.red}error:${ansi.reset} ${(e as Error).message}\n`);
-    }
-    // Update the prompt prefix with the latest context percentage.
-    rl.setPrompt(buildPrompt(printer.getUsage(), args));
-    rl.prompt();
-  }
-
-  await agent.close();
-  printer.stop();
-}
-
-function printBanner(_agent: RunningAgent, args: Args): void {
-  const s = ansiStyle(args.plain);
-  const lines = [
-    `${s.bold}${s.cyan}loom${s.reset} ${s.dim}sample cli${s.reset}`,
-    `${s.dim}model:${s.reset} ${args.model}    ${s.dim}compact-after:${s.reset} ${args.compactAfter}`,
-    `${s.dim}commands:${s.reset} /quit    /events    /compact`,
-    "",
-  ];
-  stdout.write(lines.join("\n"));
-}
-
-interface Printer {
-  stop(): void;
-  /** Latest usage observed via `usage_update`, or null. */
-  getUsage(): { used: number; size: number } | null;
-}
-
-/**
- * Subscribe to the agent's update stream and render incrementally.
- *
- * Each agent_message_chunk is buffered until we hit a logical break
- * (newline, end-of-turn) and rendered as markdown. Tool calls render as
- * a one-line summary; results render dimmed. `usage_update` events are
- * stashed for the prompt prefix.
- */
-function startPrinter(agent: RunningAgent, args: Args): Printer {
-  const s = ansiStyle(args.plain);
-  let buffer = "";
-  let inAgentMessage = false;
-  let lastUsage: { used: number; size: number } | null = null;
-  const stopFlag = { current: false };
-
-  const flush = (final: boolean): void => {
-    if (!buffer) return;
-    if (final) {
-      stdout.write(renderMarkdown(buffer, { plain: args.plain }));
-      stdout.write("\n");
-      buffer = "";
-      return;
-    }
-    // Flush whole lines we've accumulated.
-    const idx = buffer.lastIndexOf("\n");
-    if (idx >= 0) {
-      const ready = buffer.slice(0, idx + 1);
-      buffer = buffer.slice(idx + 1);
-      stdout.write(renderMarkdown(ready, { plain: args.plain }));
-    }
-  };
-
-  void (async () => {
-    for await (const u of agent.updates()) {
-      if (stopFlag.current) break;
-      handleUpdate(u, s);
-    }
-  })();
-
-  function handleUpdate(
-    u: SessionUpdate,
-    s: ReturnType<typeof ansiStyle>,
-  ): void {
-    switch (u.sessionUpdate) {
-      case "agent_message_chunk": {
-        if (u.content.type !== "text") return;
-        if (!inAgentMessage) {
-          inAgentMessage = true;
-          stdout.write(`\n${s.bold}${s.magenta}agent›${s.reset} `);
-        }
-        buffer += u.content.text;
-        flush(false);
-        break;
-      }
-      case "agent_thought_chunk": {
-        if (u.content.type !== "text") return;
-        stdout.write(`${s.gray}thought: ${u.content.text}${s.reset}\n`);
-        break;
-      }
-      case "tool_call": {
-        flush(true);
-        inAgentMessage = false;
-        const inputPreview = previewJson(u.input);
-        stdout.write(
-          `${s.yellow}↪ ${u.title}${s.reset} ${s.dim}${inputPreview}${s.reset}\n`,
-        );
-        break;
-      }
-      case "tool_call_update": {
-        const status = u.status ?? "?";
-        const color = status === "failed" ? s.red : s.green;
-        const result = (u.content ?? [])
-          .map((c) =>
-            c.type === "content" && c.content.type === "text"
-              ? c.content.text
-              : "",
-          )
-          .join("");
-        const summary = oneLine(result, 200);
-        stdout.write(
-          `  ${color}${status}${s.reset}${summary ? ` ${s.dim}${summary}${s.reset}` : ""}\n`,
-        );
-        break;
-      }
-      case "stop": {
-        flush(true);
-        inAgentMessage = false;
-        break;
-      }
-      case "usage_update": {
-        // Track for the prompt prefix; don't render mid-turn.
-        lastUsage = { used: u.used, size: u.size };
-        break;
-      }
-      case "user_message_chunk":
-      case "plan":
-        // user message we already echoed; plans aren't surfaced.
-        break;
-    }
-  }
-
-  return {
-    stop: () => {
-      stopFlag.current = true;
-      flush(true);
     },
-    getUsage: () => lastUsage,
   };
-}
 
-/**
- * Build the readline prompt prefix. Includes a context-percentage pip
- * (green/yellow/red) when usage data is available; falls back to the
- * plain `you›` prefix otherwise.
- */
-function buildPrompt(
-  usage: { used: number; size: number } | null,
-  args: Args,
-): string {
-  const s = ansiStyle(args.plain);
-  const base = `${s.bold}${s.green}you›${s.reset} `;
-  if (!usage || usage.size <= 0) {
-    return args.plain ? "you> " : base;
-  }
-  const pct = Math.round((usage.used / usage.size) * 100);
-  const color = pct >= 90 ? s.red : pct >= 75 ? s.yellow : s.green;
-  const pip = args.plain
-    ? `[${pct}%] you> `
-    : `${color}[${pct}%]${s.reset} ${base}`;
-  return pip;
-}
+  const params: RunParameters = {};
+  if (args.effort) params.effort = args.effort;
 
-function previewJson(v: unknown): string {
+  const banner = buildBanner(args);
+
   try {
-    const s = JSON.stringify(v);
-    if (!s) return "";
-    return s.length > 80 ? s.slice(0, 77) + "..." : s;
-  } catch {
-    return "";
+    await runCli({
+      agent,
+      plain: args.plain,
+      banner,
+      runParameters: Object.keys(params).length > 0 ? params : undefined,
+      commands: [compactCommand],
+    });
+  } finally {
+    await agent.close();
   }
 }
 
-function oneLine(s: string, max: number): string {
-  const collapsed = s.replace(/\s+/g, " ").trim();
-  return collapsed.length > max
-    ? collapsed.slice(0, max - 3) + "..."
-    : collapsed;
-}
-
-interface Style {
-  reset: string;
-  bold: string;
-  dim: string;
-  cyan: string;
-  yellow: string;
-  magenta: string;
-  green: string;
-  red: string;
-  gray: string;
-}
-
-function ansiStyle(plain: boolean): Style {
-  if (plain) {
-    return {
-      reset: "",
-      bold: "",
-      dim: "",
-      cyan: "",
-      yellow: "",
-      magenta: "",
-      green: "",
-      red: "",
-      gray: "",
-    };
+function buildBanner(args: Args): string {
+  if (args.plain) {
+    return (
+      `loom sample cli\n` +
+      `model: ${args.model}    compact-after: ${args.compactAfter}\n` +
+      `commands: /quit  /exit  /help  /events  /compact\n`
+    );
   }
-  return {
-    reset: ansi.reset,
-    bold: ansi.bold,
-    dim: ansi.dim,
-    cyan: ansi.cyan,
-    yellow: ansi.yellow,
-    magenta: ansi.magenta,
-    green: ansi.green,
-    red: ansi.red,
-    gray: ansi.gray,
-  };
+  return (
+    `${ansi.bold}${ansi.cyan}loom${ansi.reset} ${ansi.dim}sample cli${ansi.reset}\n` +
+    `${ansi.dim}model:${ansi.reset} ${args.model}    ${ansi.dim}compact-after:${ansi.reset} ${args.compactAfter}\n` +
+    `${ansi.dim}commands:${ansi.reset} /quit  /exit  /help  /events  /compact\n`
+  );
 }
 
 main().catch((e) => {

@@ -57,9 +57,51 @@ REPL commands:
 
 ```
 src/
-  main.ts          REPL + update-stream printer
+  main.ts          entrypoint — assembles harness + session, builds the
+                   AgentManifest, registers slash commands, hands a
+                   RunningAgent to runCli().
+  cli.ts           the REPL — takes a RunningAgent, runs turns,
+                   handles slash commands, renders updates. Knows
+                   nothing about which harness or session powers the
+                   agent.
   markdown.ts      terminal markdown renderer (~110 LOC, no deps)
 ```
+
+The split between `main.ts` and `cli.ts` is the demonstration: Loom's
+`RunningAgent` is the interface a client consumes; everything else
+(harness selection, session lifecycle, tool wiring) is a library
+concern that lives outside the UI.
+
+### Slash commands
+
+`cli.ts` exposes a small extension point:
+
+```ts
+await runCli({
+  agent,
+  commands: [
+    {
+      name: "compact",
+      description: "force a compaction pass right now",
+      handler: async () => { /* ... */ },
+    },
+  ],
+});
+```
+
+The REPL ships `/quit`, `/exit`, `/help`, and `/events` built-in;
+clients add anything else. `/compact` is the worked example — it
+closes over the `harness` and `session` references that `main.ts`
+holds and drives `session.compactNow(ctx)` directly. Bypassing the
+per-turn loop entirely is a property of the SDK, not a special-case
+run-mode.
+
+### Keys
+
+| Input | Effect |
+|---|---|
+| `Ctrl-C` | exit at idle; cancel mid-turn; force-quit on second press |
+| `Esc` | cancel the in-flight turn (no effect at idle) |
 
 ## Why this exists
 
