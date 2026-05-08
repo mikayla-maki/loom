@@ -28,6 +28,8 @@ describe("buildBashProfile", () => {
     expect(profile).toContain("(deny default)");
     expect(profile).toContain("(allow process-fork)");
     expect(profile).toContain("(allow signal (target self))");
+    // Metadata everywhere — needed for getcwd() and ls path display
+    expect(profile).toContain("(allow file-read-metadata)");
     // System library reads needed for bash to even load
     expect(profile).toContain('(allow file-read* (subpath "/usr"))');
     expect(profile).toContain('(allow file-read* (subpath "/System"))');

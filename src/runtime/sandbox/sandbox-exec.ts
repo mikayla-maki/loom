@@ -146,6 +146,12 @@ export function validateBashGrant(grant: CapabilitySet): void {
  *   - signal to self (clean process exit)
  *   - sysctl-read (uname-style introspection)
  *   - mach-lookup for common system services
+ *   - file-read-metadata broadly — stat-style access for getcwd(),
+ *     ls's path display, $PWD lookups, etc. Metadata is
+ *     existence/size/permissions/dir-entries; file CONTENTS still
+ *     require the more specific file-read* rules. Without this,
+ *     bash prints "shell-init: getcwd: cannot access parent
+ *     directories" on every command.
  *   - file-read for /usr, /System, /Library (system libraries),
  *     /private/etc (resolv.conf, hosts), /dev (terminal, /dev/null)
  *   - file-read on (literal "/") — bash stats / during cwd resolution
@@ -171,6 +177,11 @@ export function buildBashProfile(grant: CapabilitySet): string {
     "(allow signal (target self))",
     "(allow sysctl-read)",
     "(allow mach-lookup)",
+    // Metadata reads everywhere — needed for getcwd() to walk up
+    // the directory tree and for ls to display paths. File
+    // CONTENTS still require the file-read* rules below; this is
+    // strictly stat-style access (names, sizes, permissions).
+    "(allow file-read-metadata)",
     // Stat the filesystem root — bash hits this during cwd lookup
     // before any user command runs. Without it bash exits with SIGABRT.
     '(allow file-read* (literal "/"))',

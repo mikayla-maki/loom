@@ -17,15 +17,19 @@
  *   --no-tools             disable the default builtin tool set
  *   --compact-after <n>    compact when the session exceeds <n> events
  *   --model-compact        use the model to write compaction summaries
+ *   --session <path>       JSONL session log file (default: ./sample-cli-session.jsonl)
+ *   --fresh                delete the session file before starting (no resume)
  *   --plain                disable ANSI styling
  */
 
 import { stdout, stderr, exit } from "node:process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 import {
   runAgent,
   CompactingSession,
-  MemorySession,
+  FileSession,
   modelCompactor,
   AnthropicHarness,
   type AgentManifest,
@@ -59,7 +63,22 @@ async function main(): Promise<void> {
     16,
     true, // streaming
   );
-  const session = new CompactingSession(new MemorySession(), {
+
+  // File-backed session. FileSession loads existing events from the
+  // JSONL log on first pull; on next launch with the same path, the
+  // prior conversation comes back in context. Wrapped in
+  // CompactingSession so long-running sessions don't blow the model's
+  // context window.
+  const sessionPath = path.resolve(args.sessionPath);
+  if (args.fresh) {
+    try {
+      fs.unlinkSync(sessionPath);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+  }
+  const priorEventCount = countSessionEvents(sessionPath);
+  const session = new CompactingSession(new FileSession(sessionPath), {
     threshold: args.compactAfter,
     keep: Math.max(4, Math.floor(args.compactAfter / 4)),
     ...(args.modelCompact ? { compactor: modelCompactor() } : {}),
@@ -105,7 +124,7 @@ async function main(): Promise<void> {
     await runCli({
       agent,
       plain: args.plain,
-      banner: buildBanner(args),
+      banner: buildBanner(args, sessionPath, priorEventCount),
       commands: [compactCommand],
       // Wire the prompt path explicitly. The CLI hands us each line
       // of user input; we drive `agent.prompt` ourselves. Same as
@@ -132,6 +151,8 @@ interface Args {
   plain: boolean;
   modelCompact: boolean;
   effort: RunParameters["effort"] | undefined;
+  sessionPath: string;
+  fresh: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -142,6 +163,8 @@ function parseArgs(argv: string[]): Args {
     plain: !stdout.isTTY,
     modelCompact: false,
     effort: undefined,
+    sessionPath: "./sample-cli-session.jsonl",
+    fresh: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -152,6 +175,9 @@ function parseArgs(argv: string[]): Args {
       if (Number.isFinite(n) && n > 0) out.compactAfter = n;
     } else if (a === "--plain") out.plain = true;
     else if (a === "--model-compact") out.modelCompact = true;
+    else if (a === "--session") {
+      out.sessionPath = argv[++i] ?? out.sessionPath;
+    } else if (a === "--fresh") out.fresh = true;
     else if (a === "--effort") {
       const v = argv[++i];
       if (
@@ -184,6 +210,8 @@ function printHelp(): void {
       `  --no-tools             disable the default builtin tools\n` +
       `  --compact-after <n>    compact when session exceeds <n> events (default: 40)\n` +
       `  --model-compact        use the model to write compaction summaries\n` +
+      `  --session <path>       JSONL session log (default: ./sample-cli-session.jsonl)\n` +
+      `  --fresh                delete the session file before starting (no resume)\n` +
       `  --plain                disable ANSI styling\n` +
       `  -h, --help             this help\n\n` +
       `Environment:\n` +
@@ -191,17 +219,41 @@ function printHelp(): void {
   );
 }
 
-function buildBanner(args: Args): string {
+function buildBanner(
+  args: Args,
+  sessionPath: string,
+  priorEvents: number,
+): string {
+  const sessionLine =
+    priorEvents > 0
+      ? `session: ${sessionPath} (resumed, ${priorEvents} events)`
+      : `session: ${sessionPath} (new)`;
   if (args.plain) {
     return (
       `loom sample cli\n` +
       `model: ${args.model}    compact-after: ${args.compactAfter}\n` +
+      `${sessionLine}\n` +
       `commands: /quit  /exit  /help  /events  /compact\n`
     );
   }
   return (
     `${ansi.bold}${ansi.cyan}loom${ansi.reset} ${ansi.dim}sample cli${ansi.reset}\n` +
     `${ansi.dim}model:${ansi.reset} ${args.model}    ${ansi.dim}compact-after:${ansi.reset} ${args.compactAfter}\n` +
+    `${ansi.dim}${sessionLine}${ansi.reset}\n` +
     `${ansi.dim}commands:${ansi.reset} /quit  /exit  /help  /events  /compact\n`
   );
+}
+
+/**
+ * Count events in a JSONL session file without parsing them. Used
+ * only for the resume banner; if the file is missing or unreadable
+ * we report 0 (a fresh session).
+ */
+function countSessionEvents(filePath: string): number {
+  try {
+    const text = fs.readFileSync(filePath, "utf8");
+    return text.split("\n").filter((l) => l.length > 0).length;
+  } catch {
+    return 0;
+  }
 }
