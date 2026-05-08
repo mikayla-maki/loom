@@ -53,6 +53,11 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
+  hasBwrap,
+  maybeBwrapPrefix,
+  validateBashGrantLinux,
+} from "../sandbox/bwrap.js";
+import {
   hasSandboxExec,
   maybeSandboxExecPrefix,
   sandboxEngaged,
@@ -106,12 +111,14 @@ export class BashTool implements Tool {
 
   constructor(_config: ToolConfig, capabilities: CapabilitySet | undefined) {
     this.capabilities = capabilities ?? {};
-    // Reject configurations the macOS sandbox can't enforce — see
-    // validateBashGrant for the rationale per kind. Doing this in the
+    // Reject configurations the platform sandbox can't enforce — see
+    // each validator for per-kind rationale. Doing this in the
     // constructor surfaces unsupported configs at boot rather than at
     // execute time (or, worse, silently bypassing enforcement).
     if (process.platform === "darwin") {
       validateBashGrant(this.capabilities);
+    } else if (process.platform === "linux") {
+      validateBashGrantLinux(this.capabilities);
     }
     this.description = describeBash(this.capabilities);
   }
@@ -146,13 +153,22 @@ export class BashTool implements Tool {
         });
       }
     } else if (process.platform === "linux") {
-      findings.push({
-        severity: "warning",
-        message:
-          "Linux sandboxing (bwrap) is not yet implemented; structured grants will not enforce at runtime.",
-        remediation:
-          'Track the bwrap implementation, or grant `bash = "*"` to opt out of sandboxing on this platform.',
-      });
+      const has = await hasBwrap();
+      if (has) {
+        findings.push({
+          severity: "ok",
+          message:
+            "bwrap available; structured grant will engage the Linux sandbox at runtime. (Sketch implementation; verify on your machine.)",
+        });
+      } else {
+        findings.push({
+          severity: "error",
+          message:
+            "bwrap (bubblewrap) not found; bash configured with a structured grant cannot enforce it.",
+          remediation:
+            'Install bubblewrap (e.g. `apt install bubblewrap` on Debian/Ubuntu, `dnf install bubblewrap` on Fedora). Or grant `bash = "*"` to opt out of sandboxing.',
+        });
+      }
     } else {
       findings.push({
         severity: "warning",
@@ -179,26 +195,49 @@ export class BashTool implements Tool {
 
     const env = buildEnv(this.capabilities);
 
-    // Engage sandbox-exec on macOS if the grant is structured and the
-    // binary is available. On other platforms (or when grant is "*")
-    // this returns null and we fall through to plain spawn.
-    const sb = await maybeSandboxExecPrefix(this.capabilities);
+    // Engage the platform sandbox if the grant is structured and the
+    // platform's sandbox binary is available. macOS → sandbox-exec,
+    // Linux → bwrap. When neither applies (grant is `"*"`, or no
+    // platform support, or binary missing), fall through to plain
+    // spawn or refuse, depending on the strict-mode rules below.
+    let sandboxPrefix: { binary: string; prefixArgs: string[] } | null = null;
+    if (process.platform === "darwin") {
+      sandboxPrefix = await maybeSandboxExecPrefix(this.capabilities);
+    } else if (process.platform === "linux") {
+      sandboxPrefix = await maybeBwrapPrefix(this.capabilities);
+    }
+
     let binary: string;
     let args: string[];
-    if (sb) {
-      binary = sb.binary;
-      args = [...sb.prefixArgs, "/bin/bash", "-c", i.command as string];
+    if (sandboxPrefix) {
+      binary = sandboxPrefix.binary;
+      args = [
+        ...sandboxPrefix.prefixArgs,
+        "/bin/bash",
+        "-c",
+        i.command as string,
+      ];
     } else {
       binary = "/bin/bash";
       args = ["-c", i.command as string];
-      // Strict mode: macOS user wrote a structured grant but sandbox-exec
-      // is missing. Refuse to run rather than silently bypass enforcement.
-      if (sandboxEngaged(this.capabilities) && process.platform === "darwin") {
-        return {
-          content:
-            'bash: sandbox-exec is not available, and the grant is structured. Refusing to run unsandboxed. Install Xcode Command Line Tools or grant `bash = "*"` to opt out.',
-          isError: true,
-        };
+      // Strict mode: user wrote a structured grant on a platform we
+      // know how to sandbox, but the sandbox binary is missing.
+      // Refuse rather than silently bypass enforcement.
+      if (sandboxEngaged(this.capabilities)) {
+        if (process.platform === "darwin") {
+          return {
+            content:
+              'bash: sandbox-exec is not available, and the grant is structured. Refusing to run unsandboxed. Install Xcode Command Line Tools or grant `bash = "*"` to opt out.',
+            isError: true,
+          };
+        }
+        if (process.platform === "linux") {
+          return {
+            content:
+              'bash: bwrap (bubblewrap) is not available, and the grant is structured. Refusing to run unsandboxed. Install bubblewrap (`apt install bubblewrap` / `dnf install bubblewrap`) or grant `bash = "*"` to opt out.',
+            isError: true,
+          };
+        }
       }
     }
 

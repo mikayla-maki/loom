@@ -16,10 +16,17 @@ dist/
 *.tar
 *.tar.gz
 *.zip
+*.md
+!README.md
+*.js
+*.ts
+!src/**/*.ts
 
 # Subdirectories the agent likes to create
 test-git-repo/
+test-repo/
 demo-project/
+new-project/
 demo/
 playground/
 scratch/
