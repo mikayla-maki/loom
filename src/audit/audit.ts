@@ -27,7 +27,12 @@ import type {
   CapabilitySet,
   SecretAllowlist,
 } from "../types/manifest.js";
-import type { Agent, Tool, ToolConfig } from "../types/interfaces.js";
+import type {
+  Agent,
+  AuditFinding,
+  Tool,
+  ToolConfig,
+} from "../types/interfaces.js";
 
 export interface SecretRequest {
   name: string;
@@ -64,6 +69,12 @@ export interface CapabilityTree {
      * fail to boot.
      */
     missing: string[];
+    /**
+     * Findings from `Tool.audit()` — environment / readiness checks
+     * the tool reports about its own runtime preconditions. Empty
+     * when the tool didn't implement `audit()`.
+     */
+    findings: AuditFinding[];
     introducedBy: string;
     /**
      * Sub-agent trees this tool declares it may spawn. Empty when
@@ -197,12 +208,25 @@ async function auditAgentInner(
     const requires = [...(t.requires ?? [])];
     const optional = [...(t.optional ?? [])];
     const missing = computeMissing(requires, grant);
+    const findings: AuditFinding[] = [];
+    if (typeof t.audit === "function") {
+      try {
+        const result = await Promise.resolve(t.audit());
+        if (Array.isArray(result)) findings.push(...result);
+      } catch (e) {
+        findings.push({
+          severity: "error",
+          message: `tool.audit() threw: ${(e as Error).message}`,
+        });
+      }
+    }
     tools.push({
       name: ref.name,
       requires,
       optional,
       granted: grant,
       missing,
+      findings,
       introducedBy: ref.origin,
       subagents,
     });
@@ -397,6 +421,14 @@ export function formatCapabilityTree(tree: CapabilityTree, indent = 0): string {
         `${pad}    - ${t.name} (from ${t.introducedBy}):${reqStr}${optStr}${missingStr}`,
       );
       lines.push(`${pad}      granted: ${formatGrant(t.granted)}`);
+      for (const f of t.findings) {
+        const icon =
+          f.severity === "ok" ? "✓" : f.severity === "warning" ? "⚠" : "✗";
+        lines.push(`${pad}      ${icon} ${f.message}`);
+        if (f.remediation) {
+          lines.push(`${pad}        → ${f.remediation}`);
+        }
+      }
       for (const sub of t.subagents) {
         lines.push(`${pad}      sub-agent:`);
         lines.push(formatCapabilityTree(sub, indent + 4));

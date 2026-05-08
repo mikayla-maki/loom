@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
@@ -36,5 +37,41 @@ describe("auditAgent", () => {
     expect(printed).toContain("read_file");
     expect(printed).toContain("write_file");
     expect(printed).toContain("capabilities granted");
+  });
+
+  it("surfaces tool.audit() findings (bash sandbox availability)", async () => {
+    // Inline manifest with bash + a structured grant. Bash's audit()
+    // checks for /usr/bin/sandbox-exec and reports a finding either
+    // way. We assert that SOME finding shows up in the tree.
+    const spec: AgentManifest = {
+      name: "audit-bash",
+      systemPrompt: "x",
+      tools: { bash: "builtin" },
+      harness: { provider: "test" },
+      capabilities: { bash: { subprocess: "*", paths: ["./"] } },
+    };
+    const tree = await auditAgent(spec);
+    const bashEntry = tree.tools.find((t) => t.name === "bash");
+    expect(bashEntry).toBeDefined();
+    expect(bashEntry!.findings.length).toBeGreaterThan(0);
+    // The finding's message should mention sandbox-exec on macOS
+    // or the platform's lack of a backend on Linux/other.
+    const messages = bashEntry!.findings.map((f) => f.message).join(" ");
+    expect(messages).toMatch(/sandbox|bwrap|sandbox-exec/i);
+  });
+
+  it("warns when bash is granted `*` (unsandboxed)", async () => {
+    const spec: AgentManifest = {
+      name: "audit-bash-star",
+      systemPrompt: "x",
+      tools: { bash: "builtin" },
+      harness: { provider: "test" },
+      capabilities: { bash: "*" },
+    };
+    const tree = await auditAgent(spec);
+    const bashEntry = tree.tools.find((t) => t.name === "bash");
+    const warning = bashEntry!.findings.find((f) => f.severity === "warning");
+    expect(warning).toBeDefined();
+    expect(warning!.message).toMatch(/unsandboxed/i);
   });
 });

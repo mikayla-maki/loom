@@ -225,6 +225,26 @@ export interface ToolResult {
   isError?: boolean;
 }
 
+/**
+ * Severity of an audit finding.
+ *
+ *   ok      — expected, surfaced for visibility (e.g. "sandbox-exec
+ *             available; structured grant will engage")
+ *   warning — degraded but functional (e.g. "running unsandboxed; the
+ *             grant doesn't constrain anything at runtime")
+ *   error   — the tool will fail or behave unsafely under the current
+ *             configuration (e.g. "sandbox-exec not found; bash will
+ *             refuse to run with structured grant")
+ */
+export type AuditSeverity = "ok" | "warning" | "error";
+
+export interface AuditFinding {
+  severity: AuditSeverity;
+  message: string;
+  /** Optional: human-readable suggestion that would resolve the finding. */
+  remediation?: string;
+}
+
 export interface Tool extends ToolDescriptor {
   /**
    * Capability KINDS this tool MUST be granted to function. Static —
@@ -267,6 +287,20 @@ export interface Tool extends ToolDescriptor {
 
   /** Secret names this tool wants. Loom resolves the closure at boot. */
   secrets?: SecretNeeds;
+
+  /**
+   * Optional environment audit. Called by `loom audit` to surface
+   * runtime preconditions — things like "sandbox-exec is missing,
+   * so structured grants won't actually engage," or "the granted
+   * directory doesn't exist on disk." The static tree (manifest
+   * coherence) and these findings (machine readiness) appear side
+   * by side.
+   *
+   * MUST be read-only and side-effect-free — audit shouldn't open
+   * connections, prompt the user, or mutate anything. Cheap inspections
+   * only (`fs.access`, env var reads, `which`-style binary detection).
+   */
+  audit?(): Promise<AuditFinding[]> | AuditFinding[];
 
   /**
    * Optional: sub-agents this tool declares it may spawn. Trusted

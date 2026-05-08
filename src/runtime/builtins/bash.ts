@@ -11,11 +11,13 @@
  * mental model, the runtime self-policing, and (eventually) the
  * sandbox-exec rules. One source of truth.
  *
- * Today there is no OS-level sandbox: this commit migrates the cap
- * shape and surfaces the grant in the description, but bash still
- * runs as a normal child process with whatever the parent Loom
- * process can do — minus the `env` which we do enforce at the
- * spawn-call level.
+ * macOS sandbox engagement: when the grant is structured (anything
+ * other than `"*"`), bash spawns under `/usr/bin/sandbox-exec` with
+ * a generated SBPL profile derived from the grant. `"*"` opts out
+ * (no sandbox). On Linux a sandbox engagement is a no-op for now (we
+ * surface a warning at audit time); a `bwrap`-based path can slot
+ * into the same shape later. The `env` filter applies regardless of
+ * sandbox availability.
  *
  * Env semantics (asymmetric with paths/network on purpose — see below):
  *   env absent          → SAFE-DEFAULTS subset of process.env (PATH,
@@ -41,6 +43,7 @@
 import { spawn } from "node:child_process";
 
 import type {
+  AuditFinding,
   Tool,
   ToolConfig,
   ToolContext,
@@ -49,6 +52,12 @@ import type {
 import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
+import {
+  hasSandboxExec,
+  maybeSandboxExecPrefix,
+  sandboxEngaged,
+  validateBashGrant,
+} from "../sandbox/sandbox-exec.js";
 import { describePaths, paths, resolvedPaths } from "./_path.js";
 
 /**
@@ -97,7 +106,60 @@ export class BashTool implements Tool {
 
   constructor(_config: ToolConfig, capabilities: CapabilitySet | undefined) {
     this.capabilities = capabilities ?? {};
+    // Reject configurations the macOS sandbox can't enforce — see
+    // validateBashGrant for the rationale per kind. Doing this in the
+    // constructor surfaces unsupported configs at boot rather than at
+    // execute time (or, worse, silently bypassing enforcement).
+    if (process.platform === "darwin") {
+      validateBashGrant(this.capabilities);
+    }
     this.description = describeBash(this.capabilities);
+  }
+
+  async audit(): Promise<AuditFinding[]> {
+    const findings: AuditFinding[] = [];
+    if (!sandboxEngaged(this.capabilities)) {
+      findings.push({
+        severity: "warning",
+        message:
+          'capabilities = "*" — bash will run unsandboxed (no OS-level enforcement of paths/network/env).',
+        remediation:
+          'Replace with a structured grant like { subprocess = "*", paths = ["./"] } to engage the sandbox.',
+      });
+      return findings;
+    }
+    if (process.platform === "darwin") {
+      const has = await hasSandboxExec();
+      if (has) {
+        findings.push({
+          severity: "ok",
+          message:
+            "sandbox-exec available; structured grant will engage the macOS sandbox at runtime.",
+        });
+      } else {
+        findings.push({
+          severity: "error",
+          message:
+            "/usr/bin/sandbox-exec not found; bash configured with a structured grant cannot enforce it.",
+          remediation:
+            'Install Xcode Command Line Tools (`xcode-select --install`), or grant `bash = "*"` to opt out of sandboxing.',
+        });
+      }
+    } else if (process.platform === "linux") {
+      findings.push({
+        severity: "warning",
+        message:
+          "Linux sandboxing (bwrap) is not yet implemented; structured grants will not enforce at runtime.",
+        remediation:
+          'Track the bwrap implementation, or grant `bash = "*"` to opt out of sandboxing on this platform.',
+      });
+    } else {
+      findings.push({
+        severity: "warning",
+        message: `No sandbox backend on ${process.platform}; structured grants will not enforce at runtime.`,
+      });
+    }
+    return findings;
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
@@ -117,8 +179,31 @@ export class BashTool implements Tool {
 
     const env = buildEnv(this.capabilities);
 
+    // Engage sandbox-exec on macOS if the grant is structured and the
+    // binary is available. On other platforms (or when grant is "*")
+    // this returns null and we fall through to plain spawn.
+    const sb = await maybeSandboxExecPrefix(this.capabilities);
+    let binary: string;
+    let args: string[];
+    if (sb) {
+      binary = sb.binary;
+      args = [...sb.prefixArgs, "/bin/bash", "-c", i.command as string];
+    } else {
+      binary = "/bin/bash";
+      args = ["-c", i.command as string];
+      // Strict mode: macOS user wrote a structured grant but sandbox-exec
+      // is missing. Refuse to run rather than silently bypass enforcement.
+      if (sandboxEngaged(this.capabilities) && process.platform === "darwin") {
+        return {
+          content:
+            'bash: sandbox-exec is not available, and the grant is structured. Refusing to run unsandboxed. Install Xcode Command Line Tools or grant `bash = "*"` to opt out.',
+          isError: true,
+        };
+      }
+    }
+
     return await new Promise<ToolResult>((resolve) => {
-      const child = spawn("/bin/bash", ["-c", i.command as string], {
+      const child = spawn(binary, args, {
         cwd,
         env,
         stdio: ["ignore", "pipe", "pipe"],
