@@ -92,10 +92,7 @@ export class StreamingMarkdownRenderer {
       out += this.applyInlineStyles(this.lineStartBuf);
       this.lineStartBuf = "";
     }
-    if (this.inlinePending) {
-      out += this.applyInlineStyles(this.inlinePending);
-      this.inlinePending = "";
-    }
+    out += this.closePendingOnBoundary();
     if (this.lineSuffixReset) {
       out += ansi.reset;
       this.lineSuffixReset = "";
@@ -106,6 +103,34 @@ export class StreamingMarkdownRenderer {
       this.boldDelim = this.italicDelim = null;
     }
     return out;
+  }
+
+  /**
+   * Boundary handler: a newline or `flush()` has arrived while a
+   * delimiter character is buffered as pending. If that pending char
+   * would close a currently-open style of the same kind, treat it as
+   * the closing delimiter. Otherwise emit it as literal text.
+   *
+   * Without this, `*italic*\n` and `` `code`\n `` would leak the
+   * style across the line boundary because the closing delimiter
+   * never got disambiguated against the newline.
+   */
+  private closePendingOnBoundary(): string {
+    if (!this.inlinePending) return "";
+    const p = this.inlinePending;
+    this.inlinePending = "";
+    if (p === "`" && this.code) {
+      this.code = false;
+      return ansi.reset + this.reapplyOpenStyles();
+    }
+    if ((p === "*" || p === "_") && this.italic && this.italicDelim === p) {
+      this.italic = false;
+      this.italicDelim = null;
+      return ansi.reset + this.reapplyOpenStyles();
+    }
+    // Pending didn't close anything — emit as literal under whatever
+    // styles are still in effect.
+    return this.applyInlineStyles(p);
   }
 
   // ───────────────────────── plain mode ──────────────────────────
@@ -132,10 +157,11 @@ export class StreamingMarkdownRenderer {
         out += this.applyInlineStyles(this.lineStartBuf);
         this.lineStartBuf = "";
       }
-      if (this.inlinePending) {
-        out += this.applyInlineStyles(this.inlinePending);
-        this.inlinePending = "";
-      }
+      // Disambiguate any inline-pending delimiter against the line
+      // boundary. A pending closing-delimiter (e.g. backtick after
+      // `` `code` ``) would otherwise leak the open style across the
+      // newline.
+      out += this.closePendingOnBoundary();
       if (this.lineSuffixReset) {
         out += ansi.reset;
         this.lineSuffixReset = "";
@@ -296,7 +322,7 @@ export class StreamingMarkdownRenderer {
     return prefix ? prefix + chunk : chunk;
   }
 
-  // ─────────────────────── line-start dispatch ─────────────────────
+  // ─────────────────────── line-start dispatch ─────────────────
 
   /**
    * Returns:
@@ -304,27 +330,63 @@ export class StreamingMarkdownRenderer {
    *   "committed"  — line type decided, output suppressed (delimiter consumed)
    *   string       — line type decided; here's the styled prefix to emit;
    *                  inline mode is entered for the rest of the line
+   *
+   * Block-level prefix characters are `#`, `>`, `-`, ` ` (indent), and
+   * `` ` `` (potential fence). Inline delimiters `*`/`_` deliberately
+   * exit line-start mode immediately so `**bold**` and `*italic*` at
+   * the start of a line work; `* ` bullets are NOT supported (use
+   * `-` instead, which is what models output anyway).
    */
   private tryClassifyLineStart(ch: string): "buffer" | "committed" | string {
+    // First char of a fresh line: dispatch.
+    if (this.lineStartBuf === "") {
+      const isBlockPrefix =
+        ch === "#" ||
+        ch === ">" ||
+        ch === "-" ||
+        ch === "`" ||
+        ch === " " ||
+        ch === "\t";
+      if (!isBlockPrefix) {
+        // Inline content from the very first char.
+        this.atLineStart = false;
+        return this.consumeInline(ch);
+      }
+      this.lineStartBuf = ch;
+      return "buffer";
+    }
+
     this.lineStartBuf += ch;
     const buf = this.lineStartBuf;
 
-    // Code fence at line start: ```
-    if (buf === "`" || buf === "``") return "buffer";
+    // ── Code fence: ``` ──
+    if (buf === "``") return "buffer";
     if (buf === "```") {
       this.fence = true;
       this.atLineStart = false;
       this.lineStartBuf = "";
       return "committed"; // drop the fence delimiter line
     }
-    if (buf === "``" + ch && buf.length === 3 && ch !== "`") {
-      // Two backticks then non-backtick: was empty inline code, pass through.
+    // `X (X != `): single backtick at line start was inline code open.
+    if (buf.length === 2 && buf[0] === "`" && buf[1] !== "`") {
+      this.atLineStart = false;
+      this.lineStartBuf = "";
+      const opened = this.toggleCode();
+      return opened + this.consumeInline(ch);
+    }
+    // ``X (X != `): empty inline code span at line start. Emit literal `` and process X.
+    if (
+      buf.length === 3 &&
+      buf[0] === "`" &&
+      buf[1] === "`" &&
+      buf[2] !== "`"
+    ) {
       this.atLineStart = false;
       this.lineStartBuf = "";
       return this.applyInlineStyles("``") + this.consumeInline(ch);
     }
 
-    // Heading: # ... ###### + space
+    // ── Heading: `#`{1,6} + space ──
     const headingMatch = /^(#{1,6}) $/.exec(buf);
     if (headingMatch) {
       this.atLineStart = false;
@@ -335,42 +397,49 @@ export class StreamingMarkdownRenderer {
       this.lineSuffixReset = color + ansi.bold;
       return color + ansi.bold;
     }
-    // Heading hashes still being collected
     if (/^#{1,6}$/.test(buf)) return "buffer";
-    // Hashes followed by non-space → not a heading; flush as literal
+    // `#`s followed by non-space → not a heading; emit prefix literal,
+    // process the latest char inline.
     if (/^#{1,6}[^ ]/.test(buf)) {
       this.atLineStart = false;
-      const flush = buf;
+      const prefix = buf.slice(0, -1);
       this.lineStartBuf = "";
-      return this.applyInlineStyles(flush);
+      return this.applyInlineStyles(prefix) + this.consumeInline(ch);
     }
 
-    // Blockquote: > or > <space>
-    if (buf === ">") return "buffer";
+    // ── Blockquote: `> ` ──
     if (buf === "> ") {
       this.atLineStart = false;
       this.lineStartBuf = "";
       this.lineSuffixReset = ansi.gray;
       return ansi.gray + "│ " + ansi.reset + this.lineSuffixReset;
     }
-    if (buf === ">" + ch && ch !== " ") {
+    if (buf.length >= 2 && buf[0] === ">" && buf[1] !== " ") {
       this.atLineStart = false;
       this.lineStartBuf = "";
       return this.applyInlineStyles(">") + this.consumeInline(ch);
     }
 
-    // Bullet: `- ` or `* ` (with optional leading whitespace)
-    const bulletMatch = /^(\s*)([-*]) $/.exec(buf);
+    // ── Bullet: `- ` (optionally indented) ──
+    const bulletMatch = /^(\s*)- $/.exec(buf);
     if (bulletMatch) {
       this.atLineStart = false;
       this.lineStartBuf = "";
       return `${bulletMatch[1]}${ansi.cyan}•${ansi.reset} `;
     }
-    if (/^\s*[-*]$/.test(buf)) return "buffer";
+    if (/^\s*-$/.test(buf)) return "buffer";
+    // `-X` where X != ` ` → not a bullet. Emit `-` literal, process X inline.
+    if (/^\s*-[^ ]$/.test(buf)) {
+      const indent = /^(\s*)/.exec(buf)?.[1] ?? "";
+      this.atLineStart = false;
+      this.lineStartBuf = "";
+      return indent + "-" + this.consumeInline(ch);
+    }
+
+    // ── Pure leading whitespace ──
     if (/^\s+$/.test(buf)) return "buffer";
 
-    // Anything else: this is a normal line. Flush the buffer literally
-    // and switch to inline mode.
+    // Catch-all: emit indent verbatim, switch to inline mode.
     this.atLineStart = false;
     const flush = buf.slice(0, -1);
     this.lineStartBuf = "";
