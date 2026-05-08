@@ -47,7 +47,7 @@ describe("spawn_subagent builtin tool", () => {
     });
     try {
       await agent.prompt("go");
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
       expect(tu).toBeTruthy();
       if (tu && tu.sessionUpdate === "tool_call_update") {
@@ -84,8 +84,8 @@ describe("fork-of-parent session", () => {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: "earlier-reply" },
     };
-    await parentSession.append(u);
-    await parentSession.append(a);
+    await parentSession.push(u);
+    await parentSession.push(a);
 
     const parent: Agent = {
       harness: { run: async () => ({ stopReason: "end_turn" as const }) },
@@ -101,16 +101,18 @@ describe("fork-of-parent session", () => {
     const child = await forkOfParentSessionFactory.create({}, ctx, {}, parent);
 
     // Child sees the parent's events …
-    const childEvents = await child.getEvents();
+    const childEvents = (await child.pull?.([])) ?? [];
     expect(childEvents).toHaveLength(2);
 
     // … but appending to the child doesn't bleed back to the parent.
-    await child.append({
-      sessionUpdate: "user_message_chunk",
-      content: { type: "text", text: "child-only" },
-    });
-    expect(await child.count()).toBe(3);
-    expect(await parentSession.count()).toBe(2);
+    await Promise.resolve(
+      child.push?.({
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: "child-only" },
+      }),
+    );
+    expect(((await child.pull?.([])) ?? []).length).toBe(3);
+    expect((await parentSession.pull([])).length).toBe(2);
   });
 
   it("requiresParent: top-level boot fails with a clear error", async () => {

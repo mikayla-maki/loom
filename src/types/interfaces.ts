@@ -35,62 +35,83 @@ export interface SessionDescriptor {
   agentName?: string;
 }
 
+/**
+ * Session — the agent's view of conversation history plus optional
+ * lifecycle participation.
+ *
+ * The interface is push/pull rather than append/get because sessions
+ * compose. A `ChainedSession` holds N children and threads events
+ * through them; a `CompactingSession` wraps an inner session and
+ * pulls from it on its own schedule. Loom only ever talks to ONE
+ * session per agent — composition is internal to whoever the agent
+ * uses.
+ *
+ * Both `push` and `pull` are optional. Undefined means passthrough:
+ * `push?` defaults to `[event]` (forward unchanged), `pull?` defaults
+ * to returning `below` unchanged. A session that only contributes a
+ * `systemPromptSection` (e.g. a skills-catalog session) can omit
+ * both.
+ */
 export interface Session {
-  /** Append a single update to the durable log. */
-  append(update: SessionUpdate): Promise<void>;
+  /**
+   * An event happened (user input, agent message, tool call, etc.).
+   * The session may store, transform, drop, or fan-out. The return
+   * value is the events to forward to the next stage in any
+   * composition pattern. For top-level sessions Loom ignores the
+   * return; for composed sessions (e.g. inside a `ChainedSession`)
+   * it threads through the chain.
+   *
+   *   - return [event]   → forward unchanged (default if undefined)
+   *   - return [...]     → transform / fan-out
+   *   - return []        → drop (terminal or filter)
+   */
+  push?(event: SessionUpdate): Promise<SessionUpdate[]>;
 
-  /** Return events `[from, to)` (defaults: from=0, to=length). */
-  getEvents(from?: number, to?: number): Promise<SessionUpdate[]>;
-
-  /** Number of stored events. */
-  count(): Promise<number>;
+  /**
+   * Return the session's view of the context window. `below` is what
+   * an upstream stage produced (empty for the outer call from Loom).
+   * The session may augment, transform, or replace it.
+   *
+   * Default when undefined: passthrough (return `below` unchanged).
+   */
+  pull?(below: SessionUpdate[]): Promise<SessionUpdate[]>;
 
   /**
    * Optional per-turn hook. Loom calls this once per turn, after the
-   * user's message has been appended and before the runtime is built.
+   * user's message has been pushed and before the runtime is built.
    * The session receives the owning `Agent` — the runtime triple
    * (harness + session + identity).
    *
-   * This is where a session does work that needs the harness:
-   *   - compaction (drive `summarise(agent.harness, ...)` and rewrite the log)
+   * Use cases:
+   *   - compaction (a wrapping session pulls its inner, summarises,
+   *     caches the result for subsequent pulls)
    *   - memory retrieval (set up state for `systemPromptSection`)
+   *   - skills scanning (pick up newly-added markdown files)
    *   - any per-turn reflection
-   *
-   * Loom is self-similar: a session that wants RLM-style sub-agents
-   * builds them with `runAgent(submanifest, { parent: agent })`,
-   * reusing the parent's harness (and its secrets/config) for free.
-   *
-   * Sessions that don't need agent participation — plain durable logs —
-   * omit this method.
    */
   prepareTurn?(agent: Agent): Promise<void> | void;
 
   /**
    * Optional: contribute a section to the assembled system prompt.
-   *
-   * Loom owns the system prompt, but a session legitimately has
-   * identity-level content the model needs to see — retrieved memories,
-   * accumulated user preferences, scoped instructions. The returned
-   * string lands at the end of the assembled prompt, closest to the
-   * conversation history (recency favours fresh memories).
+   * Multiple sessions composed via `ChainedSession` have their
+   * contributions concatenated in order.
    *
    * Called once per turn, *after* `prepareTurn` (so any state set up
-   * there is visible). The same `Agent` ref is passed; sessions that
-   * need only identity (`agent.systemPromptCore`) can read it here
-   * without implementing `prepareTurn`.
+   * there is visible).
    */
   systemPromptSection?(agent: Agent): string | Promise<string>;
 
   /**
+   * Optional: tools this session brings into scope. Loom unions all
+   * sessions' tools (composed or not) into the agent's tool table at
+   * boot, alongside the manifest's top-level `[tools]`.
+   */
+  tools?(): Promise<ToolRef[]> | ToolRef[];
+
+  /**
    * Optional: sub-agents this session declares it may spawn. Trusted
-   * self-declaration; the point is auditability via `loom audit`, not
-   * runtime enforcement. A session that spawns a child it didn't
-   * declare is misbehaving — it's a trust violation by the session
-   * author, not a Loom bug.
-   *
-   * The session has access to its own `dependencies` field; to spawn
-   * by name it does the lookup itself and calls
-   * `runAgent(submanifest, { parent: agent })`.
+   * self-declaration; the point is auditability via `loom audit`,
+   * not runtime enforcement.
    */
   dependencies?: { subagents?: AgentManifest[] };
 
@@ -100,6 +121,12 @@ export interface Session {
 
   /** Release any resources (file handles, etc.). */
   close?(): Promise<void>;
+}
+
+/** A `(name, config)` tool reference, as it appears in manifests. */
+export interface ToolRef {
+  name: string;
+  config: ToolConfig;
 }
 
 /**
@@ -267,10 +294,19 @@ export interface ToolContext {
 // ──────────────────────────────────────────────────────────────────────────
 
 export interface Runtime {
-  /** Read the durable session log. */
-  getEvents(from?: number, to?: number): Promise<SessionUpdate[]>;
+  /**
+   * Pull the session's view of the context window. Calls
+   * `session.pull([])`; composed sessions thread the chain
+   * internally. Returns the events the harness should send to the
+   * model as conversation history.
+   */
+  getEvents(): Promise<SessionUpdate[]>;
 
-  /** Append + fan-out an update. */
+  /**
+   * Push an event to the session and fan it out to observers. The
+   * session may store, transform, or drop; the update sink sees the
+   * original event regardless.
+   */
   update(update: SessionUpdate): Promise<void>;
 
   /** The fully-assembled system prompt (default path). */

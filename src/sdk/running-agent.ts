@@ -135,7 +135,7 @@ export class RunningAgentImpl implements RunningAgent {
       sessionUpdate: "user_message_chunk",
       content: { type: "text", text },
     };
-    await this.session.append(userUpdate);
+    await Promise.resolve(this.session.push?.(userUpdate) ?? [userUpdate]);
     this.updateSink.emit(userUpdate);
 
     const ctl = new AbortController();
@@ -166,10 +166,15 @@ export class RunningAgentImpl implements RunningAgent {
         // A failing prepareTurn shouldn't kill the turn; surface it as
         // an agent_thought_chunk for visibility and continue.
         const msg = (e as Error).message ?? String(e);
-        await this.session.append({
-          sessionUpdate: "agent_thought_chunk",
-          content: { type: "text", text: `[session.prepareTurn error] ${msg}` },
-        });
+        await Promise.resolve(
+          this.session.push?.({
+            sessionUpdate: "agent_thought_chunk",
+            content: {
+              type: "text",
+              text: `[session.prepareTurn error] ${msg}`,
+            },
+          }) ?? [],
+        );
       }
     }
     let sessionSection = "";

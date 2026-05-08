@@ -50,17 +50,16 @@ class RecordingSession implements Session {
   constructor(parent: Agent | undefined) {
     this.seenParent = parent;
   }
-  async append(u: import("../src/types/acp.js").SessionUpdate): Promise<void> {
-    this.events.push(u);
-  }
-  async getEvents(
-    from = 0,
-    to?: number,
+  async push(
+    u: import("../src/types/acp.js").SessionUpdate,
   ): Promise<import("../src/types/acp.js").SessionUpdate[]> {
-    return this.events.slice(from, to);
+    this.events.push(u);
+    return [u];
   }
-  async count(): Promise<number> {
-    return this.events.length;
+  async pull(
+    _below: import("../src/types/acp.js").SessionUpdate[],
+  ): Promise<import("../src/types/acp.js").SessionUpdate[]> {
+    return [...this.events];
   }
 }
 
@@ -244,7 +243,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
         const sub = await ctx.agent.spawnSubagent(target);
         try {
           await sub.prompt("hello");
-          const events = await sub.session.getEvents();
+          const events = (await sub.session.pull?.([])) ?? [];
           const msg = events.find(
             (e) => e.sessionUpdate === "agent_message_chunk",
           );
@@ -365,7 +364,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
       let caughtMsg = "";
       try {
         await agent.prompt("go");
-        const events = await agent.session.getEvents();
+        const events = (await agent.session.pull?.([])) ?? [];
         const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
         if (tu && tu.sessionUpdate === "tool_call_update") {
           // If the tool surfaced the error in its result, read it; the
@@ -446,21 +445,19 @@ describe("agent.spawnSubagent on session hooks", () => {
     const events: import("../src/types/acp.js").SessionUpdate[] = [];
     const session = {
       dependencies: { subagents: [subManifest] },
-      async append(u: import("../src/types/acp.js").SessionUpdate) {
+      async push(u: import("../src/types/acp.js").SessionUpdate) {
         events.push(u);
+        return [u];
       },
-      async getEvents(from = 0, to?: number) {
-        return events.slice(from, to);
-      },
-      async count() {
-        return events.length;
+      async pull(_below: import("../src/types/acp.js").SessionUpdate[]) {
+        return [...events];
       },
       async prepareTurn(agent: Agent) {
         if (!agent.spawnSubagent) throw new Error("missing spawnSubagent");
         const sub = await agent.spawnSubagent("session-child");
         try {
           await sub.prompt("go");
-          const evs = await sub.session.getEvents();
+          const evs = (await sub.session.pull?.([])) ?? [];
           const msg = evs.find(
             (e) => e.sessionUpdate === "agent_message_chunk",
           );

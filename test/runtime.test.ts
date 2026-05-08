@@ -51,7 +51,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
     try {
       const result = await agent.prompt("Hi there!");
       expect(result.stopReason).toBe("end_turn");
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const messages = events
         .filter((e) => e.sessionUpdate === "agent_message_chunk")
         .map((e) => (e.content.type === "text" ? e.content.text : ""));
@@ -142,7 +142,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
     );
     try {
       await agent.prompt("go");
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
       expect(tu).toBeTruthy();
       if (tu && tu.sessionUpdate === "tool_call_update") {

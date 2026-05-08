@@ -4,6 +4,7 @@ import {
   CompactingSession,
   modelCompactor,
 } from "../src/extensions/session/compacting.js";
+import { MemorySession } from "../src/extensions/session/memory.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { summarise, summariseViaRun } from "../src/sdk/session-utils.js";
 import type {
@@ -67,15 +68,15 @@ describe("modelCompactor + Session.prepareTurn", () => {
         return "everything is fine, carry on";
       },
     };
-    const session = new CompactingSession({
+    const session = new CompactingSession(new MemorySession(), {
       threshold: 6,
       keep: 2,
       compactor: modelCompactor(),
     });
-    for (let i = 0; i < 8; i++) await session.append(userMsg(`m${i}`));
+    for (let i = 0; i < 8; i++) await session.push(userMsg(`m${i}`));
     await session.prepareTurn(fakeAgent(harness, session));
     expect(called).toBe(true);
-    const out = await session.getEvents();
+    const out = await session.pull([]);
     const body = out[1];
     if (
       body &&
@@ -90,14 +91,14 @@ describe("modelCompactor + Session.prepareTurn", () => {
 
   it("falls back to summariseViaRun when harness has no native summarise", async () => {
     const harness = fixedTextHarness("VIA_RUN_SUMMARY");
-    const session = new CompactingSession({
+    const session = new CompactingSession(new MemorySession(), {
       threshold: 6,
       keep: 2,
       compactor: modelCompactor(),
     });
-    for (let i = 0; i < 8; i++) await session.append(userMsg(`m${i}`));
+    for (let i = 0; i < 8; i++) await session.push(userMsg(`m${i}`));
     await session.prepareTurn(fakeAgent(harness, session));
-    const out = await session.getEvents();
+    const out = await session.pull([]);
     const body = out[1];
     if (
       body &&
@@ -111,18 +112,18 @@ describe("modelCompactor + Session.prepareTurn", () => {
   });
 
   it("falls back to the heuristic compactor when ctx is null", async () => {
-    const session = new CompactingSession({
+    const session = new CompactingSession(new MemorySession(), {
       threshold: 6,
       keep: 2,
       compactor: modelCompactor(),
     });
     for (let i = 0; i < 8; i++) {
-      await session.append(userMsg(`hello ${i}`));
+      await session.push(userMsg(`hello ${i}`));
     }
     // Force compaction with no context — modelCompactor should fall
     // back to heuristic.
     await session.compactNow();
-    const out = await session.getEvents();
+    const out = await session.pull([]);
     const body = out[1];
     if (
       body &&
@@ -140,7 +141,10 @@ describe("modelCompactor + Session.prepareTurn", () => {
     const seenHarnesses: Harness[] = [];
     const harness = fixedTextHarness("ack");
 
-    const session = new CompactingSession({ threshold: 1000, keep: 2 });
+    const session = new CompactingSession(new MemorySession(), {
+      threshold: 1000,
+      keep: 2,
+    });
     // Wrap prepareTurn so we can observe what loom passed in.
     const realPrepare = session.prepareTurn.bind(session);
     session.prepareTurn = async (agent: Agent) => {

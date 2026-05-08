@@ -173,7 +173,7 @@ describe("secrets pipeline", () => {
     );
     try {
       await agent.prompt("go");
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const tcus = events.filter((e) => e.sessionUpdate === "tool_call_update");
       expect(tcus).toHaveLength(2);
       const parse = (idx: number) => {

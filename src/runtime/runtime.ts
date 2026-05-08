@@ -47,12 +47,17 @@ export class RuntimeImpl implements Runtime {
     this.abortSignal = opts.abortSignal;
   }
 
-  getEvents(from?: number, to?: number): Promise<SessionUpdate[]> {
-    return this.opts.session.getEvents(from, to);
+  getEvents(): Promise<SessionUpdate[]> {
+    // Pull the session's view of the context window. Composed
+    // sessions handle the chain internally.
+    return Promise.resolve(this.opts.session.pull?.([]) ?? []);
   }
 
   async update(update: SessionUpdate): Promise<void> {
-    await this.opts.session.append(update);
+    // Push to the session (storage / transformation), then fan out to
+    // observers. Update sink sees the original event regardless of
+    // any chain-internal transforms.
+    await Promise.resolve(this.opts.session.push?.(update) ?? [update]);
     this.opts.updateSink.emit(update);
   }
 

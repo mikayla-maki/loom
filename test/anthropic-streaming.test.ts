@@ -117,7 +117,7 @@ describe("AnthropicHarness streaming", () => {
       expect(result.stopReason).toBe("end_turn");
       // Per-turn cumulative usage rides back on the prompt() result.
       expect(result.usage).toMatchObject({ inputTokens: 25, outputTokens: 14 });
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const chunks = events.filter(
         (e): e is SessionUpdate & { sessionUpdate: "agent_message_chunk" } =>
           e.sessionUpdate === "agent_message_chunk",
@@ -249,7 +249,7 @@ describe("AnthropicHarness streaming", () => {
     try {
       const result = await agent.prompt("call echo");
       expect(result.stopReason).toBe("end_turn");
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const calls = events.filter(
         (e): e is SessionUpdate & { sessionUpdate: "tool_call" } =>
           e.sessionUpdate === "tool_call",
@@ -303,7 +303,7 @@ describe("AnthropicHarness streaming", () => {
         inputTokens: 100,
         outputTokens: 5,
       });
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const text = events.find(
         (e) => e.sessionUpdate === "agent_message_chunk",
       );

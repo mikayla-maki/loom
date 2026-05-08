@@ -273,7 +273,7 @@ provider = "test"
       const agent = await runAgent(manifest, {});
       try {
         await agent.prompt("go");
-        const events = await agent.session.getEvents();
+        const events = (await agent.session.pull?.([])) ?? [];
         const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
         expect(tu).toBeTruthy();
         if (tu && tu.sessionUpdate === "tool_call_update") {

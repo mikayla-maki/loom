@@ -247,11 +247,23 @@ export async function runAgent(
     await Promise.resolve(p.instance.init(initArgs));
   }
 
-  // ─── 8. Build flat tool-ref list ───────────────────────────
+  // ─── 8. Build flat tool-ref list ───────────────────────
+  // Top-level [tools] (with defaults if absent), then anything the
+  // session contributes via `session.tools()`. Sessions composed via
+  // ChainedSession aggregate their children's tools internally before
+  // we see the result here.
   const topLevelSpec = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
   const refs: Array<{ name: string; config: ToolConfig; origin: string }> = [];
   for (const [name, config] of Object.entries(topLevelSpec)) {
     refs.push({ name, config, origin: TOP_LEVEL_INTRODUCER });
+  }
+  const sessionTools = (await session.tools?.()) ?? [];
+  for (const ref of sessionTools) {
+    refs.push({
+      name: ref.name,
+      config: ref.config,
+      origin: "(session)",
+    });
   }
 
   // ─── 9. Resolve each ref through the provider chain ────────────

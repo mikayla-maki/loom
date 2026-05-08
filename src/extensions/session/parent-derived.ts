@@ -40,8 +40,8 @@ export const forkOfParentSessionFactory: SessionFactory = {
     const session = new MemorySession();
     // Snapshot parent events at fork time. The child appends to its
     // own log; the parent's log is unaffected.
-    const events = await parent.session.getEvents();
-    for (const e of events) await session.append(e);
+    const events = (await parent.session.pull?.([])) ?? [];
+    for (const e of events) await session.push(e);
     return session;
   },
 };

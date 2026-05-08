@@ -1,6 +1,10 @@
 /**
- * In-memory session — used by tests and the test harness. Stores updates in
- * an array; goes away when the process exits.
+ * In-memory session — push events into an array, return them on pull.
+ * Goes away when the process exits.
+ *
+ * Leaf session in the new push/pull model: stores events on push,
+ * returns them on pull (ignoring the `below` argument because as a
+ * leaf it produces from its own state, not from anything below).
  */
 
 import type {
@@ -13,14 +17,14 @@ import type { SessionUpdate } from "../../types/acp.js";
 export class MemorySession implements Session {
   private events: SessionUpdate[] = [];
 
-  async append(update: SessionUpdate): Promise<void> {
+  async push(update: SessionUpdate): Promise<SessionUpdate[]> {
     this.events.push(update);
+    return [update];
   }
-  async getEvents(from = 0, to?: number): Promise<SessionUpdate[]> {
-    return this.events.slice(from, to);
-  }
-  async count(): Promise<number> {
-    return this.events.length;
+
+  async pull(_below: SessionUpdate[]): Promise<SessionUpdate[]> {
+    // Leaf: produce from internal state. `below` is empty for leaves.
+    return [...this.events];
   }
 }
 

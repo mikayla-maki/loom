@@ -3,13 +3,21 @@
  *
  * Config:
  *   path: string  — path to the JSONL file (relative to manifest dir)
+ *
+ * Leaf session in the push/pull model: persists events on push,
+ * returns the loaded log on pull. The cache is hydrated lazily on
+ * the first call and kept in sync with appends.
  */
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { ManifestError } from "../../errors.js";
-import type { ExtensionContext, Session, SessionFactory } from "../../types/interfaces.js";
+import type {
+  ExtensionContext,
+  Session,
+  SessionFactory,
+} from "../../types/interfaces.js";
 import type { SessionUpdate } from "../../types/acp.js";
 
 export class FileSession implements Session {
@@ -18,7 +26,7 @@ export class FileSession implements Session {
 
   constructor(public readonly filePath: string) {}
 
-  async append(update: SessionUpdate): Promise<void> {
+  async push(update: SessionUpdate): Promise<SessionUpdate[]> {
     if (!this.cache) await this.load();
     this.cache!.push(update);
     const line = JSON.stringify(update) + "\n";
@@ -28,17 +36,12 @@ export class FileSession implements Session {
       await fs.appendFile(this.filePath, line, "utf8");
     });
     await this.writeChain;
+    return [update];
   }
 
-  async getEvents(from = 0, to?: number): Promise<SessionUpdate[]> {
+  async pull(_below: SessionUpdate[]): Promise<SessionUpdate[]> {
     if (!this.cache) await this.load();
-    const arr = this.cache!;
-    return arr.slice(from, to);
-  }
-
-  async count(): Promise<number> {
-    if (!this.cache) await this.load();
-    return this.cache!.length;
+    return [...this.cache!];
   }
 
   async close(): Promise<void> {
@@ -71,10 +74,16 @@ export class FileSession implements Session {
 
 export const fileSessionFactory: SessionFactory = {
   name: "file",
-  create(config: Record<string, unknown>, ctx: ExtensionContext, _secrets: Record<string, string>): Session {
+  create(
+    config: Record<string, unknown>,
+    ctx: ExtensionContext,
+    _secrets: Record<string, string>,
+  ): Session {
     const p = config.path;
     if (typeof p !== "string" || !p) {
-      throw new ManifestError(`[session] provider 'file' requires config 'path'`);
+      throw new ManifestError(
+        `[session] provider 'file' requires config 'path'`,
+      );
     }
     const abs = path.isAbsolute(p) ? p : path.resolve(ctx.manifestDir, p);
     return new FileSession(abs);

@@ -41,7 +41,7 @@ describe("manifest accepts instances directly", () => {
       const result = await agent.prompt("anything");
       expect(result.stopReason).toBe("end_turn");
       expect(runs).toBe(1);
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const said = events.find(
         (e) => e.sessionUpdate === "agent_message_chunk",
       );
@@ -59,14 +59,12 @@ describe("manifest accepts instances directly", () => {
   it("a Session instance is used as-is (events flow through it)", async () => {
     const log: SessionUpdate[] = [];
     const session: Session = {
-      async append(u) {
+      async push(u) {
         log.push(u);
+        return [u];
       },
-      async getEvents() {
+      async pull() {
         return log.slice();
-      },
-      async count() {
-        return log.length;
       },
     };
 
@@ -128,7 +126,7 @@ describe("manifest accepts instances directly", () => {
     );
     try {
       await agent.prompt("go");
-      const events = await agent.session.getEvents();
+      const events = (await agent.session.pull?.([])) ?? [];
       const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
       expect(tu).toBeTruthy();
       if (tu?.sessionUpdate === "tool_call_update") {

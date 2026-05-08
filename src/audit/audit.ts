@@ -265,11 +265,10 @@ function stubHarness(): import("../types/interfaces.js").Harness {
 
 function stubSession(): import("../types/interfaces.js").Session {
   return {
-    append: async () => {
-      throw new Error("audit: session.append() called");
+    push: async () => {
+      throw new Error("audit: session.push() called");
     },
-    getEvents: async () => [],
-    count: async () => 0,
+    pull: async () => [],
   };
 }
 

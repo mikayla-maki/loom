@@ -100,9 +100,8 @@ class SyntheticRuntime implements Runtime {
     });
   }
 
-  async getEvents(from?: number, to?: number): Promise<SessionUpdate[]> {
-    const all = [...this.opts.events, ...this.extra];
-    return all.slice(from, to);
+  async getEvents(): Promise<SessionUpdate[]> {
+    return [...this.opts.events, ...this.extra];
   }
 
   async update(update: SessionUpdate): Promise<void> {

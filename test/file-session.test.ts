@@ -14,15 +14,15 @@ describe("FileSession", () => {
     try {
       const p = path.join(dir, "session.jsonl");
       const s = new FileSession(p);
-      await s.append({
+      await s.push({
         sessionUpdate: "user_message_chunk",
         content: { type: "text", text: "a" },
       });
-      await s.append({
+      await s.push({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: "b" },
       });
-      const events = await s.getEvents();
+      const events = await s.pull([]);
       expect(events).toHaveLength(2);
       const file = await fs.readFile(p, "utf8");
       expect(file.split("\n").filter(Boolean)).toHaveLength(2);
@@ -76,7 +76,7 @@ path = "./session.jsonl"
 
       const a2 = await runAgent(path.join(agentDir, "agent.toml"), opts);
       await a2.prompt("hi again");
-      const events = await a2.session.getEvents();
+      const events = (await a2.session.pull?.([])) ?? [];
       // After two prompts in two separate runs, the log contains 2 user msgs.
       const userMsgs = events.filter(
         (e) => e.sessionUpdate === "user_message_chunk",
