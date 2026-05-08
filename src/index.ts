@@ -33,12 +33,16 @@ export {
 export {
   CompactingSession,
   heuristicCompactor,
+  modelCompactor,
   adjustForToolPairs,
 } from "./extensions/session/compacting.js";
 export type {
   Compactor,
   CompactingSessionOptions,
+  ModelCompactorOptions,
 } from "./extensions/session/compacting.js";
+
+export { summarise, summariseViaRun } from "./sdk/session-utils.js";
 
 export type {
   TestHarnessConfig,

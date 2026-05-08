@@ -38,6 +38,7 @@ import type {
   Harness,
   HarnessFactory,
   Runtime,
+  SummariseArgs,
 } from "../../types/interfaces.js";
 
 interface AnthropicConfig {
@@ -84,6 +85,34 @@ export class AnthropicHarness implements Harness {
     private readonly maxTurnRequests: number,
     private readonly stream: boolean = true,
   ) {}
+
+  /**
+   * Native summarisation. Anthropic doesn't expose a dedicated
+   * summarise endpoint, but the Messages API with no tools and a
+   * single combined prompt is exactly the same shape and skips the
+   * synthetic-runtime indirection. Loom's `summariseViaRun` would
+   * arrive at the same result; this is the cheaper path.
+   */
+  async summarise(args: SummariseArgs): Promise<string> {
+    const messages = this.eventsToMessages(args.events);
+    // Append the instruction as the final user turn so the model sees
+    // it as the last thing said.
+    messages.push({
+      role: "user",
+      content: [{ type: "text", text: args.instruction }],
+    });
+    const signal = args.abortSignal ?? new AbortController().signal;
+    const response = await this.callAPI(
+      args.systemPrompt,
+      messages,
+      [],
+      signal,
+      undefined, // not streaming — caller wants a single string
+    );
+    return response.content
+      .map((b) => (b.type === "text" ? b.text : ""))
+      .join("");
+  }
 
   async run(runtime: Runtime): Promise<StopReason> {
     let requests = 0;

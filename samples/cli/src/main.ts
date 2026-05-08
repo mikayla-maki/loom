@@ -27,6 +27,7 @@ import { stdin, stdout, stderr, exit } from "node:process";
 import {
   runAgent,
   CompactingSession,
+  modelCompactor,
   type RunningAgent,
   type SessionUpdate,
   type AgentManifest,
@@ -39,6 +40,7 @@ interface Args {
   noTools: boolean;
   compactAfter: number;
   plain: boolean;
+  modelCompact: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -47,6 +49,7 @@ function parseArgs(argv: string[]): Args {
     noTools: false,
     compactAfter: 40,
     plain: !stdout.isTTY,
+    modelCompact: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -56,6 +59,7 @@ function parseArgs(argv: string[]): Args {
       const n = Number(argv[++i]);
       if (Number.isFinite(n) && n > 0) out.compactAfter = n;
     } else if (a === "--plain") out.plain = true;
+    else if (a === "--model-compact") out.modelCompact = true;
     else if (a === "--help" || a === "-h") {
       printHelp();
       exit(0);
@@ -72,6 +76,7 @@ function printHelp(): void {
       `  --model <id>           Claude model id (default: claude-3-5-sonnet-latest)\n` +
       `  --no-tools             disable the default builtin tools\n` +
       `  --compact-after <n>    compact when session exceeds <n> events (default: 40)\n` +
+      `  --model-compact        use the model to write compaction summaries\n` +
       `  --plain                disable ANSI styling\n` +
       `  -h, --help             this help\n\n` +
       `Environment:\n` +
@@ -101,12 +106,13 @@ async function main(): Promise<void> {
       provider: "anthropic",
       model: args.model,
     },
-    // Inline session instance — wraps the default in-memory session with
-    // a compaction wrapper. Real compaction is wired up below once we
-    // have the running agent (and thus its harness handle).
+    // Inline session instance: heuristic compactor by default; opt into
+    // model-driven summarisation with --model-compact (which uses the
+    // SessionRuntime adapter loom binds at boot).
     session: new CompactingSession({
       threshold: args.compactAfter,
       keep: Math.max(4, Math.floor(args.compactAfter / 4)),
+      ...(args.modelCompact ? { compactor: modelCompactor() } : {}),
     }),
     ...(args.noTools ? { tools: {} } : {}),
   };
@@ -121,16 +127,10 @@ async function main(): Promise<void> {
     exit(1);
   }
 
-  // NOTE: at this point the *real* Harness instance is held inside
-  // RunningAgentImpl and not exposed back through the SDK. If we want
-  // model-driven compaction (the session calls into a Harness-like
-  // primitive to summarise events), we either need to:
-  //   - have RunningAgent expose the harness, or
-  //   - pass the harness through to the session via a setter at boot,
-  //   - or fold compaction into the harness/runtime loop itself.
-  // For now the heuristic compactor doesn't need any of this; it works
-  // purely off the event log. See internal-docs/session-notes.md for
-  // the design discussion.
+  // The CompactingSession received a SessionRuntime via bindRuntime
+  // during runAgent(); when --model-compact is set the modelCompactor
+  // closes over it and drives a model turn for summarisation. See
+  // internal-docs/session-notes.md for the design discussion.
 
   printBanner(agent, args);
 

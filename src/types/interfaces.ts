@@ -51,12 +51,76 @@ export interface Session {
    */
   skills?(): Promise<SkillManifest[]> | SkillManifest[];
 
+  /**
+   * Optional per-turn hook. Loom calls this once per turn, after the
+   * user's message has been appended and before the runtime is built.
+   * The session receives a fresh `SessionContext` carrying the harness
+   * and identity metadata.
+   *
+   * This is where a session does work that needs the harness:
+   *   - compaction (drive `summarise(ctx.harness, ...)` and rewrite the log)
+   *   - memory retrieval (set up state for `systemPromptSection`)
+   *   - any per-turn reflection
+   *
+   * Loom is self-similar: a session that wants RLM-style sub-agents
+   * builds them with `runAgent({ harness: ctx.harness, ... })`, reusing
+   * the parent's harness (and its secrets/config) for free.
+   *
+   * Sessions that don't need agent participation — plain durable logs —
+   * omit this method.
+   */
+  prepareTurn?(ctx: SessionContext): Promise<void> | void;
+
+  /**
+   * Optional: contribute a section to the assembled system prompt.
+   *
+   * Loom owns the system prompt, but a session legitimately has
+   * identity-level content the model needs to see — retrieved memories,
+   * accumulated user preferences, scoped instructions. The returned
+   * string lands at the end of the assembled prompt, closest to the
+   * conversation history (recency favours fresh memories).
+   *
+   * Called once per turn, *after* `prepareTurn` (so any state set up
+   * there is visible). The same `SessionContext` is passed; sessions
+   * that need only identity (`ctx.systemPromptCore`) can read it here
+   * without implementing `prepareTurn`.
+   */
+  systemPromptSection?(ctx: SessionContext): string | Promise<string>;
+
   /** Optional: providers that manage many sessions. */
   list?(): Promise<SessionDescriptor[]>;
   resume?(id: string): Promise<Session>;
 
   /** Release any resources (file handles, etc.). */
   close?(): Promise<void>;
+}
+
+/**
+ * Handle passed to per-turn Session hooks. The session gets the actual
+ * harness — not a wrapper — along with enough metadata to do
+ * identity-aware things (memory, scoped retrieval).
+ *
+ * Why the harness directly: Loom is self-similar. A session that wants
+ * to summarise calls `summarise(ctx.harness, ...)`. A session that
+ * wants RLM-style sub-agents constructs them with
+ * `runAgent({ harness: ctx.harness, ... })`, reusing the parent's
+ * secrets/config implicitly because the harness instance closes over
+ * them.
+ *
+ * Why it's passed at time of use rather than bound at boot: state held
+ * across calls is footgun-y. The session has a method, that method
+ * needs the context, so the context is an argument. No life-cycle
+ * gymnastics.
+ */
+export interface SessionContext {
+  /** The agent's harness, exposed as-is. */
+  harness: Harness;
+  /** The unassembled `[agent].system_prompt` content — the identity layer. */
+  systemPromptCore: string;
+  /** Agent name (from manifest). */
+  agentName: string;
+  /** Agent description, if the manifest set one. */
+  agentDescription?: string;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -191,6 +255,40 @@ export interface Harness {
    * It SHOULD honor `runtime.abortSignal` and stop promptly when aborted.
    */
   run(runtime: Runtime): Promise<StopReason>;
+
+  /**
+   * Optional: lab-aware capabilities the harness can implement when its
+   * provider supports them natively (or coerce out of the existing wire
+   * format). Sessions and other consumers call these directly; when a
+   * harness doesn't implement a method, the relevant Loom helper
+   * synthesises it via `run()` (e.g. `summariseViaRun`).
+   *
+   * Discipline: a method earns a place here when there's a clear
+   * cost/perf/quality win over composing `run()`. Otherwise prefer the
+   * helper.
+   */
+
+  /**
+   * Run a one-shot, tool-free summarisation. Returns the assembled
+   * assistant text — does not write to any session. When omitted, Loom
+   * provides a default that drives `run()` against a synthetic Runtime.
+   */
+  summarise?(args: SummariseArgs): Promise<string>;
+}
+
+/** Arguments to `Harness.summarise` (and the matching helper). */
+export interface SummariseArgs {
+  /** Conversation history to compress. */
+  events: SessionUpdate[];
+  /** What to do with the events ("produce a tight paragraph", etc.). */
+  instruction: string;
+  /**
+   * The system prompt the model should see. Callers usually supply the
+   * agent's `systemPromptCore` plus any session-specific framing.
+   */
+  systemPrompt: string;
+  /** Optional abort signal. Defaults to never-aborted. */
+  abortSignal?: AbortSignal;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

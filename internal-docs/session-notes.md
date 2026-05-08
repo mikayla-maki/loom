@@ -1,143 +1,118 @@
-# Session — testbed notes
+# Session — design notes
 
-Field notes from building the sample CLI. The current `Session` interface
-(`src/types/interfaces.ts`) is the durable-log shape: `append`,
-`getEvents`, `count`, optional `skills()` and `list/resume/close`. Two
-in-tree impls (`memory`, `file`); a third (`compacting`) is the first
-session whose semantics aren't just "remember everything I'm told."
+## Where we landed
 
-This document records the friction discovered while wiring the
-compacting session into the sample CLI, and sketches where the
-interface might need to grow.
-
-## What worked unchanged
-
-The compacting session, in its **heuristic** form, fits the existing
-interface cleanly:
-
-- It implements `append`/`getEvents`/`count`.
-- Compaction is a private side-effect of `append`: when the in-memory
-  log crosses a threshold, older events are replaced with a synthetic
-  user→agent pair.
-- `getEvents()` remains the harness's view of conversation history; the
-  harness doesn't know or care that some events are summaries.
-
-So for *content-free* compaction (one-line-per-event recap, rule-based
-filtering, etc.), no interface changes are needed. The Session is free
-to rewrite its own contents as long as it preserves tool_call/
-tool_call_update pairing.
-
-## Where it starts to bend
-
-Three things became awkward as soon as I tried to imagine
-**model-driven** compaction:
-
-1. **The session needs a model.** A summarising compactor wants to
-   drive a model turn — system-prompt + the slice to summarise + a
-   "produce a tight summary" instruction. There's no path from the
-   session to the harness today. Three plausible shapes:
-
-   a. *Setter on Session.* Add an optional
-      `bindRuntime?(rt: SessionRuntime): void` and have `runAgent` call
-      it post-init. `SessionRuntime` exposes a `summarise(events,
-      instruction)` primitive (or just hands over the harness). Keeps
-      Session a passive object; the runtime drives.
-
-   b. *Session contributes a tool + a skill.* The session's
-      `skills()` hook returns a `compactor` skill whose `requires:`
-      points at a `compact` tool. The session's `append` decides
-      when to compact and *signals* by emitting a synthetic
-      `tool_call` for `compact`; the model loop picks it up. Honest
-      to who's deciding (the session) but uses the regular dispatch
-      path. Clunky because synthesizing tool_use blocks isn't
-      something today's harnesses know how to do.
-
-   c. *Runtime-driven.* Session exposes `shouldCompact(): boolean`;
-      the harness checks before each turn; when set, the harness
-      pauses, calls the model with a session-provided prompt, splices
-      the result into the session, then proceeds. Pushes the policy
-      out to the harness, which doesn't feel right either.
-
-   The current bias is **(a)**: keep Session in charge of its own
-   lifecycle, give it a thin runtime handle. That handle is small and
-   testable, and it's the same shape that other Session features
-   would want (e.g. "session decides to evict an extension's tool
-   when it goes idle" → it'd want the same tool/runtime references).
-
-2. **The harness instance isn't exposed.** `RunningAgentImpl` builds a
-   harness in the constructor and stores it privately. There's no
-   `agent.harness` getter. For a Setter-based design, `runAgent` would
-   need to pull the harness out of the spec and hand it to the session
-   *before* returning — which is mechanically fine (it's all
-   happening inside `runAgent`), it's just a small refactor.
-
-3. **The system prompt isn't reachable.** The harness gets it via
-   `runtime.systemPrompt()`; the session never sees it. A summarising
-   compactor probably wants the same prompt the agent normally runs
-   under, plus a delta ("you are now summarizing rather than
-   responding"). The fix is to thread the systemPromptCore through
-   `bindRuntime` too.
-
-## What I think the next interface looks like
-
-A minimal, additive change:
+The `Session` interface keeps its durable-log core (`append`,
+`getEvents`, `count`) and grows two **per-turn hooks**, each of which
+receives a fresh `SessionContext` as an argument:
 
 ```ts
-// New: a primitive the session can use mid-run.
-export interface SessionRuntime {
-  /** Drive a one-shot model turn with an explicit prompt + events.
-   *  Returns the final assistant text. Doesn't write to the session. */
-  summarise(args: {
-    events: SessionUpdate[];
-    instruction: string;
-  }): Promise<string>;
+export interface Session {
+  // unchanged
+  append, getEvents, count, skills?, list?, resume?, close?;
 
-  /** The agent's normal system prompt core. */
-  systemPromptCore: string;
+  /** Loom calls this once per turn, after the user message has been
+   *  appended and before the runtime is built. The session does any
+   *  work that needs the harness here — most importantly compaction. */
+  prepareTurn?(ctx: SessionContext): Promise<void> | void;
+
+  /** Returns the system-prompt section to splice into the assembled
+   *  prompt. Called per turn, after prepareTurn. */
+  systemPromptSection?(ctx: SessionContext): string | Promise<string>;
 }
 
-export interface Session {
-  // ...existing methods unchanged...
-
-  /** Optional: receive a runtime handle. Called once at boot, after the
-   *  harness is constructed but before the first prompt. */
-  bindRuntime?(rt: SessionRuntime): void;
+export interface SessionContext {
+  harness: Harness;
+  systemPromptCore: string;
+  agentName: string;
+  agentDescription?: string;
 }
 ```
 
-`summarise` would live in a small adapter that wraps the harness — it
-builds a synthetic `Runtime` whose `getEvents()` returns just the slice,
-runs the harness, and collects the agent_message_chunks. (Or, if the
-harness has a streaming/text-only mode, calls that directly.)
+**Pass at time of use, not at boot.** Earlier drafts had a
+`bindContext(ctx)` call at boot that the session stashed. We dropped
+that pattern: state-at-a-distance is a footgun, and there's no
+real-world use case where the session needs the context outside of a
+turn anyway. The hook gets the context as an argument.
 
-Alternatively — and this is the form the prompt hinted at — Session
-could just be handed the `Harness` instance directly, and the
-`summarise` adapter is a utility we ship alongside it. That's slightly
-less abstract but doesn't require a new wire type.
+**The harness is exposed directly.** Not a narrow wrapper. Loom is
+self-similar: a session that wants to summarise calls
+`summarise(ctx.harness, ...)`; a session that wants RLM-style
+sub-agents builds them with `runAgent({ harness: ctx.harness, ... })`,
+inheriting secrets and configuration for free because the harness
+instance closes over them.
 
-## What the current testbed doesn't tell us
+## Harness as the lab boundary
 
-- **Multi-session shapes.** `list/resume` are unused. The compacting
-  session is fine without them; whether they belong on `Session` or on
-  a separate `SessionStore` is a question the testbed didn't surface.
-- **Ordered tool-call semantics during compaction.** Today
-  `adjustForToolPairs` only cares about pair completion. A real-world
-  compactor may want to preserve more (e.g. last *N* tool results
-  verbatim because the model is mid-task). The test hook
-  (`compactor` callback) lets a consumer encode this; we haven't
-  needed to.
+Harness's job is to abstract a provider, including its quirks. It
+already had `run()`. It now also has an optional `summarise()` for
+labs with native or near-native summarisation endpoints. More may
+follow (`embed`, `classify`, parallel-tool-call hints, etc.); each
+earns its place when there's a clear cost/perf/quality win over
+composing `run()`.
 
-## Next step
+Loom ships free fallbacks for any non-native lab method. `summarise`
+falls back to `summariseViaRun(harness, args)` — drives a tool-free
+turn through `run()` and collects the assistant text. So sessions
+never branch on "is this method present?"; they just call the
+top-level helper:
 
-The proposed move:
+```ts
+const summary = await summarise(ctx.harness, { events, instruction, systemPrompt });
+```
 
-1. Add `bindRuntime` to `Session` (optional).
-2. In `runAgent`, after instantiating the harness, build a
-   `SessionRuntime` adapter and call `session.bindRuntime?.(rt)` before
-   returning the running agent.
-3. Add a `modelCompactor` factory in `compacting.ts` that uses the
-   bound runtime (and falls back to the heuristic when not bound).
-4. The CLI just wires it up.
+## System prompt, four sources
 
-Order suggests one commit for the interface change + scaffolding, one
-for `modelCompactor`. Streaming is independent and earns its own commit.
+Loom owns assembly. The order is now:
+
+1. **Manifest core** — `[agent].system_prompt` (the identity layer).
+2. **Skills** — auto-generated catalogue.
+3. **Tool reference** — auto-generated.
+4. **Ambient context** — current date.
+5. **Session section** — what the session contributes via
+   `systemPromptSection(ctx)`. Lands at the very end so retrieved
+   memories sit closest to the conversation history (model recency
+   bias works in our favour).
+
+The session section is recomputed per turn. Memory implementations
+can do per-turn retrieval; freshly-retrieved facts land for the
+current message.
+
+## Compaction
+
+`CompactingSession` is the canonical example of a session that needs
+the harness. The flow is:
+
+1. `append(update)` — store; no side effects.
+2. `prepareTurn(ctx)` — if `count >= threshold`, call the configured
+   `Compactor` with the slice and `ctx`. The compactor returns
+   replacement events; we splice.
+3. The default compactor is heuristic (no model, no API spend). The
+   `modelCompactor()` factory uses `summarise(ctx.harness, ...)` for
+   model-written prose summaries; falls back to heuristic if
+   `ctx === null` (standalone use, e.g. tests calling `compactNow()`
+   without a context).
+
+## What's next
+
+- **RLM sessions.** The interface supports them today: a session that
+  wants a sub-agent calls `runAgent({ harness: ctx.harness, ... })`
+  inside `prepareTurn` or a tool's `execute()`. We haven't shipped one
+  yet; the minimal shape would be a memory-search sub-agent with its
+  own append-only session. Two sub-agent ergonomics are still missing
+  for production use:
+  - **Secret-store flow-through.** Today the harness instance carries
+    its own API key, so the sub-agent's harness works. But if the
+    sub-agent's tools need *additional* secrets (e.g. Discord token),
+    those don't propagate. Fix: `runAgent` accepts a parent
+    `SecretsStore` in `RunAgentOptions`, used as the front of the
+    chain.
+  - **Permission handler flow-through.** Tools call
+    `ctx.requestPermission()`; the parent's handler should answer for
+    the sub-agent too. Fix: `runAgent` accepts a parent
+    `PermissionHandler`, used as the default.
+- **Memory sessions.** The pieces are in place: `prepareTurn` for
+  retrieval, `systemPromptSection` for injection, `ctx.systemPromptCore`
+  + `ctx.agentName` for identity-aware scoping.
+- **More lab methods.** `embed`, `classify`, etc. earn their place
+  when there's a real win.

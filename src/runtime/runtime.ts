@@ -28,6 +28,13 @@ export interface RuntimeImplOptions {
   agentName: string;
   agentDescription?: string;
   abortSignal: AbortSignal;
+  /**
+   * Pre-resolved section contributed by the session for this turn. The
+   * caller (RunningAgentImpl.prompt) awaits any async
+   * `Session.systemPromptSection()` before constructing the runtime, so
+   * `systemPrompt()` here stays sync.
+   */
+  sessionSection?: string;
   /** Test hook: deterministic "now" used in system-prompt assembly. */
   now?: () => Date;
 }
@@ -58,6 +65,9 @@ export class RuntimeImpl implements Runtime {
       agentName: this.opts.agentName,
       ...(this.opts.agentDescription
         ? { agentDescription: this.opts.agentDescription }
+        : {}),
+      ...(this.opts.sessionSection
+        ? { sessionSection: this.opts.sessionSection }
         : {}),
       now: this.opts.now ? this.opts.now() : new Date(),
     });

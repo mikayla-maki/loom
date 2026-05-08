@@ -6,43 +6,55 @@
  *   const s = new CompactingSession({ threshold: 40, keep: 10 });
  *
  * Semantics:
- *   - Wraps an in-memory log (the normal Session API: append/getEvents/count).
- *   - When `count >= threshold`, the next `append` triggers compaction:
- *     events `[0, cutoff)` are replaced with two synthetic events
- *     (a `user_message_chunk` introducing the summary and an
- *     `agent_message_chunk` carrying it). The most recent `keep` events
- *     stay verbatim.
+ *   - Plain in-memory log for `append/getEvents/count`.
+ *   - On every turn, loom calls `prepareTurn(ctx)`. If the log has
+ *     reached the threshold, the session compacts: events `[0, cutoff)`
+ *     are replaced with two synthetic events (a `user_message_chunk`
+ *     introducing the summary and an `agent_message_chunk` carrying it).
+ *     The most recent `keep` events stay verbatim.
  *
  * Compaction policy:
- *   The default is a deterministic heuristic — no model call. It
- *   produces a one-line-per-event summary, which is enough to keep the
- *   conversation coherent for short sessions and surfaces the rough
- *   edges around model-driven compaction. To plug in a real summarising
- *   compactor (one that drives a model turn), pass a `compactor`
- *   function: it receives the slice to compress and returns the
- *   replacement events.
+ *   Default is a deterministic heuristic — no model call. To use the
+ *   model, pass `compactor: modelCompactor()`; the model-driven path
+ *   uses the per-turn SessionContext's harness via
+ *   `summarise(harness, ...)`.
  *
  * Tool-call pairing:
  *   The harness's wire format pairs `tool_call` with a later
  *   `tool_call_update`. Compaction never cuts between a pair: the
  *   cutoff slides *backwards* past any tool_call that doesn't yet have
  *   its update inside the compaction range.
+ *
+ * No bound state:
+ *   The compacting session does not store the SessionContext between
+ *   calls. Loom hands it to `prepareTurn` each turn, which forwards it
+ *   to the compactor. Tests and standalone use can pass `null` (or
+ *   omit the context) and get heuristic-only behaviour.
  */
 
 import type {
   ExtensionContext,
   Session,
+  SessionContext,
   SessionFactory,
 } from "../../types/interfaces.js";
 import type { SessionUpdate } from "../../types/acp.js";
+import { summarise } from "../../sdk/session-utils.js";
 
 export interface Compactor {
   /**
    * Produce the replacement events for `oldEvents`. Implementations can
    * return any sequence of well-formed updates; loom will splice the
    * result in front of the kept tail.
+   *
+   * `ctx` is the per-turn SessionContext that triggered compaction, or
+   * `null` when compaction was forced standalone (e.g. from a test
+   * calling `compactNow()` directly).
    */
-  (oldEvents: SessionUpdate[]): Promise<SessionUpdate[]> | SessionUpdate[];
+  (
+    oldEvents: SessionUpdate[],
+    ctx: SessionContext | null,
+  ): Promise<SessionUpdate[]> | SessionUpdate[];
 }
 
 export interface CompactingSessionOptions {
@@ -83,7 +95,6 @@ export class CompactingSession implements Session {
 
   async append(update: SessionUpdate): Promise<void> {
     this.events.push(update);
-    await this.maybeCompact();
   }
 
   async getEvents(from = 0, to?: number): Promise<SessionUpdate[]> {
@@ -95,19 +106,30 @@ export class CompactingSession implements Session {
   }
 
   /**
-   * Force a compaction pass even if the threshold isn't met. Useful for
-   * tests and for harness-driven compaction policies.
+   * Per-turn hook. Loom calls this after the user message has been
+   * appended and before the runtime is built. We compact here when the
+   * log has reached the threshold — with the live context in hand, so
+   * a model-driven compactor can call `summarise(ctx.harness, …)`.
    */
-  async compactNow(): Promise<{ before: number; after: number } | null> {
-    return this.runCompaction(true);
+  async prepareTurn(ctx: SessionContext): Promise<void> {
+    if (this.events.length < this.threshold) return;
+    await this.runCompaction(ctx, false);
   }
 
-  private async maybeCompact(): Promise<void> {
-    if (this.events.length < this.threshold) return;
-    await this.runCompaction(false);
+  /**
+   * Force a compaction pass regardless of the threshold. Useful for
+   * tests and for sessions that want to expose a manual compaction
+   * trigger. Pass a SessionContext if the chosen compactor needs one
+   * (the model compactor falls back to heuristic on null).
+   */
+  async compactNow(
+    ctx: SessionContext | null = null,
+  ): Promise<{ before: number; after: number } | null> {
+    return this.runCompaction(ctx, true);
   }
 
   private async runCompaction(
+    ctx: SessionContext | null,
     force: boolean,
   ): Promise<{ before: number; after: number } | null> {
     if (this.compacting) return null;
@@ -120,7 +142,7 @@ export class CompactingSession implements Session {
     this.compacting = true;
     try {
       const slice = this.events.slice(0, cutoff);
-      const replacement = await Promise.resolve(this.compactor(slice));
+      const replacement = await Promise.resolve(this.compactor(slice, ctx));
       this.events = [...replacement, ...this.events.slice(cutoff)];
     } finally {
       this.compacting = false;
@@ -184,7 +206,7 @@ export function adjustForToolPairs(
  * (so the model sees it as conversation), the agent acknowledges with a
  * one-line-per-event recap.
  */
-export const heuristicCompactor: Compactor = (events) => {
+export const heuristicCompactor: Compactor = (events, _ctx = null) => {
   const lines: string[] = [];
   for (const e of events) {
     const line = summarizeOne(e);
@@ -247,6 +269,75 @@ function textOf(c: { type: string; text?: string }): string {
 function truncate(s: string, max: number): string {
   const collapsed = s.replace(/\s+/g, " ").trim();
   return collapsed.length > max ? collapsed.slice(0, max - 1) + "…" : collapsed;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Model-driven compactor.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface ModelCompactorOptions {
+  /**
+   * Instruction the summariser sees alongside the conversation. The
+   * default asks for a tight prose summary that preserves task
+   * progress, decisions, and any open threads. Override when you need
+   * domain-specific phrasing.
+   */
+  instruction?: string;
+  /**
+   * If the bound runtime is unavailable (no harness, or `bindRuntime`
+   * was never called), fall back to this compactor instead of failing.
+   * Defaults to `heuristicCompactor`.
+   */
+  fallback?: Compactor;
+}
+
+const DEFAULT_MODEL_INSTRUCTION =
+  "You are summarising the conversation above so it can be replaced with a " +
+  "compact background note. Produce one tight paragraph (≤ 200 words) that " +
+  "preserves: the user's goals, decisions made, file paths and identifiers " +
+  "that came up, and any unfinished work. Plain prose. No headings.";
+
+/**
+ * Build a Compactor that uses the bound harness to summarise the slice
+ * (via `summarise(harness, ...)` — native if the harness implements
+ * it, fallback via `summariseViaRun` otherwise) and splices the result
+ * into the log as a synthetic user→agent pair.
+ *
+ * If no context is bound (the session was constructed standalone with
+ * no harness behind it), falls back to a heuristic compactor.
+ */
+export function modelCompactor(opts: ModelCompactorOptions = {}): Compactor {
+  const instruction = opts.instruction ?? DEFAULT_MODEL_INSTRUCTION;
+  const fallback = opts.fallback ?? heuristicCompactor;
+  return async (events, ctx) => {
+    if (!ctx) return fallback(events, ctx);
+    const summary = (
+      await summarise(ctx.harness, {
+        events,
+        instruction,
+        systemPrompt: ctx.systemPromptCore,
+      })
+    ).trim();
+    if (!summary) return fallback(events, ctx);
+    return [
+      {
+        sessionUpdate: "user_message_chunk",
+        content: {
+          type: "text",
+          text:
+            "Here is a summary of the earlier conversation. Treat it as " +
+            "background context; respond to the most recent message.",
+        },
+      },
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: `[summary of ${events.length} earlier events]\n${summary}`,
+        },
+      },
+    ];
+  };
 }
 
 function previewJson(v: unknown): string {

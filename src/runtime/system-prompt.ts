@@ -2,13 +2,20 @@
  * System prompt assembly.
  *
  * Loom owns the system prompt. Each turn, the runtime composes a single
- * string from three sources:
- *   1. Runtime-owned (structural): the skill/tool catalog
- *   2. Manifest-owned (semantic): [agent].system_prompt content
- *   3. Per-turn (dynamic): current date and any other context Loom injects
+ * string from four sources:
+ *   1. Manifest-owned (identity): `[agent].system_prompt` content (the
+ *      core).
+ *   2. Runtime-owned (structural): the skill catalog and tool reference.
+ *   3. Per-turn (dynamic): current date and other ambient context.
+ *   4. Session-owned (identity — retrieved memories, etc.): the section
+ *      the Session contributes via `systemPromptSection()`.
+ *
+ * Order is: core → skills → tools → ambient context → session section.
+ * The session goes last so it lands closest to the conversation history
+ * — retrieved memories then sit in the model's freshest attention.
  *
  * Harness extensions consume the final string via runtime.systemPrompt().
- * They MAY override by reading components separately (identity(),
+ * They MAY override by reading components separately (systemPromptCore(),
  * listSkills()) — this is opt-out, not the default.
  */
 
@@ -23,6 +30,12 @@ export interface SystemPromptInputs {
   agentName: string;
   agentDescription?: string;
   now?: Date;
+  /**
+   * Section contributed by the active Session. Resolved at turn start
+   * (so memory implementations can pull from the latest user message).
+   * Empty/undefined → nothing is added.
+   */
+  sessionSection?: string;
 }
 
 export function assembleSystemPrompt(inputs: SystemPromptInputs): string {
@@ -69,6 +82,15 @@ export function assembleSystemPrompt(inputs: SystemPromptInputs): string {
   const now = inputs.now ?? new Date();
   dyn.push(`Current date: ${now.toISOString()}`);
   parts.push(dyn.join("\n"));
+
+  // 4. Session-contributed section (memory, scoped instructions, etc.).
+  // Goes last so it's closest to the conversation history — the model's
+  // recency bias works in our favour for fresh memories.
+  if (inputs.sessionSection && inputs.sessionSection.trim().length > 0) {
+    const lines: string[] = ["# Session"];
+    lines.push(inputs.sessionSection.trim());
+    parts.push(lines.join("\n"));
+  }
 
   return parts.join("\n\n---\n\n").trim() + "\n";
 }

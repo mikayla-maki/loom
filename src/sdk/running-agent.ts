@@ -16,6 +16,7 @@ import type {
   Provider,
   Runtime,
   Session,
+  SessionContext,
 } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
 import type { AgentManifest, Capabilities } from "../types/manifest.js";
@@ -132,6 +133,42 @@ export class RunningAgentImpl implements RunningAgent {
     // runtimeServices object, which we update here.
     this.runtimeServices.setAbortSignal(ctl.signal);
 
+    // Build the per-turn SessionContext and run the session's hooks.
+    // The session never holds onto the context — it gets a fresh one
+    // each turn, passed to the methods that need it.
+    const sessionCtx: SessionContext = {
+      harness: this.harness,
+      systemPromptCore: this.systemPrompt,
+      agentName: this.manifest.name,
+      ...(this.manifest.description
+        ? { agentDescription: this.manifest.description }
+        : {}),
+    };
+    if (this.session.prepareTurn) {
+      try {
+        await Promise.resolve(this.session.prepareTurn(sessionCtx));
+      } catch (e) {
+        // A failing prepareTurn shouldn't kill the turn; surface it as
+        // an agent_thought_chunk for visibility and continue.
+        const msg = (e as Error).message ?? String(e);
+        await this.session.append({
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: `[session.prepareTurn error] ${msg}` },
+        });
+      }
+    }
+    let sessionSection = "";
+    if (this.session.systemPromptSection) {
+      try {
+        sessionSection = await Promise.resolve(
+          this.session.systemPromptSection(sessionCtx),
+        );
+      } catch {
+        // A failing section shouldn't kill the turn; we just skip it.
+        sessionSection = "";
+      }
+    }
+
     const runtime: Runtime = new RuntimeImpl({
       session: this.session,
       state: this.state,
@@ -141,6 +178,7 @@ export class RunningAgentImpl implements RunningAgent {
       ...(this.manifest.description
         ? { agentDescription: this.manifest.description }
         : {}),
+      ...(sessionSection ? { sessionSection } : {}),
       abortSignal: ctl.signal,
       ...(this.now ? { now: this.now } : {}),
     });

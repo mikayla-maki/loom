@@ -55,6 +55,9 @@ describe("CompactingSession", () => {
     for (let i = 0; i < 12; i++) {
       await s.append(i % 2 === 0 ? userMsg(`u${i}`) : agentMsg(`a${i}`));
     }
+    // Auto-compaction is per-turn (via prepareTurn). Standalone use
+    // calls compactNow() to trigger.
+    await s.compactNow();
     expect(events.length).toBeGreaterThanOrEqual(1);
     const out = await s.getEvents();
     // Head is the synthetic summary pair we inject (2 events).
@@ -117,7 +120,7 @@ describe("CompactingSession", () => {
       toolCall("t1", "bash"),
       toolUpdate("t1"),
     ];
-    const out = await Promise.resolve(heuristicCompactor(events));
+    const out = await Promise.resolve(heuristicCompactor(events, null));
     expect(out).toHaveLength(2);
     const head = out[0];
     const body = out[1];

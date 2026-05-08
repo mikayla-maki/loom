@@ -169,6 +169,10 @@ export async function runAgent(
     extensionCtx,
     phase1Secrets,
   );
+  // Per-turn session hooks (`prepareTurn`, `systemPromptSection`)
+  // receive a `SessionContext` directly when they're called — nothing
+  // is bound at boot. RunningAgentImpl builds the context on each
+  // prompt() and passes it through.
   const sessionSkills = await collectSessionSkills(session);
 
   // ─── 5. Runtime services ────────────────────────────────────────────
