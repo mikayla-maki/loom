@@ -36,7 +36,8 @@ export {
   fileSessionFactory,
   compactingSessionFactory,
   forkOfParentSessionFactory,
-} from "./extensions/index.js";
+  skillsSessionFactory,
+} from "./builtins/index.js";
 
 export {
   CompactingSession,
@@ -46,14 +47,20 @@ export {
   heuristicCompactor,
   modelCompactor,
   adjustForToolPairs,
-} from "./extensions/session/compacting.js";
-export { MemorySession } from "./extensions/session/memory.js";
-export { FileSession } from "./extensions/session/file.js";
+} from "./builtins/session/compacting.js";
+export { MemorySession } from "./builtins/session/memory.js";
+export { FileSession } from "./builtins/session/file.js";
+export { SkillsSession } from "./builtins/session/skills.js";
 export type {
   Compactor,
   CompactingSessionOptions,
   ModelCompactorOptions,
-} from "./extensions/session/compacting.js";
+} from "./builtins/session/compacting.js";
+export type {
+  Skill,
+  SkillFrontmatter,
+  SkillsSessionOptions,
+} from "./builtins/session/skills.js";
 
 export { summarise, summariseViaRun } from "./sdk/session-utils.js";
 
@@ -61,37 +68,35 @@ export type {
   TestHarnessConfig,
   TurnScript,
   TurnStep,
-} from "./extensions/harness/test.js";
+} from "./builtins/harness/test.js";
 
 // Concrete harness classes — useful when an SDK consumer wants to wire
 // the harness instance themselves rather than going through the
-// `{ provider: "anthropic", … }` factory form.
-export { AnthropicHarness } from "./extensions/harness/anthropic.js";
-export { TestHarness } from "./extensions/harness/test.js";
-export { OpenAIHarness } from "./extensions/harness/openai.js";
+// `{ provider = "anthropic", … }` factory form.
+export { AnthropicHarness } from "./builtins/harness/anthropic.js";
+export { TestHarness } from "./builtins/harness/test.js";
+export { OpenAIHarness } from "./builtins/harness/openai.js";
 
 export {
-  loadExtensionPackage,
-  locateExtensionPackage,
-  listInstalledExtensions,
-} from "./extensions/loader.js";
+  loadProviderByName,
+  loadProviderFromPath,
+  loadProviderFromSource,
+  locateProviderPackage,
+  listInstalledProviders,
+} from "./providers/loader.js";
 export type {
-  LoomExtensionApi,
-  LoomExtensionModule,
-  ExtensionPackageInfo,
-  LoadOptions as ExtensionLoadOptions,
-} from "./extensions/loader.js";
+  ContributionRegistration,
+  LoomProviderApi,
+  LoomProviderModule,
+  ProviderPackageInfo,
+  LoadedProvider,
+  LoadOptions as ProviderLoadOptions,
+} from "./providers/loader.js";
 
-export {
-  nativeProviderFactory,
-  buildNativeProvider,
-} from "./extensions/provider/native.js";
+export { buildNativeTools } from "./builtins/provider/native.js";
 
 export { auditAgent, formatCapabilityTree } from "./audit/audit.js";
 export type { CapabilityTree } from "./audit/audit.js";
-
-export { LocalRegistry } from "./registry/registry.js";
-export type { RegistryOptions } from "./registry/registry.js";
 
 export {
   EnvSecretsStore,
@@ -100,6 +105,5 @@ export {
   KeychainSecretsStore,
   StaticSecretsStore,
   ChainedSecretsStore,
-  resolveSecrets,
 } from "./runtime/secrets.js";
 export type { SecretsStore } from "./runtime/secrets.js";

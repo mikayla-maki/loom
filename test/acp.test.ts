@@ -2,42 +2,42 @@ import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import { PassThrough } from "node:stream";
+import { Readable, Writable } from "node:stream";
 
-import { ndjsonStream } from "../src/acp/framing.js";
-import { AcpRouter, routerOverStreams } from "../src/acp/server.js";
+import { serveOverStream } from "../src/acp/server.js";
+import { ACP_PROTOCOL_VERSION } from "../src/acp/server.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
+import {
+  ClientSideConnection,
+  ndJsonStream,
+  type Agent,
+  type Client,
+  type SessionNotification,
+} from "@agentclientprotocol/sdk";
 import type { AgentManifest } from "../src/types/manifest.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
 /**
- * In-process ACP round-trip — a router on one pair of streams, a JSON-RPC
- * client on the inverted pair. No subprocess; tests the protocol shape.
+ * Build a pair of WHATWG streams whose readable/writable halves are
+ * cross-wired so a server connection on one side talks to a client
+ * connection on the other. No subprocess; tests the protocol shape.
  */
-function makePipes(): {
-  serverIn: PassThrough;
-  serverOut: PassThrough;
-  clientIn: PassThrough;
-  clientOut: PassThrough;
+function makeInProcessPipe(): {
+  serverStream: import("@agentclientprotocol/sdk").Stream;
+  clientStream: import("@agentclientprotocol/sdk").Stream;
 } {
-  const serverIn = new PassThrough();
-  const serverOut = new PassThrough();
+  const c2s = new TransformStream<unknown, unknown>();
+  const s2c = new TransformStream<unknown, unknown>();
   return {
-    serverIn,
-    serverOut,
-    clientIn: serverOut,
-    clientOut: serverIn,
-  };
+    serverStream: { readable: c2s.readable, writable: s2c.writable },
+    clientStream: { readable: s2c.readable, writable: c2s.writable },
+  } as never;
 }
 
 describe("ACP round-trip (in-process streams)", () => {
-  it("session/new + session/prompt + session/update notifications", async () => {
-    const { serverIn, serverOut, clientIn, clientOut } = makePipes();
-
-    // Build a pre-booted agent the router will hand out. Inline spec —
-    // this test cares about the ACP protocol shape, not disk layout.
+  it("initialize + session/new + session/prompt + updates", async () => {
     const spec: AgentManifest = {
       name: "acp-inline",
       systemPrompt: "You are an ACP test agent.",
@@ -46,99 +46,120 @@ describe("ACP round-trip (in-process streams)", () => {
         provider: "test",
         script: [[{ say: "hi from agent" }, { stop: "end_turn" }]],
       },
-      // No tools, no caps needed.
       capabilities: {},
     };
     const agent = await runAgent(spec, {
       secrets: new StaticSecretsStore({ sample_user_name: "ACP" }),
     });
 
-    const router = new AcpRouter({
-      agentFactory: async () => agent,
-      // Inline specs have no on-disk manifestPath; the router still
-      // requires *something* to satisfy session/new, but the agentFactory
-      // ignores it (always returns the pre-booted agent above).
-      fixedManifestPath: agent.manifest.manifestPath ?? "<inline>",
-    });
-    const routerDone = routerOverStreams(router, serverIn, serverOut);
+    const { serverStream, clientStream } = makeInProcessPipe();
 
-    // Client-side: drive JSON-RPC manually.
-    const clientStream = ndjsonStream(clientIn, clientOut);
-    const sent: unknown[] = [];
-    clientStream.write(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "session/new",
-        params: {},
-      }),
+    const { connection: serverConn, closeAll } = serveOverStream(
+      async () => agent,
+      serverStream,
+      { fixedManifestPath: "<inline>" },
     );
-    let ns: { sessionId?: string } = {};
-    let updates: string[] = [];
-    let promptResult: { stopReason?: string; finalMessage?: string } | null =
-      null;
 
-    const consumer = (async () => {
-      for await (const m of clientStream.messages()) {
-        sent.push(m);
-        const msg = m as {
-          id?: number;
-          result?: unknown;
-          method?: string;
-          params?: { update?: { sessionUpdate?: string } };
-        };
-        if (msg.id === 1) {
-          ns = msg.result as { sessionId: string };
-          // session/prompt next
-          clientStream.write(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: 2,
-              method: "session/prompt",
-              params: { sessionId: ns.sessionId, prompt: "hello" },
-            }),
-          );
-        } else if (msg.id === 2) {
-          promptResult = msg.result as {
-            stopReason: string;
-            finalMessage: string;
-          };
-          // close server-side
-          clientStream.write(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: 3,
-              method: "session/close",
-              params: { sessionId: ns.sessionId },
-            }),
-          );
-        } else if (msg.id === 3) {
-          serverIn.end();
-          clientStream.close();
-          break;
-        } else if (msg.method === "session/update") {
-          updates.push(msg.params!.update!.sessionUpdate!);
-        }
-      }
-    })();
+    // Build a minimal Client implementation that records the updates
+    // arriving from the agent.
+    const updates: string[] = [];
+    const clientImpl: Client = {
+      async sessionUpdate(n: SessionNotification) {
+        updates.push(n.update.sessionUpdate);
+      },
+      async requestPermission() {
+        return { outcome: { outcome: "cancelled" as const } };
+      },
+    };
+    const clientConn: Agent = new ClientSideConnection(
+      () => clientImpl,
+      clientStream,
+    );
 
-    await Promise.all([routerDone, consumer]);
+    const initResp = await clientConn.initialize({
+      protocolVersion: ACP_PROTOCOL_VERSION,
+      clientCapabilities: { fs: { readTextFile: true } },
+    });
+    expect(initResp.protocolVersion).toBe(ACP_PROTOCOL_VERSION);
+
+    const ns = await clientConn.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
     expect(ns.sessionId).toMatch(/^s\d+$/);
-    expect(promptResult).not.toBeNull();
-    expect(promptResult!.stopReason).toBe("end_turn");
-    expect(promptResult!.finalMessage).toContain("hi from agent");
+
+    const result = await clientConn.prompt({
+      sessionId: ns.sessionId,
+      prompt: [{ type: "text", text: "hello" }],
+    });
+    expect(result.stopReason).toBe("end_turn");
+
+    // Give the forwarder a chance to flush any in-flight updates.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Confirm we saw the agent's emitted updates over the wire.
     expect(updates).toContain("user_message_chunk");
     expect(updates).toContain("agent_message_chunk");
-    expect(updates).toContain("stop");
+
+    // Tear down: close streams from both ends so the SDK Connection
+    // loops exit cleanly.
+    await closeAll();
+    await clientStream.writable.close().catch(() => undefined);
+    await serverStream.writable.close().catch(() => undefined);
+    void serverConn;
+    await agent.close();
   });
 });
 
+/** Spawn `loom acp serve` and return an SDK-level Agent client. */
+async function spawnLoomAcp(args: {
+  cliEntry: string;
+  manifestPath: string;
+  /** Working directory for the child process. */
+  spawnCwd?: string;
+}): Promise<{
+  client: Agent;
+  collected: SessionNotification[];
+  shutdown(): void;
+}> {
+  const { spawn } = await import("node:child_process");
+  const child = spawn(
+    process.execPath,
+    [args.cliEntry, "acp", "serve", args.manifestPath],
+    {
+      stdio: ["pipe", "pipe", "inherit"],
+      ...(args.spawnCwd ? { cwd: args.spawnCwd } : {}),
+    },
+  );
+  const stream = ndJsonStream(
+    Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
+    Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>,
+  );
+  const collected: SessionNotification[] = [];
+  const clientImpl: Client = {
+    async sessionUpdate(n) {
+      collected.push(n);
+    },
+    async requestPermission() {
+      return { outcome: { outcome: "cancelled" as const } };
+    },
+  };
+  const client: Agent = new ClientSideConnection(() => clientImpl, stream);
+  return {
+    client,
+    collected,
+    shutdown() {
+      try {
+        child.kill();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+}
+
 describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
   it("drives the sample agent end-to-end via stdio", async () => {
-    // This test spawns the compiled CLI as a child process. If `dist/`
-    // hasn't been built yet (fresh checkout, `npm test` before `npm run
-    // build`) the spawn would hang for the test-timeout window. Skip
-    // explicitly with a clear message instead.
     const cliEntry = path.resolve("dist/cli/main.js");
     try {
       await fs.access(cliEntry);
@@ -150,11 +171,9 @@ describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
     }
 
     const { spawn } = await import("node:child_process");
-    const { connectStdio } = await import("../src/acp/client.js");
 
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-cli-"));
     try {
-      // Materialize a self-contained sample agent so secrets resolve via .loom-secrets.
       const agentDir = path.join(tmp, "agent");
       await fs.mkdir(agentDir, { recursive: true });
       await fs.cp(
@@ -178,24 +197,197 @@ path = "./session.jsonl"
 `,
       );
 
-      const child = spawn(
-        process.execPath,
-        [cliEntry, "acp", "serve", path.join(agentDir, "agent.toml")],
-        { stdio: ["pipe", "pipe", "inherit"] },
-      );
-      const client = connectStdio(child);
+      const { client, shutdown } = await spawnLoomAcp({
+        cliEntry,
+        manifestPath: path.join(agentDir, "agent.toml"),
+      });
       try {
-        // Pre-booted agent in stdio mode is bound to session id "s1" — but the
-        // server's serveOverStdio doesn't expose session/new. We use the
-        // primary session implicitly by passing only the prompt.
+        await client.initialize({
+          protocolVersion: ACP_PROTOCOL_VERSION,
+        });
+        const ns = await client.newSession({
+          cwd: agentDir,
+          mcpServers: [],
+        });
         const result = await client.prompt({
-          prompt: "hello acp",
-          sessionId: "s1",
+          sessionId: ns.sessionId,
+          prompt: [{ type: "text", text: "hello acp" }],
         });
         expect(result.stopReason).toBe("end_turn");
-        expect(result.finalMessage).toContain("echo: hello acp");
       } finally {
-        await client.close();
+        shutdown();
+      }
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("honors the client's `cwd` for tool path resolution", async () => {
+    const cliEntry = path.resolve("dist/cli/main.js");
+    try {
+      await fs.access(cliEntry);
+    } catch {
+      console.warn(
+        `[acp.test] skipping cwd test: ${cliEntry} not found. Run \`npm run build\` first.`,
+      );
+      return;
+    }
+
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-cwd-"));
+    try {
+      // Two distinct directories: the agent definition lives in one,
+      // the workspace the client is asking about lives in another.
+      // Spawning loom from yet another dir (os.tmpdir() itself)
+      // guarantees that `process.cwd()` at boot has no relationship
+      // to either, so a passing test proves the chdir actually
+      // happened.
+      const agentDir = path.join(tmp, "agent");
+      const workspaceDir = path.join(tmp, "workspace");
+      await fs.mkdir(agentDir, { recursive: true });
+      await fs.mkdir(workspaceDir, { recursive: true });
+      await fs.writeFile(path.join(workspaceDir, "hello.txt"), "world\n");
+
+      // Test harness with a scripted read_file call. The grant
+      // `paths = ["./"]` is resolved against `process.cwd()` at boot,
+      // which (if chdir works) is `workspaceDir`. read_file is then
+      // invoked with a relative path that should resolve there.
+      await fs.writeFile(
+        path.join(agentDir, "agent.toml"),
+        `[agent]
+name = "cwd-probe"
+system_prompt = "You are a test agent."
+secrets = []
+[tools]
+read_file = "builtin"
+[capabilities.read_file]
+paths = ["./"]
+[harness]
+provider = "test"
+script = [ [ { call = { tool = "read_file", input = { path = "hello.txt" } }, surface = true }, { stop = "end_turn" } ] ]
+`,
+      );
+
+      const { client, collected, shutdown } = await spawnLoomAcp({
+        cliEntry,
+        manifestPath: path.join(agentDir, "agent.toml"),
+        spawnCwd: os.tmpdir(),
+      });
+      try {
+        await client.initialize({ protocolVersion: ACP_PROTOCOL_VERSION });
+        const ns = await client.newSession({
+          cwd: workspaceDir,
+          mcpServers: [],
+        });
+        const result = await client.prompt({
+          sessionId: ns.sessionId,
+          prompt: [{ type: "text", text: "go" }],
+        });
+        expect(result.stopReason).toBe("end_turn");
+
+        // The agent_message_chunks emitted by the scripted harness
+        // should contain the contents of `hello.txt` if cwd was
+        // honored.
+        const text = collected
+          .map((n) => n.update)
+          .filter((u) => u.sessionUpdate === "agent_message_chunk")
+          .map((u) =>
+            "content" in u && u.content.type === "text" ? u.content.text : "",
+          )
+          .join("");
+        expect(text).toContain("world");
+      } finally {
+        shutdown();
+      }
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects `session/new` with a relative `cwd`", async () => {
+    const cliEntry = path.resolve("dist/cli/main.js");
+    try {
+      await fs.access(cliEntry);
+    } catch {
+      return;
+    }
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-cwd-rel-"));
+    try {
+      const agentDir = path.join(tmp, "agent");
+      await fs.mkdir(agentDir, { recursive: true });
+      await fs.writeFile(
+        path.join(agentDir, "agent.toml"),
+        `[agent]
+name = "rel-cwd"
+system_prompt = "x"
+secrets = []
+[tools]
+[harness]
+provider = "test"
+echo = true
+`,
+      );
+      const { client, shutdown } = await spawnLoomAcp({
+        cliEntry,
+        manifestPath: path.join(agentDir, "agent.toml"),
+      });
+      try {
+        await client.initialize({ protocolVersion: ACP_PROTOCOL_VERSION });
+        await expect(
+          client.newSession({ cwd: "./relative", mcpServers: [] }),
+        ).rejects.toThrow(/absolute/);
+      } finally {
+        shutdown();
+      }
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects `session/new` with non-empty `mcpServers`", async () => {
+    const cliEntry = path.resolve("dist/cli/main.js");
+    try {
+      await fs.access(cliEntry);
+    } catch {
+      return;
+    }
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-mcp-"));
+    try {
+      const agentDir = path.join(tmp, "agent");
+      await fs.mkdir(agentDir, { recursive: true });
+      await fs.writeFile(
+        path.join(agentDir, "agent.toml"),
+        `[agent]
+name = "no-mcp"
+system_prompt = "x"
+secrets = []
+[tools]
+[harness]
+provider = "test"
+echo = true
+`,
+      );
+      const { client, shutdown } = await spawnLoomAcp({
+        cliEntry,
+        manifestPath: path.join(agentDir, "agent.toml"),
+      });
+      try {
+        await client.initialize({ protocolVersion: ACP_PROTOCOL_VERSION });
+        await expect(
+          client.newSession({
+            cwd: agentDir,
+            mcpServers: [
+              {
+                type: "stdio",
+                name: "x",
+                command: "/bin/true",
+                args: [],
+                env: [],
+              } as never,
+            ],
+          }),
+        ).rejects.toThrow(/MCP/i);
+      } finally {
+        shutdown();
       }
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });

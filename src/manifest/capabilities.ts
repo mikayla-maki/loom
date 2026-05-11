@@ -1,5 +1,5 @@
 /**
- * Capability v2 — boot-time validation.
+ * Capability boot-time validation.
  *
  * The manifest's `[capabilities]` table is the single source of truth
  * for what each tool may do. It's keyed by the same names as `[tools]`;
@@ -209,7 +209,7 @@ export function assertSecretAllowlist(
 }
 
 /**
- * Structural deep-subset check, extended for the v2 `"*"` wildcard.
+ * Structural deep-subset check, extended for the `"*"` wildcard.
  * Used by audit-tree comparisons (parent grant vs child grant), not
  * by the boot guard. The boot guard is `assertRequires`, which is
  * presence-only.

@@ -30,6 +30,7 @@ import type {
 
 import { ansi } from "./markdown.js";
 import { StreamingMarkdownRenderer } from "./streaming-markdown.js";
+import { wantsColor } from "./term.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -47,9 +48,12 @@ export interface SlashCommand {
   handler(rest: string): void | Promise<void>;
 }
 
+/** Number of trailing session events replayed at REPL startup. */
+const HISTORY_REPLAY_LINES = 10;
+
 export interface ReplOptions {
   agent: RunningAgent;
-  /** Disable ANSI styling. Defaults to !stdout.isTTY. */
+  /** Override ANSI styling. Defaults to `COLORTERM`-driven detection. */
   plain?: boolean;
   /** Per-turn run parameters applied to every prompt. */
   runParameters?: RunParameters;
@@ -61,11 +65,6 @@ export interface ReplOptions {
   onPrompt?: (text: string) => Promise<TurnResult>;
   /** Banner printed at startup. */
   banner?: string;
-  /**
-   * On startup, replay the last N events of the session through the
-   * normal renderer. Default 10. Set to 0 to disable.
-   */
-  historyLines?: number;
   /** Custom slash commands. Built-ins are /quit /exit /help /audit /events /tools. */
   commands?: SlashCommand[];
 }
@@ -75,7 +74,7 @@ export interface ReplOptions {
  * Ctrl-C at idle). The agent is NOT closed here — caller owns lifecycle.
  */
 export async function runRepl(opts: ReplOptions): Promise<void> {
-  const plain = opts.plain ?? !stdout.isTTY;
+  const plain = opts.plain ?? !wantsColor();
   const s = ansiStyle(plain);
   const agent = opts.agent;
 
@@ -84,11 +83,11 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
 
   const printer = startPrinter(agent, plain);
 
-  // Resume hint: replay last N events on startup.
-  const historyLines = opts.historyLines ?? 10;
-  if (historyLines > 0) {
+  // Resume hint: replay the last few session events on startup so the
+  // user sees recent context after a reconnect.
+  {
     const all = (await agent.session.pull?.([])) ?? [];
-    const tail = all.slice(-historyLines);
+    const tail = all.slice(-HISTORY_REPLAY_LINES);
     if (tail.length > 0) {
       stdout.write(
         `${s.dim}─── resumed: showing last ${tail.length} of ${all.length} events ───${s.reset}\n`,
@@ -345,17 +344,13 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
         // Buffer; render only when the result lands.
         pendingCalls.set(u.toolCallId, {
           title: u.title,
-          input: u.input,
+          input: u.rawInput,
         });
         break;
       }
       case "tool_call_update": {
         const status = u.status ?? "?";
-        if (
-          status !== "completed" &&
-          status !== "failed" &&
-          status !== "cancelled"
-        ) {
+        if (status !== "completed" && status !== "failed") {
           break; // skip non-final transitions
         }
         const call = pendingCalls.get(u.toolCallId);
@@ -380,14 +375,8 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
           )
           .join("");
         const summary = oneLine(text, 200);
-        const icon =
-          status === "completed" ? "✓" : status === "failed" ? "✗" : "⊘";
-        const color =
-          status === "failed"
-            ? s.red
-            : status === "cancelled"
-              ? s.yellow
-              : s.green;
+        const icon = status === "completed" ? "✓" : "✗";
+        const color = status === "failed" ? s.red : s.green;
         const result = summary
           ? `${color}⎿${s.reset} ${color}${icon}${s.reset} ${s.dim}${summary}${s.reset}`
           : `${color}⎿${s.reset} ${color}${icon} ${status}${s.reset}`;

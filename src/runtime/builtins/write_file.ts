@@ -23,13 +23,29 @@ import type {
 import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
-import { describePaths, pathAllowed, paths, resolvedPaths } from "./_path.js";
+import {
+  collectTrustedPaths,
+  describePaths,
+  effectivePaths,
+  pathAllowed,
+  paths,
+  resolvedPaths,
+} from "./_path.js";
 
+/**
+ * Input schema. `ToolTable` validates against this before dispatch —
+ * `execute()` may trust the shape.
+ */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["path", "content"],
+  additionalProperties: false,
   properties: {
-    path: { type: "string", description: "File path to write." },
+    path: {
+      type: "string",
+      minLength: 1,
+      description: "File path to write.",
+    },
     content: { type: "string", description: "Full file contents." },
     append: {
       type: "boolean",
@@ -41,6 +57,13 @@ const SCHEMA: JSONSchema = {
     },
   },
 };
+
+interface WriteFileInput {
+  path: string;
+  content: string;
+  append?: boolean;
+  create_dirs?: boolean;
+}
 
 export class WriteFileTool implements Tool {
   public readonly name = "write_file";
@@ -58,24 +81,16 @@ export class WriteFileTool implements Tool {
     this.description = `Write a UTF-8 file (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
-  async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
-    const i = input as {
-      path?: unknown;
-      content?: unknown;
-      append?: unknown;
-      create_dirs?: unknown;
-    };
-    if (typeof i.path !== "string" || !i.path) {
-      return { content: "write_file: 'path' is required", isError: true };
-    }
-    if (typeof i.content !== "string") {
-      return {
-        content: "write_file: 'content' must be a string",
-        isError: true,
-      };
-    }
+  async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
+    const i = input as WriteFileInput;
     const target = path.resolve(i.path);
-    if (!pathAllowed(target, this.granted)) {
+    // Effective path set = manifest grant ∪ session trusted paths
+    // with write access (`"write"` or `"read-write"`). A skills
+    // session that advertises `~/.skills/` as read-only therefore
+    // does NOT let the agent write there — the access level matters.
+    const trusted = await collectTrustedPaths(ctx);
+    const effective = effectivePaths(this.granted, trusted, "write");
+    if (!pathAllowed(target, effective)) {
       return {
         content: `write_file: '${i.path}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,

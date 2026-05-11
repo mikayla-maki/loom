@@ -3,15 +3,15 @@ import { describe, expect, it } from "vitest";
 import { runAgent, StaticSecretsStore } from "../src/sdk/run-agent.js";
 import { SecretError } from "../src/errors.js";
 import type {
-  ExtensionContext,
+  FactoryContext,
   Harness,
   HarnessFactory,
-  Provider,
+  Tools,
   Runtime,
   Tool,
 } from "../src/types/interfaces.js";
 import type { StopReason } from "../src/types/acp.js";
-import { registerHarness } from "../src/extensions/index.js";
+import { registerHarness } from "../src/builtins/index.js";
 
 /**
  * The secrets pipeline contract:
@@ -31,7 +31,7 @@ const captureFactory: HarnessFactory = {
   secrets: { required: ["CAPTURE_REQUIRED"], optional: ["CAPTURE_OPTIONAL"] },
   create(
     _config: Record<string, unknown>,
-    _ctx: ExtensionContext,
+    _ctx: FactoryContext,
     secrets: Record<string, string>,
   ): Harness {
     const id = String(_ctx.agentName);
@@ -110,7 +110,7 @@ describe("secrets pipeline", () => {
   });
 
   it("a tool only sees its own declared secrets at execute time", async () => {
-    // Two synthetic tools supplied by an in-process Provider. Each
+    // Two synthetic tools supplied by an in-process Tools. Each
     // declares a different `secrets` allowlist; their `execute()` reads
     // ctx.secrets and emits the slice as JSON content. The runtime
     // filters bag → per-tool slice; this test asserts that filter.
@@ -138,7 +138,7 @@ describe("secrets pipeline", () => {
         return { content: JSON.stringify(out) };
       },
     };
-    const provider: Provider = {
+    const provider: Tools = {
       resolveTool(name) {
         if (name === "tool_a") return toolA;
         if (name === "tool_b") return toolB;
@@ -150,7 +150,7 @@ describe("secrets pipeline", () => {
     const agent = await runAgent(
       {
         name: "secret-iso",
-        tools: { tool_a: {}, tool_b: {} },
+        tools: { tool_a: "builtin", tool_b: "builtin" },
         harness: {
           provider: "test",
           script: [

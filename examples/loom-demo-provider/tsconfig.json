@@ -1,0 +1,30 @@
+{
+  // TypeScript config for the demo provider example.
+  //
+  // Compiles `index.ts` (source) to `index.js` (committed build output).
+  // The provider's `package.json` points `loom.provider` at `./index.js`
+  // so Loom can `import()` it at runtime without a build step.
+  //
+  //   npm run build    # one-shot
+  //   npm run dev      # tsc --watch
+  //
+  // Type imports are relative paths into the Loom source tree. When
+  // Loom is published to npm, provider authors would write
+  // `import type { LoomProviderApi } from "loom"` and add Loom as a
+  // peer/dev dependency.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "useUnknownInCatchVariables": true,
+    "declaration": false,
+    "sourceMap": false,
+  },
+  "include": ["index.ts"],
+}

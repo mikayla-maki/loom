@@ -4,92 +4,19 @@
 
 Loom is a declarative runtime for composing LLM agents. The user writes
 an `agent.toml` (or constructs an `AgentManifest` in JS); loom parses it,
-resolves secrets, instantiates a harness + session + a chain of
-providers, and runs turns.
+resolves secrets, and instantiates a running agent.
 
-The central abstraction is the **provider chain**: each tool reference
-in the manifest is a `(name, config)` pair, and loom asks each
-provider in turn whether it claims the name. The native provider
-claims the builtins (`bash`, `read_file`, etc.); extension providers
-claim domain-specific tools (S3, Discord, MCP). Capabilities are
-tool-defined; sandboxing is each tool's own responsibility (or its
-provider's, when the tool needs real isolation).
+The user-facing model fits in a paragraph: a Loom agent is composed
+from **providers** — npm packages, local paths, or built-in code that
+contribute *harnesses*, *sessions*, and *tool providers*. The
+`[providers]` table optionally gives local handles to packages you
+reference more than once. Each of `[harness]`, `[session]`, and
+`[tools.X]` carries a `provider` field that names which provider
+supplies it. `[capabilities]` is the permission ceiling for the agent
+and any subagents it spawns.
 
-Loom does NOT model skills. "Skills" — the bundled instruction +
-tool-requirement + sub-agent format Anthropic's docs describe — are
-a client-level concept that compiles down to Loom primitives (tools
-and sub-agents). A future `loom-skills` library will adapt the
-Anthropic SKILL.md format and ship as a session-factory extension;
-Loom proper stays focused on the runtime.
+See `internal-docs/manifest-v5.md` for the canonical manifest design.
 
-## Status
-
-- **Single `AgentManifest` type** — parsed from `agent.toml` or
-  constructed in-memory.
-- **Tools are JS objects.** Each builtin lives in
-  `src/runtime/builtins/`. There's no on-disk tool format; extensions
-  ship tools as code in npm packages.
-- **Sub-agents** are first-class: `Agent.spawnSubagent`,
-  `dependencies.subagents`, audit recursion, parent-derived providers.
-- **Capabilities v2** — `[capabilities]` is the single source of truth
-  for what each tool may do. Per-tool grants are `"*"` (whole-tool
-  unrestricted), `{}` (nothing), or a per-kind map
-  (`{ paths = ["./"], subprocess = "*" }`). Each tool declares
-  `requires` (kinds it must have) and `optional` (kinds it may use);
-  the boot guard checks every required kind is granted. Tools also
-  derive their model-facing description and input schema from the
-  grant — same JSON drives validation, self-policing, and the
-  agent's mental model.
-- **`[agent].secrets` allowlist** — mirrors capability star/list
-  semantics. Absent or `"*"` = no ceiling; an array = the closure of
-  secret names tools may resolve.
-- **Session extensions:** `file` (JSONL append log), `memory`
-  (in-process, the default if `[session]` is absent), `compacting`,
-  `fork-of-parent`.
-- **Harness extensions:** `test` (deterministic, scripted), `anthropic`
-  (Messages API), `openai` (Chat Completions),
-  `small-model-of-parent`.
-- **Builtin tools:** `bash`, `echo`, `read_file`, `write_file`, `find`,
-  `spawn_subagent` (opt-in).
-- **CLI:** `loom run`, `loom prompt`, `loom audit`, `loom acp serve`,
-  `loom install`, `loom list`, `loom extensions`.
-- **`LocalRegistry`** at `~/.loom/{tools,agents}/` for bare-name
-  resolution.
-- **ACP wire protocol** (server + client + `connectAcpUrl` for `acp://`
-  and `acp+unix://` URLs).
-
-### Architecture
-
-Loom owns: manifest parsing, secrets, system-prompt assembly,
-`[capabilities]` validation, and the turn loop. Providers own:
-building Tool objects from `(name, config)` references, and any state
-those tools need.
-
-A Loom agent is composed along three orthogonal axes:
-
-1. **Installation.** `[extensions]` declares npm packages that
-   register providers, harnesses, and sessions. The native provider
-   ships with Loom.
-2. **Wiring.** `[tools]` maps a model-facing name to a
-   `(provider, config)` pair. The config is the tool's runtime
-   defaults (region, timeouts, server URL) — NOT capability data.
-3. **Grant.** `[capabilities]` says what each named tool may do, in a
-   tool-defined kind vocabulary (`paths`, `subprocess`, `network`,
-   `buckets`, ...). The grant flows to the tool at construction time;
-   the tool self-polices and exposes a partially curried surface based
-   on what it was granted (multi-bucket grant → enum in input schema;
-   single-bucket grant → bucket bound, only key in schema).
-
-The trust model is the install boundary. Tools and extension providers
-are code the user installed (the loom package itself for builtins; an
-npm dep for everything else). Loom doesn't sandbox tools at runtime;
-tools that need real isolation own their sandbox setup (e.g. a future
-`bash`-with-container variant). Loom is a manifest-driven runtime, not
-a sandbox.
-
-What is intentionally not yet implemented: OS-level sandbox
-enforcement, the `loom-skills` library, and tool / agent distribution
-beyond the per-project `[extensions]` mechanism.
 
 ## Install / develop
 
@@ -108,7 +35,7 @@ The smallest viable agent is just a name and a harness:
 import { runAgent } from "loom";
 
 const agent = await runAgent({
-  agent: { name: "demo" },
+  name: "demo",
   harness: { provider: "anthropic", model: "claude-3-5-sonnet-latest" },
 });
 await agent.prompt("hello");
@@ -122,7 +49,7 @@ Defaults applied:
   `find`) auto-loads when the field is absent, with a parallel default
   capability bundle (FS tools → `paths = ["./"]`; bash →
   `subprocess = "*", paths = ["./"]` and SAFE_DEFAULT env). Declare an
-  explicit `tools` table (even empty) to opt out.
+  explicit `tools` table to opt out.
 - `capabilities` → absent. When `[tools]` is also absent, the default
   cap bundle applies; when `[tools]` is declared, no defaults apply
   and tools that have `requires` must be granted explicitly.
@@ -150,17 +77,14 @@ provider = "anthropic"
 model = "claude-3-5-sonnet-latest"
 
 [tools]
-# Each entry is `name = config`. Loom routes (name, config) through the
-# provider chain; the first non-null result wins.
+# Each entry is `name = config`. Loom routes (name, config) to a
+# Tools instance — either the built-in (no `provider` field) or one
+# materialised from a provider package.
 bash = {}
 read_file = { paths = ["./src", "./test"] }
-# Tools added by an [extensions].<pkg> entry are claimed by their
-# extension's provider and configured the same way:
-# "discord.send" = { channels = ["#general"] }
+# Tools added by an inline-anonymous provider reference:
+# fetch_url = { provider = "@my-org/loom-fetch", apiKey = { secret = "FETCH_KEY" } }
 ```
-
-The `tools` value is `string | Record<string, unknown>` — loom doesn't
-interpret it; the claiming provider does.
 
 ## File-based agents
 
@@ -179,15 +103,15 @@ provider = "file"
 path = "./session.jsonl"
 
 [tools]
-# Wiring: which provider claims the name + non-cap config. Caps live
-# in [capabilities] below; do not duplicate.
-read_file  = "builtin"
-write_file = "builtin"
-bash       = "builtin"
+# Built-ins claimed by tool name; no `provider` field needed.
+bash       = {}
+read_file  = {}
+write_file = {}
 
 [capabilities]
-# v2 grants. "*" = unrestricted. Absent kind = tool's smart default.
-# Empty {} = nothing granted (tools with requires fail boot).
+# Per-tool grants. "*" = unrestricted. Absent kind = tool's smart
+# default. Empty {} = nothing granted (tools with `requires` fail
+# boot).
 read_file  = { paths = ["./"] }
 write_file = { paths = ["./"] }
 bash       = { subprocess = "*", paths = ["./"], env = ["PATH", "HOME"] }
@@ -198,7 +122,7 @@ node dist/cli/main.js audit  test/fixtures/sample-agent/agent.toml
 node dist/cli/main.js prompt test/fixtures/sample-agent/agent.toml "hi"
 ```
 
-## Capability semantics (v2)
+## Capability semantics
 
 A capability grant is one of:
 
@@ -235,61 +159,75 @@ bash, in a follow-up) the OS-level sandbox profile.
 
 
 
-## Distributing extensions via npm / GitHub
+## Distributing providers via npm / GitHub
 
-A Loom extension is a regular npm package with a `loom.extension` field in
-its `package.json` pointing at an entry that exports a `register()` function:
+A Loom provider is an npm package with a `loom.provider` field in
+its `package.json` pointing at an entry that exports a `register()`
+function:
 
 ```json
 {
-  "name": "mcp-loom-extension",
+  "name": "@my-org/loom-mcp",
   "type": "module",
   "main": "./dist/index.js",
-  "loom": { "extension": "./dist/index.js" }
+  "loom": { "provider": "./dist/index.js" }
 }
 ```
 
 ```js
 // dist/index.js
 export function register(api) {
-  api.registerHarness({ name: "...", create(config, ctx) { /* ... */ } });
-  api.registerSession({ name: "...", create(config, ctx) { /* ... */ } });
-  api.addProvider({ /* ... */ });   // auto-activate a Provider for this agent
+  api.registerTools({
+    name: "@my-org/loom-mcp",
+    async create(config, ctx, secrets) { /* ... → Tools */ },
+  });
+  api.registerHarness({
+    name: "@my-org/loom-mcp",
+    create(config, ctx, secrets) { /* ... → Harness */ },
+  });
+  api.registerSession({
+    name: "@my-org/loom-mcp",
+    create(config, ctx, secrets) { /* ... → Session */ },
+  });
 }
 ```
 
-Activation is explicit (extensions run as the runtime trust class):
+Activation is explicit (providers run as the runtime trust class):
 
 ```toml
-[extensions]
-"mcp-loom-extension" = { servers = ["filesystem"] }
-"@my-org/loom-foo"   = {}
+[providers]
+mcp = { npm = "@my-org/loom-mcp", version = "^1.2" }
+
+[tools]
+list_files = { provider = "mcp", server = "filesystem" }
 ```
 
-Discovery walks `<manifest-dir>/node_modules` → `npm root -g` → `~/.loom/extensions`.
+Discovery walks `<manifest-dir>/node_modules` → `npm root -g` →
+`~/.loom/providers`.
 
 ```sh
-npm install mcp-loom-extension                  # local
-npm install -g mcp-loom-extension               # global
-npm install github:user/mcp-loom-extension      # any git ref
-npm install file:./local-path                   # local checkout
+npm install @my-org/loom-mcp                       # local
+npm install -g @my-org/loom-mcp                    # global
+npm install github:my-org/loom-mcp                 # any git ref
+npm install file:./local-path                      # local checkout
 ```
 
-`loom extensions list` enumerates packages with a `loom.extension` field.
+`loom providers list` enumerates packages with a `loom.provider` field.
 
 ## Design
 
-The implementation follows the v0 / v1 design documents (four resources,
-four interfaces, two faces, one external protocol, one security principle).
-Reading order:
+The implementation follows the manifest-v5 design (one reference
+word, one declaration table, one resolution rule). Reading order:
 
-1. `src/types/` — ACP types, manifest types, the four interfaces.
+1. `src/types/` — ACP types, manifest types, the runtime interfaces.
 2. `src/manifest/parser.ts`, `resolver.ts`, `capabilities.ts` — the manifest
    pipeline.
-3. `src/runtime/` — system-prompt assembly, tool table, update sink.
-4. `src/extensions/{harness,session}/*` — the pluggable extensions.
-5. `src/sdk/run-agent.ts` — `runAgent()` ties it all together.
-6. `src/acp/`, `src/server/`, `src/registry/`, `src/audit/` — v1 surfaces.
+3. `src/runtime/` — system-prompt assembly, tool table, update sink,
+   shared boot helpers.
+4. `src/builtins/{harness,session}/*` — built-in harness/session factories.
+5. `src/providers/loader.ts` — provider package discovery and registration.
+6. `src/sdk/run-agent.ts` — `runAgent()` ties it all together.
+7. `src/acp/`, `src/cli/`, `src/audit/` — surfaces on top.
 
 ## License
 

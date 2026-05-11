@@ -1,17 +1,22 @@
 /**
  * Tty-driven PermissionHandler for the CLI.
  *
- * Prints the permission request to stderr, reads y/n/o (yes-once / yes-session
- * / no) on stdin, and returns the corresponding decision. If stdin is not a
- * TTY (piped, tests) it denies — same secure default as no handler at all.
+ * Prints the permission request (and its available options) to
+ * stderr, prompts on stdin, and returns the corresponding ACP
+ * `RequestPermissionResponse`. Options are 1-indexed in the UI to
+ * keep the prompt friendly; the optionId selected is the SDK's
+ * canonical `optionId` string.
+ *
+ * If stdin is not a TTY (piped, tests) the handler returns a
+ * "cancelled" outcome — same secure default as no handler at all.
  */
 
 import * as readline from "node:readline";
 
 import type {
-  PermissionDecision,
   PermissionHandler,
-  PermissionRequest,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
 } from "../types/permissions.js";
 
 export function ttyPermissionHandler(
@@ -24,13 +29,19 @@ export function ttyPermissionHandler(
   const inp = (opts.in ?? process.stdin) as NodeJS.ReadableStream & {
     isTTY?: boolean;
   };
-  return async (req: PermissionRequest) => {
+  return async (
+    req: Omit<RequestPermissionRequest, "sessionId">,
+  ): Promise<RequestPermissionResponse> => {
     if (!inp.isTTY) {
-      out.write("\n[permission] denied — stdin is not a TTY\n");
-      return { decision: "deny" };
+      out.write("\n[permission] cancelled — stdin is not a TTY\n");
+      return { outcome: { outcome: "cancelled" } };
     }
     out.write(formatRequest(req));
-    out.write("[a]llow once / [s]ession-allow / [d]eny ? ");
+    const options = req.options;
+    options.forEach((o, i) => {
+      out.write(`  ${i + 1}) ${o.name} [${o.kind}]\n`);
+    });
+    out.write(`Select option [1-${options.length}] (or c to cancel): `);
     const rl = readline.createInterface({
       input: inp as NodeJS.ReadableStream,
       output: out,
@@ -41,19 +52,26 @@ export function ttyPermissionHandler(
         resolve((a ?? "").trim().toLowerCase());
       }),
     );
-    let decision: PermissionDecision = "deny";
-    if (answer === "a" || answer === "allow" || answer === "y")
-      decision = "allow_once";
-    else if (answer === "s" || answer === "session") decision = "allow_session";
-    return { decision };
+    if (answer === "c" || answer === "cancel") {
+      return { outcome: { outcome: "cancelled" } };
+    }
+    const idx = parseInt(answer, 10);
+    const choice = !Number.isNaN(idx) ? options[idx - 1] : undefined;
+    if (!choice) {
+      return { outcome: { outcome: "cancelled" } };
+    }
+    return { outcome: { outcome: "selected", optionId: choice.optionId } };
   };
 }
 
-function formatRequest(req: PermissionRequest): string {
+function formatRequest(
+  req: Omit<RequestPermissionRequest, "sessionId">,
+): string {
   const lines: string[] = ["", "─── permission request ───"];
-  lines.push(`reason: ${req.reason}`);
-  if (req.newCapabilities)
-    lines.push(`new capabilities: ${JSON.stringify(req.newCapabilities)}`);
-  if (req.metadata) lines.push(`details: ${JSON.stringify(req.metadata)}`);
+  lines.push(`tool: ${req.toolCall.title ?? req.toolCall.toolCallId}`);
+  if (req.toolCall.kind) lines.push(`kind: ${req.toolCall.kind}`);
+  if (req.toolCall.rawInput) {
+    lines.push(`input: ${JSON.stringify(req.toolCall.rawInput)}`);
+  }
   return lines.join("\n") + "\n";
 }

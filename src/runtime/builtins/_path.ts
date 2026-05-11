@@ -16,6 +16,7 @@
 import * as path from "node:path";
 
 import type { CapabilitySet } from "../../types/manifest.js";
+import type { ToolContext, TrustedPath } from "../../types/interfaces.js";
 
 /**
  * Read the `paths` grant from a tool's CapabilitySet.
@@ -107,4 +108,76 @@ export function describePaths(
   if (granted === "*") return `unrestricted filesystem${tag}`;
   if (granted.length === 0) return "no filesystem access";
   return `restricted to: ${granted.join(", ")}${tag}`;
+}
+
+/**
+ * Filter `trustedPaths` to entries that admit the access this tool
+ * needs. Read-oriented tools accept any access level (a write grant
+ * implies the ability to read); write-oriented tools require `"write"`
+ * or `"read-write"`.
+ */
+export function filterTrustedPaths(
+  trusted: readonly TrustedPath[],
+  needs: "read" | "write",
+): TrustedPath[] {
+  if (needs === "read") return [...trusted];
+  return trusted.filter(
+    (t) => t.access === "write" || t.access === "read-write",
+  );
+}
+
+/**
+ * Compute the effective path set for a tool call: the manifest's grant
+ * unioned with the session-declared trusted paths the access semantics
+ * admit. Returns `"*"` unchanged (already unrestricted) — the union is
+ * only relevant for concrete allowlists.
+ *
+ * Path-aware tools call this at execute time (not at construction)
+ * because a session's `trustedPaths()` can change between turns (a
+ * skills session, for instance, may pick up newly-added skills on
+ * each `prepareTurn`). The trusted paths are resolved to absolute via
+ * `path.resolve` for consistent prefix matching.
+ */
+export function effectivePaths(
+  granted: "*" | string[],
+  trusted: readonly TrustedPath[],
+  needs: "read" | "write",
+): "*" | string[] {
+  if (granted === "*") return "*";
+  const accepted = filterTrustedPaths(trusted, needs);
+  if (accepted.length === 0) return granted;
+  const extras = accepted.map((t) => path.resolve(t.path));
+  // Dedup against existing grants (cheap; small N in practice).
+  const seen = new Set(granted);
+  const out = [...granted];
+  for (const p of extras) {
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+/**
+ * Best-effort retrieval of `Session.trustedPaths()` from the tool's
+ * `ctx.agent`. Sessions that don't implement the method, throw, or
+ * are absent are treated as contributing nothing — a path-aware tool
+ * should still function with just its manifest grant.
+ *
+ * Cheap to call per dispatch: skills/file/memory sessions all keep an
+ * in-memory cache or trivial state; the I/O happens in `prepareTurn`.
+ */
+export async function collectTrustedPaths(
+  ctx: ToolContext,
+): Promise<TrustedPath[]> {
+  const session = ctx.agent?.session;
+  if (!session || typeof session.trustedPaths !== "function") return [];
+  try {
+    return (await Promise.resolve(session.trustedPaths())) ?? [];
+  } catch {
+    // Sessions that misbehave shouldn't crash tool execution; the
+    // tool falls back to its static grant.
+    return [];
+  }
 }

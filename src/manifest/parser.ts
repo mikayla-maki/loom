@@ -1,10 +1,11 @@
 /**
- * Parser for `agent.toml`. Validation only — capability checks and
- * tool construction live in providers.
+ * Parser for `agent.toml` (manifest v5). Validates shape and classifies
+ * every `Reference` value (bare handle vs. SourceSpec string fast-path
+ * vs. SourceSpec table) by *shape*. Does NOT touch the filesystem to
+ * resolve sources or look up handles — that happens in the resolver
+ * at boot time.
  *
- * The manifest model is `(name, config)` for tools: each entry's value
- * is an opaque config blob (string or object) that loom hands to the
- * provider chain. There's no on-disk tool format.
+ * See `internal-docs/manifest-v5.md` §1 for the grammar.
  */
 
 import * as fs from "node:fs/promises";
@@ -12,17 +13,23 @@ import * as path from "node:path";
 import TOML from "@iarna/toml";
 
 import { ManifestError } from "../errors.js";
-import type { ToolConfig } from "../types/interfaces.js";
 import type {
   AgentManifest,
   Capabilities,
   CapabilitySet,
   CapabilityValue,
+  HarnessSpec,
+  ProviderEntry,
+  Providers,
+  Reference,
   SecretAllowlist,
+  SessionSpec,
+  SourceSpec,
   SystemPromptSpec,
+  ToolEntry,
 } from "../types/manifest.js";
 
-// ─── agent.toml ────────────────────────────────────────────────────────────
+// ─── Top-level entry point ─────────────────────────────────────────────────
 
 export async function parseAgentManifest(
   manifestPath: string,
@@ -39,32 +46,31 @@ export async function parseAgentManifest(
   const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
   const secrets = parseSecretAllowlist(agent.secrets, abs);
 
-  const harness = ensureObject(raw.harness, "[harness]", abs);
-  if (typeof harness.provider !== "string" || !harness.provider) {
-    throw new ManifestError(
-      `agent.toml at ${abs} is missing required [harness].provider`,
+  const providers =
+    raw.providers === undefined
+      ? undefined
+      : parseProviders(raw.providers, abs);
+
+  const harness = parseHarnessSpec(
+    ensureObject(raw.harness, "[harness]", abs),
+    abs,
+  );
+
+  let session: SessionSpec | undefined;
+  if (raw.session !== undefined) {
+    session = parseSessionSpec(
+      ensureObject(raw.session, "[session]", abs),
+      abs,
     );
   }
-  let session: AgentManifest["session"] | undefined;
-  if (raw.session !== undefined) {
-    const s = ensureObject(raw.session, "[session]", abs);
-    if (typeof s.provider !== "string" || !s.provider) {
-      throw new ManifestError(
-        `agent.toml at ${abs}: [session] table is present but missing 'provider'`,
-      );
-    }
-    session = { ...(s as Record<string, unknown>), provider: s.provider };
-  }
+
+  const tools =
+    raw.tools === undefined ? undefined : parseToolTable(raw.tools, abs);
 
   const capabilities =
     raw.capabilities === undefined
       ? undefined
       : parseCapabilities(raw.capabilities, abs);
-  const tools =
-    raw.tools === undefined
-      ? undefined
-      : parseToolConfigTable(raw.tools, "[tools]", abs);
-  const extensions = parseConfigTable(raw.extensions, "[extensions]", abs);
 
   return {
     manifestPath: abs,
@@ -74,16 +80,15 @@ export async function parseAgentManifest(
       : {}),
     ...(systemPrompt !== undefined ? { systemPrompt } : {}),
     ...(secrets !== undefined ? { secrets } : {}),
-    harness: {
-      ...(harness as Record<string, unknown>),
-      provider: harness.provider as string,
-    },
+    ...(providers ? { providers } : {}),
+    harness,
     ...(session ? { session } : {}),
-    ...(capabilities ? { capabilities } : {}),
     ...(tools !== undefined ? { tools } : {}),
-    extensions,
+    ...(capabilities ? { capabilities } : {}),
   };
 }
+
+// ─── Agent-section helpers (system prompt + secrets) ──────────────────────
 
 function parseSystemPromptSpec(
   v: unknown,
@@ -100,7 +105,307 @@ function parseSystemPromptSpec(
   );
 }
 
-// ─── helpers ───────────────────────────────────────────────────────────────
+function parseSecretAllowlist(
+  v: unknown,
+  where: string,
+): SecretAllowlist | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (v === "*") return "*";
+  if (Array.isArray(v)) {
+    if (!v.every((x) => typeof x === "string")) {
+      throw new ManifestError(
+        `agent.toml at ${where}: [agent].secrets must be "*" or an array of strings`,
+      );
+    }
+    return v as string[];
+  }
+  throw new ManifestError(
+    `agent.toml at ${where}: [agent].secrets must be "*" or an array of strings, got ${typeof v}`,
+  );
+}
+
+// ─── [providers] ──────────────────────────────────────────────────────────
+
+function parseProviders(v: unknown, where: string): Providers {
+  const obj = ensureObject(v, "[providers]", where);
+  const out: Providers = {};
+  for (const [handle, val] of Object.entries(obj)) {
+    validateHandle(handle, `[providers].${handle}`, where);
+    out[handle] = parseProviderEntry(val, `[providers].${handle}`, where);
+  }
+  return out;
+}
+
+function parseProviderEntry(
+  v: unknown,
+  label: string,
+  where: string,
+): ProviderEntry {
+  // A `[providers]` entry value is always a `Reference` to a SourceSpec —
+  // never a bare handle (that would point at itself).
+  const ref = parseReference(v, label, where);
+  if (typeof ref === "string") {
+    if (!isSourceSpecShapedString(ref)) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label} must be a SourceSpec (npm-shaped string, ` +
+          `"./path", or a table { npm = "..." } / { path = "..." }). ` +
+          `Bare handles aren't allowed at this layer — that would be a circular reference.`,
+      );
+    }
+  }
+  return ref;
+}
+
+// ─── [tools] ───────────────────────────────────────────────────────────────
+
+function parseToolTable(v: unknown, where: string): Record<string, ToolEntry> {
+  const obj = ensureObject(v, "[tools]", where);
+  const out: Record<string, ToolEntry> = {};
+  for (const [k, val] of Object.entries(obj)) {
+    out[k] = parseToolEntry(val, `[tools].${k}`, where);
+  }
+  return out;
+}
+
+function parseToolEntry(v: unknown, label: string, where: string): ToolEntry {
+  // String shorthand: equivalent to `{ provider = "<string>" }`.
+  if (typeof v === "string") {
+    if (v.length === 0) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label} must be a non-empty string`,
+      );
+    }
+    validateReferenceString(v, label, where);
+    return v;
+  }
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const obj = v as Record<string, unknown>;
+    if (obj.provider === undefined) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label} is missing required 'provider' field. ` +
+          `Every [tools.X] entry must name a provider (e.g. ${label} = "builtin" ` +
+          `for native tools, or ${label} = { provider = "<handle>", ...config } ` +
+          `for a provider-backed tool). Empty \`{}\` is not accepted.`,
+      );
+    }
+    const provider = parseReference(obj.provider, `${label}.provider`, where);
+    const { provider: _p, ...config } = obj;
+    void _p;
+    return { provider, ...config };
+  }
+  throw new ManifestError(
+    `agent.toml at ${where}: ${label} must be a string or a table, got ${typeof v}`,
+  );
+}
+
+// ─── [harness] / [session] ────────────────────────────────────────────────
+
+function parseHarnessSpec(
+  raw: Record<string, unknown>,
+  where: string,
+): HarnessSpec {
+  if (raw.provider === undefined) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [harness] is missing required 'provider' field ` +
+        `(a built-in harness name like "anthropic", a [providers] handle, ` +
+        `or an inline SourceSpec)`,
+    );
+  }
+  const provider = parseReference(raw.provider, "[harness].provider", where);
+  const { provider: _p, ...config } = raw;
+  void _p;
+  return { provider, ...config };
+}
+
+function parseSessionSpec(
+  raw: Record<string, unknown>,
+  where: string,
+): SessionSpec {
+  if (raw.provider === undefined) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [session] is missing required 'provider' field ` +
+        `(a built-in session name like "file", a [providers] handle, ` +
+        `or an inline SourceSpec)`,
+    );
+  }
+  const provider = parseReference(raw.provider, "[session].provider", where);
+  const { provider: _p, ...config } = raw;
+  void _p;
+  return { provider, ...config };
+}
+
+// ─── References (shape-first classification) ──────────────────────────────
+
+/**
+ * Parse a `Reference` value. Accepts:
+ *
+ *   - string (validated by {@link validateReferenceString})
+ *   - SourceSpec table (`{ npm = ... }` / `{ path = ... }`)
+ *
+ * Resolution against the appropriate tables (`[providers]`, built-in
+ * registries) happens later in the resolver — the parser only
+ * classifies by shape.
+ */
+function parseReference(v: unknown, label: string, where: string): Reference {
+  if (typeof v === "string") {
+    if (v.length === 0) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label} must be a non-empty string`,
+      );
+    }
+    validateReferenceString(v, label, where);
+    return v;
+  }
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    return parseSourceSpecTable(v as Record<string, unknown>, label, where);
+  }
+  throw new ManifestError(
+    `agent.toml at ${where}: ${label} must be a string or a SourceSpec table, ` +
+      `got ${typeof v}`,
+  );
+}
+
+/**
+ * Validate a reference string. Accepted shapes:
+ *
+ *   - `"./..."`, `"../..."` — local path (SourceSpec fast-path)
+ *   - `"name/sub"`, `"@scope/pkg"` — npm spec (SourceSpec fast-path)
+ *   - bare identifier — handle for [providers] / built-in
+ *
+ * Absolute paths (`"/foo"`) are rejected with a pointer to the table
+ * form.
+ */
+function validateReferenceString(
+  s: string,
+  label: string,
+  where: string,
+): void {
+  if (s.startsWith("./") || s.startsWith("../")) return; // path
+  if (s.startsWith("/")) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label} "${s}" is an absolute path. ` +
+        `Use the table form: ${label} = { path = "${s}" }.`,
+    );
+  }
+  if (s.includes("/")) {
+    // npm-shaped
+    if (!/^[@a-zA-Z0-9_\-./]+$/.test(s)) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label} "${s}" doesn't look like a valid ` +
+          `npm package reference`,
+      );
+    }
+    return;
+  }
+  // Bare handle.
+  if (s.includes("@")) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label} "${s}" contains '@' without a slash. ` +
+        `Scoped npm packages must use the form "@scope/pkg".`,
+    );
+  }
+  if (!/^[a-zA-Z_][a-zA-Z0-9_\-.]*$/.test(s)) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label} "${s}" is not a valid handle ` +
+        `(letters, digits, underscore, dash, dot; must start with letter or underscore)`,
+    );
+  }
+}
+
+/** Validate a `[providers].<handle>` key. */
+function validateHandle(s: string, label: string, where: string): void {
+  if (!/^[a-zA-Z_][a-zA-Z0-9_\-.]*$/.test(s)) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label} is not a valid handle name ` +
+        `(letters, digits, underscore, dash, dot; must start with letter or underscore)`,
+    );
+  }
+}
+
+/**
+ * Classify a reference string as a SourceSpec-shaped fast-path
+ * (vs. a bare handle). Used by parsers that need to enforce
+ * SourceSpec-only (e.g., `[providers]` values can't be bare handles —
+ * that would be a self-reference).
+ */
+function isSourceSpecShapedString(s: string): boolean {
+  return s.startsWith("./") || s.startsWith("../") || s.includes("/");
+}
+
+// ─── SourceSpec table parsing ─────────────────────────────────────────────
+
+function parseSourceSpecTable(
+  obj: Record<string, unknown>,
+  label: string,
+  where: string,
+): SourceSpec {
+  const sourceKeys = ["npm", "path"] as const;
+  const present = sourceKeys.filter((k) => obj[k] !== undefined);
+  if (present.length === 0) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label} must have exactly one of: ${sourceKeys.join(", ")}`,
+    );
+  }
+  if (present.length > 1) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label} has multiple source kinds (${present.join(", ")}); pick one`,
+    );
+  }
+  const kind = present[0]!;
+  if (kind === "npm") {
+    if (typeof obj.npm !== "string" || !obj.npm) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label}.npm must be a non-empty string (package name)`,
+      );
+    }
+    const out: { npm: string; version?: string } = { npm: obj.npm };
+    if (obj.version !== undefined) {
+      if (typeof obj.version !== "string" || !obj.version) {
+        throw new ManifestError(
+          `agent.toml at ${where}: ${label}.version must be a non-empty string (npm semver range)`,
+        );
+      }
+      out.version = obj.version;
+    }
+    rejectStrayKeys(obj, ["npm", "version"], label, where);
+    return out;
+  }
+  // path
+  if (typeof obj.path !== "string" || !obj.path) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label}.path must be a non-empty string`,
+    );
+  }
+  const out: { path: string; subpath?: string } = { path: obj.path };
+  if (obj.subpath !== undefined) {
+    if (typeof obj.subpath !== "string" || !obj.subpath) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label}.subpath must be a non-empty string`,
+      );
+    }
+    out.subpath = obj.subpath;
+  }
+  rejectStrayKeys(obj, ["path", "subpath"], label, where);
+  return out;
+}
+
+function rejectStrayKeys(
+  obj: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string,
+  where: string,
+): void {
+  const set = new Set(allowed);
+  for (const k of Object.keys(obj)) {
+    if (!set.has(k)) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label}.${k} is not a known key (expected one of: ${[...set].join(", ")})`,
+      );
+    }
+  }
+}
+
+// ─── TOML I/O and ensureObject ────────────────────────────────────────────
 
 async function readToml(
   abs: string,
@@ -143,67 +448,8 @@ function ensureObject(
   return v as Record<string, unknown>;
 }
 
-/** Tables of `name = { ...config }` (used for [extensions]). */
-function parseConfigTable(
-  v: unknown,
-  label: string,
-  where: string,
-): Record<string, Record<string, unknown>> {
-  const obj = ensureObject(v, label, where);
-  const out: Record<string, Record<string, unknown>> = {};
-  for (const [k, val] of Object.entries(obj)) {
-    if (val == null) {
-      out[k] = {};
-    } else if (typeof val !== "object" || Array.isArray(val)) {
-      throw new ManifestError(
-        `${where}: ${label}."${k}" must be a table, got ${typeof val}`,
-      );
-    } else {
-      out[k] = val as Record<string, unknown>;
-    }
-  }
-  return out;
-}
+// ─── [capabilities] ───────────────────────────────────────────────────────
 
-/**
- * Tables of `name = ToolConfig` (used for [tools]). Each value is
- * `string | Record<string, unknown>` — loom doesn't interpret it;
- * providers do.
- */
-function parseToolConfigTable(
-  v: unknown,
-  label: string,
-  where: string,
-): Record<string, ToolConfig> {
-  const obj = ensureObject(v, label, where);
-  const out: Record<string, ToolConfig> = {};
-  for (const [k, val] of Object.entries(obj)) {
-    out[k] = parseToolConfigValue(val, where, `${label}.${k}`);
-  }
-  return out;
-}
-
-function parseToolConfigValue(
-  v: unknown,
-  where: string,
-  label: string,
-): ToolConfig {
-  if (typeof v === "string") return v;
-  if (v && typeof v === "object" && !Array.isArray(v)) {
-    return v as Record<string, unknown>;
-  }
-  throw new ManifestError(
-    `${where}: ${label} must be a string or a table, got ${typeof v}`,
-  );
-}
-
-/**
- * Parse the agent's `[capabilities]` table — per-tool grants. Each
- * value is `"*"` (whole tool unrestricted) or a per-kind map. Inside a
- * per-kind map, each value is `"*"` (kind unrestricted), an allowlist
- * array, or a structured object — Loom does not interpret the kind
- * argument shape; that's a tool concern.
- */
 function parseCapabilities(v: unknown, where: string): Capabilities {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     throw new ManifestError(
@@ -250,28 +496,5 @@ function parseCapabilityValue(
   }
   throw new ManifestError(
     `agent.toml at ${where}: ${label} must be "*", an array, or a table; got ${typeof v}`,
-  );
-}
-
-/**
- * Parse `[agent].secrets` — the secret allowlist. Same star-or-list
- * semantics as capabilities.
- */
-function parseSecretAllowlist(
-  v: unknown,
-  where: string,
-): SecretAllowlist | undefined {
-  if (v === undefined || v === null) return undefined;
-  if (v === "*") return "*";
-  if (Array.isArray(v)) {
-    if (!v.every((x) => typeof x === "string")) {
-      throw new ManifestError(
-        `agent.toml at ${where}: [agent].secrets must be "*" or an array of strings`,
-      );
-    }
-    return v as string[];
-  }
-  throw new ManifestError(
-    `agent.toml at ${where}: [agent].secrets must be "*" or an array of strings, got ${typeof v}`,
   );
 }

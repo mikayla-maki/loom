@@ -13,7 +13,7 @@ import { CapabilityError } from "../src/errors.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 import type {
   AuditFinding,
-  Provider,
+  Tools,
   Tool,
   ToolResult,
 } from "../src/types/interfaces.js";
@@ -22,13 +22,13 @@ function manifestWith(tool: Tool): AgentManifest {
   return {
     name: "audit-test",
     systemPrompt: "x",
-    tools: { [tool.name]: {} },
+    tools: { [tool.name]: "builtin" },
     capabilities: { [tool.name]: "*" },
     harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
   };
 }
 
-function provider(tool: Tool): Provider {
+function provider(tool: Tool): Tools {
   return {
     resolveTool(name) {
       return name === tool.name ? tool : null;
@@ -100,11 +100,11 @@ describe("runAgent runtime audit", () => {
     const manifest: AgentManifest = {
       name: "multi",
       systemPrompt: "x",
-      tools: { a: {}, b: {} },
+      tools: { a: "builtin", b: "builtin" },
       capabilities: { a: "*", b: "*" },
       harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
     };
-    const aggregateProvider: Provider = {
+    const aggregateProvider: Tools = {
       resolveTool(name) {
         if (name === "a") return a;
         if (name === "b") return b;

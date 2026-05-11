@@ -235,31 +235,3 @@ export class ChainedSecretsStore implements SecretsStore {
     return null;
   }
 }
-
-/**
- * Resolve all required secrets at agent boot time. Throws if any missing
- * (unless allowMissing is true, in which case missing become undefined).
- */
-export async function resolveSecrets(
-  store: SecretsStore,
-  required: Iterable<string>,
-  options: { allowMissing?: boolean } = {},
-): Promise<Record<string, string>> {
-  const out: Record<string, string> = {};
-  const missing: string[] = [];
-  for (const name of required) {
-    const v = await store.get(name);
-    if (v === null) {
-      if (options.allowMissing) continue;
-      missing.push(name);
-    } else {
-      out[name] = v;
-    }
-  }
-  if (missing.length > 0) {
-    throw new SecretError(
-      `Required secrets missing: ${missing.join(", ")}. Set them via environment, a secrets file, or a custom SecretsStore.`,
-    );
-  }
-  return out;
-}

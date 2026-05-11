@@ -3,13 +3,23 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { SessionUpdate } from "../src/types/acp.js";
+import { echoTestProvider } from "./fixtures/echo-tool.js";
 
 /**
- * The Anthropic harness consumes SSE. We stub `fetch` to return a body
- * built from a hand-crafted event sequence and verify that:
- *   - text deltas are surfaced as agent_message_chunks during streaming
+ * The Anthropic harness consumes SSE via the official `@anthropic-ai/sdk`
+ * `MessageStream`. We stub `global.fetch` to return a body built from a
+ * hand-crafted event sequence — fully shaped so the SDK's stricter
+ * parser accepts every event — and verify that:
+ *   - text deltas surface as `agent_message_chunk` updates during streaming
  *   - tool_use input arrives as a complete JSON object after content_block_stop
- *   - stop_reason from message_delta is honored
+ *   - stop_reason from `message_delta` is honoured (turn ends with end_turn)
+ *   - the non-streaming path produces the same shape (text + usage)
+ *
+ * NOTE: the SDK requires `message_start.message` to carry the full
+ * `Message` envelope (id, type:"message", role, content:[], model,
+ * stop_reason:null, stop_sequence:null, usage). Stripped-down fixtures
+ * trip the SDK's content-block assembler. The helpers below produce
+ * conforming events.
  */
 
 interface Stream {
@@ -31,15 +41,88 @@ function eventStream(events: Array<Record<string, unknown>>): Stream {
   };
 }
 
+/**
+ * Build a `message_start` event with all fields the SDK expects on the
+ * embedded `Message`. Callers override what they care about (id, model,
+ * usage).
+ */
+function messageStart(opts: {
+  id?: string;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}): Record<string, unknown> {
+  return {
+    type: "message_start",
+    message: {
+      id: opts.id ?? "msg_1",
+      type: "message",
+      role: "assistant",
+      model: opts.model ?? "x",
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: opts.inputTokens ?? 25,
+        output_tokens: opts.outputTokens ?? 1,
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: null,
+        server_tool_use: null,
+        service_tier: "standard",
+        cache_creation: null,
+        inference_geo: null,
+      },
+    },
+  };
+}
+
+/** A finished non-streaming `Message` body. */
+function messageBody(opts: {
+  id?: string;
+  model?: string;
+  text?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  stopReason?: string;
+}): Record<string, unknown> {
+  return {
+    id: opts.id ?? "msg_1",
+    type: "message",
+    role: "assistant",
+    model: opts.model ?? "x",
+    content: opts.text ? [{ type: "text", text: opts.text }] : [],
+    stop_reason: opts.stopReason ?? "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: opts.inputTokens ?? 25,
+      output_tokens: opts.outputTokens ?? 1,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null,
+      server_tool_use: null,
+      service_tier: "standard",
+      cache_creation: null,
+      inference_geo: null,
+    },
+  };
+}
+
 const realFetch = global.fetch;
 let capturedRequest: { url: string; body: unknown } | null = null;
 
-/** Default model-info stub returns a 200000-token context window. */
+/** `models.retrieve` stub — SDK shape (`max_input_tokens`, not `context_window`). */
 function modelInfoResponse(modelId: string): Response {
-  return new Response(JSON.stringify({ id: modelId, context_window: 200000 }), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+  return new Response(
+    JSON.stringify({
+      id: modelId,
+      type: "model",
+      display_name: modelId,
+      created_at: "2024-01-01T00:00:00Z",
+      max_input_tokens: 200000,
+      max_tokens: 8192,
+      capabilities: null,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
 }
 
 function stubFetch(events: Array<Record<string, unknown>>): void {
@@ -71,15 +154,7 @@ describe("AnthropicHarness streaming", () => {
 
   it("surfaces text deltas as they arrive", async () => {
     stubFetch([
-      {
-        type: "message_start",
-        message: {
-          id: "msg_1",
-          role: "assistant",
-          model: "x",
-          usage: { input_tokens: 25, output_tokens: 1 },
-        },
-      },
+      messageStart({ inputTokens: 25, outputTokens: 1 }),
       {
         type: "content_block_start",
         index: 0,
@@ -98,7 +173,7 @@ describe("AnthropicHarness streaming", () => {
       { type: "content_block_stop", index: 0 },
       {
         type: "message_delta",
-        delta: { stop_reason: "end_turn" },
+        delta: { stop_reason: "end_turn", stop_sequence: null },
         usage: { output_tokens: 14 },
       },
       { type: "message_stop" },
@@ -143,39 +218,11 @@ describe("AnthropicHarness streaming", () => {
   });
 
   it("buffers tool_use input across input_json_delta events", async () => {
-    stubFetch([
-      { type: "message_start", message: { id: "msg_1", role: "assistant" } },
-      {
-        type: "content_block_start",
-        index: 0,
-        content_block: {
-          type: "tool_use",
-          id: "toolu_1",
-          name: "echo",
-          input: {},
-        },
-      },
-      {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "input_json_delta", partial_json: '{"text":"' },
-      },
-      {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "input_json_delta", partial_json: 'hi"}' },
-      },
-      { type: "content_block_stop", index: 0 },
-      { type: "message_delta", delta: { stop_reason: "tool_use" } },
-      { type: "message_stop" },
-      // Second turn: model returns plain text and stops.
-    ]);
-
-    // The harness will loop; on the second iteration it asks again. We
-    // need the stub to provide a second valid stream that ends the turn.
+    // The harness will loop; the stub serves the streamed tool_use
+    // turn first, then a streamed text-only turn that ends with end_turn.
     let calls = 0;
-    global.fetch = (async (_url: string | URL, _init?: RequestInit) => {
-      const u = String(_url);
+    global.fetch = (async (url: string | URL) => {
+      const u = String(url);
       if (u.includes("/v1/models/")) {
         const modelId = u.split("/v1/models/")[1] ?? "unknown";
         return modelInfoResponse(modelId);
@@ -184,10 +231,7 @@ describe("AnthropicHarness streaming", () => {
       const events: Array<Record<string, unknown>> =
         calls === 1
           ? [
-              {
-                type: "message_start",
-                message: { id: "m1", role: "assistant" },
-              },
+              messageStart({ id: "m1" }),
               {
                 type: "content_block_start",
                 index: 0,
@@ -209,14 +253,15 @@ describe("AnthropicHarness streaming", () => {
                 delta: { type: "input_json_delta", partial_json: 'hi"}' },
               },
               { type: "content_block_stop", index: 0 },
-              { type: "message_delta", delta: { stop_reason: "tool_use" } },
+              {
+                type: "message_delta",
+                delta: { stop_reason: "tool_use", stop_sequence: null },
+                usage: { output_tokens: 7 },
+              },
               { type: "message_stop" },
             ]
           : [
-              {
-                type: "message_start",
-                message: { id: "m2", role: "assistant" },
-              },
+              messageStart({ id: "m2" }),
               {
                 type: "content_block_start",
                 index: 0,
@@ -228,7 +273,11 @@ describe("AnthropicHarness streaming", () => {
                 delta: { type: "text_delta", text: "done" },
               },
               { type: "content_block_stop", index: 0 },
-              { type: "message_delta", delta: { stop_reason: "end_turn" } },
+              {
+                type: "message_delta",
+                delta: { stop_reason: "end_turn", stop_sequence: null },
+                usage: { output_tokens: 1 },
+              },
               { type: "message_stop" },
             ];
       const s = eventStream(events);
@@ -241,30 +290,34 @@ describe("AnthropicHarness streaming", () => {
     const agent = await runAgent(
       {
         name: "tool-stream",
-        tools: { echo: {} },
+        tools: { echo: "builtin" },
+        capabilities: { echo: "*" },
         harness: { provider: "anthropic", model: "x" },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      {
+        secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }),
+        providers: [echoTestProvider],
+      },
     );
     try {
       const result = await agent.prompt("call echo");
       expect(result.stopReason).toBe("end_turn");
       const events = (await agent.session.pull?.([])) ?? [];
-      const calls = events.filter(
+      const toolCalls = events.filter(
         (e): e is SessionUpdate & { sessionUpdate: "tool_call" } =>
           e.sessionUpdate === "tool_call",
       );
-      expect(calls).toHaveLength(1);
-      expect(calls[0]?.title).toBe("echo");
-      expect(calls[0]?.input).toEqual({ text: "hi" });
+      expect(toolCalls).toHaveLength(1);
+      expect(toolCalls[0]?.title).toBe("echo");
+      expect(toolCalls[0]?.rawInput).toEqual({ text: "hi" });
     } finally {
       await agent.close();
     }
   });
 
   it("falls back to non-streaming when stream=false", async () => {
-    global.fetch = (async (_url: string | URL, init?: RequestInit) => {
-      const u = String(_url);
+    global.fetch = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
       if (u.includes("/v1/models/")) {
         const modelId = u.split("/v1/models/")[1] ?? "unknown";
         return modelInfoResponse(modelId);
@@ -274,14 +327,14 @@ describe("AnthropicHarness streaming", () => {
         body: init?.body ? JSON.parse(String(init.body)) : null,
       };
       return new Response(
-        JSON.stringify({
-          id: "msg_1",
-          role: "assistant",
-          model: "x",
-          content: [{ type: "text", text: "non-streamed" }],
-          stop_reason: "end_turn",
-          usage: { input_tokens: 100, output_tokens: 5 },
-        }),
+        JSON.stringify(
+          messageBody({
+            id: "msg_1",
+            text: "non-streamed",
+            inputTokens: 100,
+            outputTokens: 5,
+          }),
+        ),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }) as typeof fetch;

@@ -30,17 +30,27 @@ import type { AgentManifest, CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 import { lastAgentMessage } from "../extract-message.js";
 
+/**
+ * Input schema. `ToolTable` validates against this before dispatch —
+ * `execute()` may trust `prompt` is a non-empty string.
+ */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["prompt"],
+  additionalProperties: false,
   properties: {
     prompt: {
       type: "string",
+      minLength: 1,
       description:
         "The user message to send to the sub-agent. The sub-agent runs one turn and returns its final assistant message.",
     },
   },
 };
+
+interface SpawnSubagentInput {
+  prompt: string;
+}
 
 function isAgentManifest(v: unknown): v is AgentManifest {
   return (
@@ -90,13 +100,7 @@ export class SpawnSubagentTool implements Tool {
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
-    const prompt = (input as { prompt?: unknown }).prompt;
-    if (typeof prompt !== "string" || !prompt) {
-      return {
-        content: "spawn_subagent: 'prompt' is required",
-        isError: true,
-      };
-    }
+    const { prompt } = input as SpawnSubagentInput;
     if (!ctx.agent.spawnSubagent) {
       // Should be unreachable: the runtime always attaches
       // spawnSubagent to ctx.agent. Defensive guard for direct

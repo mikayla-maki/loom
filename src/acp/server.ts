@@ -1,305 +1,502 @@
 /**
- * ACP server. Two entry points:
+ * ACP server — built on `@agentclientprotocol/sdk`'s
+ * `AgentSideConnection`. Loom plugs in an `Agent` implementation that
+ * lazily boots a `RunningAgent` on the first `session/new`, then
+ * fans `session/update` notifications back out for every emitted
+ * `SessionUpdate`.
  *
- *   serveOverStdio(agent)  — single-agent stdio loop (pre-booted agent)
- *   AcpRouter              — multi-agent dispatcher used by the daemon
- *
- * Framing is newline-delimited JSON-RPC 2.0. Inbound dispatch is concurrent
- * because a `session/prompt` may issue an outbound `session/request_permission`
- * on the same connection and await the reply — serial dispatch deadlocks.
+ * Wire compliance is total: the SDK owns JSON-RPC dispatch, ndjson
+ * framing, and the schema types. Loom only supplies the
+ * agent-behavior implementation.
  */
+import * as path from "node:path";
+import * as fs from "node:fs";
+import { Readable, Writable } from "node:stream";
 
-import type { Readable, Writable } from "node:stream";
+import {
+  AgentSideConnection,
+  RequestError,
+  ndJsonStream,
+  type Agent as ACPAgent,
+  type AuthenticateRequest,
+  type AuthenticateResponse,
+  type CancelNotification,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
+  type ContentBlock,
+  type InitializeRequest,
+  type InitializeResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
+  type McpServer,
+  type NewSessionRequest,
+  type NewSessionResponse,
+  type PromptRequest,
+  type PromptResponse,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
+  type SessionId,
+  type SessionUpdate as ACPSessionUpdate,
+  type StopReason,
+  type Stream,
+} from "@agentclientprotocol/sdk";
 
 import type { RunningAgent } from "../sdk/running-agent.js";
-
-import { ndjsonStream, type MessageStream } from "./framing.js";
-import {
-  ACP_METHODS,
-  type JSONRPCRequest,
-  type JSONRPCResponse,
-  type SessionCancelParams,
-  type SessionNewParams,
-  type SessionNewResult,
-  type SessionPromptParams,
-  type SessionPromptResult,
-  type SessionRequestPermissionParams,
-  type SessionRequestPermissionResult,
-} from "./messages.js";
+import type { RunAgentOptions } from "../sdk/run-agent.js";
+import { LOOM_VERSION } from "../sdk/run-agent.js";
+import { DEFAULT_CLIENT_ACP_CAPABILITIES } from "../runtime/acp-capabilities.js";
+import type { ClientAcpCapabilities } from "../runtime/acp-capabilities.js";
 import { lastAgentMessage } from "../runtime/extract-message.js";
-import type { SessionUpdate } from "../types/acp.js";
-import type {
-  PermissionHandler,
-  PermissionRequest,
-  PermissionResult,
-} from "../types/permissions.js";
+import type { PermissionHandler } from "../types/permissions.js";
 
-interface ServeAgentBinding {
-  /** A pre-booted agent, or a factory that produces one on demand. */
-  agentFactory: (manifestPath?: string) => Promise<RunningAgent>;
-  /** If true, every session/new must explicitly target the given path. */
-  fixedManifestPath?: string;
+/** Protocol version Loom speaks. */
+export const ACP_PROTOCOL_VERSION = 1;
+
+/**
+ * The factory shape `AgentSideConnection` constructor expects: given
+ * the live connection, return an `Agent` implementation.
+ *
+ * We wire one `LoomAcpAgent` per connection. The agent lazily boots
+ * the underlying `RunningAgent` (so client `initialize` capabilities
+ * are visible to factories before they instantiate).
+ */
+/**
+ * Resolve (or boot) a `RunningAgent` for a given workspace cwd.
+ *
+ * Stdio mode boots lazily and re-boots on cwd change so that
+ * `[capabilities].paths = ["./"]` resolves against the client's
+ * workspace, not loom's launch directory. Tests typically supply a
+ * pre-booted agent and ignore `cwd`.
+ */
+type AgentFactory = (cwd: string) => Promise<RunningAgent>;
+
+interface SessionEntry {
+  agent: RunningAgent;
+  updateForwarder: Promise<void>;
+  forwarderDone: AbortController;
 }
 
-/** Run an ACP server over stdio for the lifetime of one RunningAgent. */
-export async function serveOverStdio(agent: RunningAgent): Promise<void> {
-  const stream = ndjsonStream(process.stdin, process.stdout);
-  const router = new AcpRouter({
-    agentFactory: async () => agent,
-    fixedManifestPath: agent.manifest.manifestPath,
-  });
-  const sessionId = await router.bindSession(agent, stream);
-  await router.run(stream, sessionId);
-}
+/**
+ * Source of the capability set Loom should advertise in
+ * `initialize`. In stdio mode this is a manifest probe (doesn't boot
+ * the agent); in tests it's typically derived from the pre-booted
+ * agent the test set up.
+ */
+type CapabilityProbe = (clientCaps: ClientAcpCapabilities) => Promise<{
+  agentCapabilities: import("@agentclientprotocol/sdk").AgentCapabilities;
+  agentInfo: { name: string; version: string; title?: string };
+}>;
 
-/** Server router used by both stdio and daemon transports. */
-export class AcpRouter {
-  private readonly sessions = new Map<string, RunningAgent>();
-  private readonly subscriptions = new Map<string, Promise<void>>();
-  private nextId = 1;
-  /** Outgoing request-id counter (server → client). */
-  private nextOutId = 10000;
-  /** Pending agent→client requests by id. */
-  private readonly pendingOutbound = new Map<
-    number,
-    { resolve: (v: unknown) => void; reject: (e: Error) => void }
-  >();
+class LoomAcpAgent implements ACPAgent {
+  private readonly sessions = new Map<string, SessionEntry>();
+  private clientCapabilities: ClientAcpCapabilities =
+    DEFAULT_CLIENT_ACP_CAPABILITIES;
+  private initialized = false;
+  private nextSessionIdCounter = 1;
 
-  constructor(private readonly binding: ServeAgentBinding) {}
+  constructor(
+    private readonly connection: AgentSideConnection,
+    private readonly factory: AgentFactory,
+    private readonly probeCapabilities: CapabilityProbe,
+    private readonly onInitialize:
+      | ((caps: ClientAcpCapabilities) => void)
+      | undefined,
+  ) {}
 
-  /** Bind a pre-booted agent to a freshly assigned sessionId. */
-  async bindSession(
-    agent: RunningAgent,
-    stream: MessageStream,
-  ): Promise<string> {
-    const sessionId = `s${this.nextId++}`;
-    this.sessions.set(sessionId, agent);
-    this.startUpdateForwarder(sessionId, agent, stream);
-    // Wire the agent's permission requests to the connected client.
-    agent.setPermissionHandler(
-      this.makeForwardingPermissionHandler(sessionId, stream),
-    );
-    return sessionId;
+  async initialize(params: InitializeRequest): Promise<InitializeResponse> {
+    // Bracket: if the client speaks a different major protocol
+    // version, refuse loudly rather than degrade silently.
+    if (
+      typeof params.protocolVersion === "number" &&
+      params.protocolVersion !== ACP_PROTOCOL_VERSION
+    ) {
+      throw RequestError.invalidParams(
+        {
+          received: params.protocolVersion,
+          supported: [ACP_PROTOCOL_VERSION],
+        },
+        `unsupported ACP protocolVersion ${params.protocolVersion} (this server speaks ${ACP_PROTOCOL_VERSION})`,
+      );
+    }
+    if (params.clientCapabilities) {
+      this.clientCapabilities = {
+        ...DEFAULT_CLIENT_ACP_CAPABILITIES,
+        ...params.clientCapabilities,
+      };
+    }
+    this.initialized = true;
+    try {
+      this.onInitialize?.(this.clientCapabilities);
+    } catch {
+      // Hook errors are non-fatal; the agent will still boot.
+    }
+
+    // Capabilities come from a lightweight manifest probe — no
+    // agent boot here. The full boot is deferred to `session/new`
+    // where we have the client's workspace `cwd` and can resolve
+    // path grants against the right root.
+    let probe: Awaited<ReturnType<CapabilityProbe>>;
+    try {
+      probe = await this.probeCapabilities(this.clientCapabilities);
+    } catch {
+      probe = {
+        agentCapabilities: {},
+        agentInfo: { name: "loom", version: LOOM_VERSION },
+      };
+    }
+
+    return {
+      protocolVersion: ACP_PROTOCOL_VERSION,
+      agentCapabilities: probe.agentCapabilities,
+      agentInfo: probe.agentInfo,
+    };
+  }
+
+  async authenticate(_p: AuthenticateRequest): Promise<AuthenticateResponse> {
+    // Loom doesn't require auth on stdio; treat as a no-op success.
+    return {};
+  }
+
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    validateCwd(params.cwd);
+    rejectMcpServers(params.mcpServers);
+    const agent = await this.factory(params.cwd);
+    const sessionId = this.allocateSessionId();
+    this.bindSession(sessionId, agent);
+    return { sessionId };
+  }
+
+  async loadSession(p: LoadSessionRequest): Promise<LoadSessionResponse> {
+    validateCwd(p.cwd);
+    rejectMcpServers(p.mcpServers);
+    const agent = await this.factory(p.cwd);
+    const resume = agent.session.resume;
+    if (typeof resume !== "function") {
+      throw RequestError.methodNotFound("session/load");
+    }
+    try {
+      await resume.call(agent.session, p.sessionId);
+    } catch (e) {
+      throw RequestError.internalError(undefined, (e as Error).message);
+    }
+    // The session is now bound to p.sessionId. Register the routing
+    // entry under the same id so subsequent prompts work.
+    this.bindSession(p.sessionId, agent);
+    return {};
+  }
+
+  async closeSession(p: CloseSessionRequest): Promise<CloseSessionResponse> {
+    await this.closeSession_(p.sessionId);
+    return {};
+  }
+
+  async prompt(params: PromptRequest): Promise<PromptResponse> {
+    const entry = this.sessions.get(params.sessionId);
+    if (!entry) {
+      throw RequestError.invalidParams(
+        { sessionId: params.sessionId },
+        `unknown sessionId: ${params.sessionId}`,
+      );
+    }
+    const result = await entry.agent.prompt(params.prompt as ContentBlock[]);
+    // Loom uses "error" as an internal-only stop reason; map it to a
+    // JSON-RPC error response rather than emit an out-of-spec value.
+    if (result.stopReason === "error") {
+      const tail = await lastAgentMessage(entry.agent.session);
+      throw RequestError.internalError(undefined, tail || "agent error");
+    }
+    return {
+      stopReason: result.stopReason as StopReason,
+      ...(result.usage ? { usage: result.usage } : {}),
+    };
+  }
+
+  async cancel(params: CancelNotification): Promise<void> {
+    const entry = this.sessions.get(params.sessionId);
+    if (entry) await entry.agent.cancel();
+  }
+
+  /** Allocate a fresh routing sessionId. */
+  private allocateSessionId(): SessionId {
+    return `s${this.nextSessionIdCounter++}`;
   }
 
   /**
-   * Build a PermissionHandler that, when invoked, sends a JSON-RPC request
-   * to the connected client and awaits the result. If the client doesn't
-   * implement `session/request_permission` (returns method-not-found) we
-   * treat that as a deny — the safe default.
+   * Bind a RunningAgent under a sessionId. Wires the agent's
+   * permission handler through this connection's
+   * `requestPermission()` and starts the update forwarder.
+   */
+  private bindSession(sessionId: SessionId, agent: RunningAgent): void {
+    if (this.sessions.has(sessionId)) {
+      // Idempotent rebind (e.g. for `loadSession`).
+      return;
+    }
+    agent.setPermissionHandler(this.makeForwardingPermissionHandler(sessionId));
+    const ctl = new AbortController();
+    const updateForwarder = this.startUpdateForwarder(
+      sessionId,
+      agent,
+      ctl.signal,
+    );
+    this.sessions.set(sessionId, {
+      agent,
+      updateForwarder,
+      forwarderDone: ctl,
+    });
+  }
+
+  /**
+   * Build a `PermissionHandler` that forwards each request over the
+   * ACP connection. The handler injects `sessionId` (the runtime
+   * doesn't know it) and forwards the SDK-shaped request verbatim.
    */
   private makeForwardingPermissionHandler(
-    sessionId: string,
-    stream: MessageStream,
+    sessionId: SessionId,
   ): PermissionHandler {
-    return async (req: PermissionRequest): Promise<PermissionResult> => {
-      const id = this.nextOutId++;
-      const envelope = {
-        jsonrpc: "2.0",
-        id,
-        method: ACP_METHODS.sessionRequestPermission,
-        params: {
-          sessionId,
-          request: req,
-        } satisfies SessionRequestPermissionParams,
-      };
-      const reply = await new Promise<unknown>((resolve, reject) => {
-        this.pendingOutbound.set(id, { resolve, reject });
-        stream.write(JSON.stringify(envelope));
-      }).catch((e) => {
-        return { error: e };
-      });
-      if (
-        reply &&
-        typeof reply === "object" &&
-        "decision" in (reply as Record<string, unknown>)
-      ) {
-        return reply as SessionRequestPermissionResult;
+    return async (
+      req: Omit<RequestPermissionRequest, "sessionId">,
+    ): Promise<RequestPermissionResponse> => {
+      const full: RequestPermissionRequest = { ...req, sessionId };
+      try {
+        return await this.connection.requestPermission(full);
+      } catch (e) {
+        // Client failure → treat as cancelled. Surface the original
+        // error to logs but don't propagate (tools handle cancelled
+        // explicitly).
+        void e;
+        return { outcome: { outcome: "cancelled" } };
       }
-      return { decision: "deny" };
     };
   }
 
-  async run(stream: MessageStream, primarySessionId?: string): Promise<void> {
-    const inflight = new Set<Promise<void>>();
-    for await (const raw of stream.messages()) {
-      if (typeof raw !== "object" || raw === null) continue;
-      const msg = raw as JSONRPCRequest & JSONRPCResponse;
-
-      // Inbound response to one of OUR outbound requests (e.g. permission).
-      if (
-        typeof msg.id === "number" &&
-        (msg.result !== undefined || msg.error !== undefined) &&
-        !msg.method
-      ) {
-        const pending = this.pendingOutbound.get(msg.id);
-        if (pending) {
-          this.pendingOutbound.delete(msg.id);
-          if (msg.error) pending.reject(new Error(msg.error.message));
-          else pending.resolve(msg.result);
-        }
-        continue;
-      }
-
-      const task = this.dispatch(msg, stream, primarySessionId);
-      inflight.add(task);
-      task.finally(() => inflight.delete(task));
-    }
-    // Stream closed — wait for any in-flight handlers, then clean up sessions.
-    await Promise.allSettled(inflight);
-    for (const sid of [...this.sessions.keys()]) {
-      await this.closeSession(sid);
-    }
-  }
-
-  private async dispatch(
-    msg: JSONRPCRequest,
-    stream: MessageStream,
-    primarySessionId?: string,
-  ): Promise<void> {
-    const id = msg.id ?? null;
-    try {
-      switch (msg.method) {
-        case ACP_METHODS.sessionNew: {
-          const result = await this.handleSessionNew(
-            (msg.params ?? {}) as SessionNewParams,
-            stream,
-          );
-          this.respond(stream, id, result);
-          break;
-        }
-        case ACP_METHODS.sessionPrompt: {
-          const result = await this.handleSessionPrompt(
-            (msg.params ?? {}) as SessionPromptParams,
-            primarySessionId,
-          );
-          this.respond(stream, id, result);
-          break;
-        }
-        case ACP_METHODS.sessionCancel: {
-          await this.handleSessionCancel(
-            (msg.params ?? {}) as SessionCancelParams,
-          );
-          this.respond(stream, id, {});
-          break;
-        }
-        case ACP_METHODS.sessionClose: {
-          const sid = (msg.params as { sessionId?: string } | undefined)
-            ?.sessionId;
-          if (sid) await this.closeSession(sid);
-          this.respond(stream, id, {});
-          break;
-        }
-        default:
-          this.respondError(
-            stream,
-            id,
-            -32601,
-            `Method not found: ${msg.method}`,
-          );
-      }
-    } catch (e) {
-      this.respondError(stream, id, -32000, (e as Error).message);
-    }
-  }
-
-  private async handleSessionNew(
-    params: SessionNewParams,
-    stream: MessageStream,
-  ): Promise<SessionNewResult> {
-    const path = this.binding.fixedManifestPath ?? params.manifestPath;
-    if (!path) throw new Error("session/new requires manifestPath");
-    const agent = await this.binding.agentFactory(path);
-    const sessionId = `s${this.nextId++}`;
-    this.sessions.set(sessionId, agent);
-    this.startUpdateForwarder(sessionId, agent, stream);
-    return { sessionId, agentName: agent.manifest.name };
-  }
-
-  private async handleSessionPrompt(
-    params: SessionPromptParams,
-    fallbackSessionId?: string,
-  ): Promise<SessionPromptResult> {
-    const sid = params.sessionId ?? fallbackSessionId;
-    if (!sid) throw new Error("session/prompt requires sessionId");
-    const agent = this.sessions.get(sid);
-    if (!agent) throw new Error(`unknown sessionId: ${sid}`);
-    const result = await agent.prompt(params.prompt);
-    const out: SessionPromptResult = {
-      stopReason: result.stopReason,
-      finalMessage: await lastAgentMessage(agent.session),
-    };
-    if (result.usage) out.usage = result.usage;
-    return out;
-  }
-
-  private async handleSessionCancel(
-    params: SessionCancelParams,
-  ): Promise<void> {
-    const agent = this.sessions.get(params.sessionId);
-    if (agent) await agent.cancel();
-  }
-
-  private async closeSession(sid: string): Promise<void> {
-    const agent = this.sessions.get(sid);
-    if (!agent) return;
-    this.sessions.delete(sid);
-    await agent.close().catch(() => undefined);
-    await this.subscriptions.get(sid)?.catch(() => undefined);
-    this.subscriptions.delete(sid);
-  }
-
+  /**
+   * Drain a `RunningAgent.updates()` async iterator into
+   * `connection.sessionUpdate(...)` notifications. We filter Loom's
+   * internal `"stop"` extension out — the wire signals turn end via
+   * `PromptResponse.stopReason`.
+   */
   private startUpdateForwarder(
-    sessionId: string,
+    sessionId: SessionId,
     agent: RunningAgent,
-    stream: MessageStream,
-  ): void {
-    const promise = (async () => {
+    signal: AbortSignal,
+  ): Promise<void> {
+    return (async () => {
       const sub = agent.updates();
       for await (const u of sub) {
-        const note = {
-          jsonrpc: "2.0",
-          method: ACP_METHODS.sessionUpdate,
-          params: { sessionId, update: u } satisfies {
-            sessionId: string;
-            update: SessionUpdate;
-          },
-        };
-        stream.write(JSON.stringify(note));
+        if (signal.aborted) break;
+        if (u.sessionUpdate === "stop") continue;
+        try {
+          await this.connection.sessionUpdate({
+            sessionId,
+            update: u as ACPSessionUpdate,
+          });
+        } catch {
+          // Connection probably closed; bail out cleanly.
+          break;
+        }
       }
     })().catch(() => undefined);
-    this.subscriptions.set(sessionId, promise);
   }
 
-  private respond(stream: MessageStream, id: unknown, result: unknown): void {
-    const r: JSONRPCResponse = {
-      jsonrpc: "2.0",
-      id: id as JSONRPCResponse["id"],
-      result,
-    };
-    stream.write(JSON.stringify(r));
+  /** Release a single session's resources. */
+  private async closeSession_(sessionId: SessionId): Promise<void> {
+    const entry = this.sessions.get(sessionId);
+    if (!entry) return;
+    this.sessions.delete(sessionId);
+    entry.forwarderDone.abort();
+    await entry.agent.close().catch(() => undefined);
+    await entry.updateForwarder.catch(() => undefined);
   }
-  private respondError(
-    stream: MessageStream,
-    id: unknown,
-    code: number,
-    message: string,
-  ): void {
-    const r: JSONRPCResponse = {
-      jsonrpc: "2.0",
-      id: id as JSONRPCResponse["id"],
-      error: { code, message },
-    };
-    stream.write(JSON.stringify(r));
+
+  /** Drain all sessions; called from `serveOverStdio` on disconnect. */
+  async closeAll(): Promise<void> {
+    for (const sid of [...this.sessions.keys()]) {
+      await this.closeSession_(sid);
+    }
+  }
+
+  /** Whether `initialize` has been processed (diagnostic only). */
+  get hasInitialized(): boolean {
+    return this.initialized;
   }
 }
 
-/** Convenience: run an AcpRouter over a custom Readable+Writable pair. */
-export function routerOverStreams(
-  router: AcpRouter,
-  input: Readable,
-  output: Writable,
+/**
+ * Validate the `cwd` field on `session/new` and `session/load`. The
+ * spec requires an absolute path; we additionally require it to
+ * exist and be a directory, since otherwise downstream tool calls
+ * would all fail with cryptic ENOENTs.
+ */
+function validateCwd(cwd: string): void {
+  if (typeof cwd !== "string" || !path.isAbsolute(cwd)) {
+    throw RequestError.invalidParams(
+      { cwd },
+      `cwd must be an absolute path (got ${JSON.stringify(cwd)})`,
+    );
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(cwd);
+  } catch (e) {
+    throw RequestError.invalidParams(
+      { cwd },
+      `cwd does not exist or is not accessible: ${(e as Error).message}`,
+    );
+  }
+  if (!stat.isDirectory()) {
+    throw RequestError.invalidParams({ cwd }, `cwd is not a directory: ${cwd}`);
+  }
+}
+
+/**
+ * Reject non-empty `mcpServers` payloads. Loom doesn't speak MCP yet;
+ * silently dropping the array would let the client think its servers
+ * are reachable, which is worse than a clean error.
+ */
+function rejectMcpServers(servers: McpServer[] | undefined): void {
+  if (servers && servers.length > 0) {
+    throw RequestError.invalidParams(
+      { count: servers.length },
+      "Loom does not currently support MCP servers; pass an empty `mcpServers: []`.",
+    );
+  }
+}
+
+/**
+ * Run an ACP server over stdio for a single agent.
+ *
+ * Boots the agent lazily on the first `initialize` / `session/new`
+ * call. If the client's `session/new` carries a `cwd` that differs
+ * from the cwd we booted in, we `chdir` and re-boot —
+ * `[capabilities].paths = ["./"]` is resolved at boot time, so the
+ * grants must match the workspace root the client is referring to.
+ */
+export async function serveOverStdio(
+  manifestPath: string,
+  runAgentOptions?: Omit<RunAgentOptions, "clientAcpCapabilities" | "parent">,
 ): Promise<void> {
-  const stream = ndjsonStream(input, output);
-  return router.run(stream);
+  const stream = ndJsonStream(
+    Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+    Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
+  );
+
+  // Cached booted agent + the cwd we booted in. A `session/new` with
+  // a different cwd evicts and re-boots.
+  const cell: { agent: RunningAgent | null; cwd: string | null } = {
+    agent: null,
+    cwd: null,
+  };
+  let negotiatedCaps: ClientAcpCapabilities = DEFAULT_CLIENT_ACP_CAPABILITIES;
+
+  async function bootForCwd(cwd: string): Promise<RunningAgent> {
+    const target = path.resolve(cwd);
+    if (cell.agent && cell.cwd === target) {
+      return cell.agent;
+    }
+    // Evict any prior agent before chdir-ing; closing flushes the
+    // session and releases providers, so the next boot starts clean.
+    if (cell.agent) {
+      try {
+        await cell.agent.close();
+      } catch {
+        /* non-fatal */
+      }
+      cell.agent = null;
+    }
+    // chdir before runAgent so manifest-relative paths AND default
+    // grants (`paths: ["./"]` → path.resolve(".")) resolve against
+    // the workspace the client supplied.
+    process.chdir(target);
+    cell.cwd = target;
+    const { runAgent } = await import("../sdk/run-agent.js");
+    cell.agent = await runAgent(manifestPath, {
+      ...(runAgentOptions ?? {}),
+      clientAcpCapabilities: negotiatedCaps,
+    });
+    return cell.agent;
+  }
+
+  // Capability probe — lightweight: parses the manifest, looks up
+  // factories, returns their `acpCapabilities?(config)`. No agent
+  // boot, no chdir, no cwd dependency.
+  const probeCapabilities: CapabilityProbe = async (clientCaps) => {
+    const { probeAcpCapabilities } = await import("../runtime/acp-probe.js");
+    return probeAcpCapabilities(manifestPath, clientCaps);
+  };
+
+  let loomAgent: LoomAcpAgent | undefined;
+  const connection = new AgentSideConnection((conn) => {
+    loomAgent = new LoomAcpAgent(
+      conn,
+      bootForCwd,
+      probeCapabilities,
+      (caps) => {
+        negotiatedCaps = { ...DEFAULT_CLIENT_ACP_CAPABILITIES, ...caps };
+      },
+    );
+    return loomAgent;
+  }, stream);
+
+  await connection.closed;
+  try {
+    await loomAgent?.closeAll();
+  } finally {
+    if (cell.agent) {
+      try {
+        await cell.agent.close();
+      } catch {
+        /* shutdown errors are non-fatal */
+      }
+    }
+  }
+}
+
+/**
+ * Construct an `AgentSideConnection` over the provided WHATWG stream
+ * pair. Used by tests and library consumers that want to control the
+ * transport directly (e.g. in-process pipes). Returns the connection;
+ * call `await conn.closed` to wait for the peer to disconnect.
+ */
+export function serveOverStream(
+  agentFactory: AgentFactory,
+  stream: Stream,
+  options: {
+    onInitialize?(caps: ClientAcpCapabilities): void;
+    /**
+     * Optional probe override. Defaults to a probe that invokes the
+     * factory with `process.cwd()`, derives the agent's manifest, and
+     * runs `probeAcpCapabilitiesFromManifest`. Tests that want a fast
+     * deterministic probe can supply their own.
+     */
+    probeCapabilities?: CapabilityProbe;
+  } = {},
+): { connection: AgentSideConnection; closeAll(): Promise<void> } {
+  // Default probe: call the factory (pre-booted in test setups) and
+  // run the manifest probe against its manifest. This is cheap when
+  // the factory caches.
+  const defaultProbe: CapabilityProbe = async (clientCaps) => {
+    const { probeAcpCapabilitiesFromManifest } =
+      await import("../runtime/acp-probe.js");
+    const agent = await agentFactory(process.cwd());
+    return probeAcpCapabilitiesFromManifest(
+      agent.manifest,
+      agent.manifest.manifestPath,
+      clientCaps,
+    );
+  };
+
+  let loomAgent: LoomAcpAgent | undefined;
+  const connection = new AgentSideConnection((conn) => {
+    loomAgent = new LoomAcpAgent(
+      conn,
+      agentFactory,
+      options.probeCapabilities ?? defaultProbe,
+      options.onInitialize,
+    );
+    return loomAgent;
+  }, stream);
+  return {
+    connection,
+    closeAll: () => loomAgent?.closeAll() ?? Promise.resolve(),
+  };
 }

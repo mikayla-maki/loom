@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runAgent } from "../src/sdk/run-agent.js";
 import type {
   Harness,
-  Provider,
+  Tools,
   Runtime,
   Session,
   Tool,
@@ -12,7 +12,7 @@ import type { SessionUpdate, StopReason } from "../src/types/acp.js";
 
 /**
  * Verifies that `runAgent` accepts pre-built `Harness` / `Session` /
- * `Provider` *instances* directly in the manifest, not just the
+ * `Tools` *instances* directly in the manifest, not just the
  * `{ provider: "name", ...config }` reference form. This is the path the
  * SDK consumer takes when building a custom CLI/TUI on top of Loom.
  */
@@ -89,7 +89,7 @@ describe("manifest accepts instances directly", () => {
     }
   });
 
-  it("a Provider instance via RunAgentOptions.providers contributes tools", async () => {
+  it("a Tools instance via RunAgentOptions.providers contributes tools", async () => {
     const stubTool: Tool = {
       name: "stub",
       description: "literal output",
@@ -99,7 +99,7 @@ describe("manifest accepts instances directly", () => {
       },
     };
     let closed = false;
-    const provider: Provider = {
+    const provider: Tools = {
       resolveTool(name) {
         if (name === "stub") return stubTool;
         return null;
@@ -114,7 +114,7 @@ describe("manifest accepts instances directly", () => {
         name: "inst-provider",
         // Reference the provider-supplied tool by name in [tools] so it's
         // in the resolution list.
-        tools: { stub: {} },
+        tools: { stub: "builtin" },
         harness: {
           provider: "test",
           script: [
@@ -122,7 +122,7 @@ describe("manifest accepts instances directly", () => {
           ],
         },
       },
-      { providers: [provider] }, // ← raw Provider instance, programmatic injection
+      { providers: [provider] }, // ← raw Tools instance, programmatic injection
     );
     try {
       await agent.prompt("go");

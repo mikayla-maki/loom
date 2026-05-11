@@ -3,12 +3,13 @@ import { describe, expect, it } from "vitest";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
 import { SpawnSubagentTool } from "../src/runtime/builtins/spawn_subagent.js";
-import { AnthropicHarness } from "../src/extensions/harness/anthropic.js";
-import { MemorySession } from "../src/extensions/session/memory.js";
-import { forkOfParentSessionFactory } from "../src/extensions/session/parent-derived.js";
-import { smallModelOfParentHarnessFactory } from "../src/extensions/harness/parent-derived.js";
+import { AnthropicHarness } from "../src/builtins/harness/anthropic.js";
+import { MemorySession } from "../src/builtins/session/memory.js";
+import { forkOfParentSessionFactory } from "../src/builtins/session/parent-derived.js";
+import { smallModelOfParentHarnessFactory } from "../src/builtins/harness/parent-derived.js";
 import type { AgentManifest } from "../src/types/manifest.js";
-import type { Agent, ExtensionContext } from "../src/types/interfaces.js";
+import type { Agent, FactoryContext } from "../src/types/interfaces.js";
+import { DEFAULT_CLIENT_ACP_CAPABILITIES } from "../src/runtime/acp-capabilities.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 
 const childManifest: AgentManifest = {
@@ -27,8 +28,9 @@ describe("spawn_subagent builtin tool", () => {
       name: "parent-using-builtin",
       systemPrompt: "x",
       tools: {
-        // Pass the sub-manifest directly as the config.
-        spawn_subagent: childManifest as unknown as Record<string, unknown>,
+        // Pass the sub-manifest under `manifest` so the tool entry can
+        // still carry the required `provider` field.
+        spawn_subagent: { provider: "builtin", manifest: childManifest },
       },
       harness: {
         provider: "test",
@@ -94,10 +96,11 @@ describe("fork-of-parent session", () => {
       systemPromptCore: "core",
       agentName: "parent",
     };
-    const ctx: ExtensionContext = {
+    const ctx: FactoryContext = {
       manifestDir: process.cwd(),
       agentName: "child",
       loomVersion: "test",
+      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
     };
     const child = await forkOfParentSessionFactory.create({}, ctx, {}, parent);
 
@@ -125,9 +128,7 @@ describe("fork-of-parent session", () => {
         harness: { provider: "test" },
         session: { provider: "fork-of-parent" },
       }),
-    ).rejects.toThrow(
-      /Session provider 'fork-of-parent' requires a parent agent/,
-    );
+    ).rejects.toThrow(/Session 'fork-of-parent' requires a parent agent/);
   });
 });
 
@@ -141,7 +142,7 @@ describe("small-model-of-parent harness", () => {
         harness: { provider: "small-model-of-parent", model: "tiny" },
       }),
     ).rejects.toThrow(
-      /Harness provider 'small-model-of-parent' requires a parent agent/,
+      /Harness 'small-model-of-parent' requires a parent agent/,
     );
   });
 
@@ -160,10 +161,11 @@ describe("small-model-of-parent harness", () => {
       systemPromptCore: "x",
       agentName: "parent",
     };
-    const ctx: ExtensionContext = {
+    const ctx: FactoryContext = {
       manifestDir: process.cwd(),
       agentName: "child",
       loomVersion: "test",
+      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
     };
     const child = (await smallModelOfParentHarnessFactory.create(
       { model: "claude-3-5-haiku-latest" },
@@ -191,10 +193,11 @@ describe("small-model-of-parent harness", () => {
       systemPromptCore: "x",
       agentName: "parent",
     };
-    const ctx: ExtensionContext = {
+    const ctx: FactoryContext = {
       manifestDir: process.cwd(),
       agentName: "child",
       loomVersion: "test",
+      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({ model: "x" }, ctx, {}, parent),
@@ -215,10 +218,11 @@ describe("small-model-of-parent harness", () => {
       systemPromptCore: "x",
       agentName: "parent",
     };
-    const ctx: ExtensionContext = {
+    const ctx: FactoryContext = {
       manifestDir: process.cwd(),
       agentName: "child",
       loomVersion: "test",
+      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({}, ctx, {}, parent),
@@ -234,7 +238,7 @@ describe("loom audit recursion", () => {
       // The spawn_subagent builtin is opt-in; declaring it here pulls
       // its sub-manifest into the audit walk.
       tools: {
-        spawn_subagent: childManifest as unknown as Record<string, unknown>,
+        spawn_subagent: { provider: "builtin", manifest: childManifest },
       },
       harness: { provider: "test" },
     });
@@ -267,7 +271,7 @@ describe("loom audit recursion", () => {
     // The tool's sub-manifest is the same manifestPath as the parent
     // — that's the cycle.
     recursive.tools = {
-      spawn_subagent: recursive as unknown as Record<string, unknown>,
+      spawn_subagent: { provider: "builtin", manifest: recursive },
     };
 
     const tree = await auditAgent(recursive);

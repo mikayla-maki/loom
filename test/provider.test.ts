@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
 import type {
-  Provider,
+  Tools,
   Tool,
   ToolContext,
   ToolResult,
 } from "../src/types/interfaces.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 
-describe("Provider extension — dynamic tool resolution", () => {
+describe("Tools extension — dynamic tool resolution", () => {
   it("a programmatic provider supplies a tool the model uses", async () => {
     let receivedInput: unknown = null;
     const stubTool: Tool = {
@@ -27,7 +27,7 @@ describe("Provider extension — dynamic tool resolution", () => {
       },
     };
 
-    const provider: Provider = {
+    const provider: Tools = {
       resolveTool(name) {
         if (name === "stub.shout") return stubTool;
         return null;
@@ -40,7 +40,7 @@ describe("Provider extension — dynamic tool resolution", () => {
     const spec: AgentManifest = {
       name: "provider-agent",
       systemPrompt: "x",
-      tools: { "stub.shout": {} },
+      tools: { "stub.shout": "builtin" },
       harness: {
         provider: "test",
         script: [
@@ -101,7 +101,7 @@ describe("Provider extension — dynamic tool resolution", () => {
       },
     };
 
-    const provider: Provider = {
+    const provider: Tools = {
       resolveTool(name) {
         if (name === "fs.search") return fsSearch;
         if (name === "fs.read") return fsRead;
@@ -113,7 +113,7 @@ describe("Provider extension — dynamic tool resolution", () => {
     const spec: AgentManifest = {
       name: "skill-provider-agent",
       systemPrompt: "x",
-      tools: { "fs.search": {}, "fs.read": {} },
+      tools: { "fs.search": "builtin", "fs.read": "builtin" },
       harness: {
         provider: "test",
         script: [
@@ -162,7 +162,7 @@ describe("Provider extension — dynamic tool resolution", () => {
         return { content: "noop" };
       },
     };
-    const provider: Provider = {
+    const provider: Tools = {
       resolveTool(name) {
         if (name === "danger.net") return netTool;
         return null;
@@ -173,7 +173,7 @@ describe("Provider extension — dynamic tool resolution", () => {
     const spec: AgentManifest = {
       name: "n",
       systemPrompt: "x",
-      tools: { "danger.net": {} },
+      tools: { "danger.net": "builtin" },
       harness: { provider: "test" },
       capabilities: { "danger.net": {} }, // empty grant, network missing
     };
@@ -197,7 +197,7 @@ describe("Provider extension — dynamic tool resolution", () => {
         return { content: "" };
       },
     };
-    const provider: Provider = {
+    const provider: Tools = {
       resolveTool(name, _config, _agent, capabilities) {
         if (name === "observed") {
           receivedCapabilities = capabilities;
@@ -210,7 +210,7 @@ describe("Provider extension — dynamic tool resolution", () => {
     const spec: AgentManifest = {
       name: "n",
       systemPrompt: "x",
-      tools: { observed: {} },
+      tools: { observed: "builtin" },
       harness: { provider: "test" },
       capabilities: { observed: { foo: ["a", "b"] } },
     };

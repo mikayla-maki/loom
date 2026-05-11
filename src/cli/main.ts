@@ -11,7 +11,6 @@
  * The CLI is intentionally minimal — the surface area is the SDK.
  */
 
-import * as readline from "node:readline";
 import { runAgent } from "../sdk/run-agent.js";
 import { TextRenderer } from "./renderer.js";
 import { auditAgent, formatCapabilityTree } from "../audit/audit.js";
@@ -19,6 +18,7 @@ import { ttyPermissionHandler } from "./permissions.js";
 import { ttyMissingSecretHandler } from "./secret-prompt.js";
 import { runRepl } from "./repl.js";
 import { ansi } from "./markdown.js";
+import { wantsColor } from "./term.js";
 import type { AuditFinding } from "../types/interfaces.js";
 
 /**
@@ -26,10 +26,11 @@ import type { AuditFinding } from "../types/interfaces.js";
  * with severity-colored icons. Errors don't reach this hook — they
  * throw at boot — so we only see ok / warning here.
  */
-function stderrAuditPrinter(plain: boolean) {
-  const dim = plain ? "" : "\x1b[2m";
-  const yellow = plain ? "" : "\x1b[33m";
-  const reset = plain ? "" : "\x1b[0m";
+function stderrAuditPrinter() {
+  const color = wantsColor();
+  const dim = color ? "\x1b[2m" : "";
+  const yellow = color ? "\x1b[33m" : "";
+  const reset = color ? "\x1b[0m" : "";
   return (f: AuditFinding & { tool: string }): void => {
     if (f.severity === "warning") {
       process.stderr.write(`${yellow}⚠${reset} ${f.tool}: ${f.message}\n`);
@@ -58,10 +59,8 @@ async function main(argv: string[]): Promise<number> {
       return await cmdAcp(argv.slice(1));
     case "install":
       return await cmdInstall(argv.slice(1));
-    case "list":
-      return await cmdList(argv.slice(1));
-    case "extensions":
-      return await cmdExtensions(argv.slice(1));
+    case "providers":
+      return await cmdProviders(argv.slice(1));
     default:
       console.error(`Unknown subcommand: ${cmd}`);
       printHelp();
@@ -74,24 +73,18 @@ function printHelp(): void {
     `loom — manifest-driven agent meta-harness
 
 Usage:
-  loom run <agent.toml> [opts]           Interactive REPL with the agent.
+  loom run <agent.toml>                  Interactive REPL with the agent.
   loom prompt <agent.toml> [text]        One-shot prompt (stdin if [text] omitted).
-  loom audit <agent.toml>                Print the static capability tree.
+  loom audit <agent.toml> [--strict] [--json]
+                                         Print the static capability tree.
   loom acp serve <agent.toml>            Speak ACP over stdio.
-  loom install <kind> <path> [--name N]  Install a tool/agent into ~/.loom.
-  loom list <kind>                       List installed tools/agents.
-  loom extensions list                   List Loom extension npm packages on disk.
-  loom extensions info <name>            Show resolved metadata for an extension package.
+  loom install [agent.toml]              Install the manifest's deps (npm + path sources).
+  loom install --frozen [agent.toml]     Refuse if lock.toml is missing or stale (CI).
+  loom providers list                    List Loom provider npm packages on disk.
+  loom providers info <name>             Show resolved metadata for a provider package.
 
-Where <kind> ∈ { tool | agent }.
-
-Flags (run/prompt):
-  --no-colors                             Disable ANSI colour output.
-  --show-thoughts                         Render agent_thought_chunk updates.
-
-Flags (run only):
-  --no-resume                             Skip the history-replay banner at startup.
-  --history-lines <N>                     Replay last N events (default 10, 0 = off).
+ANSI styling tracks the COLORTERM env var — unset COLORTERM for plain
+output. Agent thought chunks are always shown.
 
 In the REPL: tab to complete /commands. Built-ins:
   /quit /exit /help /audit /events [N] /tools
@@ -106,25 +99,16 @@ async function cmdRun(args: string[]): Promise<number> {
     console.error("usage: loom run <agent.toml>");
     return 2;
   }
-  const plain = !!opts.flags["no-colors"];
+  const plain = !wantsColor();
   const agent = await runAgent(manifestPath, {
     permissionHandler: ttyPermissionHandler(),
     onMissingSecret: ttyMissingSecretHandler(),
-    onAuditFinding: stderrAuditPrinter(plain),
+    onAuditFinding: stderrAuditPrinter(),
   });
-  // Decode --history-lines, with --no-resume as a shorthand for 0.
-  const historyLinesArg = opts.flags["history-lines"];
-  let historyLines = 10;
-  if (opts.flags["no-resume"]) historyLines = 0;
-  if (typeof historyLinesArg === "string") {
-    const n = parseInt(historyLinesArg, 10);
-    if (Number.isFinite(n) && n >= 0) historyLines = n;
-  }
   try {
     await runRepl({
       agent,
       plain,
-      historyLines,
       banner: buildRunBanner(agent.manifest.name, plain),
     });
   } finally {
@@ -160,12 +144,9 @@ async function cmdPrompt(args: string[]): Promise<number> {
   const agent = await runAgent(manifestPath, {
     permissionHandler: ttyPermissionHandler(),
     onMissingSecret: ttyMissingSecretHandler(),
-    onAuditFinding: stderrAuditPrinter(!!opts.flags["no-colors"]),
+    onAuditFinding: stderrAuditPrinter(),
   });
-  const renderer = new TextRenderer({
-    useColors: !opts.flags["no-colors"],
-    showThoughts: !!opts.flags["show-thoughts"],
-  });
+  const renderer = new TextRenderer();
   const sub = agent.updates();
   const consume = (async () => {
     for await (const u of sub) renderer.render(u);
@@ -183,16 +164,26 @@ async function cmdAudit(args: string[]): Promise<number> {
   const opts = parseFlags(args);
   const manifestPath = opts._[0];
   if (!manifestPath) {
-    console.error("usage: loom audit <agent.toml> [--json]");
+    console.error("usage: loom audit <agent.toml> [--json] [--strict]");
     return 2;
   }
-  const tree = await auditAgent(manifestPath);
-  if (opts.flags.json) {
-    process.stdout.write(JSON.stringify(tree, null, 2) + "\n");
-  } else {
-    process.stdout.write(formatCapabilityTree(tree) + "\n");
+  // Colours track COLORTERM — callers unset it to get plain output
+  // when piping.
+  const color = wantsColor();
+  try {
+    const tree = await auditAgent(manifestPath, {
+      strict: !!opts.flags.strict,
+    });
+    if (opts.flags.json) {
+      process.stdout.write(JSON.stringify(tree, null, 2) + "\n");
+    } else {
+      process.stdout.write(formatCapabilityTree(tree, { color }) + "\n");
+    }
+    return 0;
+  } catch (e) {
+    console.error(`loom audit: ${(e as Error).message}`);
+    return 1;
   }
-  return 0;
 }
 
 async function cmdAcp(args: string[]): Promise<number> {
@@ -207,20 +198,24 @@ async function cmdAcp(args: string[]): Promise<number> {
     return 2;
   }
   const { serveOverStdio } = await import("../acp/server.js");
-  const agent = await runAgent(manifestPath);
-  await serveOverStdio(agent);
+  // serveOverStdio waits for `initialize`, then constructs the agent
+  // with the negotiated client capabilities. The CLI just supplies
+  // the manifest path and lets the server own the lifecycle.
+  await serveOverStdio(manifestPath, {
+    onMissingSecret: ttyMissingSecretHandler(),
+  });
   return 0;
 }
 
-async function cmdExtensions(args: string[]): Promise<number> {
+async function cmdProviders(args: string[]): Promise<number> {
   const sub = args[0];
-  const { listInstalledExtensions, locateExtensionPackage } =
-    await import("../extensions/loader.js");
+  const { listInstalledProviders, locateProviderPackage } =
+    await import("../providers/loader.js");
   if (sub === "list") {
-    const items = await listInstalledExtensions({});
+    const items = await listInstalledProviders({});
     if (items.length === 0) {
       process.stdout.write(
-        "(no Loom extension packages found in node_modules, npm root -g, or ~/.loom/extensions)\n",
+        "(no Loom provider packages found in node_modules, npm root -g, or ~/.loom/providers)\n",
       );
       return 0;
     }
@@ -235,11 +230,11 @@ async function cmdExtensions(args: string[]): Promise<number> {
   if (sub === "info") {
     const name = args[1];
     if (!name) {
-      console.error("usage: loom extensions info <name>");
+      console.error("usage: loom providers info <name>");
       return 2;
     }
     try {
-      const info = await locateExtensionPackage(name, {
+      const info = await locateProviderPackage(name, {
         agentManifestDir: process.cwd(),
       });
       process.stdout.write(JSON.stringify(info, null, 2) + "\n");
@@ -249,60 +244,40 @@ async function cmdExtensions(args: string[]): Promise<number> {
       return 1;
     }
   }
-  console.error("usage: loom extensions <list|info> [name]");
+  console.error("usage: loom providers <list|info> [name]");
   return 2;
 }
 
+/**
+ * `loom install` — install the manifest's declared deps (npm + path
+ * sources). Delegates to `cli/install.ts`.
+ */
 async function cmdInstall(args: string[]): Promise<number> {
   const opts = parseFlags(args);
-  const kind = opts._[0];
-  const src = opts._[1];
-  if (!kind || !src) {
-    console.error(
-      "usage: loom install <tool|agent> <path> [--name <name>] [--symlink]",
-    );
-    return 2;
-  }
-  if (kind !== "tool" && kind !== "agent") {
-    console.error(`unknown kind: ${kind}`);
-    return 2;
-  }
-  const { LocalRegistry } = await import("../registry/registry.js");
-  const reg = new LocalRegistry();
-  const dest = await reg.install(kind, src, {
-    ...(typeof opts.flags.name === "string" ? { name: opts.flags.name } : {}),
-    symlink: !!opts.flags.symlink,
-  });
-  process.stdout.write(`installed ${kind} → ${dest}\n`);
-  return 0;
-}
-
-async function cmdList(args: string[]): Promise<number> {
-  const kind = args[0];
-  if (kind !== "tool" && kind !== "agent") {
-    console.error("usage: loom list <tool|agent>");
-    return 2;
-  }
-  const fs = await import("node:fs/promises");
-  const path = await import("node:path");
-  const os = await import("node:os");
-  const home = process.env.LOOM_HOME ?? path.join(os.homedir(), ".loom");
-  const dir = path.join(home, kind === "tool" ? "tools" : "agents");
-  let entries: string[] = [];
+  const manifestPath = opts._[0] ?? "agent.toml";
+  const { installManifest } = await import("./install.js");
   try {
-    entries = (await fs.readdir(dir, { withFileTypes: true }))
-      .filter((d) => d.isDirectory() || d.isSymbolicLink())
-      .map((d) => d.name)
-      .sort();
-  } catch {
-    entries = [];
-  }
-  if (entries.length === 0) {
-    process.stdout.write(`(no installed ${kind}s under ${dir})\n`);
+    const result = await installManifest(manifestPath, {
+      frozen: !!opts.flags.frozen,
+    });
+    if (result.sources.length === 0) {
+      process.stdout.write(
+        "nothing to install (manifest uses only builtins).\n",
+      );
+    } else {
+      process.stdout.write(
+        `installed ${result.sources.length} source(s) into ${result.loomDir}\n`,
+      );
+      for (const s of result.sources) {
+        const ver = s.resolved ? ` (resolved: ${s.resolved})` : "";
+        process.stdout.write(`  - ${s.spec}${ver}\n`);
+      }
+    }
     return 0;
+  } catch (e) {
+    console.error(`loom install: ${(e as Error).message}`);
+    return 1;
   }
-  for (const e of entries) process.stdout.write(`${e}\n`);
-  return 0;
 }
 
 function parseFlags(args: string[]): {

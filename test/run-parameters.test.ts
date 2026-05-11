@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
-import { TestHarness } from "../src/extensions/harness/test.js";
+import { TestHarness } from "../src/builtins/harness/test.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { Harness } from "../src/types/interfaces.js";
 

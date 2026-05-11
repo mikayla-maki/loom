@@ -3,10 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
-import { FileSession } from "../src/extensions/session/file.js";
+import { FileSession } from "../src/builtins/session/file.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
-import { testHarnessFactory } from "../src/extensions/harness/test.js";
+import { testHarnessFactory } from "../src/builtins/harness/test.js";
 
 describe("FileSession", () => {
   it("appends and reads back JSONL", async () => {

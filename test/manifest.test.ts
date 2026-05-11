@@ -19,18 +19,18 @@ describe("agent.toml parser", () => {
       expect(m.session.provider).toBe("file");
     // [agent].secrets allowlist parsed.
     expect(m.secrets).toEqual(["sample_user_name"]);
-    // v2 [capabilities]: per-tool grants. `"*"` for echo (whole-tool
-    // unrestricted), per-kind maps for FS tools.
+    // Per-tool capability grants. The fixture uses per-kind maps for
+    // each FS tool; the `"*"` whole-tool form is exercised elsewhere.
     expect(m.capabilities?.read_file).toEqual({ paths: ["./"] });
     expect(m.capabilities?.write_file).toEqual({ paths: ["./"] });
     expect(m.capabilities?.find).toEqual({ paths: ["./"] });
-    expect(m.capabilities?.echo).toBe("*");
-    // [tools] is wiring-only — no caps mixed in.
+    // v5: tool entries are tables (with a required `provider` field)
+    // or the string shorthand. The sample agent uses the string form
+    // `"builtin"` for its native tools.
     expect(m.tools).toEqual({
       read_file: "builtin",
       write_file: "builtin",
       find: "builtin",
-      echo: "builtin",
     });
   });
 
@@ -48,7 +48,10 @@ describe("agent.toml parser", () => {
     }
   });
 
-  it("parses an explicit [tools] table (string-valued)", async () => {
+  it("parses an explicit [tools] table with string shorthand (v3)", async () => {
+    // v3: string shorthand still works — it's a bare provider ref.
+    // `"builtin"` resolves to the native provider; `"./local-tool"`
+    // resolves to a local-path source.
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-tools-"));
     try {
       const p = path.join(dir, "agent.toml");
@@ -71,6 +74,89 @@ my_thing = "./local-tool"
         bash: "builtin",
         my_thing: "./local-tool",
       });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses tool entries with inline SourceSpec table providers", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-tools-tbl-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "with-tools-tbl"
+system_prompt = "x"
+
+[harness]
+provider = "test"
+
+[tools.fs_read]
+provider = { npm = "@my-org/mcp" }
+server = "stdio"
+
+[tools.local_grep]
+provider = { path = "../my-fast-grep" }
+flags = ["-i"]
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(m.tools).toEqual({
+        fs_read: {
+          provider: { npm: "@my-org/mcp" },
+          server: "stdio",
+        },
+        local_grep: {
+          provider: { path: "../my-fast-grep" },
+          flags: ["-i"],
+        },
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects [tools.X] entries with an empty table", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-empty-tool-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "empty-entry"
+system_prompt = "x"
+[harness]
+provider = "test"
+[tools]
+bash = {}
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /\[tools\]\.bash is missing required 'provider' field/,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects stray keys in a SourceSpec table", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-stray-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "stray"
+system_prompt = "x"
+[harness]
+provider = { npm = "@my-org/harness", greeting = "hi" }
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(/is not a known key/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

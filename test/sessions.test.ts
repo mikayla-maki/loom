@@ -4,8 +4,8 @@ import {
   ChainedSession,
   CompactingSession,
   compactingMemorySession,
-} from "../src/extensions/session/compacting.js";
-import { MemorySession } from "../src/extensions/session/memory.js";
+} from "../src/builtins/session/compacting.js";
+import { MemorySession } from "../src/builtins/session/memory.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import type {
   Agent,
@@ -14,6 +14,7 @@ import type {
   ToolRef,
 } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
+import { echoTestProvider } from "./fixtures/echo-tool.js";
 
 function userMsg(text: string): SessionUpdate {
   return {
@@ -336,13 +337,17 @@ describe("End-to-end: ChainedSession through runAgent", () => {
     const sessionWithTool: Session = {
       tools: () => [{ name: "echo", config: {} }],
     };
-    const agent = await runAgent({
-      name: "session-tools",
-      systemPrompt: "x",
-      tools: {},
-      harness: { provider: "test" },
-      session: sessionWithTool,
-    });
+    const agent = await runAgent(
+      {
+        name: "session-tools",
+        systemPrompt: "x",
+        tools: {},
+        capabilities: { echo: "*" },
+        harness: { provider: "test" },
+        session: sessionWithTool,
+      },
+      { providers: [echoTestProvider] },
+    );
     try {
       const tools = agent.agentState.toolTable.list().map((t) => t.name);
       expect(tools).toContain("echo");

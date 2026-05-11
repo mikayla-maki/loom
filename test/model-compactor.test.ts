@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   CompactingSession,
   modelCompactor,
-} from "../src/extensions/session/compacting.js";
-import { MemorySession } from "../src/extensions/session/memory.js";
+} from "../src/builtins/session/compacting.js";
+import { MemorySession } from "../src/builtins/session/memory.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { summarise, summariseViaRun } from "../src/sdk/session-utils.js";
 import type {

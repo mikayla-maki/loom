@@ -4,18 +4,19 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 
 import {
-  listInstalledExtensions,
-  loadExtensionPackage,
-  locateExtensionPackage,
-} from "../src/extensions/loader.js";
+  listInstalledProviders,
+  loadProviderByName,
+  locateProviderPackage,
+} from "../src/providers/loader.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { parseAgentManifest } from "../src/manifest/parser.js";
 import { LoomError } from "../src/errors.js";
 
 /**
  * Build a directory tree that looks like a node_modules folder, containing
- * a single Loom extension package. The package's `loom.extension` field
- * points at an entry that registers a Provider supplying a synthetic tool.
+ * a single Loom provider package. The package's `loom.provider` field
+ * points at an entry that registers a Tools instance supplying a
+ * synthetic tool.
  */
 async function buildExtensionFixture(opts: {
   rootDir: string;
@@ -35,58 +36,57 @@ async function buildExtensionFixture(opts: {
       {
         name: fullName,
         version: "0.1.0",
-        description: "Synthetic Loom extension for tests",
+        description: "Synthetic Loom provider for tests",
         type: "module",
         main: "./index.js",
-        loom: { extension: "./index.js" },
+        loom: { provider: "./index.js" },
       },
       null,
       2,
     ),
   );
-  // Entry: ESM module exporting register(). Registers a ProviderFactory
-  // via api.addProvider(); the factory's Provider.resolveTool() returns a
-  // synthetic 'fixture.echo' tool by name.
+  // Entry: ESM module exporting register(). Registers a Tools
+  // contribution via api.registerTools(); its Tools.resolveTool()
+  // returns a synthetic 'fixture.echo' tool by name. v5: per-tool
+  // config (`greeting`) flows into `Tools.resolveTool(name, config, …)`.
   await fs.writeFile(
     path.join(packageDir, "index.js"),
     `export function register(api) {
-  const greeting = api.config && typeof api.config.greeting === "string" ? api.config.greeting : "hi";
-  const factory = {
+  api.registerTools({
     name: "${fullName}",
-    create() {
-      const tool = {
-        name: "fixture.echo",
-        description: "Echo with greeting prefix",
-        inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
-        async execute(input) {
-          return { content: greeting + ": " + String((input || {}).text || "") };
-        },
-      };
+    create(_cfg, _ctx, _secrets) {
       return {
-        resolveTool(name, _config) {
-          if (name === "fixture.echo") return tool;
-          return null;
+        resolveTool(name, config) {
+          if (name !== "fixture.echo") return null;
+          const greeting = config && typeof config.greeting === "string" ? config.greeting : "hi";
+          return {
+            name: "fixture.echo",
+            description: "Echo with greeting prefix",
+            inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
+            async execute(input) {
+              return { content: greeting + ": " + String((input || {}).text || "") };
+            },
+          };
         },
         async close() { /* noop */ },
       };
     },
-  };
-  api.addProvider(factory);
+  });
 }
 `,
   );
   return { packageDir, nodeModulesDir: nm };
 }
 
-describe("extension package loader", () => {
-  it("locates and imports a package with loom.extension metadata", async () => {
+describe("provider package loader", () => {
+  it("locates and imports a package with loom.provider metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-loc-"));
     try {
       await buildExtensionFixture({
         rootDir: root,
         packageName: "fixture-loom-ext",
       });
-      const info = await locateExtensionPackage("fixture-loom-ext", {
+      const info = await locateProviderPackage("fixture-loom-ext", {
         agentManifestDir: root,
       });
       expect(info.name).toBe("fixture-loom-ext");
@@ -101,16 +101,16 @@ describe("extension package loader", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-miss-"));
     try {
       await expect(
-        locateExtensionPackage("does-not-exist-loom-ext", {
+        locateProviderPackage("does-not-exist-loom-ext", {
           agentManifestDir: root,
         }),
-      ).rejects.toThrow(/Cannot find Loom extension/);
+      ).rejects.toThrow(/Cannot find Loom provider/);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
 
-  it("rejects packages without a loom.extension field (treats as 'not an extension')", async () => {
+  it("rejects packages without a loom.provider field (treats as 'not a provider')", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-nope-"));
     try {
       const nm = path.join(root, "node_modules", "boring-pkg");
@@ -125,8 +125,8 @@ describe("extension package loader", () => {
       );
       await fs.writeFile(path.join(nm, "index.js"), "export const x = 1;");
       await expect(
-        locateExtensionPackage("boring-pkg", { agentManifestDir: root }),
-      ).rejects.toThrow(/Cannot find Loom extension/);
+        locateProviderPackage("boring-pkg", { agentManifestDir: root }),
+      ).rejects.toThrow(/Cannot find Loom provider/);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -140,7 +140,7 @@ describe("extension package loader", () => {
         packageName: "fixture",
         scope: "@my-org",
       });
-      const info = await locateExtensionPackage("@my-org/fixture", {
+      const info = await locateProviderPackage("@my-org/fixture", {
         agentManifestDir: root,
       });
       expect(info.name).toBe("@my-org/fixture");
@@ -149,19 +149,19 @@ describe("extension package loader", () => {
     }
   });
 
-  it("listInstalledExtensions enumerates packages with loom.extension metadata", async () => {
+  it("listInstalledProviders enumerates packages with loom.provider metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-list-"));
     try {
       await buildExtensionFixture({ rootDir: root, packageName: "fixture-a" });
       await buildExtensionFixture({ rootDir: root, packageName: "fixture-b" });
-      // A non-extension package alongside.
+      // A non-provider package alongside.
       const boring = path.join(root, "node_modules", "boring");
       await fs.mkdir(boring, { recursive: true });
       await fs.writeFile(
         path.join(boring, "package.json"),
         JSON.stringify({ name: "boring", version: "1.0.0" }),
       );
-      const items = await listInstalledExtensions(
+      const items = await listInstalledProviders(
         { agentManifestDir: root },
         { searchPaths: [path.join(root, "node_modules")] },
       );
@@ -174,21 +174,25 @@ describe("extension package loader", () => {
     }
   });
 
-  it("loadExtensionPackage executes register() and surfaces added provider factories", async () => {
+  it("loadProviderByName executes register() and surfaces contributed Tools registrations", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-load-"));
     try {
       await buildExtensionFixture({
         rootDir: root,
         packageName: "register-side-effect-ext",
       });
-      const { addedProviderFactories } = await loadExtensionPackage(
+      const { toolsContributions } = await loadProviderByName(
         "register-side-effect-ext",
-        { greeting: "yo" },
-        { agentManifestDir: root, agentName: "test", loomVersion: "0.1.0" },
+        {
+          agentManifestDir: root,
+          agentName: "test",
+          loomVersion: "0.1.0",
+          providerName: "register-side-effect-ext",
+        },
       );
-      // The fixture's register() calls api.addProvider() with a factory
-      // whose name matches the package.
-      const names = addedProviderFactories.map((f) => f.name);
+      // The fixture's register() calls api.registerTools() with a
+      // contribution whose name matches the package.
+      const names = toolsContributions.map((f) => f.name);
       expect(names).toContain("register-side-effect-ext");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
@@ -206,7 +210,7 @@ describe("extension package loader", () => {
           name: "no-register",
           version: "1.0.0",
           type: "module",
-          loom: { extension: "./index.js" },
+          loom: { provider: "./index.js" },
         }),
       );
       await fs.writeFile(
@@ -214,11 +218,12 @@ describe("extension package loader", () => {
         `export const noop = true;`,
       );
       await expect(
-        loadExtensionPackage(
-          "no-register",
-          {},
-          { agentManifestDir: root, agentName: "x", loomVersion: "0" },
-        ),
+        loadProviderByName("no-register", {
+          agentManifestDir: root,
+          agentName: "x",
+          loomVersion: "0",
+          providerName: "no-register",
+        }),
       ).rejects.toThrow(LoomError);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
@@ -226,8 +231,8 @@ describe("extension package loader", () => {
   });
 });
 
-describe("agent.toml [extensions] activation end-to-end", () => {
-  it("extensions listed in [extensions] are loaded before tool resolution", async () => {
+describe("agent.toml v5 source resolution end-to-end", () => {
+  it("a tool with a path source loads the package and resolves through its Tools instance", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-ext-e2e-"));
     try {
       const agentDir = path.join(root, "agent");
@@ -237,22 +242,24 @@ describe("agent.toml [extensions] activation end-to-end", () => {
         packageName: "ext-pkg-e2e",
       });
 
-      // [tools] references the extension's tool by name; the extension
-      // provider's resolveTool() claims it ahead of the native chain.
+      // v5: the tool entry's `provider` field is an inline SourceSpec
+      // pointing at the provider package on disk. Loom loads it, runs
+      // `register()`, and routes 'fixture.echo' through the Tools
+      // instance that package added via `registerTools()`. The
+      // `greeting` field is per-tool config (the test fixture reads
+      // it inside `resolveTool`).
       await fs.writeFile(
         path.join(agentDir, "agent.toml"),
         `[agent]
 name = "ext-driven"
 system_prompt = "be brief"
 
-[tools]
-"fixture.echo" = {}
-
 [harness]
 provider = "test"
 
-[extensions]
-"ext-pkg-e2e" = { greeting = "yo" }
+[tools."fixture.echo"]
+provider = { path = "./node_modules/ext-pkg-e2e" }
+greeting = "yo"
 `,
       );
 

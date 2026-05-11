@@ -1,0 +1,55 @@
+# ───────────────────────────────────────────────────────────────────────────
+# Loom minimal-agent example — demonstrates the full v5 provider surface
+# ───────────────────────────────────────────────────────────────────────────
+#
+# Run:           loom run examples/agent.toml
+# Audit:         loom audit examples/agent.toml
+#
+# What this example shows:
+#   - `[providers]` declares a local handle for an external provider.
+#   - `[harness]`   picks a built-in factory.
+#   - `[session]`   picks a provider-backed factory by handle.
+#   - `[tools]`     mixes built-in tools, a handle-anonymous reference,
+#                   and an inline-anonymous reference. Both `shout` and
+#                   `whisper` route through the same provider (the
+#                   runtime dedupes by (source, config) so distinct
+#                   configs get distinct Tools instances).
+#   - `[capabilities]` is a transitive ceiling
+# ───────────────────────────────────────────────────────────────────────────
+
+[agent]
+name = "loom-demo"
+system_prompt = "You are a helpful assistant. Use the echo tool to confirm wiring; use bash/read_file/write_file/find for real work."
+
+[providers]
+demo = { path = "./loom-demo-provider" }
+
+[harness]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+maxTokens = 4096
+maxTurnRequests = 16
+stream = true
+
+[session]
+provider = "demo"
+tag = "showpiece"
+
+[tools]
+bash = "builtin"
+read_file = "builtin"
+write_file = "builtin"
+find = "builtin"
+shout = { provider = "demo", prefix = "📢" }
+
+[tools.whisper]
+provider = "demo"
+prefix = "🤫"
+
+[capabilities]
+bash = { subprocess = "*", paths = ["./"] }
+read_file = { paths = ["./"] }
+write_file = { paths = ["./"] }
+find = { paths = ["./"] }
+shout = "*"
+whisper = "*"

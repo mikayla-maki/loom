@@ -42,8 +42,12 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.21.0",
+    "@anthropic-ai/sdk": "^0.95.1",
     "@iarna/toml": "^2.2.5",
-    "ajv": "^8.17.1"
+    "ajv": "^8.17.1",
+    "openai": "^6.37.0",
+    "yaml": "^2.8.4"
   },
   "devDependencies": {
     "@types/node": "^22.5.0",

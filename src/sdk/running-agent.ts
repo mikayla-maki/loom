@@ -1,27 +1,25 @@
 /**
  * RunningAgentImpl — the SDK handle returned to clients.
  *
- * Lifecycle:
- *   - prompt(text) appends a user_message_chunk + runs ONE turn to completion.
- *   - cancel() aborts the in-flight turn (the harness should observe the
- *     AbortSignal and stop promptly).
- *   - updates() returns an async iterable that yields every SessionUpdate
- *     emitted during turns (and any that the runtime emits out-of-band).
- *   - close() releases resources (sessions, providers, sink subscribers).
+ * `prompt()` appends a user_message_chunk and runs one turn to
+ * completion; `cancel()` aborts the in-flight turn via AbortSignal;
+ * `updates()` yields every SessionUpdate emitted; `close()` releases
+ * sessions, providers, and sink subscribers.
  */
 
-import type { SessionUpdate } from "../types/acp.js";
+import type { ContentBlock, SessionUpdate } from "../types/acp.js";
 import type {
   Agent,
   Harness,
-  Provider,
   RunParameters,
   Runtime,
   Session,
+  Tools,
   TurnResult,
 } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
 import type { AgentManifest, Capabilities } from "../types/manifest.js";
+import type { Ref } from "../internal/util.js";
 
 import { RuntimeImpl } from "../runtime/runtime.js";
 import type { AgentState } from "../runtime/agent-state.js";
@@ -30,33 +28,31 @@ import { agentForSession, type RuntimeServicesImpl } from "./run-agent.js";
 
 export interface RunningAgent {
   /**
-   * Append a user message and run one turn to completion. Returns the
-   * turn's stop reason plus (when the harness reports it) the
-   * cumulative usage breakdown matching ACP RFD `PromptResponse.usage`.
-   *
-   * `params` is forwarded to the harness for this single turn (effort,
-   * streaming, lab-specific thinking config). The harness's defaults
-   * apply for any unset fields.
+   * Append a user message and run one turn. Accepts either a plain
+   * string (shorthand for `[{ type: "text", text }]`) or an array of
+   * `ContentBlock`s for multi-part prompts (text + images + embedded
+   * resources). Returns the stop reason and (when the harness reports
+   * it) cumulative usage. `params` is forwarded to the harness for
+   * this turn only; unset fields fall back to harness defaults.
    */
-  prompt(text: string, params?: RunParameters): Promise<TurnResult>;
+  prompt(
+    prompt: string | ContentBlock[],
+    params?: RunParameters,
+  ): Promise<TurnResult>;
   cancel(): Promise<void>;
   updates(opts?: { capacity?: number }): AsyncIterableIterator<SessionUpdate>;
   readonly session: Session;
-  /** Source manifest the agent was constructed from (diagnostics only). */
+  /** Source manifest (diagnostics only). */
   readonly manifest: AgentManifest;
-  /** Resolved [agent].system_prompt content. */
+  /** Resolved `[agent].system_prompt` content. */
   readonly systemPrompt: string;
   /** Effective per-tool capability ceiling. */
   readonly capabilities: Capabilities;
-  /** Resolved secret names (for diagnostics; never the values). */
+  /** Resolved secret names (never values). */
   readonly secretNames: string[];
   /** Live skills/tools/ceiling view. */
   readonly agentState: AgentState;
-  /**
-   * Attach (or replace) the user-consent handler. Tools' next call to
-   * `ctx.requestPermission()` observes the new handler. Pass null to
-   * clear.
-   */
+  /** Attach/replace the user-consent handler. Pass `null` to clear. */
   setPermissionHandler(handler: PermissionHandler | null): void;
   close(): Promise<void>;
 }
@@ -70,15 +66,14 @@ interface RunningAgentImplOptions {
   harness: Harness;
   state: AgentState;
   updateSink: UpdateSink;
-  providers: Provider[];
+  providers: Tools[];
   /**
-   * Shared mutable holder for the active permission handler. Both the
-   * RunningAgent and the runtime services read through the same
-   * reference so `setPermissionHandler()` after boot is visible to
-   * tools mid-turn.
+   * Shared mutable holder for the active permission handler. The
+   * RunningAgent and runtime services share this reference so
+   * `setPermissionHandler()` is visible to tools mid-turn.
    */
-  permissionHolder: { current: PermissionHandler | null };
-  /** Runtime services impl — receives setAbortSignal each turn. */
+  permissionHolder: Ref<PermissionHandler | null>;
+  /** Receives `setAbortSignal` each turn. */
   runtimeServices: RuntimeServicesImpl;
   now?: () => Date;
 }
@@ -93,8 +88,8 @@ export class RunningAgentImpl implements RunningAgent {
   private readonly harness: Harness;
   private readonly state: AgentState;
   private readonly updateSink: UpdateSink;
-  private readonly providers: Provider[];
-  private readonly permissionHolder: { current: PermissionHandler | null };
+  private readonly providers: Tools[];
+  private readonly permissionHolder: Ref<PermissionHandler | null>;
   private readonly runtimeServices: RuntimeServicesImpl;
   private readonly now: (() => Date) | undefined;
 
@@ -125,30 +120,35 @@ export class RunningAgentImpl implements RunningAgent {
     this.permissionHolder.current = handler ?? null;
   }
 
-  async prompt(text: string, params?: RunParameters): Promise<TurnResult> {
+  async prompt(
+    prompt: string | ContentBlock[],
+    params?: RunParameters,
+  ): Promise<TurnResult> {
     if (this.closed) throw new Error("Agent has been closed");
     if (this.inflight) {
-      // Serialise turns: wait for the previous one to finish.
+      // Serialise turns.
       await this.inflight.catch(() => undefined);
     }
-    const userUpdate: SessionUpdate = {
-      sessionUpdate: "user_message_chunk",
-      content: { type: "text", text },
-    };
-    await Promise.resolve(this.session.push?.(userUpdate) ?? [userUpdate]);
-    this.updateSink.emit(userUpdate);
+    const blocks: ContentBlock[] =
+      typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt;
+    // Each block lands as its own `user_message_chunk` so downstream
+    // sessions can decide how to coalesce / persist them.
+    for (const block of blocks) {
+      const userUpdate: SessionUpdate = {
+        sessionUpdate: "user_message_chunk",
+        content: block,
+      };
+      await Promise.resolve(this.session.push?.(userUpdate) ?? [userUpdate]);
+      this.updateSink.emit(userUpdate);
+    }
 
     const ctl = new AbortController();
     this.currentAbortCtl = ctl;
-    // Tools running this turn read ctx.abortSignal through the shared
-    // runtimeServices object, which we update here.
+    // Tools read ctx.abortSignal through the shared runtimeServices.
     this.runtimeServices.setAbortSignal(ctl.signal);
 
-    // Build the per-turn `Agent` ref and run the session's hooks.
-    // The session never holds onto the ref — it gets a fresh one each
-    // turn, passed to the methods that need it. `agentForSession`
-    // attaches a `spawnSubagent` whose lookup scope is the session's
-    // own `dependencies.subagents`.
+    // Per-turn Agent ref; session gets a fresh one each turn.
+    // `agentForSession` scopes `spawnSubagent` to the session's deps.
     const baseAgent: Agent = {
       harness: this.harness,
       session: this.session,
@@ -163,8 +163,7 @@ export class RunningAgentImpl implements RunningAgent {
       try {
         await Promise.resolve(this.session.prepareTurn(agentRef));
       } catch (e) {
-        // A failing prepareTurn shouldn't kill the turn; surface it as
-        // an agent_thought_chunk for visibility and continue.
+        // Don't kill the turn; surface as agent_thought_chunk.
         const msg = (e as Error).message ?? String(e);
         await Promise.resolve(
           this.session.push?.({
@@ -184,7 +183,7 @@ export class RunningAgentImpl implements RunningAgent {
           this.session.systemPromptSection(agentRef),
         );
       } catch {
-        // A failing section shouldn't kill the turn; we just skip it.
+        // Skip a failing section; don't kill the turn.
         sessionSection = "";
       }
     }
@@ -235,7 +234,7 @@ export class RunningAgentImpl implements RunningAgent {
     if (this.session.close) await this.session.close();
     for (const p of this.providers) {
       try {
-        await p.close();
+        await p.close?.();
       } catch {
         /* ignore cleanup errors */
       }

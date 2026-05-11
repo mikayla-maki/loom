@@ -8,7 +8,7 @@
  * rather than throwing into the harness.
  */
 
-import Ajv from "ajv";
+import Ajv, { type ValidateFunction } from "ajv";
 
 import { ToolExecutionError, ToolInputError } from "../errors.js";
 import type {
@@ -45,10 +45,7 @@ export class ToolTable {
   private readonly byName = new Map<string, ToolEntry>();
   private readonly secrets: Record<string, string>;
   private readonly contextFactory: ToolContextFactory;
-  private readonly validators = new Map<
-    string,
-    import("ajv").ValidateFunction
-  >();
+  private readonly validators = new Map<string, ValidateFunction>();
 
   constructor(opts: {
     tools: Array<Tool | ToolEntry>;
@@ -82,6 +79,15 @@ export class ToolTable {
       description: e.tool.description,
       inputSchema: e.tool.inputSchema,
     }));
+  }
+
+  /**
+   * The full `Tool` instances backing the table, in insertion order.
+   * Used by aggregation paths (e.g. ACP capability negotiation) that
+   * need to call optional methods like `Tool.acpCapabilities()`.
+   */
+  tools(): Tool[] {
+    return [...this.byName.values()].map((e) => e.tool);
   }
 
   has(name: string): boolean {

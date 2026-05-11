@@ -88,18 +88,36 @@ export const SAFE_DEFAULT_ENV_NAMES = [
   "TMPDIR",
 ] as const;
 
+/**
+ * Input schema. `ToolTable` validates against this with `ajv` before
+ * dispatch, so `execute()` may trust the shape — `command` is a
+ * non-empty string, `cwd` is a string when set, `timeout_ms` is a
+ * positive number when set. No defensive `typeof` checks below.
+ */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["command"],
+  additionalProperties: false,
   properties: {
-    command: { type: "string", description: "The bash command to run." },
+    command: {
+      type: "string",
+      minLength: 1,
+      description: "The bash command to run.",
+    },
     cwd: { type: "string", description: "Optional working directory." },
     timeout_ms: {
       type: "number",
+      exclusiveMinimum: 0,
       description: "Optional timeout in milliseconds (default 30000).",
     },
   },
 };
+
+interface BashInput {
+  command: string;
+  cwd?: string;
+  timeout_ms?: number;
+}
 
 export class BashTool implements Tool {
   public readonly name = "bash";
@@ -179,19 +197,13 @@ export class BashTool implements Tool {
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
-    const i = input as {
-      command?: unknown;
-      cwd?: unknown;
-      timeout_ms?: unknown;
-    };
-    if (typeof i.command !== "string" || !i.command) {
-      return { content: "bash: 'command' is required", isError: true };
-    }
-    const cwd = typeof i.cwd === "string" ? i.cwd : process.cwd();
-    const timeout =
-      typeof i.timeout_ms === "number" && i.timeout_ms > 0
-        ? i.timeout_ms
-        : 30_000;
+    // Schema-validated upstream by `ToolTable`.
+    const {
+      command,
+      cwd = process.cwd(),
+      timeout_ms = 30_000,
+    } = input as BashInput;
+    const timeout = timeout_ms;
 
     const env = buildEnv(this.capabilities);
 
@@ -211,15 +223,10 @@ export class BashTool implements Tool {
     let args: string[];
     if (sandboxPrefix) {
       binary = sandboxPrefix.binary;
-      args = [
-        ...sandboxPrefix.prefixArgs,
-        "/bin/bash",
-        "-c",
-        i.command as string,
-      ];
+      args = [...sandboxPrefix.prefixArgs, "/bin/bash", "-c", command];
     } else {
       binary = "/bin/bash";
-      args = ["-c", i.command as string];
+      args = ["-c", command];
       // Strict mode: user wrote a structured grant on a platform we
       // know how to sandbox, but the sandbox binary is missing.
       // Refuse rather than silently bypass enforcement.

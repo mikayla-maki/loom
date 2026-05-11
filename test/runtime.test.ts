@@ -4,7 +4,8 @@ import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import { assembleSystemPrompt } from "../src/runtime/system-prompt.js";
 import type { AgentManifest } from "../src/types/manifest.js";
-import type { TurnScript } from "../src/extensions/harness/test.js";
+import type { TurnScript } from "../src/builtins/harness/test.js";
+import { echoTestProvider } from "./fixtures/echo-tool.js";
 
 /**
  * Build the canonical sample-agent inline spec used by these tests. With
@@ -53,6 +54,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
       ]),
       {
         secrets: new StaticSecretsStore({ sample_user_name: "ALICE" }),
+        providers: [echoTestProvider],
       },
     );
     try {
@@ -78,6 +80,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
       sampleAgentSpec([[{ say: "ack" }, { stop: "end_turn" }]]),
       {
         secrets: new StaticSecretsStore({ sample_user_name: "BOB" }),
+        providers: [echoTestProvider],
       },
     );
     const seen: string[] = [];
@@ -120,6 +123,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
     }
     const agent = await runAgent(spec, {
       secrets: new StaticSecretsStore({ sample_user_name: "CARL" }),
+      providers: [echoTestProvider],
     });
     try {
       const p = agent.prompt("go");
@@ -145,6 +149,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
       ]),
       {
         secrets: new StaticSecretsStore({ sample_user_name: "DIANA" }),
+        providers: [echoTestProvider],
       },
     );
     try {

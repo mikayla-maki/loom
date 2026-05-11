@@ -14,6 +14,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import * as path from "node:path";
 
 import type {
@@ -25,21 +26,44 @@ import type {
 import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
-import { describePaths, pathAllowed, paths, resolvedPaths } from "./_path.js";
+import {
+  collectTrustedPaths,
+  describePaths,
+  effectivePaths,
+  pathAllowed,
+  paths,
+  resolvedPaths,
+} from "./_path.js";
 
+/**
+ * Input schema. `ToolTable` validates against this before dispatch —
+ * `execute()` may trust the shape.
+ */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["pattern"],
+  additionalProperties: false,
   properties: {
     pattern: {
       type: "string",
+      minLength: 1,
       description:
         "Glob (e.g. '**/*.ts'). * = any non-/ chars; ** = any depth.",
     },
     root: { type: "string", description: "Root to walk (default '.')." },
-    limit: { type: "number", description: "Max results (default 200)." },
+    limit: {
+      type: "number",
+      exclusiveMinimum: 0,
+      description: "Max results (default 200).",
+    },
   },
 };
+
+interface FindInput {
+  pattern: string;
+  root?: string;
+  limit?: number;
+}
 
 const SKIP = new Set(["node_modules", ".git", "dist", ".cache", ".turbo"]);
 
@@ -59,20 +83,19 @@ export class FindTool implements Tool {
     this.description = `List files matching a glob pattern (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
-  async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
-    const i = input as {
-      pattern?: unknown;
-      root?: unknown;
-      limit?: unknown;
-    };
-    if (typeof i.pattern !== "string" || !i.pattern) {
-      return { content: "find: 'pattern' is required", isError: true };
-    }
-    const requestedRoot = typeof i.root === "string" ? i.root : ".";
+  async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
+    const {
+      pattern,
+      root: requestedRoot = ".",
+      limit = 200,
+    } = input as FindInput;
     const root = path.resolve(requestedRoot);
-    const limit = typeof i.limit === "number" && i.limit > 0 ? i.limit : 200;
 
-    if (!pathAllowed(root, this.granted)) {
+    // Effective path set = manifest grant ∪ session trusted paths
+    // (read access — listing files is a read).
+    const trusted = await collectTrustedPaths(ctx);
+    const effective = effectivePaths(this.granted, trusted, "read");
+    if (!pathAllowed(root, effective)) {
       return {
         content: `find: root '${requestedRoot}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,
@@ -91,7 +114,7 @@ export class FindTool implements Tool {
       };
     }
 
-    const re = globToRegex(i.pattern);
+    const re = globToRegex(pattern);
     const matches: string[] = [];
     await walk(root, root, re, matches, limit);
     return { content: matches.join("\n") };
@@ -106,7 +129,7 @@ async function walk(
   limit: number,
 ): Promise<void> {
   if (out.length >= limit) return;
-  let entries: import("node:fs").Dirent[];
+  let entries: Dirent[];
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
   } catch {

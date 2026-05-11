@@ -20,10 +20,9 @@ describe("manifest walk via runAgent", () => {
     );
     try {
       const tools = agent.agentState.toolTable.list().map((t) => t.name);
-      expect(tools.sort()).toEqual(["echo", "find", "read_file", "write_file"]);
+      expect(tools.sort()).toEqual(["find", "read_file", "write_file"]);
       // The agent surfaces the granted caps from [capabilities].
       expect(agent.capabilities.read_file).toEqual({ paths: ["./"] });
-      expect(agent.capabilities.echo).toBe("*");
     } finally {
       await agent.close();
     }
@@ -60,7 +59,7 @@ describe("manifest walk via runAgent", () => {
     const spec: AgentManifest = {
       name: "unknown-tool",
       systemPrompt: "x",
-      tools: { not_a_real_tool: {} },
+      tools: { not_a_real_tool: "builtin" },
       harness: { provider: "test" },
     };
     await expect(runAgent(spec, {})).rejects.toThrow(ResolutionError);

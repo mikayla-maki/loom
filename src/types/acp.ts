@@ -1,111 +1,68 @@
 /**
- * ACP-shaped session updates and protocol primitives.
+ * ACP wire types — re-exported from `@agentclientprotocol/sdk`.
  *
- * The Harness emits these as it runs a turn; the Session stores them; the
- * client consumes them via `RunningAgent.updates()`. The shape mirrors
- * agentclientprotocol.com so the SDK and the wire protocol can share types.
+ * Loom used to maintain its own ACP-shaped types; now it consumes the
+ * SDK's generated types verbatim so wire conformance is automatic.
+ *
+ * One small extension: Loom's `SessionUpdate` union includes a
+ * `"stop"` variant the SDK does not model. Harnesses emit it to mark
+ * turn end inside the session update stream; the ACP server filters
+ * stops out before forwarding so the wire stays standards-conformant.
  */
 
-/** Discriminated content blocks (mirrors ACP `ContentBlock`). */
-export type ContentBlock =
-  | { type: "text"; text: string }
-  | { type: "image"; mimeType: string; data: string }
-  | { type: "resource"; uri: string; mimeType?: string; text?: string };
+import type {
+  SessionUpdate as SDKSessionUpdate,
+  StopReason as SDKStopReason,
+} from "@agentclientprotocol/sdk";
 
-export type ToolCallStatus =
-  | "pending"
-  | "in_progress"
-  | "completed"
-  | "failed"
-  | "cancelled";
+export type {
+  ContentBlock,
+  Plan,
+  PlanEntry,
+  PlanEntryPriority,
+  PlanEntryStatus,
+  ToolCallContent,
+  ToolCallId,
+  ToolCallStatus,
+  ToolCallUpdate,
+  ToolKind,
+  Usage,
+  UsageUpdate,
+} from "@agentclientprotocol/sdk";
 
-/** ACP-style tool call content blocks. */
-export type ToolCallContent =
-  | { type: "content"; content: ContentBlock }
-  | { type: "diff"; path: string; oldText: string; newText: string };
+// Note: the SDK's `ToolCall` (wire shape) is intentionally NOT
+// re-exported here. Loom's runtime defines its own `ToolCall`
+// (dispatch shape) in `interfaces.ts`. Import the SDK's directly via
+// `import type { ToolCall } from "@agentclientprotocol/sdk"` if you
+// need the wire shape (e.g. when constructing a `SessionUpdate`).
+export type { ToolCall as WireToolCall } from "@agentclientprotocol/sdk";
 
-/** SessionUpdate — the unified vocabulary harnesses emit and sessions store. */
-export type SessionUpdate =
-  | {
-      sessionUpdate: "user_message_chunk";
-      content: ContentBlock;
-    }
-  | {
-      sessionUpdate: "agent_message_chunk";
-      content: ContentBlock;
-    }
-  | {
-      sessionUpdate: "agent_thought_chunk";
-      content: ContentBlock;
-    }
-  | {
-      sessionUpdate: "tool_call";
-      toolCallId: string;
-      title: string;
-      kind?: string;
-      status: ToolCallStatus;
-      input?: unknown;
-      content?: ToolCallContent[];
-    }
-  | {
-      sessionUpdate: "tool_call_update";
-      toolCallId: string;
-      status?: ToolCallStatus;
-      title?: string;
-      content?: ToolCallContent[];
-      output?: unknown;
-    }
-  | {
-      sessionUpdate: "plan";
-      entries: Array<{ content: string; priority?: string; status?: string }>;
-    }
-  | {
-      /**
-       * Context-window state for this session, pushed by the harness
-       * after each API request. Modeled after the draft ACP RFD
-       * (Session Usage and Context Status). Clients render a context
-       * indicator from `used / size`; sessions decide whether to
-       * compact based on `used`.
-       *
-       * Fields are camelCase even though the RFD currently uses
-       * snake_case — the rest of our SessionUpdate variants use
-       * camelCase, and the RFD will likely normalise.
-       */
-      sessionUpdate: "usage_update";
-      /** Tokens currently in context. */
-      used: number;
-      /** Model's context window in tokens. */
-      size: number;
-      /** Cumulative session cost. Optional — not all harnesses track. */
-      cost?: { amount: number; currency: string };
-    }
-  | {
-      sessionUpdate: "stop";
-      stopReason: StopReason;
-    };
+import type { Usage } from "@agentclientprotocol/sdk";
 
 /**
- * Per-turn cumulative token breakdown returned alongside `StopReason`.
- * Modeled after the draft ACP RFD's `PromptResponse.usage` shape.
- * Cumulative across the session — the harness adds to running totals on
- * each API request.
+ * Why a turn ended. Loom extends the SDK's `StopReason` enum with a
+ * non-wire `"error"` value used internally by harnesses to signal
+ * unexpected exits (network failure, malformed response, etc.). The
+ * ACP server maps `"error"` to a JSON-RPC error response rather than
+ * a normal `PromptResponse.stopReason` value.
  */
-export interface TurnUsage {
-  inputTokens: number;
-  outputTokens: number;
-  thoughtTokens?: number;
-  cachedReadTokens?: number;
-  cachedWriteTokens?: number;
-}
+export type StopReason = SDKStopReason | "error";
 
-/** Why a turn ended. */
-export type StopReason =
-  | "end_turn"
-  | "max_tokens"
-  | "max_turn_requests"
-  | "refusal"
-  | "cancelled"
-  | "error";
+/**
+ * Per-turn cumulative token breakdown. Carries the SDK's `Usage`
+ * shape (with `totalTokens`); the old Loom-specific shape is gone.
+ */
+export type TurnUsage = Usage;
+
+/**
+ * Loom-internal `SessionUpdate` extension: adds a `"stop"` variant so
+ * harnesses can mark turn boundaries in the update log. The ACP
+ * server strips `"stop"` updates before forwarding to clients (the
+ * wire signals turn end via `PromptResponse.stopReason`).
+ */
+export type SessionUpdate =
+  | SDKSessionUpdate
+  | { sessionUpdate: "stop"; stopReason: StopReason };
 
 /** A persisted session update with monotonically increasing index + timestamp. */
 export interface PersistedUpdate {

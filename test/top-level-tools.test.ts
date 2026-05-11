@@ -16,8 +16,9 @@ import * as path from "node:path";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
 import type { AgentManifest, Capabilities } from "../src/types/manifest.js";
-import type { TurnScript, TurnStep } from "../src/extensions/harness/test.js";
+import type { TurnScript, TurnStep } from "../src/builtins/harness/test.js";
 import type { Runtime } from "../src/types/interfaces.js";
+import { echoTestProvider } from "./fixtures/echo-tool.js";
 
 function buildAgent(opts: {
   tools?: AgentManifest["tools"];
@@ -83,12 +84,15 @@ describe("top-level [tools]", () => {
     // When [tools] is declared explicitly, no default cap bundle
     // applies. Tools with no `requires` (read_file is `optional`,
     // not `requires`) construct fine and rely on smart defaults.
+    // We pair read_file (a builtin) with echo from a test provider
+    // to confirm the no-default-cap-bundle path doesn't trip up
+    // either route.
     const agent = await runAgent(
       buildAgent({
         tools: { read_file: "builtin", echo: "builtin" },
         // No [capabilities] section at all.
       }),
-      {},
+      { providers: [echoTestProvider] },
     );
     try {
       const names = agent.agentState.toolTable.list().map((t) => t.name);
@@ -116,13 +120,19 @@ describe("top-level [tools]", () => {
     ).rejects.toThrow(/missing required.*subprocess/);
   });
 
-  it("audit: top-level tools show with introducedBy === '(top-level)' and render in output", async () => {
+  it("audit: top-level tools show with a tools-table introducedBy label", async () => {
     const tree = await auditAgent(buildAgent({}));
-    expect(tree.tools.every((t) => t.introducedBy === "(top-level)")).toBe(
-      true,
-    );
+    // v4: each tool's origin labels its `[tools.<name>]` block (or
+    // `(default builtin)` for the auto-loaded set when [tools] is absent).
+    expect(
+      tree.tools.every(
+        (t) =>
+          t.introducedBy === "(default builtin)" ||
+          t.introducedBy.startsWith("[tools."),
+      ),
+    ).toBe(true);
     const printed = formatCapabilityTree(tree);
-    expect(printed).toMatch(/from \(top-level\)/);
+    expect(printed).toMatch(/default builtin|\[tools\./);
   });
 
   it("system prompt: tools surface via Tool Reference", async () => {

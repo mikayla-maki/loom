@@ -1,34 +1,54 @@
 /**
- * runAgent — the top-level SDK entry point.
+ * runAgent — top-level SDK entry point. Turns an agent.toml (or parsed
+ * manifest) into a `RunningAgent`.
  *
- * Lifecycle:
- *   1. Parse manifest (or accept inline AgentManifest), resolve system_prompt.
- *   2. Build secrets store; load phase-1 secrets (harness/session/provider factory needs).
- *   3. Instantiate harness + session.
- *   4. Build runtime primitives (the methods that flow into ToolContext).
- *   5. Instantiate providers: SDK-supplied → extension-loaded → native (last).
- *      Call optional `provider.init()` on each.
- *   6. Build the flat tool-ref list from top-level `[tools]` (with the
- *      default builtin set when the field is absent).
- *   7. For each `(name, config)` ref, walk providers in order; first
- *      non-null result wins. Throw if no provider claims the name.
- *   8. Phase-2 secrets (per-tool secret needs from resolved Tools).
- *   9. Validate `[capabilities.<name>]` ceilings against each tool's declared caps.
+ * Boot pipeline (v5):
+ *   1. Parse manifest → AgentManifest.
+ *   2. Resolve manifest → ResolvedManifest (Tools instances,
+ *      tool bindings, distinct SourceSpecs, harness/session bindings).
+ *   3. Load each distinct provider source (`register()` runs,
+ *      contributing Tools / harness / session registrations).
+ *   4. Phase-1 secrets (harness + session + Tools contribution needs).
+ *   5. Instantiate harness + session from their bindings.
+ *   6. Materialise each Tools instance (`contribution.create(config,
+ *      ctx, secrets, parent?)`), then `Tools.init()` in registration
+ *      order.
+ *   7. Bind each tool to its specific Tools instance (no chain;
+ *      one Tools instance per tool per the resolver's output).
+ *   8. Phase-2 secrets (per-tool needs).
+ *   9. Validate `[capabilities]` grants + secret allowlist; runtime audit.
  *  10. Build ToolTable + AgentState + RunningAgent.
- *
- * Tools are JS objects, fully constructed by providers. Loom doesn't
- * sandbox tools at runtime; tools enforce their own declared caps.
  */
 
 import * as path from "node:path";
 
-import { getHarnessFactory, getSessionFactory } from "../extensions/index.js";
+import { getHarnessFactory, getSessionFactory } from "../builtins/index.js";
+import { type LoadOptions } from "../providers/loader.js";
 import {
-  loadExtensionPackage,
-  type LoadOptions,
-} from "../extensions/loader.js";
-import { nativeProviderFactory } from "../extensions/provider/native.js";
-import { resolveSystemPrompt } from "../manifest/resolver.js";
+  DEFAULT_CLIENT_ACP_CAPABILITIES,
+  type ClientAcpCapabilities,
+} from "../runtime/acp-capabilities.js";
+import {
+  buildNativeTools,
+  nativeBuiltinNames,
+} from "../builtins/provider/native.js";
+import {
+  resolveManifest,
+  resolveSystemPrompt,
+  sourceSpecKey,
+  type HarnessBinding,
+  type ProviderInstance,
+  type ResolvedManifest,
+  type SessionBinding,
+  type ToolBinding,
+} from "../manifest/resolver.js";
+import {
+  instantiateFromBinding,
+  loadManifestProviders,
+  lookupFactoryByBinding,
+  materialiseTools,
+  type ToolsIndex,
+} from "../runtime/boot.js";
 import {
   assertKnownKinds,
   assertRequires,
@@ -47,134 +67,83 @@ import {
   type SecretsStore,
 } from "../runtime/secrets.js";
 import { CapabilityError, ResolutionError, SecretError } from "../errors.js";
+import { ref, type Ref } from "../internal/util.js";
 import type {
   Agent,
   AuditFinding,
-  ExtensionContext,
+  FactoryContext,
   Harness,
-  Provider,
-  ProviderFactory,
-  ProviderInitArgs,
+  InitArgs,
   RuntimePrimitives,
   SecretNeeds,
   Session,
   Tool,
-  ToolConfig,
+  Tools,
 } from "../types/interfaces.js";
 import type {
   PermissionHandler,
-  PermissionRequest,
-  PermissionResult,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
 } from "../types/permissions.js";
-import type { AgentManifest, SessionSpec } from "../types/manifest.js";
+import type {
+  AgentManifest,
+  Capabilities,
+  CapabilitySet,
+  SessionSpec,
+} from "../types/manifest.js";
 
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 
 export const LOOM_VERSION = "0.1.0";
 
-const DEFAULT_SESSION = { provider: "memory" } as const;
+const DEFAULT_SESSION: SessionSpec = { provider: "memory" };
 
-/**
- * Default top-level tool set when `[tools]` is omitted from the
- * manifest. Each entry resolves through the native provider with
- * empty config; the parallel default capability grants below give
- * each tool a sensible default scope (`./` for FS tools, full env
- * for bash so commands can resolve).
- */
-const DEFAULT_TOP_LEVEL_TOOLS: Record<string, ToolConfig> = {
-  bash: {},
-  read_file: {},
-  write_file: {},
-  find: {},
-};
-
-/**
- * Default per-tool capabilities granted alongside the default tool set.
- * Used only when both `[tools]` and `[capabilities]` are absent. When
- * the manifest declares `[tools]` explicitly, no defaults apply on
- * either axis — the manifest is the source of truth.
- *
- * Note: bash gets `subprocess: "*"` and `paths: ["./"]` but no `env`
- * grant, which means bash falls back to its SAFE_DEFAULT_ENV_NAMES
- * list (PATH, HOME, locale, terminal info — no credentials).
- */
-const DEFAULT_TOP_LEVEL_CAPABILITIES: Record<
-  string,
-  import("../types/manifest.js").CapabilitySet
-> = {
+/** Default capability grants applied when both `[tools]` and `[capabilities]` are absent. */
+const DEFAULT_TOP_LEVEL_CAPABILITIES = {
   bash: { subprocess: "*", paths: ["./"] },
   read_file: { paths: ["./"] },
   write_file: { paths: ["./"] },
   find: { paths: ["./"] },
-};
-
-/** Tool-origin label for tools declared at the top level of agent.toml. */
-const TOP_LEVEL_INTRODUCER = "(top-level)";
+} as const satisfies Record<string, CapabilitySet>;
 
 export interface RunAgentOptions {
-  /** Highest-priority secret store; falls through to env/XDG/keychain/file. */
+  /** Top-priority secret store; falls through to env/XDG/keychain/file. */
   secrets?: SecretsStore;
-  /** If a required secret is missing, omit it rather than throwing. */
+  /** Omit missing required secrets instead of throwing. */
   allowMissingSecrets?: boolean;
-  /** Last-chance hook called when the secrets chain misses. */
+  /** Last-chance hook when the chain misses. */
   onMissingSecret?: OnMissingSecret;
   /**
-   * Programmatic provider instances — added BEFORE extension-loaded and
-   * native. The SDK consumer constructed these and is responsible for
-   * their trust class; loom does not resolve secrets for raw instances.
+   * Extra SDK-supplied Tools instances. Each is bound to a synthetic
+   * source key — tools that should route to one of these need a
+   * binding wired by the caller (the SDK direct path doesn't use
+   * the manifest's `[tools]` `provider` field).
    */
-  providers?: Provider[];
-  /** Capability-expansion / consent gate. Defaults to deny-all. */
+  providers?: Tools[];
+  /** Consent gate. Defaults to deny-all. */
   permissionHandler?: PermissionHandler;
-  /**
-   * Hook for non-error environment-audit findings (severity "ok" or
-   * "warning") collected from each tool's `Tool.audit()` at boot.
-   * Errors throw a `CapabilityError` and never reach this callback;
-   * warnings/oks are surfaced here so SDK consumers can log them,
-   * show them in their UI, etc. CLI clients typically print warnings
-   * to stderr; embedded callers might ignore them.
-   *
-   * When the option is omitted, warnings are silently dropped (only
-   * errors block boot). Run `loom audit` for the full picture.
-   */
+  /** Non-error `Tool.audit()` findings. Error findings throw and skip this hook. */
   onAuditFinding?: (
     finding: AuditFinding & { tool: string },
   ) => void | Promise<void>;
-  /**
-   * Skip the runtime environment audit. The static manifest checks
-   * (assertRequires, assertKnownKinds, assertSecretAllowlist) still
-   * run; this only disables the per-tool `Tool.audit()` step that
-   * surfaces things like "sandbox-exec is missing".
-   *
-   * Off by default. Set true if you want the SDK to never make IO
-   * calls (`fs.access`, etc.) at boot, e.g. in test fixtures.
-   */
+  /** Skip per-tool `Tool.audit()`. Static checks still run. */
   skipRuntimeAudit?: boolean;
-  /** Extension-package search-path overrides (used in tests). */
-  extensionLoadOptions?: LoadOptions;
-  /** Test hook: deterministic 'now' for system-prompt assembly. */
+  /** Provider discovery search-path overrides (tests). */
+  providerLoadOptions?: LoadOptions;
+  /** Deterministic 'now' for system-prompt assembly (tests). */
   now?: () => Date;
-  /**
-   * Parent agent, when this `runAgent()` call is constructing a
-   * sub-agent. Forwarded to harness/session factories as their
-   * optional 4th `parent` arg, exposed to the child's tools as
-   * `ctx.agent` (the *child* agent) plus available for
-   * parent-derived providers (`fork-of-parent`, etc.) to read off
-   * `parent.harness` / `parent.session`.
-   *
-   * Top-level `runAgent` calls leave this undefined. SDK consumers
-   * spawning a sub-agent from inside a tool typically use
-   * `ctx.spawnSubagent(...)` rather than calling `runAgent` directly
-   * — the helper auto-fills `parent` with `ctx.agent`.
-   */
+  /** Parent agent when constructing a sub-agent. Undefined at top level. */
   parent?: Agent;
+  /** Negotiated ACP client caps. Defaults to `DEFAULT_CLIENT_ACP_CAPABILITIES`. */
+  clientAcpCapabilities?: ClientAcpCapabilities;
 }
 
+/** Last-chance hook for missing secrets. Return a value or null to skip. */
 export type OnMissingSecret = (req: {
   name: string;
-  /** Comma-joined list of components asking for this secret. */
+  /** Comma-joined list of requesters. */
   requestedBy: string;
-  /** True iff at least one requester marked the secret required. */
+  /** True iff at least one requester marked it required. */
   required: boolean;
 }) => Promise<string | null> | string | null;
 
@@ -182,231 +151,143 @@ export async function runAgent(
   source: string | AgentManifest,
   options: RunAgentOptions = {},
 ): Promise<RunningAgent> {
-  // ─── 1. Parse + system prompt ───────────────────────────────────────
-  const manifest =
-    typeof source === "string"
-      ? await (await import("../manifest/parser.js")).parseAgentManifest(source)
-      : source;
+  // 1. Manifest + system prompt + factory context.
+  const manifest = await loadManifest(source);
   const baseDir = manifest.manifestPath
     ? path.dirname(manifest.manifestPath)
     : process.cwd();
   const systemPrompt = await resolveSystemPrompt(manifest, baseDir);
-
-  const extensionCtx: ExtensionContext = {
+  const factoryCtx: FactoryContext = {
     manifestDir: baseDir,
     agentName: manifest.name,
     loomVersion: LOOM_VERSION,
+    clientCapabilities:
+      options.clientAcpCapabilities ?? DEFAULT_CLIENT_ACP_CAPABILITIES,
   };
 
-  // ─── 2. Secrets store ───────────────────────────────────────────────
-  const store = buildSecretStore(manifest, options);
+  // 2. Resolve manifest to IR. Pure; throws on ambiguity / missing handles.
+  const builtinToolNames = new Set(nativeBuiltinNames());
+  const resolved = resolveManifest(manifest, { builtinToolNames });
 
-  // ─── 3. Phase-1 secrets ─────────────────────────────────────────────
-  const extensionFactories = await collectExtensionFactories(
-    manifest,
-    extensionCtx,
-    options,
+  // 3. Load each distinct provider source. `register()` registers
+  //    harness/session factories into the global registries and
+  //    returns contributed Tools registrations. The map below keys
+  //    contributions by (sourceKey + contributionName) so the
+  //    per-instance materialisation can look them up.
+  const { toolsIndex, loadErrors } = await loadManifestProviders(
+    resolved,
+    factoryCtx,
+    {
+      ...(options.providerLoadOptions
+        ? { loadOptions: options.providerLoadOptions }
+        : {}),
+    },
   );
-  const phase1Needs = collectPhase1SecretNeeds(manifest, extensionFactories);
+  // Runtime is strict: any provider load failure aborts boot. (Audit
+  // collects these errors and keeps going.)
+  if (loadErrors.size > 0) {
+    const first = [...loadErrors.entries()][0]!;
+    throw first[1];
+  }
+
+  // 4. Secrets store + phase-1 needs (harness + session + provider-
+  //    contributed Tools registrations this manifest will instantiate).
+  const store = buildSecretStore(manifest, options);
   const phase1Secrets = await loadSecretsBundle(
     store,
-    phase1Needs,
+    collectPhase1SecretNeeds(resolved, toolsIndex),
     options.allowMissingSecrets ?? false,
     options.onMissingSecret,
   );
 
-  // ─── 4. Harness + session ─────────────────────────────────
-  const harness = await instantiateHarness(
-    manifest,
-    extensionCtx,
-    phase1Secrets,
-    options.parent,
-  );
-  const session = await instantiateSession(
-    manifest,
-    extensionCtx,
-    phase1Secrets,
-    options.parent,
-  );
-  // Per-turn session hooks (`prepareTurn`, `systemPromptSection`)
-  // receive an `Agent` ref directly when they're called — nothing is
-  // bound at boot. RunningAgentImpl builds the ref on each prompt()
-  // and passes it through.
+  // 5. Harness + session + the self-Agent ref tools/providers see.
+  //    Pre-built instances pass through unchanged; specs resolve via
+  //    factory + config.
+  const harness =
+    "provider" in manifest.harness
+      ? await instantiateHarness(
+          resolved.harness!,
+          factoryCtx,
+          phase1Secrets,
+          options.parent,
+        )
+      : (manifest.harness as Harness);
+  const session =
+    manifest.session && !("provider" in manifest.session)
+      ? (manifest.session as Session)
+      : await instantiateSession(
+          resolved.session,
+          factoryCtx,
+          phase1Secrets,
+          options.parent,
+        );
+  const ownAgent = buildOwnAgent(harness, session, systemPrompt, manifest);
 
-  // The owning `Agent` ref. Stable across turns; the harness/session
-  // refs in it are the same instances RunningAgent uses. Tools see a
-  // tool-scoped variant via `ctx.agent`; providers receive this
-  // ref directly via `resolveTool(name, config, agent)`.
-  const ownAgent: Agent = {
-    harness,
-    session,
-    systemPromptCore: systemPrompt,
-    agentName: manifest.name,
-    ...(manifest.description ? { agentDescription: manifest.description } : {}),
-  };
-
-  // ─── 5. Runtime services ────────────────────────────────
-  const permissionHolder: { current: PermissionHandler | null } = {
-    current: options.permissionHandler ?? null,
-  };
+  // 6. Runtime services (per-turn abort + permission handler).
+  const permissionHolder = ref<PermissionHandler | null>(
+    options.permissionHandler ?? null,
+  );
   const runtimeServices = new RuntimeServicesImpl(permissionHolder);
-  const runtime: RuntimePrimitives = runtimeServices;
 
-  // ─── 6. Instantiate providers ───────────────────────────────────────
-  const providers: Array<{
-    name: string;
-    instance: Provider;
-    secrets: Record<string, string>;
-    config: Record<string, unknown>;
-  }> = [];
-  for (const inst of options.providers ?? []) {
-    providers.push({
-      name: "(sdk-provider)",
-      instance: inst,
-      secrets: {},
-      config: {},
-    });
-  }
-  for (const f of extensionFactories) {
-    providers.push({
-      name: f.factory.name,
-      instance: f.factory.create(),
-      secrets: secretsFor(phase1Secrets, f.factory.secrets),
-      config: f.config,
-    });
-  }
-  providers.push({
-    name: nativeProviderFactory.name,
-    instance: nativeProviderFactory.create(),
-    secrets: {},
-    config: {},
+  // 7. Materialise + init each Tools instance the resolver asked for.
+  //    SDK-supplied Tools instances are appended afterwards under a
+  //    synthetic "(sdk)" slot — they don't participate in the
+  //    manifest's bindings but are still init'd and closed with the
+  //    rest.
+  const instances = await materialiseTools_all({
+    resolved,
+    toolsIndex,
+    sdkTools: options.providers ?? [],
+    manifest,
+    factoryCtx,
+    phase1Secrets,
+    runtime: runtimeServices,
+    parent: options.parent,
   });
 
-  // ─── 7. Init each provider ──────────────────────────────────────────
-  for (const p of providers) {
-    if (!p.instance.init) continue;
-    const initArgs: ProviderInitArgs = {
-      manifest,
-      config: p.config,
-      secrets: p.secrets,
-      extensionContext: extensionCtx,
-      runtime,
-    };
-    await Promise.resolve(p.instance.init(initArgs));
-  }
+  // 8. Bind tools (manifest [tools] → resolver bindings + session.tools()).
+  //    Each binding maps to a single provider instance by id.
+  const effectiveCapabilities = effectiveCapabilitiesFor(manifest);
+  const sessionToolBindings = await collectSessionToolBindings(session);
+  const allBindings: ToolBinding[] = [
+    ...resolved.tools,
+    ...sessionToolBindings,
+  ];
+  const resolvedTools = await bindTools(
+    allBindings,
+    effectiveCapabilities,
+    ownAgent,
+    instances,
+  );
 
-  // ─── 8. Build flat tool-ref list ───────────────────────
-  // Top-level [tools] (with defaults if absent), then anything the
-  // session contributes via `session.tools()`. Sessions composed via
-  // ChainedSession aggregate their children's tools internally before
-  // we see the result here.
-  const topLevelSpec = manifest.tools ?? DEFAULT_TOP_LEVEL_TOOLS;
-  // When the manifest declares neither [tools] nor [capabilities], use
-  // the default-tool capability bundle. When it declares [tools], the
-  // manifest's [capabilities] table (or empty) is the source of truth.
-  const effectiveCapabilities: import("../types/manifest.js").Capabilities =
-    manifest.tools === undefined && manifest.capabilities === undefined
-      ? DEFAULT_TOP_LEVEL_CAPABILITIES
-      : (manifest.capabilities ?? {});
-  const refs: Array<{ name: string; config: ToolConfig; origin: string }> = [];
-  for (const [name, config] of Object.entries(topLevelSpec)) {
-    refs.push({ name, config, origin: TOP_LEVEL_INTRODUCER });
-  }
-  const sessionTools = (await session.tools?.()) ?? [];
-  for (const ref of sessionTools) {
-    refs.push({
-      name: ref.name,
-      config: ref.config,
-      origin: "(session)",
-    });
-  }
-
-  // ─── 9. Resolve each ref through the provider chain ────────────
-  // ─── 9. Resolve each ref through the provider chain ────
-  const resolvedTools = new Map<string, Tool>();
-  for (const ref of refs) {
-    let claimed: Tool | null = null;
-    const grant = effectiveCapabilities[ref.name];
-    for (const p of providers) {
-      const result = await Promise.resolve(
-        p.instance.resolveTool(ref.name, ref.config, ownAgent, grant),
-      );
-      if (result) {
-        claimed = result;
-        break;
-      }
-    }
-    if (!claimed) {
-      throw new ResolutionError(
-        `Tool '${ref.name}' (introduced by ${ref.origin}) was not claimed by any provider. Registered providers: ${providers.map((p) => p.name).join(", ")}.`,
-      );
-    }
-    if (claimed.name !== ref.name) {
-      throw new ResolutionError(
-        `Tool '${ref.name}' was constructed with a mismatched name '${claimed.name}'. Provider must honor the requested name.`,
-      );
-    }
-    resolvedTools.set(ref.name, claimed);
-  }
-
-  // ─── 10. Phase-2 secrets ──────────────────────────────────
-  const toolNeeds = collectToolSecretNeeds(resolvedTools);
+  // 9. Phase-2 secrets (per-tool needs).
   const phase2Secrets = await loadSecretsBundle(
     store,
-    toolNeeds,
+    collectToolSecretNeeds(resolvedTools),
     options.allowMissingSecrets ?? false,
     options.onMissingSecret,
   );
   const allSecrets = { ...phase1Secrets, ...phase2Secrets };
 
-  // ─── 11. Validate capability grants + secret allowlist ───────────
-  // Three boot guards on the manifest grants:
-  //   (a) every kind in a structured grant is one the tool declares
-  //       it understands (catches typos / phantom-constraint footguns)
-  //   (b) every tool's `requires` kinds are present in its grant
-  //   (c) every tool's secret needs fit in [agent].secrets (when set)
+  // 10. Validate grants + secret allowlist; runtime tool audit.
   assertKnownKinds(resolvedTools, effectiveCapabilities);
   assertRequires(resolvedTools, effectiveCapabilities);
   assertSecretAllowlist(resolvedTools, manifest.secrets);
-
-  // ─── 11b. Runtime environment audit ───────────────────────
-  // Each tool's `audit()` reports environment-readiness preconditions
-  // (e.g. "bwrap not installed"). Error-severity findings throw at boot;
-  // warnings flow to options.onAuditFinding for the SDK consumer to
-  // surface (or ignore). Static manifest issues are caught above; this
-  // catches things only knowable at runtime.
   if (!options.skipRuntimeAudit) {
     await runRuntimeAudit(resolvedTools, options.onAuditFinding);
   }
 
-  // ─── 12. Build ToolTable + AgentState ─────────────────────
-  const toolTable = new ToolTable({
-    tools: [...resolvedTools.values()].map((tool) => ({
-      tool,
-      allowedSecrets: secretAllowlist({
-        required: tool.secrets?.required ?? [],
-        optional: tool.secrets?.optional ?? [],
-      }),
-    })),
-    secrets: allSecrets,
-    contextFactory: {
-      build: ({ tool }) => ({
-        secrets: {}, // overridden by ToolTable per-call
-        abortSignal: runtimeServices.currentAbortSignal(),
-        requestPermission: (req) => runtime.requestPermission(req),
-        // The Agent ref handed to the tool. Same data as `ownAgent`
-        // but with a tool-scoped `spawnSubagent` closure — lookups by
-        // name resolve against THIS tool's `dependencies.subagents`.
-        agent: agentForTool(ownAgent, tool),
-      }),
-    },
-  });
-
+  // 11. ToolTable + AgentState + RunningAgent.
+  const toolTable = buildToolTable(
+    resolvedTools,
+    allSecrets,
+    runtimeServices,
+    ownAgent,
+  );
   const state = new AgentState({
     grants: effectiveCapabilities,
     toolTable,
   });
-
   return new RunningAgentImpl({
     manifest,
     systemPrompt,
@@ -416,111 +297,330 @@ export async function runAgent(
     state,
     updateSink: new UpdateSink(),
     secrets: allSecrets,
-    providers: providers.map((p) => p.instance),
+    providers: instances.map((i) => i.tools),
     permissionHolder,
     runtimeServices,
     ...(options.now ? { now: options.now } : {}),
   });
 }
 
+// ─── 1. manifest loading ──────────────────────────────────────────────────
+
+async function loadManifest(
+  source: string | AgentManifest,
+): Promise<AgentManifest> {
+  if (typeof source !== "string") return source;
+  const { parseAgentManifest } = await import("../manifest/parser.js");
+  return parseAgentManifest(source);
+}
+
+// ─── self-agent ref ───────────────────────────────────────────────────────
+
+function buildOwnAgent(
+  harness: Harness,
+  session: Session,
+  systemPrompt: string,
+  manifest: AgentManifest,
+): Agent {
+  return {
+    harness,
+    session,
+    systemPromptCore: systemPrompt,
+    agentName: manifest.name,
+    ...(manifest.description ? { agentDescription: manifest.description } : {}),
+  };
+}
+
+// ─── 3. provider loading ────────────────────────────────────────────────────
+
 /**
- * Run each tool's `Tool.audit()`, throw on `error` severity, surface
- * `ok` / `warning` via the optional callback. Aggregates errors
- * across all tools so the user sees every issue at once instead of
- * fixing one and discovering the next.
+ * Index of provider-contributed Tools registrations, keyed by source
+ * + contribution name.
+ *
+ * Built when we load each distinct SourceSpec the manifest references.
+ * `ToolsIndex` is the shared shape (handled by `loadManifestProviders`
+ * in `runtime/boot.ts`). Each provider's contributions are indexed
+ * both under their declared name AND under the package's default name
+ * so the v5 "primary contribution = package name" convention
+ * resolves cleanly.
  */
-async function runRuntimeAudit(
-  tools: Map<string, Tool>,
-  onFinding: RunAgentOptions["onAuditFinding"],
-): Promise<void> {
-  const errors: Array<{ tool: string; finding: AuditFinding }> = [];
-  for (const [name, tool] of tools) {
-    if (typeof tool.audit !== "function") continue;
-    let findings: AuditFinding[] = [];
-    try {
-      const result = await Promise.resolve(tool.audit());
-      if (Array.isArray(result)) findings = result;
-    } catch (e) {
-      findings = [
-        {
-          severity: "error",
-          message: `tool.audit() threw: ${(e as Error).message}`,
-        },
-      ];
-    }
-    for (const finding of findings) {
-      if (finding.severity === "error") {
-        errors.push({ tool: name, finding });
-        continue;
-      }
-      if (onFinding) {
-        await Promise.resolve(onFinding({ tool: name, ...finding }));
-      }
-    }
+
+// ─── 7. Tools instance materialisation ──────────────────────────────────
+
+/**
+ * Materialised Tools instance — paired with its boot inputs so we
+ * can call `init()` and report it back to the RunningAgent for cleanup.
+ */
+interface MaterialisedTools {
+  /** Resolver-assigned id (`"native"`, `"p1"`, `"p2"`, …) or `"(sdk-N)"`. */
+  id: string;
+  tools: Tools;
+  /** Config passed to the contribution's `create()`. */
+  config: Record<string, unknown>;
+  /** Filtered secrets the contribution asked for. */
+  secrets: Record<string, string>;
+  /** Contribution name for diagnostics. */
+  contributionName: string;
+}
+
+async function materialiseTools_all(args: {
+  resolved: ResolvedManifest;
+  toolsIndex: ToolsIndex;
+  sdkTools: Tools[];
+  manifest: AgentManifest;
+  factoryCtx: FactoryContext;
+  phase1Secrets: Record<string, string>;
+  runtime: RuntimePrimitives;
+  parent: Agent | undefined;
+}): Promise<MaterialisedTools[]> {
+  const out: MaterialisedTools[] = [];
+
+  // Always materialise the native Tools instance, even when the
+  // resolver didn't reference it. It's stateless and cheap;
+  // session-contributed tools and SDK-direct paths can route through
+  // it without the manifest having an explicit binding.
+  const hasNative = args.resolved.providers.some((p) => p.kind === "native");
+  if (!hasNative) {
+    out.push({
+      id: "native",
+      tools: buildNativeTools(),
+      config: {},
+      secrets: {},
+      contributionName: "native",
+    });
   }
-  if (errors.length > 0) {
-    const summary = errors
-      .map((e) => {
-        const r = e.finding.remediation
-          ? `\n    → ${e.finding.remediation}`
-          : "";
-        return `  ✗ ${e.tool}: ${e.finding.message}${r}`;
-      })
-      .join("\n");
-    throw new CapabilityError(
-      `Runtime environment audit failed for ${errors.length} tool${
-        errors.length === 1 ? "" : "s"
-      }:\n${summary}`,
-      Object.fromEntries(errors.map((e) => [e.tool, e.finding.message])),
-      {},
+
+  for (const instance of args.resolved.providers) {
+    if (instance.kind === "native") {
+      out.push({
+        id: instance.id,
+        tools: buildNativeTools(),
+        config: {},
+        secrets: {},
+        contributionName: "native",
+      });
+      continue;
+    }
+    // Provider-backed instance: shared construction via boot.ts.
+    // Filter secrets to what the contribution declared interest in;
+    // we need to peek at the contribution first to do this.
+    const peek = peekToolsContribution(args.toolsIndex, instance);
+    const secrets = secretsFor(args.phase1Secrets, peek?.secrets);
+    const { tools, contribution } = await materialiseTools(
+      instance,
+      args.toolsIndex,
+      args.factoryCtx,
+      secrets,
+      args.parent,
     );
+    out.push({
+      id: instance.id,
+      tools,
+      config: instance.config,
+      secrets,
+      contributionName: contribution.name,
+    });
   }
+
+  // SDK-supplied Tools instances are appended; they're addressable only
+  // by SDK-direct callers (not by manifest [tools] entries).
+  args.sdkTools.forEach((inst, i) => {
+    out.push({
+      id: `(sdk-${i})`,
+      tools: inst,
+      config: {},
+      secrets: {},
+      contributionName: "(sdk)",
+    });
+  });
+
+  // Init phase. Tools instances must NOT call runtime methods inside
+  // their own init(); the contract is "init runs in registration
+  // order; runtime methods are usable once all inits have returned."
+  for (const m of out) {
+    if (!m.tools.init) continue;
+    const initArgs: InitArgs = {
+      manifest: args.manifest,
+      config: m.config,
+      secrets: m.secrets,
+      factoryContext: args.factoryCtx,
+      runtime: args.runtime,
+    };
+    await Promise.resolve(m.tools.init(initArgs));
+  }
+
+  return out;
 }
 
-// ─── runtime services (the RuntimePrimitives implementation) ───────
-
-class RuntimeServicesImpl implements RuntimePrimitives {
-  private abortSignal: AbortSignal = new AbortController().signal;
-
-  constructor(
-    private readonly permissionHolder: { current: PermissionHandler | null },
-  ) {}
-
-  /** Called by RunningAgent at the start of each turn. */
-  setAbortSignal(signal: AbortSignal): void {
-    this.abortSignal = signal;
+/** Best-effort peek at the contribution registration for a provider instance. */
+function peekToolsContribution(
+  index: ToolsIndex,
+  instance: ProviderInstance,
+): { secrets?: SecretNeeds } | undefined {
+  if (instance.kind !== "provider" || !instance.source) return undefined;
+  const srcKey = sourceSpecKey(instance.source);
+  for (const [key, c] of index) {
+    if (key.startsWith(`${srcKey}::`)) return c;
   }
-
-  currentAbortSignal(): AbortSignal {
-    return this.abortSignal;
-  }
-
-  requestPermission(req: PermissionRequest): Promise<PermissionResult> {
-    const handler = this.permissionHolder.current;
-    if (!handler) return Promise.resolve({ decision: "deny" });
-    return Promise.resolve(handler(req));
-  }
+  return undefined;
 }
 
-export type { RuntimeServicesImpl };
+// ─── 8. tool binding ──────────────────────────────────────────────────────
 
-// ─── secrets pipeline ────────────────────────────────────────────────────
+/**
+ * Per-manifest effective capability set. Defaults apply only when
+ * BOTH `[tools]` and `[capabilities]` are absent.
+ */
+function effectiveCapabilitiesFor(manifest: AgentManifest): Capabilities {
+  if (manifest.tools === undefined && manifest.capabilities === undefined) {
+    return DEFAULT_TOP_LEVEL_CAPABILITIES;
+  }
+  return manifest.capabilities ?? {};
+}
+
+async function bindTools(
+  bindings: ToolBinding[],
+  capabilities: Capabilities,
+  ownAgent: Agent,
+  instances: MaterialisedTools[],
+): Promise<Map<string, Tool>> {
+  const byId = new Map<string, MaterialisedTools>(
+    instances.map((m) => [m.id, m]),
+  );
+  // SDK-supplied Tools instances act as a fallback chain when the
+  // resolver-assigned instance returns null for a tool. This preserves
+  // the SDK-direct pattern (caller wires a custom Tools instance,
+  // manifest's `[tools]` doesn't specify a `provider` field, custom
+  // names get claimed by the SDK Tools) without requiring per-tool
+  // bindings.
+  const sdkChain = instances.filter((m) => m.id.startsWith("(sdk-"));
+
+  const resolved = new Map<string, Tool>();
+  for (const binding of bindings) {
+    const inst = byId.get(binding.providerInstanceId);
+    if (!inst) {
+      throw new ResolutionError(
+        `Tool '${binding.toolName}' (${binding.origin}) references Tools ` +
+          `instance '${binding.providerInstanceId}', which wasn't materialised. ` +
+          `This is a resolver/runtime mismatch.`,
+      );
+    }
+    const grant = capabilities[binding.toolName];
+    let tool = await Promise.resolve(
+      inst.tools.resolveTool(
+        binding.toolName,
+        binding.toolConfig,
+        ownAgent,
+        grant,
+      ),
+    );
+    // Fallback: when the assigned Tools instance declines (likely the
+    // native Tools being asked for a non-builtin tool name), walk the
+    // SDK-supplied Tools as a chain.
+    if (!tool && binding.providerInstanceId === "native") {
+      for (const sdk of sdkChain) {
+        tool = await Promise.resolve(
+          sdk.tools.resolveTool(
+            binding.toolName,
+            binding.toolConfig,
+            ownAgent,
+            grant,
+          ),
+        );
+        if (tool) break;
+      }
+    }
+    if (!tool) {
+      throw new ResolutionError(
+        `Tools instance '${binding.providerInstanceId}' (${inst.contributionName}) ` +
+          `did not claim tool '${binding.toolName}' (${binding.origin}). ` +
+          `Its resolveTool() returned null. ` +
+          (sdkChain.length > 0
+            ? `SDK-supplied Tools also declined.`
+            : `No SDK Tools instances configured to fall back to.`),
+      );
+    }
+    resolved.set(binding.toolName, tool);
+  }
+  return resolved;
+}
+
+/** Session-contributed tools, fed into the resolver's binding shape. */
+async function collectSessionToolBindings(
+  session: Session,
+): Promise<ToolBinding[]> {
+  const tools = (await session.tools?.()) ?? [];
+  return tools.map((ref) => ({
+    toolName: ref.name,
+    providerInstanceId: "native",
+    toolConfig: typeof ref.config === "string" ? {} : ref.config,
+    origin: "(session)",
+  }));
+}
+
+// ─── 5. harness + session instantiation ───────────────────────────────────
+
+async function instantiateHarness(
+  binding: HarnessBinding,
+  factoryCtx: FactoryContext,
+  phase1Secrets: Record<string, string>,
+  parent: Agent | undefined,
+): Promise<Harness> {
+  // Two-phase secret filter: look up the factory first (with the
+  // package-name fallback in boot.ts), then pass it the secrets
+  // it declared interest in. We need a peek-then-create dance
+  // because `instantiateFromBinding` takes already-filtered secrets.
+  const factory = lookupFactoryByBinding(
+    binding.factoryName,
+    binding.source,
+    getHarnessFactory,
+  );
+  const { instance } = await instantiateFromBinding<Harness>(
+    binding,
+    () => factory,
+    factoryCtx,
+    secretsFor(phase1Secrets, factory.secrets),
+    parent,
+    "harness",
+  );
+  return instance;
+}
+
+async function instantiateSession(
+  binding: SessionBinding | undefined,
+  factoryCtx: FactoryContext,
+  phase1Secrets: Record<string, string>,
+  parent: Agent | undefined,
+): Promise<Session> {
+  // Default session is the in-process `memory` factory.
+  const effective: SessionBinding = binding ?? {
+    factoryName: "memory",
+    config: {},
+  };
+  const factory = lookupFactoryByBinding(
+    effective.factoryName,
+    effective.source,
+    getSessionFactory,
+  );
+  const { instance } = await instantiateFromBinding<Session>(
+    effective,
+    () => factory,
+    factoryCtx,
+    secretsFor(phase1Secrets, factory.secrets),
+    parent,
+    "session",
+  );
+  return instance;
+}
+
+// ─── 4 + 9. secrets pipeline ──────────────────────────────────────────────
 
 interface SecretRequest {
   name: string;
   required: boolean;
-  /** Diagnostic label: "harness:anthropic" / "tool:bash" / "provider:mcp". */
   requestedBy: string;
 }
 
-/**
- * Default chain priority (first hit wins):
- *   1. caller-supplied store (`options.secrets`)
- *   2. environment
- *   3. XDG: `$XDG_CONFIG_HOME/loom/secrets.toml`
- *   4. macOS Keychain (silent on other OSes)
- *   5. per-agent `.loom-secrets`
- */
 function buildSecretStore(
   manifest: AgentManifest,
   options: RunAgentOptions,
@@ -541,23 +641,44 @@ function buildSecretStore(
 }
 
 function collectPhase1SecretNeeds(
-  manifest: AgentManifest,
-  extensionFactories: Array<{
-    factory: ProviderFactory;
-    config: Record<string, unknown>;
-  }>,
+  resolved: ResolvedManifest,
+  toolsIndex: ToolsIndex,
 ): SecretRequest[] {
   const out: SecretRequest[] = [];
-  if ("provider" in manifest.harness) {
-    const f = getHarnessFactory(manifest.harness.provider);
-    pushNeeds(out, f.secrets, `harness:${f.name}`);
+  // Harness factory needs (only when a HarnessBinding is present —
+  // pre-built instances bring their own state and don't need secrets
+  // resolved at the SDK layer).
+  if (resolved.harness) {
+    try {
+      const f = getHarnessFactory(resolved.harness.factoryName);
+      pushNeeds(out, f.secrets, `harness:${f.name}`);
+    } catch {
+      // Surfaced later by instantiateHarness.
+    }
   }
-  if (manifest.session && "provider" in manifest.session) {
-    const f = getSessionFactory(manifest.session.provider);
-    pushNeeds(out, f.secrets, `session:${f.name}`);
+  // Session factory needs.
+  if (resolved.session) {
+    try {
+      const f = getSessionFactory(resolved.session.factoryName);
+      pushNeeds(out, f.secrets, `session:${f.name}`);
+    } catch {
+      // Surfaced later by instantiateSession.
+    }
   }
-  for (const ef of extensionFactories) {
-    pushNeeds(out, ef.factory.secrets, `provider:${ef.factory.name}`);
+  // Tools-contribution needs (one entry per *distinct* materialised
+  // instance — we collect needs per contribution by visiting each
+  // instance's source).
+  for (const instance of resolved.providers) {
+    if (instance.kind === "native") continue;
+    if (!instance.source) continue;
+    const srcKey = sourceSpecKey(instance.source);
+    // Look for any Tools registration for this source; use its
+    // secrets as a best-effort approximation.
+    for (const [key, contribution] of toolsIndex) {
+      if (!key.startsWith(`${srcKey}::`)) continue;
+      pushNeeds(out, contribution.secrets, `provider:${contribution.name}`);
+      break;
+    }
   }
   return out;
 }
@@ -698,95 +819,136 @@ function secretAllowlist(needs: {
   return new Set([...(needs.required ?? []), ...(needs.optional ?? [])]);
 }
 
-// ─── instantiate harness / session ────────────────────────────────────────
+// ─── 11. tool table + runtime audit ───────────────────────────────────────
 
-async function instantiateHarness(
-  manifest: AgentManifest,
-  ctx: ExtensionContext,
-  phase1Secrets: Record<string, string>,
-  parent: Agent | undefined,
-): Promise<Harness> {
-  const spec = manifest.harness;
-  if ("provider" in spec) {
-    const factory = getHarnessFactory(spec.provider);
-    if (factory.requiresParent && !parent) {
-      throw new ResolutionError(
-        `Harness provider '${factory.name}' requires a parent agent and cannot be used at the top level. Construct it inside a tool/session that spawns this manifest as a sub-agent (e.g. via \`ctx.spawnSubagent(...)\` or \`runAgent(submanifest, { parent })\`).`,
-      );
-    }
-    const { provider: _p, ...config } = spec;
-    void _p;
-    const sub = secretsFor(phase1Secrets, factory.secrets);
-    return await factory.create(config, ctx, sub, parent);
-  }
-  return spec;
+function buildToolTable(
+  resolvedTools: Map<string, Tool>,
+  allSecrets: Record<string, string>,
+  runtimeServices: RuntimeServicesImpl,
+  ownAgent: Agent,
+): ToolTable {
+  return new ToolTable({
+    tools: [...resolvedTools.values()].map((tool) => ({
+      tool,
+      allowedSecrets: secretAllowlist({
+        required: tool.secrets?.required ?? [],
+        optional: tool.secrets?.optional ?? [],
+      }),
+    })),
+    secrets: allSecrets,
+    contextFactory: {
+      build: ({ tool }) => ({
+        secrets: {}, // overridden by ToolTable per-call
+        abortSignal: runtimeServices.currentAbortSignal(),
+        requestPermission: (req) => runtimeServices.requestPermission(req),
+        agent: agentForTool(ownAgent, tool),
+      }),
+    },
+  });
 }
 
-async function instantiateSession(
-  manifest: AgentManifest,
-  ctx: ExtensionContext,
-  phase1Secrets: Record<string, string>,
-  parent: Agent | undefined,
-): Promise<Session> {
-  const spec: SessionSpec = manifest.session ?? { ...DEFAULT_SESSION };
-  if ("provider" in spec) {
-    const factory = getSessionFactory(spec.provider);
-    if (factory.requiresParent && !parent) {
-      throw new ResolutionError(
-        `Session provider '${factory.name}' requires a parent agent and cannot be used at the top level. Construct it inside a tool/session that spawns this manifest as a sub-agent (e.g. via \`ctx.spawnSubagent(...)\` or \`runAgent(submanifest, { parent })\`).`,
-      );
+async function runRuntimeAudit(
+  tools: Map<string, Tool>,
+  onFinding: RunAgentOptions["onAuditFinding"],
+): Promise<void> {
+  const errors: Array<{ tool: string; finding: AuditFinding }> = [];
+  for (const [name, tool] of tools) {
+    if (typeof tool.audit !== "function") continue;
+    let findings: AuditFinding[] = [];
+    try {
+      const result = await Promise.resolve(tool.audit());
+      if (Array.isArray(result)) findings = result;
+    } catch (e) {
+      findings = [
+        {
+          severity: "error",
+          message: `tool.audit() threw: ${(e as Error).message}`,
+        },
+      ];
     }
-    const { provider: _p, ...config } = spec;
-    void _p;
-    const sub = secretsFor(phase1Secrets, factory.secrets);
-    return await factory.create(config, ctx, sub, parent);
+    for (const finding of findings) {
+      if (finding.severity === "error") {
+        errors.push({ tool: name, finding });
+        continue;
+      }
+      if (onFinding) {
+        await Promise.resolve(onFinding({ tool: name, ...finding }));
+      }
+    }
   }
-  return spec;
+  if (errors.length > 0) {
+    const summary = errors
+      .map((e) => {
+        const r = e.finding.remediation
+          ? `\n    → ${e.finding.remediation}`
+          : "";
+        return `  ✗ ${e.tool}: ${e.finding.message}${r}`;
+      })
+      .join("\n");
+    throw new CapabilityError(
+      `Runtime environment audit failed for ${errors.length} tool${
+        errors.length === 1 ? "" : "s"
+      }:\n${summary}`,
+      Object.fromEntries(errors.map((e) => [e.tool, e.finding.message])),
+      {},
+    );
+  }
 }
 
-/**
- * Build a tool-scoped Agent ref — same data as the caller's
- * `ownAgent`, but with a `spawnSubagent` method whose lookup scope is
- * THIS tool's `dependencies.subagents`. The runtime hands this to
- * tools as `ctx.agent`; the same Agent ref also flows out as `parent`
- * when the tool spawns a child via `ctx.agent.spawnSubagent(...)`.
- *
- * Recursion-friendly: the spawned `RunningAgent` is itself a fresh
- * call into `runAgent`, with its own provider chain and tool
- * registry. No fan-up of updates; no cascade-cancellation.
- */
+// ─── runtime services ─────────────────────────────────────────────────────
+
+class RuntimeServicesImpl implements RuntimePrimitives {
+  private abortSignal: AbortSignal = new AbortController().signal;
+
+  constructor(
+    private readonly permissionHolder: Ref<PermissionHandler | null>,
+  ) {}
+
+  setAbortSignal(signal: AbortSignal): void {
+    this.abortSignal = signal;
+  }
+
+  currentAbortSignal(): AbortSignal {
+    return this.abortSignal;
+  }
+
+  requestPermission(
+    req: Omit<RequestPermissionRequest, "sessionId">,
+  ): Promise<RequestPermissionResponse> {
+    const handler = this.permissionHolder.current;
+    if (!handler) return Promise.resolve({ outcome: { outcome: "cancelled" } });
+    return Promise.resolve(handler(req));
+  }
+}
+
+export type { RuntimeServicesImpl };
+
+// ─── subagent scope ───────────────────────────────────────────────────────
+
+function agentWithScopedSpawn(
+  base: Agent,
+  scope: { declared: AgentManifest[]; who: string },
+): Agent {
+  const scoped: Agent = {
+    ...base,
+    spawnSubagent: (nameOrManifest) =>
+      spawnSubagentInScope(nameOrManifest, scope.declared, scope.who, scoped),
+  };
+  return scoped;
+}
+
 function agentForTool(base: Agent, tool: Tool): Agent {
-  const ref: Agent = {
-    ...base,
-    spawnSubagent: (nameOrManifest) =>
-      spawnSubagentInScope(
-        nameOrManifest,
-        tool.dependencies?.subagents ?? [],
-        `Tool '${tool.name}'`,
-        ref,
-      ),
-  };
-  return ref;
+  return agentWithScopedSpawn(base, {
+    declared: tool.dependencies?.subagents ?? [],
+    who: `Tool '${tool.name}'`,
+  });
 }
 
-/**
- * Build a session-scoped Agent ref — same data as `ownAgent`, but
- * with a `spawnSubagent` whose lookup scope is THIS session's
- * `dependencies.subagents`. RunningAgent hands this to session hooks
- * (`prepareTurn`, `systemPromptSection`).
- */
 export function agentForSession(base: Agent, session: Session): Agent {
-  const ref: Agent = {
-    ...base,
-    spawnSubagent: (nameOrManifest) =>
-      spawnSubagentInScope(
-        nameOrManifest,
-        session.dependencies?.subagents ?? [],
-        `Session '${base.agentName}'`,
-        ref,
-      ),
-  };
-  return ref;
+  return agentWithScopedSpawn(base, {
+    declared: session.dependencies?.subagents ?? [],
+    who: `Session '${base.agentName}'`,
+  });
 }
 
 async function spawnSubagentInScope(
@@ -801,7 +963,11 @@ async function spawnSubagentInScope(
     if (!found) {
       const have = declared.map((m) => m.name).join(", ") || "(none)";
       throw new ResolutionError(
-        `${who} tried to spawn sub-agent '${nameOrManifest}', but its \`dependencies.subagents\` declares: ${have}. Lookups are scoped to the caller's own deps — there is no global registry. Either add the manifest to \`dependencies.subagents\` (so audit can see it) or pass the manifest object inline.`,
+        `${who} tried to spawn sub-agent '${nameOrManifest}', but its ` +
+          `\`dependencies.subagents\` declares: ${have}. Lookups are scoped ` +
+          `to the caller's own deps — there is no global registry. Either ` +
+          `add the manifest to \`dependencies.subagents\` (so audit can ` +
+          `see it) or pass the manifest object inline.`,
       );
     }
     submanifest = found;
@@ -809,39 +975,6 @@ async function spawnSubagentInScope(
     submanifest = nameOrManifest;
   }
   return runAgent(submanifest, { parent });
-}
-
-// ─── extensions ──────────────────────────────────────────────────────────
-
-async function collectExtensionFactories(
-  manifest: AgentManifest,
-  ctx: ExtensionContext,
-  options: RunAgentOptions,
-): Promise<
-  Array<{ factory: ProviderFactory; config: Record<string, unknown> }>
-> {
-  const factories: Array<{
-    factory: ProviderFactory;
-    config: Record<string, unknown>;
-  }> = [];
-  for (const [pkgName, pkgConfig] of Object.entries(
-    manifest.extensions ?? {},
-  )) {
-    const { addedProviderFactories } = await loadExtensionPackage(
-      pkgName,
-      pkgConfig,
-      {
-        agentManifestDir: ctx.manifestDir,
-        agentName: ctx.agentName,
-        loomVersion: ctx.loomVersion,
-      },
-      options.extensionLoadOptions ?? {},
-    );
-    for (const f of addedProviderFactories) {
-      factories.push({ factory: f, config: pkgConfig });
-    }
-  }
-  return factories;
 }
 
 export { StaticSecretsStore };

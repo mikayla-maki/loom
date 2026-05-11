@@ -23,15 +23,35 @@ import type {
 import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
-import { describePaths, pathAllowed, paths, resolvedPaths } from "./_path.js";
+import {
+  collectTrustedPaths,
+  describePaths,
+  effectivePaths,
+  pathAllowed,
+  paths,
+  resolvedPaths,
+} from "./_path.js";
 
+/**
+ * Input schema. `ToolTable` validates against this before dispatch —
+ * `execute()` may trust `path` is a non-empty string.
+ */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["path"],
+  additionalProperties: false,
   properties: {
-    path: { type: "string", description: "Path to the file to read." },
+    path: {
+      type: "string",
+      minLength: 1,
+      description: "Path to the file to read.",
+    },
   },
 };
+
+interface ReadFileInput {
+  path: string;
+}
 
 export class ReadFileTool implements Tool {
   public readonly name = "read_file";
@@ -49,13 +69,15 @@ export class ReadFileTool implements Tool {
     this.description = `Read a UTF-8 file from disk (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
-  async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
-    const requested = (input as { path?: unknown }).path;
-    if (typeof requested !== "string" || !requested) {
-      return { content: "read_file: 'path' is required", isError: true };
-    }
+  async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
+    const { path: requested } = input as ReadFileInput;
     const target = path.resolve(requested);
-    if (!pathAllowed(target, this.granted)) {
+    // Effective path set = manifest grant ∪ session trusted paths
+    // (read-or-better). Trusted paths come from the session and may
+    // change per-turn; recomputing here keeps the check honest.
+    const trusted = await collectTrustedPaths(ctx);
+    const effective = effectivePaths(this.granted, trusted, "read");
+    if (!pathAllowed(target, effective)) {
       return {
         content: `read_file: '${requested}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,

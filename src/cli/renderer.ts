@@ -2,16 +2,15 @@
  * Simple line-based renderer — prints session updates to stdout in plain text.
  *
  * The renderer is split out so it can be reused by the CLI, ACP smoke tests,
- * etc. It does NOT do anything fancy (no spinners, no colours by default).
- * Pass `useColors: true` to enable minimal ANSI styling.
  */
 
 import type { SessionUpdate } from "../types/acp.js";
+import { wantsColor } from "./term.js";
 
 export interface RendererOptions {
   out?: NodeJS.WritableStream;
+  /** Override colour detection. Defaults to `COLORTERM`-driven. */
   useColors?: boolean;
-  showThoughts?: boolean;
 }
 
 const ANSI = {
@@ -27,13 +26,11 @@ const ANSI = {
 export class TextRenderer {
   private readonly out: NodeJS.WritableStream;
   private readonly colors: boolean;
-  private readonly showThoughts: boolean;
   private lastKind: string | null = null;
 
   constructor(options: RendererOptions = {}) {
     this.out = options.out ?? process.stdout;
-    this.colors = options.useColors ?? Boolean(process.stdout.isTTY);
-    this.showThoughts = options.showThoughts ?? false;
+    this.colors = options.useColors ?? wantsColor();
   }
 
   render(update: SessionUpdate): void {
@@ -49,14 +46,14 @@ export class TextRenderer {
         }
         break;
       case "agent_thought_chunk":
-        if (this.showThoughts && update.content.type === "text") {
+        if (update.content.type === "text") {
           this.line("thought", update.content.text, ANSI.dim);
         }
         break;
       case "tool_call":
         this.line(
           "tool",
-          `${update.title} ${this.briefJson(update.input)}`,
+          `${update.title} ${this.briefJson(update.rawInput)}`,
           ANSI.yellow,
         );
         break;
@@ -64,7 +61,11 @@ export class TextRenderer {
         const status = update.status ?? "";
         const text =
           (update.content ?? [])
-            .map((c) => (c.type === "content" && c.content.type === "text" ? c.content.text : ""))
+            .map((c) =>
+              c.type === "content" && c.content.type === "text"
+                ? c.content.text
+                : "",
+            )
             .join("")
             .trim() || "(no output)";
         const color = update.status === "failed" ? ANSI.red : ANSI.green;

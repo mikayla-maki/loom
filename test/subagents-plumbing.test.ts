@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
-import { registerHarness, registerSession } from "../src/extensions/index.js";
+import { registerHarness, registerSession } from "../src/builtins/index.js";
 import type {
   Agent,
   Harness,
   HarnessFactory,
-  Provider,
+  Tools,
   Session,
   SessionFactory,
   Tool,
@@ -162,7 +162,7 @@ describe("RunAgentOptions.parent", () => {
         harness: { provider: "needs-parent-harness" },
       }),
     ).rejects.toThrow(
-      /Harness provider 'needs-parent-harness' requires a parent agent/i,
+      /Harness 'needs-parent-harness' requires a parent agent/i,
     );
   });
 
@@ -176,7 +176,7 @@ describe("RunAgentOptions.parent", () => {
         session: { provider: "needs-parent-session" },
       }),
     ).rejects.toThrow(
-      /Session provider 'needs-parent-session' requires a parent agent/i,
+      /Session 'needs-parent-session' requires a parent agent/i,
     );
   });
 
@@ -224,7 +224,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
     capture: { ctx?: ToolContext; agent?: Agent; childResult?: string };
     deps?: AgentManifest[];
     spawn: "by-name" | "inline" | "missing";
-  }): Provider {
+  }): Tools {
     const tool: Tool = {
       name: "spawner",
       description: "Spawns a sub-agent and records ctx.",
@@ -282,7 +282,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
       {
         name: "parent",
         systemPrompt: "x",
-        tools: { spawner: {} },
+        tools: { spawner: "builtin" },
         harness: {
           provider: "test",
           script: [
@@ -316,7 +316,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
       {
         name: "parent",
         systemPrompt: "x",
-        tools: { spawner: {} },
+        tools: { spawner: "builtin" },
         harness: {
           provider: "test",
           script: [
@@ -346,7 +346,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
       {
         name: "parent",
         systemPrompt: "x",
-        tools: { spawner: {} },
+        tools: { spawner: "builtin" },
         harness: {
           provider: "test",
           script: [
@@ -388,10 +388,10 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
   });
 });
 
-describe("Provider.resolveTool receives the owning Agent", () => {
+describe("Tools.resolveTool receives the owning Agent", () => {
   it("passes the owning agent to resolveTool so providers can capture it at construction", async () => {
     let captured: Agent | undefined;
-    const provider: Provider = {
+    const provider: Tools = {
       resolveTool: (name, _config, agent) => {
         captured = agent;
         if (name === "noop") {
@@ -411,7 +411,7 @@ describe("Provider.resolveTool receives the owning Agent", () => {
       {
         name: "self-aware",
         systemPrompt: "x",
-        tools: { noop: {} },
+        tools: { noop: "builtin" },
         harness: { provider: "test" },
       },
       { providers: [provider] },

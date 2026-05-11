@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
@@ -13,7 +15,6 @@ describe("auditAgent", () => {
     );
     expect(tree.name).toBe("sample-agent");
     expect(tree.tools.map((t) => t.name).sort()).toEqual([
-      "echo",
       "find",
       "read_file",
       "write_file",
@@ -24,9 +25,6 @@ describe("auditAgent", () => {
     expect(readEntry?.requires).toEqual([]); // no required kinds
     expect(readEntry?.granted).toEqual({ paths: ["./"] });
     expect(readEntry?.missing).toEqual([]);
-    // echo got the whole-tool `"*"` grant.
-    const echoEntry = tree.tools.find((t) => t.name === "echo");
-    expect(echoEntry?.granted).toBe("*");
     // The agent's grant table is exposed under `grants`.
     expect(tree.grants.read_file).toEqual({ paths: ["./"] });
     // [agent].secrets allowlist surfaces in the tree.
@@ -73,5 +71,67 @@ describe("auditAgent", () => {
     const warning = bashEntry!.findings.find((f) => f.severity === "warning");
     expect(warning).toBeDefined();
     expect(warning!.message).toMatch(/unsandboxed/i);
+  });
+
+  it("records unresolved sources without throwing in default mode", async () => {
+    // A manifest that references an npm package that doesn't exist on
+    // disk. Default audit keeps going and records the gap; the tool
+    // also shows up as unresolved because no provider claimed it.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-audit-uns-"));
+    try {
+      const manifestPath = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        manifestPath,
+        [
+          "[agent]",
+          'name = "missing-src"',
+          'system_prompt = "x"',
+          "[harness]",
+          'provider = "test"',
+          "[tools.fancy_tool]",
+          'provider = { npm = "@nonexistent/loom-pkg" }',
+        ].join("\n"),
+        "utf8",
+      );
+      const tree = await auditAgent(manifestPath);
+      expect(tree.unresolvedSources).toHaveLength(1);
+      expect(tree.unresolvedSources[0]?.spec).toBe(
+        "npm:@nonexistent/loom-pkg@*",
+      );
+      expect(tree.unresolvedSources[0]?.reason).toMatch(/Cannot find/);
+      // The tool itself is also unresolved because its source didn't
+      // load.
+      expect(tree.unresolvedTools.map((u) => u.name)).toContain("fancy_tool");
+      // formatCapabilityTree should mention the unresolved source.
+      const printed = formatCapabilityTree(tree);
+      expect(printed.toLowerCase()).toContain("unresolved");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("--strict throws when any source is unresolved", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-audit-strict-"));
+    try {
+      const manifestPath = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        manifestPath,
+        [
+          "[agent]",
+          'name = "strict-test"',
+          'system_prompt = "x"',
+          "[harness]",
+          'provider = "test"',
+          "[tools.fancy_tool]",
+          'provider = { npm = "@nonexistent/loom-pkg" }',
+        ].join("\n"),
+        "utf8",
+      );
+      await expect(auditAgent(manifestPath, { strict: true })).rejects.toThrow(
+        /unresolved source/,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });
