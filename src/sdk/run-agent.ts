@@ -22,7 +22,11 @@
 
 import * as path from "node:path";
 
-import { getHarnessFactory, getSessionFactory } from "../builtins/index.js";
+import {
+  findToolsFactory,
+  getHarnessFactory,
+  getSessionFactory,
+} from "../builtins/index.js";
 import { type LoadOptions } from "../providers/loader.js";
 import {
   DEFAULT_CLIENT_ACP_CAPABILITIES,
@@ -33,12 +37,14 @@ import {
   nativeBuiltinNames,
 } from "../builtins/provider/native.js";
 import {
+  isPreBuiltSessionLayer,
   resolveManifest,
   resolveSystemPrompt,
   sourceSpecKey,
   type HarnessBinding,
   type ProviderInstance,
   type ResolvedManifest,
+  type ResolvedSessionLayer,
   type SessionBinding,
   type ToolBinding,
 } from "../manifest/resolver.js";
@@ -49,6 +55,7 @@ import {
   materialiseTools,
   type ToolsIndex,
 } from "../runtime/boot.js";
+import { resolveAgentStorage } from "../runtime/storage.js";
 import {
   assertKnownKinds,
   assertRequires,
@@ -169,18 +176,27 @@ export async function runAgent(
   source: string | AgentManifest,
   options: RunAgentOptions = {},
 ): Promise<RunningAgent> {
-  // 1. Manifest + system prompt + factory context.
+  // 1. Manifest + system prompt + per-agent storage + factory context.
   const manifest = await loadManifest(source);
   const baseDir = manifest.manifestPath
     ? path.dirname(manifest.manifestPath)
     : process.cwd();
   const systemPrompt = await resolveSystemPrompt(manifest, baseDir);
+  // Resolve the storage root and surface any collision warnings
+  // via console.warn. (Audit surfaces them on its tree; the runtime
+  // doesn't have a dedicated diagnostic channel yet, so stderr
+  // is the conservative default.)
+  const storage = await resolveAgentStorage(manifest);
+  for (const w of storage.warnings) {
+    console.warn(`loom storage: ${w}`);
+  }
   const factoryCtx: FactoryContext = {
     manifestDir: baseDir,
     agentName: manifest.name,
     loomVersion: LOOM_VERSION,
     clientCapabilities:
       options.clientAcpCapabilities ?? DEFAULT_CLIENT_ACP_CAPABILITIES,
+    storage: storage.path,
   };
 
   // 2. Resolve manifest to IR. Pure; throws on ambiguity / missing handles.
@@ -447,9 +463,15 @@ async function materialiseTools_all(args: {
     }
     // Provider-backed instance: shared construction via boot.ts.
     // Filter secrets to what the contribution declared interest in;
-    // we need to peek at the contribution first to do this.
+    // we need to peek at the contribution first to do this. Both
+    // the static `secrets` field AND per-instance needs (Chunk 6's
+    // `instanceSecretNeeds(config)`) contribute to the filter.
     const peek = peekToolsContribution(args.toolsIndex, instance);
-    const secrets = secretsFor(args.phase1Secrets, peek?.secrets);
+    const merged = mergeSecretNeeds(
+      peek?.secrets,
+      peek?.instanceSecretNeeds?.(instance.config),
+    );
+    const secrets = secretsFor(args.phase1Secrets, merged);
     const { tools, contribution } = await materialiseTools(
       instance,
       args.toolsIndex,
@@ -512,11 +534,27 @@ async function materialiseTools_all(args: {
 function peekToolsContribution(
   index: ToolsIndex,
   instance: ProviderInstance,
-): { secrets?: SecretNeeds } | undefined {
-  if (instance.kind !== "provider" || !instance.source) return undefined;
-  const srcKey = sourceSpecKey(instance.source);
-  for (const [key, c] of index) {
-    if (key.startsWith(`${srcKey}::`)) return c;
+):
+  | {
+      secrets?: SecretNeeds;
+      instanceSecretNeeds?(
+        config: Record<string, unknown>,
+      ): SecretNeeds | undefined;
+    }
+  | undefined {
+  if (instance.kind !== "provider") return undefined;
+  if (instance.source) {
+    const srcKey = sourceSpecKey(instance.source);
+    for (const [key, c] of index) {
+      if (key.startsWith(`${srcKey}::`)) return c;
+    }
+    return undefined;
+  }
+  if (instance.factoryName) {
+    // Factory-backed instance — look up the built-in / SDK-registered
+    // Tools factory by name. Returns the registration directly
+    // (which is the contribution shape).
+    return findToolsFactory(instance.factoryName);
   }
   return undefined;
 }
@@ -659,7 +697,7 @@ async function instantiateHarness(
 }
 
 async function instantiateSession(
-  bindings: SessionBinding[] | undefined,
+  layers: ResolvedSessionLayer[] | undefined,
   factoryCtx: FactoryContext,
   phase1Secrets: Record<string, string>,
   parent: Agent | undefined,
@@ -667,23 +705,32 @@ async function instantiateSession(
   // Default chain when the manifest omits the session section: build
   // bindings from DEFAULT_SESSION_CHAIN. Each spec has only a
   // `provider` field, so config is empty.
-  const effective: SessionBinding[] =
-    bindings && bindings.length > 0
-      ? bindings
-      : DEFAULT_SESSION_CHAIN.map((spec) => ({
-          factoryName: spec.provider as string,
-          config: {},
-        }));
+  const effective: ResolvedSessionLayer[] =
+    layers && layers.length > 0
+      ? layers
+      : DEFAULT_SESSION_CHAIN.map(
+          (spec): SessionBinding => ({
+            factoryName: spec.provider as string,
+            config: {},
+          }),
+        );
 
   const instances: Session[] = [];
-  for (const binding of effective) {
+  for (const layer of effective) {
+    if (isPreBuiltSessionLayer(layer)) {
+      // Pass-through: the SDK consumer constructed this layer
+      // themselves. Secrets, factory lookup, and `requiresParent`
+      // checks are skipped — the layer is whatever they handed us.
+      instances.push(layer.instance);
+      continue;
+    }
     const factory = lookupFactoryByBinding(
-      binding.factoryName,
-      binding.source,
+      layer.factoryName,
+      layer.source,
       getSessionFactory,
     );
     const { instance } = await instantiateFromBinding<Session>(
-      binding,
+      layer,
       () => factory,
       factoryCtx,
       secretsFor(phase1Secrets, factory.secrets),
@@ -706,7 +753,7 @@ interface SecretRequest {
   requestedBy: string;
 }
 
-function buildSecretStore(
+export function buildSecretStore(
   manifest: AgentManifest,
   options: RunAgentOptions,
 ): SecretsStore {
@@ -725,7 +772,7 @@ function buildSecretStore(
   return new ChainedSecretsStore(stores);
 }
 
-function collectPhase1SecretNeeds(
+export function collectPhase1SecretNeeds(
   resolved: ResolvedManifest,
   toolsIndex: ToolsIndex,
 ): SecretRequest[] {
@@ -741,10 +788,13 @@ function collectPhase1SecretNeeds(
       // Surfaced later by instantiateHarness.
     }
   }
-  // Session factory needs (per chain link).
-  for (const link of resolved.session ?? []) {
+  // Session factory needs (per chain link). Pre-built layers have no
+  // factory to consult — their secrets, if any, are the SDK consumer's
+  // problem.
+  for (const layer of resolved.session ?? []) {
+    if (isPreBuiltSessionLayer(layer)) continue;
     try {
-      const f = getSessionFactory(link.factoryName);
+      const f = getSessionFactory(layer.factoryName);
       pushNeeds(out, f.secrets, `session:${f.name}`);
     } catch {
       // Surfaced later by instantiateSession.
@@ -752,17 +802,42 @@ function collectPhase1SecretNeeds(
   }
   // Tools-contribution needs (one entry per *distinct* materialised
   // instance — we collect needs per contribution by visiting each
-  // instance's source).
+  // instance's source/factory). Each contribution may declare:
+  //   - static `secrets`            — always-needed
+  //   - `instanceSecretNeeds(config)` — derived from instance config
+  //
+  // The MCP factory uses the per-instance path to honour the
+  // user-authored `secrets = { ... }` map on `[tools.X]` /
+  // `[providers]` entries (Chunk 6).
   for (const instance of resolved.providers) {
     if (instance.kind === "native") continue;
-    if (!instance.source) continue;
-    const srcKey = sourceSpecKey(instance.source);
-    // Look for any Tools registration for this source; use its
-    // secrets as a best-effort approximation.
-    for (const [key, contribution] of toolsIndex) {
-      if (!key.startsWith(`${srcKey}::`)) continue;
-      pushNeeds(out, contribution.secrets, `provider:${contribution.name}`);
-      break;
+    let contribution:
+      | {
+          name: string;
+          secrets?: SecretNeeds;
+          instanceSecretNeeds?(
+            config: Record<string, unknown>,
+          ): SecretNeeds | undefined;
+        }
+      | undefined;
+    if (instance.source) {
+      const srcKey = sourceSpecKey(instance.source);
+      for (const [key, c] of toolsIndex) {
+        if (!key.startsWith(`${srcKey}::`)) continue;
+        contribution = c;
+        break;
+      }
+    } else if (instance.factoryName) {
+      contribution = findToolsFactory(instance.factoryName);
+    }
+    if (!contribution) continue;
+    pushNeeds(out, contribution.secrets, `provider:${contribution.name}`);
+    if (contribution.instanceSecretNeeds) {
+      pushNeeds(
+        out,
+        contribution.instanceSecretNeeds(instance.config),
+        `provider:${contribution.name}(instance ${instance.id})`,
+      );
     }
   }
   return out;
@@ -793,7 +868,7 @@ function pushNeeds(
     out.push({ name, required: false, requestedBy });
 }
 
-async function loadSecretsBundle(
+export async function loadSecretsBundle(
   store: SecretsStore,
   needs: SecretRequest[],
   allowMissingRequired: boolean,
@@ -895,6 +970,21 @@ export function secretsFor(
     if (allow.has(k)) out[k] = v;
   }
   return out;
+}
+
+/** Merge two `SecretNeeds` records (used to combine static + per-instance needs). */
+function mergeSecretNeeds(
+  a: SecretNeeds | undefined,
+  b: SecretNeeds | undefined,
+): SecretNeeds | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const required = [...(a.required ?? []), ...(b.required ?? [])];
+  const optional = [...(a.optional ?? []), ...(b.optional ?? [])];
+  return {
+    ...(required.length ? { required: [...new Set(required)] } : {}),
+    ...(optional.length ? { optional: [...new Set(optional)] } : {}),
+  };
 }
 
 function secretAllowlist(needs: {

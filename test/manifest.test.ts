@@ -488,4 +488,148 @@ provider = "in-memory"
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
+
+  // ─── [providers] configured-factory form (MCP integration, Chunk 1) ───
+  //
+  // The configured-factory form lets a [providers] entry name a Tools
+  // factory (built-in or, in future, source-loaded) plus per-handle
+  // config. Same shape as [harness] / [session] / [tools.X]:
+  // `{ provider = "<factory>", ...config }`. The big use case is MCP
+  // servers via the built-in `mcp-server` factory, but the shape is
+  // factory-agnostic — these parser tests use a fake `test-meta`
+  // factory name to exercise the plumbing without depending on
+  // anything that hasn't been built yet.
+
+  it("parses [providers] entries in the configured-factory form", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-prov-cf-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "prov-cf"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[providers]
+fs_mcp = { provider = "test-meta", npm = "@example/mcp-fs" }
+linear  = { provider = "test-meta", command = "npx", args = ["@linear/mcp"] }
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(m.providers).toEqual({
+        fs_mcp: {
+          provider: "test-meta",
+          npm: "@example/mcp-fs",
+        },
+        linear: {
+          provider: "test-meta",
+          command: "npx",
+          args: ["@linear/mcp"],
+        },
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still parses [providers] entries in the SourceSpec form alongside configured-factory", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-prov-mixed-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "prov-mixed"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[providers]
+local     = { path = "./my-tools" }
+npm_thing = "@scope/pkg"
+mcp_thing = { provider = "test-meta", npm = "@example/mcp" }
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(m.providers).toEqual({
+        local: { path: "./my-tools" },
+        npm_thing: "@scope/pkg",
+        mcp_thing: { provider: "test-meta", npm: "@example/mcp" },
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses [agent].storage_id override", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-storage-id-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "x"
+storage_id = "pinned-id"
+[harness]
+provider = "test"
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(m.storageId).toBe("pinned-id");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects [agent].storage_id containing path separators", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-storage-bad-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "x"
+storage_id = "../escape"
+[harness]
+provider = "test"
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /storage_id.*path separator/,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still rejects bare-handle strings as [providers] entries", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-prov-bare-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "prov-bare"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[providers]
+oops = "some_handle"
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /Bare handles aren't allowed at this layer/,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 });

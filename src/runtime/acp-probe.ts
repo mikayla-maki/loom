@@ -19,9 +19,13 @@ import * as path from "node:path";
 
 import { getHarnessFactory, getSessionFactory } from "../builtins/index.js";
 import { parseAgentManifest } from "../manifest/parser.js";
-import { resolveManifest } from "../manifest/resolver.js";
+import {
+  isPreBuiltSessionLayer,
+  resolveManifest,
+} from "../manifest/resolver.js";
 import { nativeBuiltinNames } from "../builtins/provider/native.js";
 import { loadManifestProviders } from "./boot.js";
+import { transientStorage } from "./storage.js";
 import { LOOM_VERSION } from "../sdk/run-agent.js";
 
 import type {
@@ -85,6 +89,12 @@ export async function probeAcpCapabilitiesFromManifest(
     agentName: manifest.name,
     loomVersion: LOOM_VERSION,
     clientCapabilities,
+    // Probe is a transient introspection: we instantiate factories
+    // only to ask what ACP capabilities they declare, then throw
+    // them away. Use tmpdir rather than the agent's real storage so
+    // probing doesn't side-effect a `<dataHome>/agents/<name>/`
+    // directory on every boot.
+    storage: transientStorage("loom-acp-probe"),
   };
 
   // Provider loading is the only side-effecting step. Built-in-only
@@ -115,10 +125,13 @@ export async function probeAcpCapabilitiesFromManifest(
   // Session contribution. A manifest without a session section falls
   // back to the default chain; absent links contribute nothing here.
   // For a multi-link chain, every link gets a chance to contribute.
-  for (const link of resolved.session ?? []) {
+  // Pre-built `Session` instances are SDK-construct and have no
+  // static factory metadata to consult — skip them.
+  for (const layer of resolved.session ?? []) {
+    if (isPreBuiltSessionLayer(layer)) continue;
     try {
-      const factory: SessionFactory = getSessionFactory(link.factoryName);
-      const c = factory.acpCapabilities?.(link.config);
+      const factory: SessionFactory = getSessionFactory(layer.factoryName);
+      const c = factory.acpCapabilities?.(layer.config);
       if (c) contributions.push(c);
     } catch {
       // see above

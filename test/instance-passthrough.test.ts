@@ -89,6 +89,53 @@ describe("manifest accepts instances directly", () => {
     }
   });
 
+  it("a session array mixes pre-built instances with named layers", async () => {
+    // Heterogeneous session: a hand-built Session instance in the
+    // outer position, a string-shorthand layer in the inner. The
+    // runtime should resolve the string (`"in-memory"`) via the
+    // built-in registry and wrap both in a ChainedSession.
+    const captured: SessionUpdate[] = [];
+    const outer: Session = {
+      async push(u) {
+        captured.push(u);
+        // Pass through to the inner layer unchanged.
+        return [u];
+      },
+      async pull(below) {
+        return below;
+      },
+    };
+
+    const agent = await runAgent({
+      name: "inst-session-mix",
+      tools: {},
+      harness: { provider: "test", echo: true },
+      // Heterogeneous: instance + string. The runtime resolves
+      // `"in-memory"` via the built-in session registry and chains
+      // both layers outer-to-inner.
+      session: [outer, "in-memory"],
+    });
+    try {
+      await agent.prompt("hello");
+      // The outer (pre-built) layer saw events flow through it.
+      expect(
+        captured.some((e) => e.sessionUpdate === "user_message_chunk"),
+      ).toBe(true);
+      expect(
+        captured.some((e) => e.sessionUpdate === "agent_message_chunk"),
+      ).toBe(true);
+      // Pulling from the chain returns events the inner storage
+      // retained, replayed back up through the outer (which is a
+      // passthrough).
+      const events = (await agent.session.pull?.([])) ?? [];
+      expect(events.some((e) => e.sessionUpdate === "user_message_chunk")).toBe(
+        true,
+      );
+    } finally {
+      await agent.close();
+    }
+  });
+
   it("a Tools instance via RunAgentOptions.providers contributes tools", async () => {
     const stubTool: Tool = {
       name: "stub",

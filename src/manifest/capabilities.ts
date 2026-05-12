@@ -19,6 +19,7 @@
 
 import { CapabilityError, SecretError } from "../errors.js";
 import type { Tool } from "../types/interfaces.js";
+import type { JSONSchema } from "../types/schema.js";
 import type {
   Capabilities,
   CapabilitySet,
@@ -206,6 +207,156 @@ export function assertSecretAllowlist(
       `Tool secret needs exceed the [agent].secrets allowlist (${allowlist.length === 0 ? "empty" : `${allowlist.length} allowed`}):\n${summary}`,
     );
   }
+}
+
+// ─── Argument-binding grants (MCP-style provider tools) ───────────────
+//
+// The historical capability model is "kinds the tool may exercise"
+// (paths, subprocess, network, …): one kind per capability concern,
+// orthogonal to the tool's input schema. Built-in tools self-police
+// on those kinds at execute time.
+//
+// Provider-contributed tools (notably MCP-backed tools) have a
+// different shape: the tool's MCP "args" already ARE structured
+// kinds the user wants to constrain. Re-using `[capabilities]` for
+// argument binding lets one mechanism do two jobs:
+//
+//   1. Authorise which model-visible inputs are allowed.
+//   2. Pre-bind a fixed value the model never sees.
+//
+// This block adds the helper that turns a per-arg grant into a
+// (narrowed inputSchema, bound merge values, model-visible arg
+// names) triple. Per-argument grant semantics:
+//
+//   | grant value          | schema effect                       | execute effect              |
+//   |----------------------|-------------------------------------|-----------------------------|
+//   | "<literal>" / number | drop arg from properties + required | merge bound value into call |
+//   | true / false (bool)  | drop arg from properties + required | merge bound value into call |
+//   | ["a", "b"]           | narrow property to `enum`           | passed through from model   |
+//   | "*"                  | unchanged                           | passed through from model   |
+//   | (arg absent in grant)| unchanged                           | passed through from model   |
+//
+// `"*"` on the whole tool means "full schema, no binding". `{}`
+// produces no binding and no narrowing — boot fails via
+// `assertRequires` when the tool has required args.
+//
+// The default-value form (`{ default = "..." }`) hinted at in the
+// implementation prompt is a v2 stretch and intentionally NOT
+// implemented here.
+
+/** Result of narrowing a JSON Schema by a capability-set grant. */
+export interface AppliedArgGrant {
+  /** Narrowed schema the model sees. */
+  schema: JSONSchema;
+  /** Fixed arg values the provider merges at execute time. */
+  bound: Record<string, unknown>;
+  /** Property names the model may still provide (after narrowing). */
+  modelArgs: Set<string>;
+}
+
+/**
+ * Narrow a JSON Schema by an argument-binding capability grant.
+ * Pure (no error throws); the grant has been pre-validated by
+ * `assertRequires` / `assertKnownKinds` upstream.
+ *
+ *   - `undefined` grant: no narrowing, no binding.
+ *   - `"*"` grant:      no narrowing, no binding.
+ *   - per-arg map:      see semantics table above.
+ */
+export function applyArgGrant(
+  schema: JSONSchema,
+  grant: CapabilitySet | undefined,
+): AppliedArgGrant {
+  const original = (schema ?? {}) as Record<string, unknown>;
+  const properties = isObject(original.properties)
+    ? (original.properties as Record<string, unknown>)
+    : {};
+  const required = Array.isArray(original.required)
+    ? (original.required as unknown[]).filter(
+        (x): x is string => typeof x === "string",
+      )
+    : [];
+  const allProperties = new Set(Object.keys(properties));
+
+  // Whole-tool grants leave the schema alone.
+  if (grant === undefined || grant === "*") {
+    return {
+      schema,
+      bound: {},
+      modelArgs: allProperties,
+    };
+  }
+  // Empty grant: nothing pre-bound, nothing narrowed. boot.guards
+  // (assertRequires) will reject this when the tool has required
+  // args; we just thread the shape through.
+  if (typeof grant !== "object" || Array.isArray(grant)) {
+    return { schema, bound: {}, modelArgs: allProperties };
+  }
+
+  const bound: Record<string, unknown> = {};
+  const narrowedProperties: Record<string, unknown> = { ...properties };
+  const modelArgs = new Set(allProperties);
+  const dropped = new Set<string>();
+
+  for (const [arg, value] of Object.entries(grant)) {
+    if (value === undefined) continue;
+    // `"*"` per-arg: leave the property untouched.
+    if (value === "*") continue;
+    if (isLiteralBindable(value)) {
+      // Drop from the visible schema; bind for execute().
+      delete narrowedProperties[arg];
+      modelArgs.delete(arg);
+      dropped.add(arg);
+      bound[arg] = value;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      // Constrain to an enum. Preserve the original property's
+      // metadata (type, description) so the model sees the same
+      // shape minus the freedom.
+      const orig = isObject(properties[arg])
+        ? (properties[arg] as Record<string, unknown>)
+        : {};
+      narrowedProperties[arg] = { ...orig, enum: [...value] };
+      continue;
+    }
+    // Other grant shapes (objects like `{ default = ... }`) reserved
+    // for future use; leave the property untouched.
+  }
+
+  // Drop bound args from `required` too — they're satisfied via the
+  // merge at execute time, not by the model.
+  const narrowedRequired = required.filter((r) => !dropped.has(r));
+
+  // Rebuild the schema object. Preserve the top-level keys we don't
+  // own (description, $schema, additionalProperties, etc.).
+  const narrowedSchema: Record<string, unknown> = {
+    ...original,
+    properties: narrowedProperties,
+  };
+  if (required.length > 0) {
+    if (narrowedRequired.length === 0) {
+      delete narrowedSchema.required;
+    } else {
+      narrowedSchema.required = narrowedRequired;
+    }
+  }
+  return {
+    schema: narrowedSchema as JSONSchema,
+    bound,
+    modelArgs,
+  };
+}
+
+function isLiteralBindable(v: unknown): v is string | number | boolean {
+  if (v === "*") return false;
+  return (
+    typeof v === "string" || typeof v === "number" || typeof v === "boolean"
+  );
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
 /**

@@ -2,14 +2,19 @@
 # Loom minimal-agent example — demonstrates the full v5 provider surface
 # ───────────────────────────────────────────────────────────────────────────
 #
-# Run:           loom run examples/agent.toml
-# Audit:         loom audit examples/agent.toml
+# Run:           loom run examples/minimal-agent/agent.toml
+# Audit:         loom audit examples/minimal-agent/agent.toml
 #
-# This is the declarative shape. For the imperative shape — same
-# agent constructed in TypeScript — see `examples/agent.ts`.
+# This is the declarative shape. For the same agent constructed in
+# TypeScript — hand-building the `CompactingSession` so it can
+# drive `compactNow()` from a `/compact` slash command — see
+# `examples/sdk-agent/agent.ts`. This manifest depends on the
+# sibling `examples/notes-provider/` package (referenced below
+# under `[providers]`).
 #
 # What this example shows:
-#   - `[providers]` declares a local handle for an external provider.
+#   - `[providers]` declares a local handle for an external provider
+#                   — here, the sibling `notes-provider/` package.
 #   - `[harness]`   picks a built-in factory.
 #   - `[session]`   declares the agent's session as a layered
 #                   composition (outer-to-inner): bounded growth via
@@ -19,7 +24,7 @@
 #                   interesting one — it loads notes from a markdown
 #                   file into the system prompt AND owns the `remember`
 #                   verb the model uses to save new ones. See
-#                   `loom-notes-provider/index.ts`.
+#                   `../notes-provider/index.ts`.
 #   - `[tools]`     mixes built-in tools with names contributed by
 #                   the session itself (here: `remember`). When a
 #                   session contributes a tool, the runtime treats
@@ -41,7 +46,7 @@ declarative fact. Use bash/read_file/write_file/find for real work.
 """
 
 [providers]
-notes = { path = "./loom-notes-provider" }
+notes = { path = "../notes-provider" }
 
 [harness]
 provider = "anthropic"
@@ -60,7 +65,9 @@ threshold = 60
 
 [[session.layers]]
 provider = "notes"
-file = "./loom-notes.md"   # markdown bullets, human-editable
+# `file = "./somewhere.md"` overrides; default is
+# `<ctx.storage>/notes.md` (= `<loom-data-home>/agents/<agent-name>/notes.md`).
+# Override with LOOM_DATA_HOME to point storage elsewhere.
 # Optional: max_notes = 50  # FIFO eviction once exceeded
 
 [[session.layers]]

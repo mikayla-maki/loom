@@ -29,7 +29,7 @@ src/
   cli/            # `loom` CLI
 
 test/             # vitest, 270+ tests; deterministic
-examples/         # agent.toml + agent.ts + a working demo provider
+examples/         # four self-contained projects: minimal-agent, sdk-agent, mcp-agent, notes-provider
 internal-docs/    # design docs (manifest-v5.md is canonical)
 ```
 

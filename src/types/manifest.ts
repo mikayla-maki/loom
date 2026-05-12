@@ -34,11 +34,28 @@ export type SystemPromptSpec = string | { path: string };
 // ─── Capabilities ──────────────────────────────────────────────────────────
 
 /**
- * Grant for one capability KIND. `"*"` = unrestricted; an array is a
- * kind-defined allowlist (usually string[]); a record is reserved for
- * richer per-kind structures. Absence from a `CapabilitySet` = denied.
+ * Grant for one capability KIND. Five shapes:
+ *
+ *   - `"*"`         — whole-kind unrestricted
+ *   - `string`      — literal binding (≠ `"*"`): pre-bound value at the
+ *                    use site (e.g. an argument-binding tool grant
+ *                    fixes the arg to this value and removes it from
+ *                    the model-visible schema). Built-in kinds that
+ *                    don't bind ignore the literal shape.
+ *   - `number`/`bool` — literal binding (same as `string`, non-string
+ *                    flavours of fixed values).
+ *   - `array`       — kind-defined allowlist (usually string[]).
+ *   - `object`      — richer per-kind structure (kind-specific).
+ *
+ * Absence from a `CapabilitySet` = denied.
  */
-export type CapabilityValue = "*" | unknown[] | Record<string, unknown>;
+export type CapabilityValue =
+  | "*"
+  | string
+  | number
+  | boolean
+  | unknown[]
+  | Record<string, unknown>;
 
 /**
  * Full grant for one tool. `"*"` = whole tool unrestricted; otherwise
@@ -103,17 +120,37 @@ export type Reference = string | SourceSpec;
 // ─── Providers ─────────────────────────────────────────────────────────────
 
 /**
- * A `[providers].<handle>` entry. The value is just a `SourceSpec` (or
- * its string fast-path); providers don't carry boot-time config in v5 —
- * any configuration lives at the use site (`[harness]`, `[session]`,
- * `[tools.X]`) and reaches the contribution's `create()` as its
- * per-instance config.
+ * A `[providers].<handle>` entry. Two on-disk shapes:
  *
- * Stored shape after parse: the value is either a string fast-path
- * (we keep it as-is for round-trip fidelity) or a normalised
- * `SourceSpec` table.
+ *   - **SourceSpec form** — a `Reference` to code-on-disk (string
+ *     fast-path like `"./local"` / `"@org/pkg"`, or a table
+ *     `{ npm = "..." }` / `{ path = "..." }`). Loaded by the provider
+ *     loader at boot; the contribution's `create()` receives per-tool
+ *     config at the use site.
+ *   - **Configured-factory form** — `{ provider = "<factory>", ...config }`,
+ *     same shape as `[harness]` / `[session]` / `[tools.X]`. The
+ *     `provider` field names a Tools factory (a built-in like
+ *     `"mcp-server"`, or in future a source-loaded factory); the
+ *     rest of the table is per-handle config merged with use-site
+ *     config when a downstream `[tools.X]` / `[harness]` / `[session]`
+ *     references this handle. This is the shape MCP servers use:
+ *     `fs_mcp = { provider = "mcp-server", npm = "@…/server-filesystem" }`.
+ *
+ * Bare-handle strings are NOT accepted at this layer — they would
+ * point at themselves.
  */
-export type ProviderEntry = Reference;
+export type ProviderEntry = Reference | ProviderEntryTable;
+
+/**
+ * Configured-factory shape for `[providers].<handle>` entries. The
+ * `provider` field names a Tools factory; remaining keys are
+ * per-handle config. Mirrors `HarnessSpec` / `SessionSpec` /
+ * `ToolEntryTable`.
+ */
+export interface ProviderEntryTable {
+  provider: Reference;
+  [configKey: string]: unknown;
+}
 
 /**
  * `[providers]` table. Optional; absent means no named provider
@@ -171,6 +208,25 @@ export interface SessionSpec {
   [configKey: string]: unknown;
 }
 
+/**
+ * One entry in a layered-session array. Mirrors the TOML
+ * `[session].layers` form (strings or inline tables) and extends it
+ * to also accept a pre-built `Session` instance — enabling mixes
+ * like `[compactingInstance, "notes", "in-memory"]` where the
+ * runtime resolves the named layers and uses the instance verbatim
+ * at its position in the chain.
+ *
+ *   - **String**: shorthand for `{ provider: str }`. Same as the
+ *     TOML `layers = ["compacting", "in-memory"]` inline form.
+ *   - **`SessionSpec`**: object with `provider` (+ optional config).
+ *     Same as a TOML inline table or `[[session.layers]]` block.
+ *   - **`Session` instance**: a pre-constructed layer. Bypasses
+ *     factory resolution; useful when you want to hold a direct
+ *     reference (e.g. to call `compactNow()` on a `CompactingSession`
+ *     from a slash command).
+ */
+export type SessionLayerEntry = SessionSpec | Session | string;
+
 // ─── Agent manifest (input shape) ──────────────────────────────────────────
 
 export interface AgentManifest {
@@ -181,6 +237,19 @@ export interface AgentManifest {
   systemPrompt?: SystemPromptSpec;
   /** See {@link SecretAllowlist}. */
   secrets?: SecretAllowlist;
+  /**
+   * Override for the per-agent storage directory's identifier.
+   * When set, the agent's data lives under
+   * `<loom-data-home>/agents/<storage_id>/` instead of
+   * `<loom-data-home>/agents/<name>/`.
+   *
+   * Use this when two manifests share `[agent].name` but should
+   * NOT share state, or vice-versa (two manifests with different
+   * names that should explicitly share state). Move-stable: the
+   * identifier is user-owned, not derived from the manifest's
+   * on-disk path.
+   */
+  storageId?: string;
 
   /** Optional. Local handles for code sources referenced from below. */
   providers?: Providers;
@@ -198,21 +267,27 @@ export interface AgentManifest {
    *   - **Singleton** — a single `SessionSpec`. TOML form is
    *     `[session]` with a `provider` field. The trivial one-layer
    *     session.
-   *   - **Layered** — a `SessionSpec[]` describing a composition,
-   *     outer-to-inner. TOML form is `[session]` with a `layers`
-   *     array (or the dotted-key array-of-tables
-   *     `[[session.layers]]`). `push` flows top-to-bottom, `pull`
-   *     flows bottom-to-top; other hooks (`tools`, `prepareTurn`,
+   *   - **Layered** — a `SessionLayerEntry[]` describing a
+   *     composition, outer-to-inner. Each entry may be a string
+   *     (shorthand for `{ provider: str }`), a `SessionSpec`, OR a
+   *     pre-built `Session` instance — mixing freely is supported,
+   *     so e.g. `[compactingInstance, "notes", "in-memory"]` is a
+   *     valid chain where the runtime resolves the two named layers
+   *     and uses the instance verbatim. TOML form is `[session]`
+   *     with a `layers` array (or the dotted-key array-of-tables
+   *     `[[session.layers]]`); the TOML form can't carry pre-built
+   *     instances. `push` flows top-to-bottom, `pull` flows
+   *     bottom-to-top; other hooks (`tools`, `prepareTurn`,
    *     `systemPromptSection`, etc.) aggregate across layers.
    *   - **Pre-built instance** — a constructed `Session` the runtime
-   *     uses directly. Bypasses manifest resolution; useful when you
-   *     want a direct reference to the underlying layers from SDK
-   *     code.
+   *     uses directly. Bypasses manifest resolution entirely; useful
+   *     when you've already hand-built the whole chain and just want
+   *     to hand it over.
    *
    * Absent → runtime uses the default chain `skills → compacting →
    * memory` (skills silently no-op when `~/.skills` is missing).
    */
-  session?: SessionSpec | SessionSpec[] | Session;
+  session?: SessionSpec | SessionLayerEntry[] | Session;
 
   /**
    * Top-level tools, model-facing name → entry. Absent → loom

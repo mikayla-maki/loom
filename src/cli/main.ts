@@ -12,8 +12,12 @@
  */
 
 import { runAgent } from "../sdk/run-agent.js";
-import { TextRenderer } from "./renderer.js";
-import { auditAgent, formatCapabilityTree } from "../audit/audit.js";
+import { runPromptCommand, type PromptFormat } from "./prompt.js";
+import {
+  AuditError,
+  auditAgent,
+  formatCapabilityTree,
+} from "../audit/audit.js";
 import { ttyPermissionHandler } from "./permissions.js";
 import { ttyMissingSecretHandler } from "./secret-prompt.js";
 import { runRepl } from "./repl.js";
@@ -61,6 +65,8 @@ async function main(argv: string[]): Promise<number> {
       return await cmdInstall(argv.slice(1));
     case "providers":
       return await cmdProviders(argv.slice(1));
+    case "mcp":
+      return await cmdMcp(argv.slice(1));
     default:
       console.error(`Unknown subcommand: ${cmd}`);
       printHelp();
@@ -70,21 +76,25 @@ async function main(argv: string[]): Promise<number> {
 
 function printHelp(): void {
   process.stdout.write(
-    `loom — manifest-driven agent meta-harness
+    `loom — A capability-secure, manifest-driven agent runtime.
 
 Usage:
   loom run <agent.toml>                  Interactive REPL with the agent.
-  loom prompt <agent.toml> [text]        One-shot prompt (stdin if [text] omitted).
-  loom audit <agent.toml> [--strict] [--json]
-                                         Print the static capability tree.
+  loom prompt <agent.toml> [text] [--format <text|trace|jsonl>]
+                                         One-shot prompt (stdin if [text] omitted).
+                                         text (default): final agent message to stdout.
+                                         trace: coalesced labelled debug view.
+                                         jsonl: raw SessionUpdate per line.
+  loom audit <agent.toml> [--json]       Print the static capability tree.
+                                         Exits non-zero (with partial tree)
+                                         if the manifest isn't fully resolved.
   loom acp serve <agent.toml>            Speak ACP over stdio.
   loom install [agent.toml]              Install the manifest's deps (npm + path sources).
   loom install --frozen [agent.toml]     Refuse if lock.toml is missing or stale (CI).
   loom providers list                    List Loom provider npm packages on disk.
   loom providers info <name>             Show resolved metadata for a provider package.
-
-ANSI styling tracks the COLORTERM env var — unset COLORTERM for plain
-output. Agent thought chunks are always shown.
+  loom mcp inspect <provider> [--manifest <agent.toml>] [--json]
+                                         Dump an MCP server's tools as TOML you can paste.
 
 In the REPL: tab to complete /commands. Built-ins:
   /quit /exit /help /audit /events [N] /tools
@@ -130,9 +140,20 @@ async function cmdPrompt(args: string[]): Promise<number> {
   const opts = parseFlags(args);
   const manifestPath = opts._[0];
   if (!manifestPath) {
-    console.error("usage: loom prompt <agent.toml> [text]");
+    console.error(
+      "usage: loom prompt <agent.toml> [text] [--format <text|trace|jsonl>]",
+    );
     return 2;
   }
+  const rawFormat =
+    typeof opts.flags.format === "string" ? opts.flags.format : "text";
+  if (rawFormat !== "text" && rawFormat !== "trace" && rawFormat !== "jsonl") {
+    console.error(
+      `error: --format must be one of text, trace, jsonl (got "${rawFormat}")`,
+    );
+    return 2;
+  }
+  const format = rawFormat as PromptFormat;
   let text = opts._.slice(1).join(" ");
   if (!text) text = await readStdin();
   if (!text.trim()) {
@@ -141,39 +162,28 @@ async function cmdPrompt(args: string[]): Promise<number> {
     );
     return 2;
   }
-  const agent = await runAgent(manifestPath, {
+  return await runPromptCommand({
+    manifest: manifestPath,
+    text,
+    format,
     permissionHandler: ttyPermissionHandler(),
     onMissingSecret: ttyMissingSecretHandler(),
     onAuditFinding: stderrAuditPrinter(),
   });
-  const renderer = new TextRenderer();
-  const sub = agent.updates();
-  const consume = (async () => {
-    for await (const u of sub) renderer.render(u);
-  })();
-  try {
-    await agent.prompt(text);
-  } finally {
-    await agent.close();
-    await consume.catch(() => undefined);
-  }
-  return 0;
 }
 
 async function cmdAudit(args: string[]): Promise<number> {
   const opts = parseFlags(args);
   const manifestPath = opts._[0];
   if (!manifestPath) {
-    console.error("usage: loom audit <agent.toml> [--json] [--strict]");
+    console.error("usage: loom audit <agent.toml> [--json]");
     return 2;
   }
   // Colours track COLORTERM — callers unset it to get plain output
   // when piping.
   const color = wantsColor();
   try {
-    const tree = await auditAgent(manifestPath, {
-      strict: !!opts.flags.strict,
-    });
+    const tree = await auditAgent(manifestPath);
     if (opts.flags.json) {
       process.stdout.write(JSON.stringify(tree, null, 2) + "\n");
     } else {
@@ -181,6 +191,28 @@ async function cmdAudit(args: string[]): Promise<number> {
     }
     return 0;
   } catch (e) {
+    // AuditError carries the partial tree + a structured health
+    // summary. Print the tree so the user can see what DID resolve,
+    // then the structured error message, then exit non-zero. There
+    // is no "lenient" path that returns success with hidden
+    // problems — either the manifest is fully resolved or it isn't.
+    if (e instanceof AuditError) {
+      if (opts.flags.json) {
+        process.stdout.write(
+          JSON.stringify(
+            { tree: e.tree, health: e.health, error: e.message },
+            null,
+            2,
+          ) + "\n",
+        );
+      } else {
+        process.stdout.write(formatCapabilityTree(e.tree, { color }) + "\n");
+        const red = color ? "\x1b[31m" : "";
+        const reset = color ? "\x1b[0m" : "";
+        process.stderr.write(`${red}✖ ${e.message}${reset}\n`);
+      }
+      return 1;
+    }
     console.error(`loom audit: ${(e as Error).message}`);
     return 1;
   }
@@ -246,6 +278,57 @@ async function cmdProviders(args: string[]): Promise<number> {
   }
   console.error("usage: loom providers <list|info> [name]");
   return 2;
+}
+
+/**
+ * `loom mcp <subcmd>` — MCP-related authoring aids. Only `inspect`
+ * today.
+ */
+async function cmdMcp(args: string[]): Promise<number> {
+  const sub = args[0];
+  if (sub !== "inspect") {
+    console.error(
+      "usage: loom mcp inspect <provider-spec> [--manifest <agent.toml>] [--json]",
+    );
+    return 2;
+  }
+  const opts = parseFlags(args.slice(1));
+  const providerSpec = opts._[0];
+  if (!providerSpec) {
+    console.error(
+      "usage: loom mcp inspect <provider-spec> [--manifest <agent.toml>] [--json]",
+    );
+    return 2;
+  }
+  const { inspectMcpServer } = await import("./mcp-inspect.js");
+  try {
+    const result = await inspectMcpServer(providerSpec, {
+      ...(typeof opts.flags.manifest === "string"
+        ? { manifestPath: opts.flags.manifest }
+        : {}),
+      json: !!opts.flags.json,
+    });
+    if (opts.flags.json) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            serverName: result.serverName,
+            serverVersion: result.serverVersion,
+            launchConfig: result.launchConfig,
+            tools: result.tools,
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    } else {
+      process.stdout.write(result.toml);
+    }
+    return 0;
+  } catch (e) {
+    console.error(`loom mcp inspect: ${(e as Error).message}`);
+    return 1;
+  }
 }
 
 /**

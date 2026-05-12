@@ -50,6 +50,7 @@ export {
 export { InMemorySession } from "./builtins/session/memory.js";
 export { FileSession } from "./builtins/session/file.js";
 export { SkillsSession } from "./builtins/session/skills.js";
+export { ChainedSession } from "./runtime/session-chain.js";
 export type {
   Compactor,
   CompactingSessionOptions,

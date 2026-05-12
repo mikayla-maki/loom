@@ -40,8 +40,8 @@ shape (`register<X>` returns an `X`).
 
 | Table | Required? | Holds |
 |---|---|---|
-| `[agent]` | yes | name, description, system prompt, secrets allowlist |
-| `[providers]` | no | local handles for code sources (npm / path / git) |
+| `[agent]` | yes | name, description, system prompt, secrets allowlist, optional `storage_id` override |
+| `[providers]` | no | local handles for code sources (npm / path / git) **or** for configured-factory aliases (e.g. MCP servers via the `mcp-server` built-in factory) |
 | `[harness]` | yes | which harness this agent runs |
 | `[session]` | no (defaults) | the agent's session: a singleton (`provider`) or a layered composition (`layers`) |
 | `[tools]` | no (defaults) | model-facing verbs |
@@ -59,6 +59,20 @@ of:
 | `{ npm = "...", version? = "..." }` | inline `SourceSpec` table | auto-load |
 | `{ path = "...", subpath? = "..." }` | inline `SourceSpec` table | auto-load |
 | `{ git = "...", rev? = "..." }` | inline `SourceSpec` table (future) | auto-load |
+
+`[providers]` entries themselves accept **two** shapes:
+
+- A bare `SourceSpec` (above table) — the historical form: the
+  handle aliases a code source that the provider loader
+  materialises at boot.
+- A **configured-factory** form: `{ provider = "<factory>", ...config }`,
+  same shape as `[harness]` / `[session]` / `[tools.X]`. The
+  `provider` field names a Tools factory (built-in or, in future,
+  source-loaded); the rest of the table is per-handle config that
+  the runtime merges with use-site config when a downstream entry
+  references the handle. This is what MCP servers use:
+  `fs_mcp = { provider = "mcp-server", npm = "@…/server-filesystem" }`.
+  See `mcp-server` in §4 for the built-in factory.
 
 `provider` is **required** on every `[tools.X]`, `[harness]`, and
 every `[session]` (singleton) or `[[session.layers]]` (layered) entry.
@@ -195,6 +209,40 @@ Carried over from v4 §1.6 unchanged. Briefly:
 `[capabilities]` entries do **not** require matching local `[tools]` —
 a parent grants `read_database = { db = "primary" }` so a subagent
 spawned later can use it, even if the parent has no such tool itself.
+
+#### Argument-binding interpretation (MCP-style tools)
+
+For tools whose "kinds" are their input-schema argument names —
+MCP-backed tools today, any provider-contributed tool that opts in
+to the same model via `applyArgGrant` tomorrow — a per-arg grant
+doubles as a *binding directive*. Same field, same shape; richer
+interpretation. Schema effect / execute effect by grant value:
+
+| Grant value                  | Schema effect                       | Execute effect              |
+|------------------------------|-------------------------------------|-----------------------------|
+| `"<literal>"` / number / bool | drop arg from properties + required | merge bound value into call |
+| `["a", "b"]`                  | narrow property to `enum: [...]`    | passed through from model   |
+| `"*"`                         | unchanged                           | passed through from model   |
+| (arg absent in grant)         | unchanged                           | passed through from model   |
+
+Whole-tool `"*"` keeps the full schema with no binding; `{}`
+produces no binding and no narrowing — boot fails via
+`assertRequires` when the tool has required args.
+
+The model-visible `Tool.inputSchema` reflects the narrowing; the
+provider merges the bound values back at execute time. If the
+model tries to pass a value for a bound arg (e.g. by ignoring the
+now-removed schema property), execute() rejects with `isError`
+rather than silently letting the model overwrite a fixed binding.
+
+This is what enables the "same MCP tool, multiple model-facing
+names, each with a different binding" pattern — see `mcp_tool` in
+§4's `mcp-server` description.
+
+**Built-in tools are unchanged.** Bash's `paths` is *not* an
+argument — it's a kind in the historical sense. The argument-
+binding semantic is opt-in by providers via `applyArgGrant`. Native
+tools keep their own `assertRequires` semantics.
 
 ### 1.7 Layered sessions — the universal composition shape
 
@@ -372,6 +420,35 @@ The shape is uniform across all three methods. What differs is `T`
 
 ### 2.4 Runtime interfaces
 
+All three factory `create()` methods receive a `FactoryContext`:
+
+```ts
+interface FactoryContext {
+  manifestDir: string;           // where agent.toml lives
+  agentName: string;
+  loomVersion: string;
+  clientCapabilities: ClientAcpCapabilities;
+  /**
+   * Absolute path to a per-agent directory Loom guarantees exists.
+   * One root per `[agent].storage_id` (defaulting to `[agent].name`).
+   * Plugins put arbitrary state here — cached tool lists, journals,
+   * notes files, PID files. No key-value abstraction; the path is
+   * the entire surface. Convention (not enforced): namespace by
+   * factory name to avoid colliding with siblings, e.g.
+   * `<storage>/mcp/<handle>/cache.json` or
+   * `<storage>/notes-provider/notes.md`.
+   */
+  storage: string;
+}
+```
+
+The storage root is **lazy + side-effecting**: created on first
+`runAgent` / `auditAgent` against a manifest, not at parse time. A
+`.loom-agent` metadata file sits at the root recording which
+manifest first created it; subsequent opens from a different
+manifest path produce a non-fatal collision warning (visible in
+`loom audit` output and `RunningAgent` boot logs).
+
 ```ts
 interface Tools {
   /** Resolve a tool by name. Return null to decline (the runtime will surface as unresolved). */
@@ -498,11 +575,22 @@ internally through the same `registerHarness` / `registerSession` /
 `registerTools` machinery. There's no special-case code path
 for built-ins; they're registered eagerly before any agent boots.
 
-Built-in names today: `anthropic`, `openai`, `test`,
-`small-model-of-parent` (harnesses); `in-memory`, `file`,
-`compacting`, `fork-of-parent`, `skills` (sessions); `builtin` (the
-tool provider that yields `bash`, `read_file`, `write_file`, `find`,
-`spawn_subagent`).
+Built-in names today:
+
+- **Harnesses:** `anthropic`, `openai`, `test`,
+  `small-model-of-parent`.
+- **Sessions:** `in-memory`, `file`, `compacting`, `fork-of-parent`,
+  `skills`.
+- **Tools provider:** `builtin` (yields `bash`, `read_file`,
+  `write_file`, `find`, `spawn_subagent`).
+- **Tools meta-factories:** `mcp-server` (registered in the Tools
+  meta-factory registry; used via the configured-factory form of
+  `[providers]`, e.g. `fs = { provider = "mcp-server", npm = "..." }`).
+  Spawns the named MCP server, drives the `initialize` + `tools/list`
+  handshake, and adapts each MCP tool to Loom's `Tool` interface.
+  Lifecycle (close on agent shutdown), per-instance secret injection
+  into the child env, and the `mcp_tool` rename + capability-based
+  argument binding (§1.6+) are all handled inside the factory.
 
 A manifest references a built-in identically to a plugin:
 
@@ -517,6 +605,30 @@ provider = "file"             # built-in
 bash = {}                     # tool key matches a built-in; provider defaults to "builtin"
 read_file = { provider = "builtin", paths = ["./"] }   # explicit form
 ```
+
+The `mcp-server` Tools meta-factory lives in its own registry (one
+step up from the Tools-from-source loader) so it can be looked up
+by name without going through `package.json`. A manifest plugs in
+any MCP server via the configured-factory `[providers]` form:
+
+```toml
+[providers]
+fs = { provider = "mcp-server", npm = "@modelcontextprotocol/server-filesystem" }
+
+[tools.read_text_file]
+provider = "fs"
+
+[tools.read_welcome]
+provider = "fs"
+mcp_tool = "read_text_file"          # rename: same MCP tool, new model-facing name
+
+[capabilities]
+read_text_file = { path = "*" }
+read_welcome   = { path = "/welcome.md" }   # pre-bind → zero-arg tool
+```
+
+Per-tool `secrets = { LOOM_NAME = "ENV_VAR" }` config injects
+Loom-store secrets into the child process's env at spawn time.
 
 The unification means **plugins and builtins are conceptually
 identical**. The only difference is *where the code lives* — built-in

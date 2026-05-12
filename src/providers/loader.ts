@@ -62,6 +62,19 @@ export interface ContributionRegistration<T> {
   readonly name: string;
   /** Secret names this contribution wants. Resolved before `create` runs. */
   readonly secrets?: SecretNeeds;
+  /**
+   * Per-INSTANCE secret-need callback. Some factories (notably the
+   * built-in `mcp-server`) can only know which secrets they need by
+   * inspecting the user's instance config. Implement this when the
+   * static `secrets` field can't cover it; the runtime merges the
+   * returned needs into Phase 1 of secret loading and passes the
+   * resolved values to `create()` alongside the static set.
+   *
+   * Return `undefined` when this instance needs no extra secrets.
+   */
+  instanceSecretNeeds?(
+    config: Record<string, unknown>,
+  ): SecretNeeds | undefined;
   /** Optional JSON schema for the contribution's per-instance config. */
   readonly configSchema?: JSONSchema;
   /**

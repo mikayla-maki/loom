@@ -45,6 +45,7 @@ export async function parseAgentManifest(
   }
   const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
   const secrets = parseSecretAllowlist(agent.secrets, abs);
+  const storageId = parseStorageId(agent.storage_id, abs);
 
   const providers =
     raw.providers === undefined
@@ -77,6 +78,7 @@ export async function parseAgentManifest(
       : {}),
     ...(systemPrompt !== undefined ? { systemPrompt } : {}),
     ...(secrets !== undefined ? { secrets } : {}),
+    ...(storageId !== undefined ? { storageId } : {}),
     ...(providers ? { providers } : {}),
     harness,
     ...(session ? { session } : {}),
@@ -85,7 +87,29 @@ export async function parseAgentManifest(
   };
 }
 
-// ─── Agent-section helpers (system prompt + secrets) ──────────────────────
+// ─── Agent-section helpers (system prompt + secrets + storage) ──────
+
+/**
+ * Parse `[agent].storage_id`. Must be a non-empty string with no
+ * path separators — same character class as a directory name. The
+ * storage layer further sanitizes punctuation; the parser only
+ * enforces the structural invariants the user might typo.
+ */
+function parseStorageId(v: unknown, where: string): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string" || v.length === 0) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [agent].storage_id must be a non-empty string`,
+    );
+  }
+  if (v.includes("/") || v.includes("\\")) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [agent].storage_id '${v}' contains a ` +
+        `path separator. Use letters, digits, underscore, dash, or dot.`,
+    );
+  }
+  return v;
+}
 
 function parseSystemPromptSpec(
   v: unknown,
@@ -138,17 +162,41 @@ function parseProviderEntry(
   label: string,
   where: string,
 ): ProviderEntry {
-  // A `[providers]` entry value is always a `Reference` to a SourceSpec —
-  // never a bare handle (that would point at itself).
-  const ref = parseReference(v, label, where);
-  if (typeof ref === "string") {
-    if (!isSourceSpecShapedString(ref)) {
-      throw new ManifestError(
-        `agent.toml at ${where}: ${label} must be a SourceSpec (npm-shaped string, ` +
-          `"./path", or a table { npm = "..." } / { path = "..." }). ` +
-          `Bare handles aren't allowed at this layer — that would be a circular reference.`,
-      );
+  // Two accepted on-disk shapes (see `ProviderEntry` JSDoc):
+  //
+  //   1. SourceSpec form — string fast-path or a `{ npm }` / `{ path }`
+  //      table. Code-on-disk; loaded by the provider loader.
+  //   2. Configured-factory form — a table with a `provider` field.
+  //      Same shape as [harness] / [session] / [tools.X]; the
+  //      `provider` field names a Tools factory (built-in or, in
+  //      future, source-loaded) and the rest of the table is
+  //      per-handle config.
+  //
+  // Discriminator: a table carrying a `provider` field IS the
+  // configured-factory form; any other table shape is parsed as a
+  // SourceSpec table.
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const obj = v as Record<string, unknown>;
+    if (obj.provider !== undefined) {
+      const provider = parseReference(obj.provider, `${label}.provider`, where);
+      const { provider: _p, ...config } = obj;
+      void _p;
+      return { provider, ...config };
     }
+    // SourceSpec table (no `provider` field).
+    return parseSourceSpecTable(obj, label, where);
+  }
+  // Otherwise the value must be a SourceSpec-shaped string. Bare
+  // handles aren't accepted at this layer — they would point at
+  // themselves.
+  const ref = parseReference(v, label, where);
+  if (typeof ref === "string" && !isSourceSpecShapedString(ref)) {
+    throw new ManifestError(
+      `agent.toml at ${where}: ${label} must be a SourceSpec (npm-shaped string, ` +
+        `"./path", or a table { npm = "..." } / { path = "..." }), or the ` +
+        `configured-factory form { provider = "<factory>", ...config }. ` +
+        `Bare handles aren't allowed at this layer — that would be a circular reference.`,
+    );
   }
   return ref;
 }
@@ -590,6 +638,12 @@ function parseCapabilityValue(
   label: string,
 ): CapabilityValue {
   if (v === "*") return "*";
+  // Literal-binding shapes (used by argument-binding tool grants, see
+  // `applyArgGrant`). Built-in kinds that don't recognise the literal
+  // shape will leave the value untouched at audit time.
+  if (typeof v === "string") return v;
+  if (typeof v === "number") return v;
+  if (typeof v === "boolean") return v;
   if (Array.isArray(v)) return v as unknown[];
   if (v !== null && typeof v === "object") {
     return v as Record<string, unknown>;

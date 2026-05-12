@@ -457,6 +457,15 @@ export interface FactoryContext {
    * the full picture.
    */
   clientCapabilities: ClientAcpCapabilities;
+  /**
+   * Absolute path to a per-agent directory Loom guarantees exists.
+   * Sessions / harnesses / Tools factories may keep arbitrary state
+   * here (cached tool lists, journals, notes files, PID files).
+   * One root per `[agent].storage_id` (or `[agent].name` when not
+   * overridden). Convention: namespace by factory name to avoid
+   * stomping siblings, e.g. `<storage>/mcp/<handle>/cache.json`.
+   */
+  storage: string;
 }
 
 // ─── Tools (the runtime tool-routing instance) ───────────────────────────

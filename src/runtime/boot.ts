@@ -27,6 +27,7 @@
 import * as path from "node:path";
 
 import { ResolutionError } from "../errors.js";
+import { findToolsFactory } from "../builtins/index.js";
 import {
   loadProviderFromSource,
   type ContributionRegistration,
@@ -204,12 +205,35 @@ export async function materialiseTools(
   tools: Tools;
   contribution: ContributionRegistration<Tools>;
 }> {
-  if (instance.kind !== "provider" || !instance.source) {
+  if (instance.kind !== "provider") {
     throw new ResolutionError(
       `materialiseTools: instance ${instance.id} is not provider-backed`,
     );
   }
-  const contribution = pickToolsContribution(toolsIndex, instance);
+  // Two materialisation paths:
+  //   1. Source-backed — contribution from the on-disk provider loader
+  //      (ToolsIndex), keyed by source.
+  //   2. Factory-backed — built-in / SDK-registered Tools meta-factory
+  //      from `builtins/index.ts`, looked up by name.
+  let contribution: ContributionRegistration<Tools>;
+  if (instance.source) {
+    contribution = pickToolsContribution(toolsIndex, instance);
+  } else if (instance.factoryName) {
+    const fromBuiltin = findToolsFactory(instance.factoryName);
+    if (!fromBuiltin) {
+      throw new ResolutionError(
+        `materialiseTools: built-in Tools factory '${instance.factoryName}' is ` +
+          `not registered. ${describeOrigin(instance)}. Built-in factories live ` +
+          `in src/builtins/provider/; SDK consumers can also call ` +
+          `registerToolsFactory(...) before booting.`,
+      );
+    }
+    contribution = fromBuiltin;
+  } else {
+    throw new ResolutionError(
+      `materialiseTools: instance ${instance.id} is missing both source and factoryName`,
+    );
+  }
   const tools = await Promise.resolve(
     contribution.create(instance.config, ctx, secrets, parent),
   );
@@ -248,6 +272,8 @@ function describeOrigin(instance: ProviderInstance): string {
       return "the native provider";
     case "handle-anonymous":
       return `(via [providers].${instance.origin.providerHandle})`;
+    case "handle-factory":
+      return `(via [providers].${instance.origin.providerHandle} → factory '${instance.origin.factoryName}')`;
     case "inline-anonymous":
       return instance.origin.toolName
         ? `(inline at [tools.${instance.origin.toolName}])`

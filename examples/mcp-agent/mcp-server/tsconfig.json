@@ -1,0 +1,30 @@
+{
+  // TypeScript config for the example MCP server.
+  //
+  // Compiles `server.ts` (source) to `server.js` (committed build output)
+  // next to the source, mirroring `examples/loom-notes-provider/`.
+  //
+  //   npm install      # pull in @modelcontextprotocol/sdk + zod
+  //   npm run build    # one-shot
+  //   npm run dev      # tsc --watch
+  //
+  // Unlike the notes provider, this package has REAL runtime imports
+  // (`@modelcontextprotocol/sdk`, `zod`), so we use NodeNext module
+  // resolution to keep `.js`-suffixed ESM imports honest at both
+  // compile and run time.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "useUnknownInCatchVariables": true,
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["server.ts"]
+}

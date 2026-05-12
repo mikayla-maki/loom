@@ -1,0 +1,74 @@
+# ───────────────────────────────────────────────────────────────────────────
+# Loom MCP-integration example — a tour of the `mcp-server` factory.
+# Companion: the sibling `mcp-server/` directory ships the MCP server.
+#
+# Setup once:  (cd examples/mcp-agent/mcp-server && npm install && npm run build)
+# Audit:       MOCK_API_KEY=demokey loom audit examples/mcp-agent/agent.toml
+# Run:         ANTHROPIC_API_KEY=... MOCK_API_KEY=demokey loom run examples/mcp-agent/agent.toml
+# Inspect:     loom mcp inspect ./examples/mcp-agent/mcp-server/server.js
+# ───────────────────────────────────────────────────────────────────────────
+
+[agent]
+name = "mcp-tour"
+system_prompt = """
+You're a demo assistant wired up to a small example MCP server. Use
+the tools when asked; show their output verbatim when it's the
+natural response. `set_status` only accepts "online"/"away".
+"""
+
+# Configured-factory `[providers]` form: `provider = "mcp-server"`
+# names the built-in factory. The rest of the table is the server-spawn
+# config — one process per [providers] handle, shared by every
+# [tools.X] that references it. `secrets = { ... }` maps Loom-store
+# names to env-var names injected into the child at spawn time.
+[providers]
+mock_server = { provider = "mcp-server", command = "node", args = ["./mcp-server/server.js"], secrets = { MOCK_API_KEY = "MOCK_API_KEY" } }
+
+[harness]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+maxTokens = 4096
+maxTurnRequests = 8
+stream = true
+
+[session]
+layers = ["compacting", "in-memory"]
+
+# ── Tools ─────────────────────────────────────────────────────────────────
+# Static enumeration: every tool the model can call MUST appear here.
+# `mcp_tool = "X"` renames the MCP tool to the manifest key so the same
+# server-side tool can be exposed under multiple narrowed names. The
+# actual narrowing / pre-binding lives in [capabilities] below — see
+# the comments there for what each model-facing tool ends up looking
+# like to the LLM.
+#
+# `dangerous_delete` is advertised by the server but DELIBERATELY
+# absent here — `loom audit` flags it as "advertised but unexposed".
+[tools]
+echo             = { provider = "mock_server" }
+read_document    = { provider = "mock_server" }                              # full schema
+read_welcome_doc = { provider = "mock_server", mcp_tool = "read_document" }  # → narrowed
+query_users      = { provider = "mock_server", mcp_tool = "query_table" }    # → narrowed
+query_orders     = { provider = "mock_server", mcp_tool = "query_table" }    # → narrowed
+set_status       = { provider = "mock_server" }                              # → enum-constrained
+send_alert       = { provider = "mock_server" }
+
+# ── Capabilities ──────────────────────────────────────────────────────────
+# Per-arg grant semantics for argument-binding tools (MCP):
+#
+#   "<literal>" / number / bool  →  arg dropped from schema, merged at execute
+#   ["a", "b"]                    →  arg constrained to `enum: [...]`
+#   "*"                           →  arg unchanged
+#   (arg absent)                  →  arg unchanged
+#
+# Whole-tool "*" keeps the full schema; `{}` denies everything (boot
+# fails if the tool has required args). Bound args are reported by
+# `loom audit`; their values are NOT shown (secrets-safe).
+[capabilities]
+echo             = "*"
+read_document    = "*"
+read_welcome_doc = { doc_id = "welcome" }                          # → model sees `{ format? }`
+query_users      = { table = "users",  limit = "*" }               # → model sees `{ limit? }`
+query_orders     = { table = "orders", limit = "*" }               # → model sees `{ limit? }`
+set_status       = { status = ["online", "away"] }                 # → enum
+send_alert       = { channel = "*", message = "*" }

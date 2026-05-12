@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import * as os from "node:os";
 
 import { runAgent } from "../src/sdk/run-agent.js";
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
@@ -102,6 +103,7 @@ describe("fork-of-parent session", () => {
       agentName: "child",
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+      storage: os.tmpdir(),
     };
     const child = await forkOfParentSessionFactory.create({}, ctx, {}, parent);
 
@@ -167,6 +169,7 @@ describe("small-model-of-parent harness", () => {
       agentName: "child",
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+      storage: os.tmpdir(),
     };
     const child = (await smallModelOfParentHarnessFactory.create(
       { model: "claude-3-5-haiku-latest" },
@@ -209,6 +212,7 @@ describe("small-model-of-parent harness", () => {
       agentName: "child",
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+      storage: os.tmpdir(),
     };
     const child = (await smallModelOfParentHarnessFactory.create(
       { model: "gpt-4o-mini" },
@@ -237,6 +241,7 @@ describe("small-model-of-parent harness", () => {
       agentName: "child",
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+      storage: os.tmpdir(),
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({ model: "x" }, ctx, {}, parent),
@@ -267,6 +272,7 @@ describe("small-model-of-parent harness", () => {
       agentName: "child",
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+      storage: os.tmpdir(),
     };
     const child = (await smallModelOfParentHarnessFactory.create(
       {},
@@ -301,6 +307,7 @@ describe("small-model-of-parent harness", () => {
       agentName: "child",
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+      storage: os.tmpdir(),
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({}, ctx, {}, parent),

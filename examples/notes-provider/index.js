@@ -1,5 +1,5 @@
 /**
- * Example Loom provider — `loom-notes-provider`. Contributes a single
+ * Example Loom provider — `notes-provider`. Contributes a single
  * end-to-end story: **a notes-taking session for persistent recall**.
  *
  *   - A **Session contribution** (`NotesSession`) that loads notes
@@ -24,7 +24,11 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-const PROVIDER_NAME = "loom-notes-provider";
+// By convention this matches the package name (and, for path-based
+// references, the directory name) so a manifest's local handle
+// (e.g. `notes = { path = "../notes-provider" }`) can resolve to
+// this contribution even when the handle name doesn't match.
+const PROVIDER_NAME = "notes-provider";
 /**
  * Wraps the on-disk markdown file with an in-memory mirror. Loaded
  * once at session construction; appended on every `remember` call.
@@ -98,18 +102,28 @@ function parseNotesFile(text) {
     return out;
 }
 /**
- * Pull `file` + `max_notes` out of the session config. The `file`
- * path resolves against the manifest directory (so `./notes.md` lives
- * next to `agent.toml`, not next to `process.cwd()`).
+ * Pull `file` + `max_notes` out of the session config.
+ *
+ *   - If `file` is set, resolve it: absolute paths win, relative
+ *     paths anchor at the manifest directory (so `./notes.md` lives
+ *     next to `agent.toml`, not next to `process.cwd()`).
+ *   - If `file` is omitted, fall back to
+ *     `<ctx.storage>/notes.md` — the per-agent storage root Loom
+ *     hands every plugin via `FactoryContext.storage`. This makes
+ *     notes follow the agent across `cd`s and survive deletes of
+ *     the manifest's containing directory.
  */
 function readSessionConfig(raw, ctx) {
     const c = (raw ?? {});
-    const fileRaw = typeof c.file === "string" && c.file.length > 0
-        ? c.file
-        : "./loom-notes.md";
-    const file = path.isAbsolute(fileRaw)
-        ? fileRaw
-        : path.resolve(ctx.manifestDir, fileRaw);
+    let file;
+    if (typeof c.file === "string" && c.file.length > 0) {
+        file = path.isAbsolute(c.file)
+            ? c.file
+            : path.resolve(ctx.manifestDir, c.file);
+    }
+    else {
+        file = path.join(ctx.storage, "notes.md");
+    }
     const max = typeof c.max_notes === "number" && c.max_notes > 0
         ? c.max_notes
         : undefined;

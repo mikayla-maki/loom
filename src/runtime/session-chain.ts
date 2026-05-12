@@ -13,9 +13,12 @@
  * `trustedPaths`, `dependencies`, `close`) are aggregated across all
  * children.
  *
- * Not public API: the SDK exposes chains via `SessionSpec[]` on the
- * manifest's `session` field. `ChainedSession` is the runtime's
- * composition vehicle, not a user-facing class.
+ * Two consumers compose chains this way:
+ *   - The runtime, when a manifest's `session` field is a
+ *     `SessionSpec[]` (each spec is instantiated, then composed).
+ *   - SDK code that wants direct references to specific layers —
+ *     e.g. holding the `CompactingSession` to wire `compactNow()`
+ *     to a `/compact` slash command. See `examples/sdk-agent/`.
  */
 
 import type {

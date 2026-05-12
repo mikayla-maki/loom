@@ -26,10 +26,13 @@
 import * as path from "node:path";
 
 import {
+  isPreBuiltSessionLayer,
   resolveManifest,
   resolveSystemPrompt,
   sourceSpecKey,
+  type ResolvedSessionLayer,
   type ResolvedSource,
+  type SessionBinding,
 } from "../manifest/resolver.js";
 import { getHarnessFactory, getSessionFactory } from "../builtins/index.js";
 import {
@@ -44,6 +47,12 @@ import {
   materialiseTools as bootMaterialiseTools,
   defaultProviderName as bootDefaultProviderName,
 } from "../runtime/boot.js";
+import {
+  buildSecretStore,
+  collectPhase1SecretNeeds,
+  loadSecretsBundle,
+} from "../sdk/run-agent.js";
+import { resolveAgentStorage } from "../runtime/storage.js";
 import { ChainedSession } from "../runtime/session-chain.js";
 import { LoomError } from "../errors.js";
 import { parseAgentManifest } from "../manifest/parser.js";
@@ -84,13 +93,38 @@ export interface SecretRequest {
 export interface ProviderSummary {
   /** Canonical structural key (matches `lock.toml`). */
   key: string;
-  source: SourceSpec;
+  /** SourceSpec for source-backed providers; undefined for factory-backed. */
+  source?: SourceSpec;
   /** Local `[providers]` handle, when declared. */
   handle?: string;
+  /**
+   * Factory name for `[providers]` configured-factory entries (e.g.
+   * `"mcp-server"`). Source-backed providers don't have one.
+   */
+  factoryName?: string;
   /** Where in the manifest this provider is referenced. */
   origins: string[];
   /** Set when audit tried to load this provider but couldn't. */
   loadError?: string;
+  /**
+   * Set when audit tried to initialise the Tools instance but the
+   * underlying init() threw. Distinct from `loadError`; that's for
+   * package loading. This catches spawn failures, MCP handshake
+   * errors, etc.
+   */
+  initError?: string;
+  /**
+   * Populated for MCP-backed providers after a successful init().
+   * Carries the server's reported name + version + protocol version
+   * so reviewers see exactly what they're talking to.
+   */
+  mcpServer?: {
+    name: string;
+    version: string;
+    protocolVersion: string;
+    /** Names of tools the server advertised but the manifest didn't expose. */
+    advertisedButUnexposed: string[];
+  };
 }
 
 /**
@@ -150,6 +184,17 @@ export interface CapabilityTree {
   /** The agent's `[agent].secrets` allowlist (or undefined when unset). */
   secretAllowlist?: SecretAllowlist;
   /**
+   * Per-agent storage root: absolute path, identifier source
+   * (`storage_id` override vs `name` default), and any collision
+   * warnings produced when the storage dir was opened (e.g. a
+   * different manifest path previously used the same id).
+   */
+  storage: {
+    path: string;
+    source: "storage_id" | "name";
+    warnings: string[];
+  };
+  /**
    * Every provider (declared or inline) this manifest pulls in.
    * Includes load failures (e.g. `npm install` hasn't run); see
    * `loadError`.
@@ -177,6 +222,18 @@ export interface CapabilityTree {
     providerKey?: string;
     /** Local provider handle when declared. */
     providerHandle?: string;
+    /**
+     * Model-visible JSON Schema (i.e. POST-narrowing for MCP-style
+     * argument-bound tools). Only populated when the tool resolved
+     * successfully; useful for reviewing what the model sees.
+     */
+    inputSchema?: unknown;
+    /**
+     * Names of arguments pre-bound via `[capabilities]` for
+     * argument-binding tools. The bound values themselves are NOT
+     * surfaced (they may include user-secret-ish literals).
+     */
+    boundArgs?: string[];
   }>;
   /** Every secret name a component declares it needs. */
   secrets: SecretRequest[];
@@ -243,16 +300,14 @@ export interface CapabilityTree {
 }
 
 /**
- * Options for {@link auditAgent}.
+ * Audit-time options. Currently empty: audit has one behaviour
+ * (succeed cleanly, or throw `AuditError` with the partial tree).
+ * Reserved for future flags that genuinely vary semantics, not for
+ * lenient/strict toggles — "how thoroughly is this manifest
+ * actually wired up?" should always have one honest answer.
  */
 export interface AuditOptions {
-  /**
-   * When true, throw a `LoomError` if any non-builtin source can't be
-   * loaded (i.e. you haven't run `loom install`). CI uses this; the
-   * default (false) keeps audit lenient so dev workflows aren't
-   * blocked when packages aren't yet on disk.
-   */
-  strict?: boolean;
+  // Intentionally empty.
 }
 
 const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
@@ -262,21 +317,249 @@ const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
   find: { paths: ["./"] },
 };
 
+/**
+ * Run a static audit against a manifest. Either the manifest is
+ * fully resolvable — in which case audit returns a `CapabilityTree`
+ * describing what would happen at boot — or it isn't, in which case
+ * audit throws `AuditError` with the partial tree + structured
+ * problem list attached.
+ *
+ * There is no "lenient" mode. Before MCP, audit could be a pure
+ * static walk that always answered; now that MCP requires init()
+ * to populate tool caches, audit may not be able to answer at all,
+ * and pretending otherwise would let broken manifests look fine.
+ *
+ * Callers who want to inspect a partially-resolved tree (UI
+ * authoring tools, IDE integrations) should catch `AuditError` and
+ * read `error.tree` + `error.health`.
+ */
 export async function auditAgent(
   source: string | AgentManifest,
-  options: AuditOptions = {},
+  _options: AuditOptions = {},
 ): Promise<CapabilityTree> {
+  void _options; // reserved; see AuditOptions.
   const tree = await auditAgentInner(source, new Set());
-  if (options.strict && tree.unresolvedSources.length > 0) {
-    const list = tree.unresolvedSources
-      .map((u) => `  - ${u.spec}: ${u.reason}`)
-      .join("\n");
-    throw new LoomError(
-      `loom audit --strict: ${tree.unresolvedSources.length} unresolved source(s) in '${tree.name}'. ` +
-        `Run \`loom install\` to materialise them.\n${list}`,
-    );
+  const health = summariseAuditHealth(tree);
+  if (health.totalProblems > 0) {
+    throw new AuditError(formatAuditFailure(tree.name, health), tree, health);
   }
   return tree;
+}
+
+/**
+ * Thrown by `auditAgent()` when a manifest doesn't fully resolve.
+ * Carries the partial tree + structured health so callers can
+ * inspect both without re-running.
+ */
+export class AuditError extends LoomError {
+  constructor(
+    message: string,
+    public readonly tree: CapabilityTree,
+    public readonly health: AuditHealth,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Audit-health summary: every condition that means "this manifest
+ * is NOT fully resolved." Recursive over the agent tree — a
+ * sub-agent that doesn't resolve makes the parent unsoundly
+ * executable too, so `totalProblems` rolls up through every
+ * reachable sub-agent. Use the per-node counts (`unresolvedSources`
+ * etc.) for direct attribution; use `subagents` to walk the
+ * recursive structure.
+ */
+export interface AuditHealth {
+  /**
+   * Name of the agent this health belongs to. Lets callers walk
+   * `subagents` and identify which sub-agent each child belongs
+   * to without cross-referencing the tree.
+   */
+  agentName: string;
+  /**
+   * Recursive total: this node's direct problems plus every
+   * sub-agent's `totalProblems`. Zero means the manifest AND every
+   * sub-agent it can reach are fully resolved. Audit succeeds iff
+   * this is zero.
+   */
+  totalProblems: number;
+  /**
+   * This node's direct problems, sum of the per-category counts
+   * below. Useful for "which level is broken?" attribution.
+   */
+  directProblems: number;
+  /** Sources audit couldn't load (run `loom install`). */
+  unresolvedSources: number;
+  /**
+   * Providers that loaded but failed to construct or initialise.
+   * Distinct from `unresolvedSources` because the package was found;
+   * the side-effecting `init()` is what broke (MCP server didn't
+   * start, declared secret missing, etc.).
+   */
+  providerInitErrors: number;
+  /**
+   * Tools named in `[tools]` that no provider claimed at audit time.
+   * Typically follows a provider load/init failure but can also
+   * happen when a provider doesn't recognise the requested name
+   * (typo in `mcp_tool`, etc.).
+   */
+  unresolvedTools: number;
+  /**
+   * Tools whose `requires` capability kinds aren't granted by
+   * `[capabilities]`. The runtime fails boot on these via
+   * `assertRequires`; audit should match.
+   */
+  toolsMissingRequires: number;
+  /**
+   * Sub-agent capability ceiling violations (a sub-agent grants
+   * something the parent doesn't allow).
+   */
+  capabilityCeilingViolations: number;
+  /**
+   * Tool `audit()` findings with severity `"error"` (e.g. bash
+   * reports sandbox-exec missing on macOS). These would block boot
+   * via the runtime audit.
+   */
+  toolAuditErrors: number;
+  /**
+   * Recursive children — one entry per reachable sub-agent
+   * (tool-declared via `tool.dependencies.subagents` AND
+   * session-declared via `session.dependencies.subagents`). The
+   * order mirrors the audit tree.
+   */
+  subagents: AuditHealth[];
+}
+
+export function summariseAuditHealth(tree: CapabilityTree): AuditHealth {
+  const unresolvedSources = tree.unresolvedSources.length;
+  // `loadError` providers are already counted under `unresolvedSources`.
+  // `initError` is the disjoint category: package loaded but the
+  // factory's create()/init() threw.
+  const providerInitErrors = tree.providers.filter(
+    (p) => p.initError && !p.loadError,
+  ).length;
+  // The audit walker plants a synthetic `(cycle)` marker when it
+  // bottoms out on a recursive sub-agent declaration. That's a
+  // diagnostic for the user, not a real unresolved tool — the
+  // *parent* (the one declaring the cycle) is the place the
+  // problem materially lives, and is counted via its own
+  // `unresolvedTools` etc. Filter the synthetic markers so they
+  // don't double-count.
+  const unresolvedTools = tree.unresolvedTools.filter(
+    (u) => u.name !== "(cycle)",
+  ).length;
+  const toolsMissingRequires = tree.tools.filter(
+    (t) => t.missing.length > 0,
+  ).length;
+  const capabilityCeilingViolations = tree.capabilityCeilingViolations.length;
+  let toolAuditErrors = 0;
+  for (const t of tree.tools) {
+    for (const f of t.findings) {
+      if (f.severity === "error") toolAuditErrors++;
+    }
+  }
+  const directProblems =
+    unresolvedSources +
+    providerInitErrors +
+    unresolvedTools +
+    toolsMissingRequires +
+    capabilityCeilingViolations +
+    toolAuditErrors;
+
+  // Recurse into every reachable sub-agent: those declared by tools
+  // (`tool.dependencies.subagents`) plus those declared by sessions
+  // (`session.dependencies.subagents`, surfaced as `sessionSubagents`).
+  const subagentTrees: CapabilityTree[] = [
+    ...tree.tools.flatMap((t) => t.subagents),
+    ...tree.sessionSubagents,
+  ];
+  const subagents = subagentTrees.map(summariseAuditHealth);
+  const subagentTotal = subagents.reduce((sum, s) => sum + s.totalProblems, 0);
+
+  return {
+    agentName: tree.name,
+    totalProblems: directProblems + subagentTotal,
+    directProblems,
+    unresolvedSources,
+    providerInitErrors,
+    unresolvedTools,
+    toolsMissingRequires,
+    capabilityCeilingViolations,
+    toolAuditErrors,
+    subagents,
+  };
+}
+
+function formatAuditFailure(name: string, h: AuditHealth): string {
+  // Count how many distinct agents in the tree have a non-zero
+  // direct-problem count. Audit consumers want to know "is this
+  // broken at the top level, deep in a sub-agent, or both?" before
+  // they start reading individual messages.
+  const affectedAgents = countAffectedAgents(h);
+  const headerSuffix =
+    affectedAgents > 1 ? ` across ${affectedAgents} agent(s)` : "";
+  const lines: string[] = [
+    `'${name}' is not fully resolved (${h.totalProblems} problem(s)${headerSuffix}):`,
+  ];
+  appendHealthLines(h, [], lines);
+  return lines.join("\n");
+}
+
+/**
+ * Walk the recursive health, emitting a section per agent that has
+ * direct problems. `path` accumulates the sub-agent chain so deep
+ * problems are easy to locate ("parent → child → grandchild").
+ */
+function appendHealthLines(
+  h: AuditHealth,
+  path: string[],
+  out: string[],
+): void {
+  if (h.directProblems > 0) {
+    const label =
+      path.length === 0 ? h.agentName : path.concat(h.agentName).join(" → ");
+    out.push(`  ${label}:`);
+    if (h.unresolvedSources > 0) {
+      out.push(
+        `    - ${h.unresolvedSources} unresolved source(s) — run \`loom install\``,
+      );
+    }
+    if (h.providerInitErrors > 0) {
+      out.push(
+        `    - ${h.providerInitErrors} provider load/init failure(s) — see provider summary for details`,
+      );
+    }
+    if (h.unresolvedTools > 0) {
+      out.push(
+        `    - ${h.unresolvedTools} unresolved [tools] entr(ies) — no provider claimed the name`,
+      );
+    }
+    if (h.toolsMissingRequires > 0) {
+      out.push(
+        `    - ${h.toolsMissingRequires} tool(s) missing required capability grants`,
+      );
+    }
+    if (h.capabilityCeilingViolations > 0) {
+      out.push(
+        `    - ${h.capabilityCeilingViolations} sub-agent capability-ceiling violation(s)`,
+      );
+    }
+    if (h.toolAuditErrors > 0) {
+      out.push(
+        `    - ${h.toolAuditErrors} tool.audit() error finding(s) — tools that would fail at runtime`,
+      );
+    }
+  }
+  for (const sub of h.subagents) {
+    appendHealthLines(sub, path.concat(h.agentName), out);
+  }
+}
+
+function countAffectedAgents(h: AuditHealth): number {
+  let n = h.directProblems > 0 ? 1 : 0;
+  for (const sub of h.subagents) n += countAffectedAgents(sub);
+  return n;
 }
 
 async function auditAgentInner(
@@ -297,6 +580,10 @@ async function auditAgentInner(
       manifestPath,
       name: manifest.name,
       grants: {},
+      // Storage isn't resolved for the cycle stub — we never
+      // reach the side-effecting path. Surface a placeholder so
+      // the field is non-optional but consumers see it's empty.
+      storage: { path: "", source: "name", warnings: [] },
       providers: [],
       harness: {
         display: "<cycle>",
@@ -326,23 +613,52 @@ async function auditAgentInner(
   const builtinToolNames = new Set(nativeBuiltinNames());
   const resolved = resolveManifest(manifest, { builtinToolNames });
 
-  // ─── provider loading (lenient) ───────────────────────────────
+  // ─── provider loading (lenient) ─────────────────────────────────
   // Same machinery as `runAgent` (via `runtime/boot.js`), but where
   // the runtime treats any provider load failure as fatal, audit
   // collects them in `unresolvedSources` and keeps walking the tree.
+  //
+  // Storage is resolved here too so plugins that read `ctx.storage`
+  // during init() see a real path. Collision warnings surface on
+  // the audit tree (see `tree.storage.warnings`) rather than via
+  // console.warn — audit's contract is "return everything, log
+  // nothing."
+  const storage = await resolveAgentStorage(manifest);
   const factoryCtx: FactoryContext = {
     manifestDir: baseDir,
     agentName: manifest.name,
     loomVersion: "audit",
     clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    storage: storage.path,
   };
   const { toolsIndex, loadErrors } = await loadManifestProviders(
     resolved,
     factoryCtx,
   );
 
+  // Best-effort secrets bundle so audit can construct + init
+  // provider Tools whose `create()` consults secrets (MCP being
+  // the motivating case — it injects them into the spawned
+  // server's env). `allowMissingRequired: true` keeps audit non-
+  // fatal: missing secrets simply aren't in the resulting map; the
+  // factory will surface that as `initError` on the provider
+  // summary if it actually can't proceed.
+  let auditSecrets: Record<string, string> = {};
+  try {
+    const store = buildSecretStore(manifest, {});
+    auditSecrets = await loadSecretsBundle(
+      store,
+      collectPhase1SecretNeeds(resolved, toolsIndex),
+      /*allowMissingRequired*/ true,
+      undefined,
+    );
+  } catch {
+    /* fall through with empty secrets */
+  }
+
   const unresolvedSources: CapabilityTree["unresolvedSources"] = [];
   const providers: ProviderSummary[] = [];
+  const providerSummariesByInstanceId = new Map<string, ProviderSummary>();
   for (const [key, resolvedSrc] of resolved.sources) {
     const summary: ProviderSummary = {
       key,
@@ -360,6 +676,34 @@ async function auditAgentInner(
       });
     }
     providers.push(summary);
+    // Wire instance → summary lookup so the materialisation loop
+    // below can attach init errors / mcp-server info to the right
+    // entry. Source-backed: every instance pointing at this source
+    // shares the same summary.
+    for (const p of resolved.providers) {
+      if (
+        p.kind === "provider" &&
+        p.source &&
+        sourceSpecKey(p.source) === key
+      ) {
+        providerSummariesByInstanceId.set(p.id, summary);
+      }
+    }
+  }
+  // Configured-factory `[providers]` entries have no SourceSpec
+  // — they're absent from `resolved.sources`. Add a synthetic
+  // ProviderSummary per factory-backed instance so reviewers see
+  // the MCP-style provider in audit output.
+  for (const p of resolved.providers) {
+    if (p.kind !== "provider" || p.source || !p.factoryName) continue;
+    const summary: ProviderSummary = {
+      key: `factory:${p.factoryName}#${p.id}`,
+      factoryName: p.factoryName,
+      ...(p.providerHandle ? { handle: p.providerHandle } : {}),
+      origins: [originLabelFor(p)],
+    };
+    providers.push(summary);
+    providerSummariesByInstanceId.set(p.id, summary);
   }
   // Stable order: declared handles first (alphabetically), then inline.
   providers.sort((a, b) => {
@@ -387,29 +731,35 @@ async function auditAgentInner(
     constructionError?: string;
   }> = [];
   const auditedSessionLinks: Session[] = [];
-  for (const [i, binding] of sessionBindings.entries()) {
+  for (const [i, layer] of sessionBindings.entries()) {
     let linkInstance: Session | null = null;
     let linkError: string | undefined;
-    try {
-      const { instance } = await instantiateFromBinding<Session>(
-        binding,
-        getSessionFactory,
-        factoryCtx,
-        {},
-        undefined,
-        "session",
-      );
-      linkInstance = instance;
-      auditedSessionLinks.push(instance);
-    } catch (e) {
-      linkError = (e as Error).message;
-      const linkLabel =
-        sessionBindings.length === 1
-          ? "session"
-          : `session link ${i} ('${binding.factoryName}')`;
-      sessionConstructionError =
-        (sessionConstructionError ? sessionConstructionError + "; " : "") +
-        `${linkLabel}: ${linkError}`;
+    if (isPreBuiltSessionLayer(layer)) {
+      // Pre-built instance — nothing to construct, can't fail here.
+      linkInstance = layer.instance;
+      auditedSessionLinks.push(layer.instance);
+    } else {
+      try {
+        const { instance } = await instantiateFromBinding<Session>(
+          layer,
+          getSessionFactory,
+          factoryCtx,
+          {},
+          undefined,
+          "session",
+        );
+        linkInstance = instance;
+        auditedSessionLinks.push(instance);
+      } catch (e) {
+        linkError = (e as Error).message;
+        const linkLabel =
+          sessionBindings.length === 1
+            ? "session"
+            : `session link ${i} ('${layer.factoryName}')`;
+        sessionConstructionError =
+          (sessionConstructionError ? sessionConstructionError + "; " : "") +
+          `${linkLabel}: ${linkError}`;
+      }
     }
     perLinkContributions.push({
       contributedTools: [],
@@ -429,17 +779,18 @@ async function auditAgentInner(
   const sessionToolBindings: typeof resolved.tools = [];
   const claimedSessionTools = new Set(resolved.tools.map((b) => b.toolName));
   let cursor = 0;
-  for (const [i, binding] of sessionBindings.entries()) {
-    // Find the i'th binding's instance among auditedSessionLinks.
+  for (const [i, layer] of sessionBindings.entries()) {
+    // Find the i'th layer's instance among auditedSessionLinks.
     // perLinkContributions[i].constructionError set ⇒ no instance
     // was created and `cursor` skips it.
     const slot = perLinkContributions[i]!;
     if (slot.constructionError) continue;
     const linkInstance = auditedSessionLinks[cursor++]!;
+    const layerLabel = sessionLayerLabel(layer);
     const originLabel =
       sessionBindings.length === 1
-        ? `(session: ${binding.factoryName})`
-        : `(session link ${i}: ${binding.factoryName})`;
+        ? `(session: ${layerLabel})`
+        : `(session link ${i}: ${layerLabel})`;
     try {
       const refs = (await linkInstance.tools?.()) ?? [];
       for (const ref of refs) {
@@ -459,7 +810,7 @@ async function auditAgentInner(
     } catch (e) {
       sessionConstructionError =
         (sessionConstructionError ? sessionConstructionError + "; " : "") +
-        `session link ${i} ('${binding.factoryName}') .tools() threw: ${
+        `session link ${i} ('${layerLabel}') .tools() threw: ${
           (e as Error).message
         }`;
     }
@@ -470,7 +821,7 @@ async function auditAgentInner(
     } catch (e) {
       sessionConstructionError =
         (sessionConstructionError ? sessionConstructionError + "; " : "") +
-        `session link ${i} ('${binding.factoryName}') .trustedPaths() threw: ${
+        `session link ${i} ('${layerLabel}') .trustedPaths() threw: ${
           (e as Error).message
         }`;
     }
@@ -505,21 +856,56 @@ async function auditAgentInner(
       providerByInstanceId.set(p.id, native);
       continue;
     }
+    const summary = providerSummariesByInstanceId.get(p.id);
+    let tools: Tools;
     try {
-      const { tools } = await bootMaterialiseTools(
+      ({ tools } = await bootMaterialiseTools(
         p,
         toolsIndex,
         factoryCtx,
-        {},
+        auditSecrets,
         undefined,
-      );
-      providerByInstanceId.set(p.id, tools);
-      auditedProviderTools.push(tools);
-    } catch {
-      // No matching Tools contribution (or create() threw). Tools
-      // routing through this instance will surface as
-      // `unresolvedTools`.
+      ));
+    } catch (e) {
+      // construction failure (e.g. MCP missing a declared secret,
+      // bad config). Tools routing through this instance will
+      // surface as `unresolvedTools`; also record the error on the
+      // summary so reviewers don't have to guess why.
+      if (summary) {
+        summary.initError = (e as Error).message;
+      }
+      continue;
     }
+    providerByInstanceId.set(p.id, tools);
+    auditedProviderTools.push(tools);
+    // Best-effort init() so MCP server info + tool cache populate
+    // before we walk tool bindings. Failures get attributed to the
+    // provider summary; the tools route through unresolvedTools.
+    if (tools.init) {
+      try {
+        await tools.init({
+          manifest,
+          config: p.config,
+          secrets: auditSecrets,
+          factoryContext: factoryCtx,
+          runtime: {
+            async requestPermission() {
+              throw new Error("audit doesn't route runtime requests");
+            },
+          },
+        });
+      } catch (e) {
+        if (summary) {
+          summary.initError = (e as Error).message;
+        }
+        continue;
+      }
+    }
+    // Pull MCP server info out of the freshly-inited Tools when the
+    // instance is an MCP factory — we identify it duck-typed so we
+    // don't need a runtime import of McpServerTools (audit lives
+    // upstream of builtins/provider).
+    if (summary) attachMcpServerInfo(summary, tools, resolved, p.id);
   }
 
   // Mirror the runtime's synthetic `"(session)"` Tools instance.
@@ -634,21 +1020,39 @@ async function auditAgentInner(
       );
       const layerBinding =
         layerIdx >= 0 ? sessionBindings[layerIdx] : undefined;
-      if (layerBinding?.source) {
-        providerKey = sourceSpecKey(layerBinding.source);
-      }
-      if (layerBinding?.providerHandle) {
-        providerHandle = layerBinding.providerHandle;
+      // Only factory-backed layers carry source/handle; pre-built
+      // instances have neither.
+      if (layerBinding && !isPreBuiltSessionLayer(layerBinding)) {
+        if (layerBinding.source) {
+          providerKey = sourceSpecKey(layerBinding.source);
+        }
+        if (layerBinding.providerHandle) {
+          providerHandle = layerBinding.providerHandle;
+        }
       }
     } else {
       const instance = instanceById.get(binding.providerInstanceId);
       if (instance && instance.kind === "provider" && instance.source) {
         providerKey = sourceSpecKey(instance.source);
       }
+      if (
+        instance &&
+        instance.kind === "provider" &&
+        !instance.source &&
+        instance.factoryName
+      ) {
+        // Factory-backed (e.g. MCP) — use the synthetic provider
+        // summary key so the audit attribution lines up.
+        providerKey = `factory:${instance.factoryName}#${instance.id}`;
+      }
       if (instance?.providerHandle) {
         providerHandle = instance.providerHandle;
       }
     }
+    // For argument-binding tools (MCP), surface the bound arg names
+    // so reviewers see what `[capabilities]` pre-fills without
+    // having to mentally simulate `applyArgGrant`.
+    const boundArgs = boundArgsForGrant(grant);
     tools.push({
       name: binding.toolName,
       requires,
@@ -660,7 +1064,35 @@ async function auditAgentInner(
       subagents,
       ...(providerKey ? { providerKey } : {}),
       ...(providerHandle ? { providerHandle } : {}),
+      ...(t.inputSchema ? { inputSchema: t.inputSchema } : {}),
+      ...(boundArgs.length > 0 ? { boundArgs } : {}),
     });
+  }
+
+  // After walking all tool bindings, compute the
+  // "advertised but unexposed" set per factory-backed provider so
+  // audit reviewers can see what the underlying MCP server offered
+  // that the manifest didn't opt into.
+  for (const [instanceId, summary] of providerSummariesByInstanceId) {
+    if (!summary.mcpServer) continue;
+    const exposed = new Set<string>();
+    for (const binding of resolved.tools) {
+      if (binding.providerInstanceId !== instanceId) continue;
+      // The dispatched MCP-tool name is either `config.mcp_tool` or
+      // the model-facing name. Reflect both for safety.
+      const dispatched =
+        typeof binding.toolConfig.mcp_tool === "string"
+          ? (binding.toolConfig.mcp_tool as string)
+          : binding.toolName;
+      exposed.add(dispatched);
+    }
+    const tools = providerByInstanceId.get(instanceId);
+    const cache = (tools as unknown as { toolsCache?: Map<string, unknown> })
+      ?.toolsCache;
+    if (!cache) continue;
+    summary.mcpServer.advertisedButUnexposed = [...cache.keys()]
+      .filter((n) => !exposed.has(n))
+      .sort();
   }
 
   // Clean up audit-built Tools instances (skip close errors — they're not fatal here).
@@ -725,6 +1157,11 @@ async function auditAgentInner(
     ...(manifest.secrets !== undefined
       ? { secretAllowlist: manifest.secrets }
       : {}),
+    storage: {
+      path: storage.path,
+      source: storage.source,
+      warnings: storage.warnings,
+    },
     providers,
     harness: harnessSummary,
     ...(sessionSummary ? { session: sessionSummary } : {}),
@@ -846,19 +1283,32 @@ function buildSessionLayerSummaries(
     ];
   }
 
-  return bindings.map((binding, i) => {
+  return bindings.map((layer, i) => {
     const slot = perLinkContributions[i] ?? {
       contributedTools: [],
       trustedPaths: [],
     };
+    if (isPreBuiltSessionLayer(layer)) {
+      return {
+        display: "<pre-built Session instance>",
+        config: {},
+        resolved: true,
+        preBuilt: true,
+        contributedTools: [...slot.contributedTools],
+        trustedPaths: [...slot.trustedPaths],
+        ...(slot.constructionError
+          ? { constructionError: slot.constructionError }
+          : {}),
+      };
+    }
     let registryHit = false;
     try {
-      getSessionFactory(binding.factoryName);
+      getSessionFactory(layer.factoryName);
       registryHit = true;
     } catch {
-      if (binding.source) {
+      if (layer.source) {
         try {
-          getSessionFactory(defaultProviderName(binding.source));
+          getSessionFactory(defaultProviderName(layer.source));
           registryHit = true;
         } catch {
           /* unresolved */
@@ -866,13 +1316,11 @@ function buildSessionLayerSummaries(
       }
     }
     return {
-      display: binding.providerHandle ?? binding.factoryName,
-      factoryName: binding.factoryName,
-      config: binding.config,
-      ...(binding.source ? { providerKey: sourceSpecKey(binding.source) } : {}),
-      ...(binding.providerHandle
-        ? { providerHandle: binding.providerHandle }
-        : {}),
+      display: layer.providerHandle ?? layer.factoryName,
+      factoryName: layer.factoryName,
+      config: layer.config,
+      ...(layer.source ? { providerKey: sourceSpecKey(layer.source) } : {}),
+      ...(layer.providerHandle ? { providerHandle: layer.providerHandle } : {}),
       resolved: registryHit,
       preBuilt: false,
       contributedTools: [...slot.contributedTools],
@@ -882,6 +1330,18 @@ function buildSessionLayerSummaries(
         : {}),
     };
   });
+}
+
+/**
+ * Human-readable identifier for a `ResolvedSessionLayer`, used in
+ * audit error messages and origin labels. Factory-backed layers
+ * fall back to their factory name; pre-built instances render as
+ * `(pre-built)`.
+ */
+function sessionLayerLabel(layer: ResolvedSessionLayer): string {
+  return isPreBuiltSessionLayer(layer)
+    ? "(pre-built)"
+    : (layer.providerHandle ?? layer.factoryName);
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
@@ -986,12 +1446,15 @@ function collectSecrets(
       /* unknown harness — skip */
     }
   }
-  // Session factory needs (per chain link).
-  for (const link of resolved.session ?? []) {
+  // Session factory needs (per chain link). Pre-built instances
+  // bring their own state; the audit can't see what secrets they
+  // closed over at construction time.
+  for (const layer of resolved.session ?? []) {
+    if (isPreBuiltSessionLayer(layer)) continue;
     try {
       const f = lookupFactoryByBinding(
-        link.factoryName,
-        link.source,
+        layer.factoryName,
+        layer.source,
         getSessionFactory,
       );
       addNeeds(f.secrets, `session:${f.name}`);
@@ -1031,6 +1494,76 @@ function collectSecrets(
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
+}
+
+/**
+ * Render an origin label for a factory-backed `ProviderInstance`.
+ * Mirrors `resolver.ts`'s `originLabel` but lives here so the audit
+ * doesn't need to import the resolver's internals.
+ */
+function originLabelFor(
+  p: ReturnType<typeof resolveManifest>["providers"][number],
+): string {
+  if (p.origin.kind === "handle-factory") {
+    return `(via [providers].${p.origin.providerHandle} → factory '${p.origin.factoryName}')`;
+  }
+  return "(factory-backed)";
+}
+
+/**
+ * If `tools` looks like an MCP `McpServerTools` instance — we duck-
+ * type via the public `serverInfo` / `toolsCache` fields — attach
+ * the server info to the provider summary so reviewers see
+ * `mcp-server-name 1.2.3` in the audit output.
+ */
+function attachMcpServerInfo(
+  summary: ProviderSummary,
+  tools: Tools,
+  _resolved: ReturnType<typeof resolveManifest>,
+  _instanceId: string,
+): void {
+  const info = (
+    tools as unknown as {
+      serverInfo?: {
+        name: string;
+        version: string;
+        protocolVersion: string;
+      };
+    }
+  ).serverInfo;
+  if (!info) return;
+  summary.mcpServer = {
+    name: info.name,
+    version: info.version,
+    protocolVersion: info.protocolVersion,
+    advertisedButUnexposed: [],
+  };
+}
+
+/**
+ * Surface the arg names that a per-arg capability grant pre-binds.
+ * Used by the audit output so reviewers can see which inputs the
+ * model never gets to choose.
+ */
+function boundArgsForGrant(grant: CapabilitySet | undefined): string[] {
+  if (
+    !grant ||
+    grant === "*" ||
+    typeof grant !== "object" ||
+    Array.isArray(grant)
+  ) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const [arg, value] of Object.entries(grant)) {
+    if (value === undefined) continue;
+    if (value === "*") continue;
+    if (Array.isArray(value)) continue;
+    if (typeof value === "object") continue;
+    // Scalar: it's a literal binding.
+    out.push(arg);
+  }
+  return out.sort();
 }
 
 function stubHarness(): Harness {
@@ -1087,13 +1620,35 @@ export function formatCapabilityTree(
     `${pad}${p.bold(p.cyan(tree.name))}  ${p.dim(`(${tree.manifestPath})`)}`,
   );
 
+  // Storage. Hidden when the cycle stub left it empty.
+  if (tree.storage.path) {
+    const sourceTag =
+      tree.storage.source === "storage_id"
+        ? p.dim("(from [agent].storage_id)")
+        : p.dim("(from [agent].name)");
+    lines.push(
+      `${pad}  ${p.bold("storage:")} ${p.cyan(tree.storage.path)}  ${sourceTag}`,
+    );
+    for (const w of tree.storage.warnings) {
+      lines.push(`${pad}  ${p.yellow(`⚠ ${w}`)}`);
+    }
+  }
+
   // Providers.
   if (tree.providers.length > 0) {
     lines.push(`${pad}  ${p.bold("providers:")}`);
     for (const pl of tree.providers) {
-      const label = pl.handle
-        ? `${p.cyan(pl.handle)}  ${p.dim(`(${pl.key})`)}`
-        : `${p.cyan(pl.key)}  ${p.dim("(inline)")}`;
+      // Factory-backed providers (e.g. MCP) get a `→ factory` hint.
+      let label: string;
+      if (pl.factoryName) {
+        label = pl.handle
+          ? `${p.cyan(pl.handle)}  ${p.dim(`(→ factory '${pl.factoryName}')`)}`
+          : `${p.cyan(`factory '${pl.factoryName}'`)}`;
+      } else if (pl.handle) {
+        label = `${p.cyan(pl.handle)}  ${p.dim(`(${pl.key})`)}`;
+      } else {
+        label = `${p.cyan(pl.key)}  ${p.dim("(inline)")}`;
+      }
       const origins =
         pl.origins.length > 0
           ? `  ${p.dim(`referenced by ${pl.origins.join(", ")}`)}`
@@ -1101,6 +1656,20 @@ export function formatCapabilityTree(
       lines.push(`${pad}    ${p.dim("-")} ${label}${origins}`);
       if (pl.loadError) {
         lines.push(`${pad}      ${p.yellow(`⚠ load failed: ${pl.loadError}`)}`);
+      }
+      if (pl.initError) {
+        lines.push(`${pad}      ${p.yellow(`⚠ init failed: ${pl.initError}`)}`);
+      }
+      if (pl.mcpServer) {
+        const mc = pl.mcpServer;
+        lines.push(
+          `${pad}      ${p.dim("server:")} ${p.cyan(mc.name)} ${p.dim(mc.version)} ${p.dim(`(mcp ${mc.protocolVersion})`)}`,
+        );
+        if (mc.advertisedButUnexposed.length > 0) {
+          lines.push(
+            `${pad}      ${p.dim(`advertised but unexposed (${mc.advertisedButUnexposed.length}):`)} ${p.dim(mc.advertisedButUnexposed.join(", "))}`,
+          );
+        }
       }
     }
   }
@@ -1185,6 +1754,13 @@ export function formatCapabilityTree(
       lines.push(
         `${pad}      ${p.dim("granted:")} ${p.dim(formatGrant(t.granted))}`,
       );
+      if (t.boundArgs && t.boundArgs.length > 0) {
+        // Surface MCP-style pre-bindings inline so reviewers see
+        // which args the model never gets to choose.
+        lines.push(
+          `${pad}      ${p.dim("pre-bound args:")} ${p.cyan(t.boundArgs.join(", "))}`,
+        );
+      }
       for (const f of t.findings) {
         const { icon, paint } = severityIcon(f.severity, p);
         lines.push(`${pad}      ${paint(icon)} ${f.message}`);
