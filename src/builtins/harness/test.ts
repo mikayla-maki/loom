@@ -147,16 +147,12 @@ export class TestHarness implements Harness {
           name: step.call.tool,
           input: step.call.input,
         });
-        await runtime.update({
-          sessionUpdate: "tool_call_update",
+        // Split-channel emit (see `Runtime.emitToolResult`).
+        await runtime.emitToolResult({
           toolCallId: id,
           status: result.isError ? "failed" : "completed",
-          content: [
-            {
-              type: "content",
-              content: { type: "text", text: result.content },
-            },
-          ],
+          modelContent: result.content,
+          ...(result.display ? { display: result.display } : {}),
         });
         if (step.surface !== false) {
           await runtime.update({

@@ -39,52 +39,70 @@ export class FileSession implements Session {
   constructor(public readonly filePath: string) {}
 
   async push(update: SessionUpdate): Promise<SessionUpdate[]> {
-    if (!this.cache) await this.load();
+    const cache = await this.ensureCache();
 
     if (isCoalescable(update)) {
+      const head = this.pending[0];
       // Same kind as buffer head → keep collecting; no disk write.
-      if (this.pending.length === 0 || sameKind(this.pending[0]!, update)) {
+      if (head === undefined || sameKind(head, update)) {
         this.pending.push(update);
         await this.writeChain;
         return [update];
       }
       // Different coalescable kind → boundary; flush and start fresh.
-      this.flushPending();
+      this.flushPending(cache);
       this.pending.push(update);
       await this.writeChain;
       return [update];
     }
 
     // Non-coalescable → boundary; flush, then write this event verbatim.
-    this.flushPending();
-    this.cache!.push(update);
+    this.flushPending(cache);
+    cache.push(update);
     this.queueAppend(update);
     await this.writeChain;
     return [update];
   }
 
   async pull(_below: SessionUpdate[]): Promise<SessionUpdate[]> {
-    if (!this.cache) await this.load();
+    const cache = await this.ensureCache();
     if (this.pending.length > 0) {
       // Surface the in-flight buffer (merged) so in-process readers see
       // the message being produced this turn.
-      return [...this.cache!, mergeChunks(this.pending)];
+      return [...cache, mergeChunks(this.pending)];
     }
-    return [...this.cache!];
+    return [...cache];
   }
 
   async close(): Promise<void> {
-    this.flushPending();
+    if (this.pending.length > 0) {
+      // close() may run before any push()/pull(), so the cache might
+      // still be null — but in that case the buffer is empty by
+      // construction, so we can short-circuit (handled by the guard
+      // above).
+      this.flushPending(await this.ensureCache());
+    }
     await this.writeChain;
   }
 
   /** Merge pending chunks, append to cache, queue disk write, reset buffer. */
-  private flushPending(): void {
+  private flushPending(cache: SessionUpdate[]): void {
     if (this.pending.length === 0) return;
     const merged = mergeChunks(this.pending);
-    this.cache!.push(merged);
+    cache.push(merged);
     this.queueAppend(merged);
     this.pending = [];
+  }
+
+  private async ensureCache(): Promise<SessionUpdate[]> {
+    if (this.cache === null) await this.load();
+    if (this.cache === null) {
+      // `load()` always assigns `this.cache` (even the ENOENT branch).
+      throw new Error(
+        "FileSession: internal invariant violated — cache unset after load()",
+      );
+    }
+    return this.cache;
   }
 
   /** Schedule a JSONL append; serialised through `writeChain`. */
@@ -128,10 +146,18 @@ function sameKind(a: SessionUpdate, b: SessionUpdate): boolean {
   return a.sessionUpdate === b.sessionUpdate;
 }
 
-/** Merge a run of same-kind coalescable chunks by concatenating text. */
+/**
+ * Merge a run of same-kind coalescable chunks by concatenating text.
+ * Callers must ensure `chunks` is non-empty (every internal call site
+ * checks `pending.length > 0` first); we still guard at runtime so
+ * the invariant is loud if it ever breaks.
+ */
 function mergeChunks(chunks: SessionUpdate[]): SessionUpdate {
-  if (chunks.length === 1) return chunks[0]!;
-  const first = chunks[0]!;
+  const first = chunks[0];
+  if (first === undefined) {
+    throw new Error("mergeChunks called with an empty buffer");
+  }
+  if (chunks.length === 1) return first;
   // All coalescable kinds share `{ sessionUpdate, content: { type: "text", text } }`.
   let text = "";
   for (const c of chunks) {

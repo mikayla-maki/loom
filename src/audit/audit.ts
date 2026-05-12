@@ -32,13 +32,12 @@ import {
   sourceSpecKey,
   type ResolvedSessionLayer,
   type ResolvedSource,
-  type SessionBinding,
 } from "../manifest/resolver.js";
 import { getHarnessFactory, getSessionFactory } from "../builtins/index.js";
 import {
   buildNativeTools,
   nativeBuiltinNames,
-} from "../builtins/provider/native.js";
+} from "../builtins/tools/native.js";
 import { DEFAULT_CLIENT_ACP_CAPABILITIES } from "../runtime/acp-capabilities.js";
 import {
   instantiateFromBinding,
@@ -306,15 +305,13 @@ export interface CapabilityTree {
  * lenient/strict toggles — "how thoroughly is this manifest
  * actually wired up?" should always have one honest answer.
  */
-export interface AuditOptions {
-  // Intentionally empty.
-}
+export type AuditOptions = Record<string, never>;
 
 const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
   bash: { subprocess: "*", paths: ["./"] },
   read_file: { paths: ["./"] },
   write_file: { paths: ["./"] },
-  find: { paths: ["./"] },
+  edit_file: { paths: ["./"] },
 };
 
 /**
@@ -769,7 +766,9 @@ async function auditAgentInner(
     void linkInstance; // populated below from per-link queries
   }
   if (auditedSessionLinks.length === 1) {
-    auditSession = auditedSessionLinks[0]!;
+    // Length-check above narrows index 0 at runtime; TS needs help.
+    const [only] = auditedSessionLinks as [Session];
+    auditSession = only;
   } else if (auditedSessionLinks.length > 1) {
     auditSession = new ChainedSession(auditedSessionLinks);
   }
@@ -782,10 +781,20 @@ async function auditAgentInner(
   for (const [i, layer] of sessionBindings.entries()) {
     // Find the i'th layer's instance among auditedSessionLinks.
     // perLinkContributions[i].constructionError set ⇒ no instance
-    // was created and `cursor` skips it.
-    const slot = perLinkContributions[i]!;
+    // was created and `cursor` skips it. Both lookups are invariants
+    // of how we just built the parallel arrays, hence the runtime
+    // guards (rather than `!`) to surface any future drift.
+    const slot = perLinkContributions[i];
+    if (!slot) {
+      throw new Error(
+        `audit: perLinkContributions missing slot for layer ${i}`,
+      );
+    }
     if (slot.constructionError) continue;
-    const linkInstance = auditedSessionLinks[cursor++]!;
+    const linkInstance = auditedSessionLinks[cursor++];
+    if (!linkInstance) {
+      throw new Error(`audit: auditedSessionLinks exhausted before layer ${i}`);
+    }
     const layerLabel = sessionLayerLabel(layer);
     const originLabel =
       sessionBindings.length === 1
@@ -836,10 +845,10 @@ async function auditAgentInner(
   // ─── tool resolution ──────────────────────────────────
   const native = buildNativeTools();
   const auditAgentRef: Agent = {
+    manifest,
     harness: stubHarness(),
     session: stubSession(),
     systemPromptCore: "",
-    agentName: manifest.name,
   };
 
   // Materialise each resolver-determined Tools instance the same way
@@ -1160,7 +1169,12 @@ async function auditAgentInner(
     storage: {
       path: storage.path,
       source: storage.source,
-      warnings: storage.warnings,
+      // Storage collision warnings only surface on the top-level
+      // audit. A sub-agent inherits its identity from a parent that
+      // already opened the same storage (and may have surfaced the
+      // collision there); repeating the warning per sub-agent is
+      // noise the user can't act on from inside a sub-tree.
+      warnings: seenManifests.size === 0 ? storage.warnings : [],
     },
     providers,
     harness: harnessSummary,
@@ -1360,7 +1374,7 @@ function computeMissing(
   if (grant === undefined) return [...requires];
   const missing: string[] = [];
   for (const k of requires) {
-    if (!Object.prototype.hasOwnProperty.call(grant, k)) missing.push(k);
+    if (!Object.hasOwn(grant, k)) missing.push(k);
   }
   return missing;
 }
@@ -1696,7 +1710,7 @@ export function formatCapabilityTree(
   const layers = tree.sessionLayers ?? (tree.session ? [tree.session] : []);
   if (layers.length > 0) {
     if (layers.length === 1) {
-      const s = layers[0]!;
+      const [s] = layers as [(typeof layers)[number]];
       const status = s.resolved
         ? ""
         : `  ${p.yellow("⚠ not registered at audit time")}`;

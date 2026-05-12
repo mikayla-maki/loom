@@ -86,6 +86,11 @@ function renderNoteLine(n) {
 function renderNotesFile(ns) {
     return ns.map(renderNoteLine).join("");
 }
+function truncateForTitle(s) {
+    const oneLine = s.replace(/\s+/g, " ").trim();
+    const max = 60;
+    return oneLine.length > max ? oneLine.slice(0, max - 1) + "\u2026" : oneLine;
+}
 /**
  * Parse the markdown file. Lines that don't match the bullet pattern
  * are skipped silently — that way a user can add comments / headings
@@ -96,8 +101,12 @@ function parseNotesFile(text) {
     const lineRe = /^- \((\d{4}-\d{2}-\d{2}T[^)]+)\) (.+)$/;
     for (const line of text.split("\n")) {
         const m = lineRe.exec(line);
-        if (m)
-            out.push({ at: m[1], text: m[2] });
+        // The regex has two required capture groups, so a successful
+        // match guarantees both. Destructure to make that the contract.
+        if (m) {
+            const [, at, body] = m;
+            out.push({ at, text: body });
+        }
     }
     return out;
 }
@@ -196,7 +205,17 @@ class NotesSession {
                 }
                 try {
                     const note = await store.add(fact);
-                    return { content: `Noted: "${note.text}"` };
+                    // `display` is light-ACP rendering metadata: the harness
+                    // folds it into the `tool_call_update` so ACP clients
+                    // (Zed, etc.) render a meaningful title + icon instead of
+                    // the bare tool name.
+                    return {
+                        content: `Noted: "${note.text}"`,
+                        display: {
+                            title: `Remembered: ${truncateForTitle(note.text)}`,
+                            kind: "other",
+                        },
+                    };
                 }
                 catch (e) {
                     return {

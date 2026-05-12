@@ -1,6 +1,6 @@
 /**
  * Shared path utilities for filesystem-shaped tools (read_file,
- * write_file, find).
+ * write_file, edit_file, find).
  *
  * The capability kind is `paths`. Star/list/absent semantics:
  *   absent      → tool's smart default (each tool decides; FS tools

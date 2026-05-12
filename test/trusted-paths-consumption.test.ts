@@ -1,12 +1,16 @@
 /**
- * Path-aware tools (`read_file`, `write_file`, `find`) must honour
- * `Session.trustedPaths()`: the effective allowlist at execute time
- * is the manifest grant unioned with session-declared trusted paths
- * (filtered by access semantics — read tools accept any access,
- * write tools require write or read-write).
+ * Path-aware tools (`read_file`, `write_file`, `edit_file`, `find`)
+ * must honour `Session.trustedPaths()`: the effective allowlist at
+ * execute time is the manifest grant unioned with session-declared
+ * trusted paths (filtered by access semantics — read tools accept
+ * any access, write tools require write or read-write).
  *
  * `bash` deliberately does NOT honour `trustedPaths` to preserve its
  * sandbox — that property is tested separately.
+ *
+ * `edit_file` shares the same `effectivePaths(granted, trusted, "write")`
+ * call as `write_file`, so the write-access filtering tests below
+ * cover it transitively.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -47,10 +51,10 @@ afterEach(async () => {
 
 function makeCtx(session: Session): ToolContext {
   const agent: Agent = {
+    manifest: { name: "test", harness: { provider: "test" } },
     harness: { run: async () => ({ stopReason: "end_turn" as const }) },
     session,
     systemPromptCore: "",
-    agentName: "test",
   };
   return {
     secrets: {},

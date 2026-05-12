@@ -38,7 +38,7 @@ import { inMemorySessionFactory } from "./session/memory.js";
 import { forkOfParentSessionFactory } from "./session/parent-derived.js";
 import { skillsSessionFactory } from "./session/skills.js";
 
-import { mcpServerToolsFactory } from "./provider/mcp.js";
+import { mcpServerToolsFactory } from "./tools/mcp.js";
 
 const harnessRegistry = new Map<string, HarnessFactory>();
 const sessionRegistry = new Map<string, SessionFactory>();

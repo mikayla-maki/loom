@@ -292,8 +292,11 @@ export interface AgentManifest {
   /**
    * Top-level tools, model-facing name → entry. Absent → loom
    * auto-loads the default builtin set (`bash`, `read_file`,
-   * `write_file`, `find`) with default capabilities. Present (even
-   * empty) → exactly what's listed; no defaults.
+   * `write_file`, `edit_file`) with default capabilities. `find`
+   * and `spawn_subagent` are also built-in but opt-in only — list
+   * them in `[tools]` explicitly to pull them in.
+   *
+   * Present (even empty) → exactly what's listed; no defaults.
    */
   tools?: Record<string, ToolEntry>;
 

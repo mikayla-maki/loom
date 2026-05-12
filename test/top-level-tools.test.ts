@@ -48,7 +48,7 @@ describe("top-level [tools]", () => {
         .list()
         .map((t) => t.name)
         .sort();
-      expect(names).toEqual(["bash", "find", "read_file", "write_file"]);
+      expect(names).toEqual(["bash", "edit_file", "read_file", "write_file"]);
     } finally {
       await agent.close();
     }
@@ -158,7 +158,7 @@ describe("top-level [tools]", () => {
     expect(captured).toMatch(/`bash`/);
     expect(captured).toMatch(/`read_file`/);
     expect(captured).toMatch(/`write_file`/);
-    expect(captured).toMatch(/`find`/);
+    expect(captured).toMatch(/`edit_file`/);
   });
 
   it("end-to-end: agent uses default tools (write_file then read_file)", async () => {

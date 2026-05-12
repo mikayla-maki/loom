@@ -134,6 +134,13 @@ class SyntheticRuntime implements Runtime {
       isError: true,
     };
   }
+
+  async emitToolResult(): Promise<void> {
+    // No-op. `summarise()` is a tool-free turn (see `executeTool`),
+    // so no harness should ever call this. We satisfy the interface
+    // contract without dragging session/sink wiring into the synthetic
+    // runtime.
+  }
 }
 
 // Re-export StopReason so consumers can write summarise wrappers.

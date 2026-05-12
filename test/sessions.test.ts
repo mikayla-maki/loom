@@ -213,10 +213,10 @@ describe("Session push/pull semantics", () => {
     const chained = new ChainedSession([a, b]);
 
     const fakeAgent: Agent = {
+      manifest: { name: "x", harness: { provider: "test" } },
       harness: { run: async () => ({ stopReason: "end_turn" as const }) },
       session: chained,
       systemPromptCore: "x",
-      agentName: "x",
     };
 
     await chained.prepareTurn?.(fakeAgent);

@@ -18,6 +18,7 @@ import type {
   Tool,
   ToolConfig,
   ToolContext,
+  ToolDisplay,
   ToolResult,
 } from "../../types/interfaces.js";
 import type { CapabilitySet } from "../../types/manifest.js";
@@ -83,11 +84,37 @@ export class ReadFileTool implements Tool {
         isError: true,
       };
     }
+
+    const display: ToolDisplay = {
+      title: `Read ${path.basename(target)}`,
+      kind: "read",
+      locations: [{ path: target }],
+    };
+
+    // ── ACP path: client returns unsaved-buffer contents when applicable ──
+    if (ctx.client?.readTextFile) {
+      try {
+        const text = await ctx.client.readTextFile({ path: target });
+        return { content: text, display };
+      } catch (e) {
+        return {
+          content: `read_file: ${(e as Error).message}`,
+          isError: true,
+          display,
+        };
+      }
+    }
+
+    // ── Fast path: local fs ──
     try {
       const text = await fs.readFile(target, "utf8");
-      return { content: text };
+      return { content: text, display };
     } catch (e) {
-      return { content: `read_file: ${(e as Error).message}`, isError: true };
+      return {
+        content: `read_file: ${(e as Error).message}`,
+        isError: true,
+        display,
+      };
     }
   }
 }

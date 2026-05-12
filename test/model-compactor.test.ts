@@ -59,10 +59,10 @@ function fixedTextHarness(reply: string): Harness {
 
 function fakeAgent(harness: Harness, session: Session): Agent {
   return {
+    manifest: { name: "t", harness: { provider: "test" } },
     harness,
     session,
     systemPromptCore: "test-core",
-    agentName: "t",
   };
 }
 
@@ -170,8 +170,8 @@ describe("modelCompactor + Session.prepareTurn", () => {
     compactor.prepareTurn = async (agent: Agent) => {
       seenHarnesses.push(agent.harness);
       expect(agent.session).toBe(session);
-      expect(agent.agentName).toBe("turn-test");
-      expect(agent.agentDescription).toBe("for the test");
+      expect(agent.manifest.name).toBe("turn-test");
+      expect(agent.manifest.description).toBe("for the test");
       expect(agent.systemPromptCore).toBeTypeOf("string");
       await realPrepare(agent);
     };

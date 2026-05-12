@@ -25,14 +25,14 @@ function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
       bash: "builtin",
       read_file: "builtin",
       write_file: "builtin",
-      find: "builtin",
+      edit_file: "builtin",
       echo: "builtin",
     },
     capabilities: {
       bash: { subprocess: "*", paths: ["./"] },
       read_file: { paths: ["./"] },
       write_file: { paths: ["./"] },
-      find: { paths: ["./"] },
+      edit_file: { paths: ["./"] },
       echo: "*",
     },
     harness: {

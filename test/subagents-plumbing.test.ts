@@ -105,7 +105,14 @@ function trivialManifest(name: string): AgentManifest {
 }
 
 describe("RunAgentOptions.parent", () => {
-  it("forwards a parent Agent to harness + session factories", async () => {
+  it("forwards the parent Agent ref to the session factory", async () => {
+    // The RunningAgent surface doesn't re-expose the constructed
+    // harness, so we observe the parent only via the session
+    // factory's recorded `seenParent`. The harness-side branch
+    // (factory receives `parent`) is exercised separately by the
+    // `requiresParent` tests below — if the runtime didn't pass
+    // `parent` to `harnessFactory.create`, those would crash with
+    // "should have been guarded".
     const parentAgent = await runAgent({
       name: "parent",
       systemPrompt: "x",
@@ -114,10 +121,10 @@ describe("RunAgentOptions.parent", () => {
     });
     try {
       const parentRef: Agent = {
-        harness: parentAgent.session as unknown as Harness, // any object; we only check identity
+        manifest: { name: "parent", harness: { provider: "test" } },
+        harness: parentAgent.session as unknown as Harness, // identity only
         session: parentAgent.session,
         systemPromptCore: "x",
-        agentName: "parent",
       };
       const child = await runAgent(
         {
@@ -130,21 +137,8 @@ describe("RunAgentOptions.parent", () => {
         { parent: parentRef },
       );
       try {
-        const h = (child as unknown as { agentState: unknown }).agentState; // touch
-        void h;
-        const harness = (child as unknown as { harness: RecordingHarness })
-          .harness;
-        // RunningAgent doesn't expose the harness directly; reach via
-        // session instead — RecordingSession is the session.
         const sess = child.session as unknown as RecordingSession;
         expect(sess.seenParent).toBe(parentRef);
-        // Harness saw the parent too. We can't reach it via RunningAgent's
-        // public surface; assert through the test factory's recorded
-        // value via the manifest-spec path (the harness is constructed
-        // inside runAgent and not re-exposed). Instead we exercise it
-        // by spinning up another child where the harness factory's
-        // `create` sets a side-effect we can read.
-        void harness;
       } finally {
         await child.close();
       }
@@ -184,10 +178,10 @@ describe("RunAgentOptions.parent", () => {
     const parent = await runAgent(trivialManifest("parent"));
     try {
       const parentRef: Agent = {
+        manifest: { name: "parent", harness: { provider: "test" } },
         harness: { run: async () => ({ stopReason: "end_turn" as const }) },
         session: parent.session,
         systemPromptCore: "x",
-        agentName: "parent",
       };
       const child = await runAgent(
         {
@@ -297,7 +291,7 @@ describe("ctx.spawnSubagent + ctx.agent", () => {
       expect(captured.childResult).toBe("hi from child");
       // ctx.agent is the *parent* (i.e. the agent the spawner tool is
       // part of), not the child.
-      expect(captured.agent?.agentName).toBe("parent");
+      expect(captured.agent?.manifest.name).toBe("parent");
       expect(captured.agent?.session).toBe(agent.session);
     } finally {
       await agent.close();
@@ -418,7 +412,7 @@ describe("Tools.resolveTool receives the owning Agent", () => {
     );
     try {
       expect(captured).toBeDefined();
-      expect(captured?.agentName).toBe("self-aware");
+      expect(captured?.manifest.name).toBe("self-aware");
       expect(captured?.session).toBe(agent.session);
       // The Agent passed to resolveTool is data-only; spawnSubagent is
       // bound at the per-call ToolContext layer, not here.

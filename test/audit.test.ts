@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 import {
@@ -10,16 +9,27 @@ import {
   summariseAuditHealth,
 } from "../src/audit/audit.js";
 import type { AgentManifest } from "../src/types/manifest.js";
+import { useTmpDir, withTmpDir } from "./helpers/tmp.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
 describe("auditAgent", () => {
+  const tmp = useTmpDir("loom-audit-");
+
+  /** Write `agent.toml` with `body` into this test's tmp dir. */
+  async function writeManifest(body: string): Promise<string> {
+    const p = path.join(tmp(), "agent.toml");
+    await fs.writeFile(p, body, "utf8");
+    return p;
+  }
+
   it("produces a static capability tree for the sample agent", async () => {
     const tree = await auditAgent(
       path.join(FIXTURES, "sample-agent/agent.toml"),
     );
     expect(tree.name).toBe("sample-agent");
     expect(tree.tools.map((t) => t.name).sort()).toEqual([
+      "edit_file",
       "find",
       "read_file",
       "write_file",
@@ -38,7 +48,7 @@ describe("auditAgent", () => {
     const printed = formatCapabilityTree(tree);
     expect(printed).toContain("sample-agent");
     expect(printed).toContain("read_file");
-    expect(printed).toContain("write_file");
+    expect(printed).toContain("edit_file");
     expect(printed).toContain("capabilities granted");
   });
 
@@ -83,48 +93,40 @@ describe("auditAgent", () => {
     // on disk. Audit always validates fully now — there's no lenient
     // mode — but the thrown `AuditError` carries the partial tree so
     // callers can still inspect what DID resolve.
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-audit-uns-"));
+    const manifestPath = await writeManifest(
+      [
+        "[agent]",
+        'name = "missing-src"',
+        'system_prompt = "x"',
+        "[harness]",
+        'provider = "test"',
+        "[tools.fancy_tool]",
+        'provider = { npm = "@nonexistent/loom-pkg" }',
+      ].join("\n"),
+    );
+    let err: AuditError | undefined;
     try {
-      const manifestPath = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        manifestPath,
-        [
-          "[agent]",
-          'name = "missing-src"',
-          'system_prompt = "x"',
-          "[harness]",
-          'provider = "test"',
-          "[tools.fancy_tool]",
-          'provider = { npm = "@nonexistent/loom-pkg" }',
-        ].join("\n"),
-        "utf8",
-      );
-      let err: AuditError | undefined;
-      try {
-        await auditAgent(manifestPath);
-      } catch (e) {
-        err = e as AuditError;
-      }
-      expect(err).toBeInstanceOf(AuditError);
-      expect(err!.tree.unresolvedSources).toHaveLength(1);
-      expect(err!.tree.unresolvedSources[0]?.spec).toBe(
-        "npm:@nonexistent/loom-pkg@*",
-      );
-      expect(err!.tree.unresolvedSources[0]?.reason).toMatch(/Cannot find/);
-      expect(err!.tree.unresolvedTools.map((u) => u.name)).toContain(
-        "fancy_tool",
-      );
-      // health includes both the source AND the tool that depended
-      // on it.
-      expect(err!.health.unresolvedSources).toBe(1);
-      expect(err!.health.unresolvedTools).toBeGreaterThanOrEqual(1);
-      // The tree is still renderable — callers (the CLI included)
-      // can print it before surfacing the error.
-      const printed = formatCapabilityTree(err!.tree);
-      expect(printed.toLowerCase()).toContain("unresolved");
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
+      await auditAgent(manifestPath);
+    } catch (e) {
+      err = e as AuditError;
     }
+    expect(err).toBeInstanceOf(AuditError);
+    expect(err!.tree.unresolvedSources).toHaveLength(1);
+    expect(err!.tree.unresolvedSources[0]?.spec).toBe(
+      "npm:@nonexistent/loom-pkg@*",
+    );
+    expect(err!.tree.unresolvedSources[0]?.reason).toMatch(/Cannot find/);
+    expect(err!.tree.unresolvedTools.map((u) => u.name)).toContain(
+      "fancy_tool",
+    );
+    // health includes both the source AND the tool that depended
+    // on it.
+    expect(err!.health.unresolvedSources).toBe(1);
+    expect(err!.health.unresolvedTools).toBeGreaterThanOrEqual(1);
+    // The tree is still renderable — callers (the CLI included)
+    // can print it before surfacing the error.
+    const printed = formatCapabilityTree(err!.tree);
+    expect(printed.toLowerCase()).toContain("unresolved");
   });
 
   it("renders each layer of a layered session under one heading", async () => {
@@ -175,10 +177,10 @@ describe("auditAgent", () => {
   });
 
   it("surfaces per-agent storage on the tree and renders it in the formatter", async () => {
-    const dataHome = await fs.mkdtemp(
-      path.join(os.tmpdir(), "loom-audit-storage-"),
-    );
-    try {
+    // Note: separate `withTmpDir` because we need an isolated
+    // LOOM_DATA_HOME, not the per-test tmp from useTmpDir (which is
+    // already used for manifest scratch files when present).
+    await withTmpDir("loom-audit-storage-", async (dataHome) => {
       const prev = process.env.LOOM_DATA_HOME;
       process.env.LOOM_DATA_HOME = dataHome;
       try {
@@ -213,9 +215,7 @@ describe("auditAgent", () => {
           process.env.LOOM_DATA_HOME = prev;
         }
       }
-    } finally {
-      await fs.rm(dataHome, { recursive: true, force: true });
-    }
+    });
   });
 
   it("summariseAuditHealth: zero problems for a clean manifest", async () => {
@@ -357,58 +357,58 @@ describe("auditAgent", () => {
     );
   });
 
-  it("audit throws on provider load failures", async () => {
-    const dir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "loom-audit-load-fail-"),
-    );
-    try {
-      const manifestPath = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        manifestPath,
-        [
-          "[agent]",
-          'name = "missing-pkg"',
-          'system_prompt = "x"',
-          "[harness]",
-          'provider = "test"',
-          "[tools.something]",
-          'provider = { npm = "@nonexistent/pkg" }',
-        ].join("\n"),
-        "utf8",
-      );
-      let err: AuditError | undefined;
-      try {
-        await auditAgent(manifestPath);
-      } catch (e) {
-        err = e as AuditError;
-      }
-      expect(err).toBeInstanceOf(AuditError);
-      expect(err!.message).toMatch(/unresolved source/);
-      expect(err!.health.unresolvedSources).toBe(1);
-      expect(err!.health.totalProblems).toBeGreaterThan(0);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
+  // ─── audit-failure surface area ────────────────────────────────
+  //
+  // Three distinct ways for `auditAgent` to throw: an unresolved
+  // [tools] entry against a built-in provider, an unresolved source
+  // (e.g. missing npm package), and an MCP provider whose init
+  // crashes. Each row asserts the error message + the health
+  // counter that should fire.
 
-  it("audit throws on MCP init failures (server can't start)", async () => {
-    // The MCP factory loads from the built-in registry (no
-    // SourceSpec), so `unresolvedSources` won't fire. The init
-    // failure path is what catches a bad config.
-    const spec: AgentManifest = {
-      name: "bad-mcp",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        nope: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: ["/definitely/missing/server.mjs"],
+  it.each([
+    {
+      label: "unresolved [tools] entry against builtin",
+      spec: {
+        name: "unresolved-tool",
+        systemPrompt: "x",
+        harness: { provider: "test" },
+        tools: { not_a_tool: "builtin" },
+        capabilities: { not_a_tool: "*" },
+      } as AgentManifest,
+      message: /1 unresolved \[tools\] entr/,
+      healthField: "unresolvedTools" as const,
+    },
+    {
+      label: "missing npm source",
+      spec: {
+        name: "strict-test",
+        systemPrompt: "x",
+        harness: { provider: "test" },
+        tools: { fancy_tool: { provider: { npm: "@nonexistent/loom-pkg" } } },
+      } as AgentManifest,
+      message: /unresolved source/,
+      healthField: "unresolvedSources" as const,
+    },
+    {
+      label: "MCP server init failure",
+      spec: {
+        name: "bad-mcp",
+        systemPrompt: "x",
+        harness: { provider: "test" },
+        providers: {
+          nope: {
+            provider: "mcp-server",
+            command: process.execPath,
+            args: ["/definitely/missing/server.mjs"],
+          },
         },
-      },
-      tools: { x: { provider: "nope" } },
-      capabilities: { x: "*" },
-    };
+        tools: { x: { provider: "nope" } },
+        capabilities: { x: "*" },
+      } as AgentManifest,
+      message: /not fully resolved.*problem/,
+      healthField: "providerInitErrors" as const,
+    },
+  ])("audit throws on $label", async ({ spec, message, healthField }) => {
     let err: AuditError | undefined;
     try {
       await auditAgent(spec);
@@ -416,84 +416,33 @@ describe("auditAgent", () => {
       err = e as AuditError;
     }
     expect(err).toBeInstanceOf(AuditError);
-    expect(err!.message).toMatch(/not fully resolved.*problem/);
-    // Both init AND unresolved-tool fire (the tool can't resolve
-    // through a provider that didn't init).
-    expect(err!.health.providerInitErrors).toBeGreaterThanOrEqual(1);
-    expect(err!.health.unresolvedTools).toBeGreaterThanOrEqual(1);
-  });
-
-  it("audit throws on unresolved [tools] entries", async () => {
-    // The native provider doesn't claim `not_a_tool`, so this
-    // shows up in `unresolvedTools` even in a fully-loaded
-    // manifest.
-    const spec: AgentManifest = {
-      name: "unresolved-tool",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      tools: { not_a_tool: "builtin" },
-      capabilities: { not_a_tool: "*" },
-    };
-    await expect(auditAgent(spec)).rejects.toThrow(
-      /1 unresolved \[tools\] entr/,
-    );
+    expect(err!.message).toMatch(message);
+    expect(err!.health[healthField]).toBeGreaterThanOrEqual(1);
+    expect(err!.health.totalProblems).toBeGreaterThan(0);
   });
 
   it("audit failure lists every problem category, not just the first", async () => {
-    // Combine: missing source + unresolved tool.
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-audit-multi-"));
+    // Combine: missing source + unresolved tool against builtin.
+    const manifestPath = await writeManifest(
+      [
+        "[agent]",
+        'name = "multi-fail"',
+        'system_prompt = "x"',
+        "[harness]",
+        'provider = "test"',
+        "[tools.from_missing]",
+        'provider = { npm = "@nonexistent/pkg" }',
+        "[tools.bogus]",
+        'provider = "builtin"',
+      ].join("\n"),
+    );
     try {
-      const manifestPath = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        manifestPath,
-        [
-          "[agent]",
-          'name = "multi-fail"',
-          'system_prompt = "x"',
-          "[harness]",
-          'provider = "test"',
-          "[tools.from_missing]",
-          'provider = { npm = "@nonexistent/pkg" }',
-          "[tools.bogus]",
-          'provider = "builtin"',
-        ].join("\n"),
-        "utf8",
-      );
-      try {
-        await auditAgent(manifestPath);
-        throw new Error("expected throw");
-      } catch (e) {
-        const msg = (e as Error).message;
-        expect(msg).toMatch(/unresolved source/);
-        expect(msg).toMatch(/unresolved \[tools\] entr/);
-      }
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("audit throws when any source is unresolved", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-audit-strict-"));
-    try {
-      const manifestPath = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        manifestPath,
-        [
-          "[agent]",
-          'name = "strict-test"',
-          'system_prompt = "x"',
-          "[harness]",
-          'provider = "test"',
-          "[tools.fancy_tool]",
-          'provider = { npm = "@nonexistent/loom-pkg" }',
-        ].join("\n"),
-        "utf8",
-      );
-      await expect(auditAgent(manifestPath)).rejects.toThrow(
-        /unresolved source/,
-      );
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
+      await auditAgent(manifestPath);
+      throw new Error("expected throw");
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toMatch(/unresolved source/);
+      expect(msg).toMatch(/unresolved \[tools\] entr/);
     }
   });
 });

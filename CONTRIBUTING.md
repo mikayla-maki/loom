@@ -33,20 +33,9 @@ examples/         # four self-contained projects: minimal-agent, sdk-agent, mcp-
 internal-docs/    # design docs (manifest-v5.md is canonical)
 ```
 
-The canonical manifest design is in
-[`internal-docs/manifest-v5.md`](./internal-docs/manifest-v5.md).
-Read that before touching the parser or resolver.
-
 ## House style
 
-- **TypeScript, strict mode.** `noUncheckedIndexedAccess` is on; the
-  v5 type rename pass got rid of all back-compat aliases — keep it
-  that way.
-- **One reference word.** v5 says `provider` is the only field used
-  to reference code. Don't reintroduce `kind`, `extension`, `plugin`,
-  or anything similar.
-- **No migration scaffolding.** Loom hasn't shipped, so we don't
-  carry compat shims for prior drafts. Hard cuts only.
+- **TypeScript, strict mode.** `noUncheckedIndexedAccess` is on
 - **Vocabulary.** "Provider" is the package/source-layer word.
   "Tools" is the runtime-class word. They don't appear together in
   the same sentence — separation is the win.
@@ -97,5 +86,5 @@ good thing to include too.
 
 ## License
 
-By contributing you agree your work is MIT-licensed (the project
+By contributing you agree your work is CC0-licensed (the project
 license). No CLA.

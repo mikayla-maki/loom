@@ -57,15 +57,23 @@
 import { spawn } from "node:child_process";
 
 import type {
+  EnvVariable,
+  TerminalHandle,
+  ToolCallContent,
+} from "../../types/acp.js";
+import type {
   AuditFinding,
   Tool,
   ToolConfig,
   ToolContext,
+  ToolDisplay,
   ToolResult,
 } from "../../types/interfaces.js";
 import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
+import type { ClientBridge } from "../client-bridge.js";
+import { raceAbort } from "../client-bridge.js";
 import {
   hasBwrap,
   maybeBwrapPrefix,
@@ -286,6 +294,30 @@ export class BashTool implements Tool {
       }
     }
 
+    // ── ACP path: route through the client so the user sees a live
+    //    terminal pane in the editor. Sandbox prefix already baked
+    //    into (binary, args) — the client just exec()'s it verbatim.
+    if (ctx.client?.createTerminal) {
+      return runViaClientTerminal(ctx.client, {
+        binary,
+        args,
+        cwd,
+        timeout,
+        command,
+        env,
+        abortSignal: ctx.abortSignal,
+      });
+    }
+
+    // ── Fast path: local spawn. No client bridge present (CLI / SDK /
+    //    tests), so we run the child ourselves and stream output into
+    //    in-memory buffers. The display is still populated so non-ACP
+    //    consumers (or future ACP clients without terminal support)
+    //    get the nicer per-invocation title.
+    const baseDisplay: ToolDisplay = {
+      title: describeCommand(command),
+      kind: "execute",
+    };
     return await new Promise<ToolResult>((resolve) => {
       const child = spawn(binary, args, {
         cwd,
@@ -315,28 +347,159 @@ export class BashTool implements Tool {
       child.on("close", (code, signal) => {
         clearTimeout(timer);
         ctx.abortSignal.removeEventListener("abort", onAbort);
+        const display: ToolDisplay = {
+          ...baseDisplay,
+          rawOutput: { exitCode: code, signal },
+        };
         if (timedOut) {
           resolve({
             content: `bash: timed out after ${timeout}ms\n${stderr}`,
             isError: true,
+            display,
           });
           return;
         }
         if (code === 0) {
-          resolve({ content: stdout });
+          resolve({ content: stdout, display });
         } else {
           resolve({
             content: `exit ${code ?? signal}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
             isError: true,
+            display,
           });
         }
       });
       child.on("error", (err) => {
         clearTimeout(timer);
         ctx.abortSignal.removeEventListener("abort", onAbort);
-        resolve({ content: `bash: ${err.message}`, isError: true });
+        resolve({
+          content: `bash: ${err.message}`,
+          isError: true,
+          display: baseDisplay,
+        });
       });
     });
+  }
+}
+
+/**
+ * Run the (already sandbox-wrapped) command through the ACP client's
+ * `terminal/create`. The client renders a live terminal pane bound
+ * to `handle.id`; we embed that id in the `tool_call_update` content
+ * so the pane shows up under this tool call in the UI.
+ *
+ * Lifecycle: createTerminal → set timeout → waitForExit (racing the
+ * turn's abort signal, which kills the process to unblock the wait)
+ * → snapshot final output → release. `release()` is idempotent and
+ * already-emitted updates referencing the terminal id keep rendering
+ * after release — the client has its own copy of the output.
+ */
+async function runViaClientTerminal(
+  client: ClientBridge,
+  opts: {
+    binary: string;
+    args: string[];
+    cwd: string;
+    timeout: number;
+    command: string;
+    env: NodeJS.ProcessEnv;
+    abortSignal: AbortSignal;
+  },
+): Promise<ToolResult> {
+  const { binary, args, cwd, timeout, command, env, abortSignal } = opts;
+
+  // Non-null by caller's check, but TypeScript wants it spelled out.
+  const createTerminal = client.createTerminal;
+  if (!createTerminal) {
+    return { content: "bash: client terminal not available", isError: true };
+  }
+
+  const handle: TerminalHandle = await createTerminal({
+    command: binary,
+    args,
+    cwd,
+    env: toEnvVariables(env),
+    outputByteLimit: 1_000_000,
+  });
+
+  const terminalContent: ToolCallContent = {
+    type: "terminal",
+    terminalId: handle.id,
+  };
+  const baseDisplay: ToolDisplay = {
+    title: describeCommand(command),
+    kind: "execute",
+    content: [terminalContent],
+  };
+
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    void handle.kill().catch(() => undefined);
+  }, timeout);
+
+  // NOTE on terminal lifecycle: we deliberately do NOT call
+  // `handle.release()` here. The ACP spec says:
+  //
+  //   "Tool calls that already reference this terminal will continue
+  //    to display its output."
+  //
+  // The keyword is *already*. Release MUST happen after the client
+  // has received the `tool_call_update` carrying this terminalId in
+  // its content; otherwise the client sees the release first,
+  // discards the terminal, and renders nothing when the (now-stale)
+  // tool_call_update arrives.
+  //
+  // We don't have a clean cross-process hook for "the update has
+  // landed on the wire" — the harness emits via `runtime.update`,
+  // which enqueues into an UpdateSink that the ACP forwarder loop
+  // drains asynchronously. By the time `runtime.update` resolves,
+  // the wire send hasn't necessarily happened.
+  //
+  // The pragmatic choice: leave the terminal live. The client caps
+  // output at `outputByteLimit` (1 MB above), so each terminal's
+  // retained memory is bounded; the client releases all session
+  // terminals when the session closes. A leaked terminal is
+  // cheaper than a missing UI.
+  try {
+    const exit = await raceAbort(handle.waitForExit(), abortSignal, () => {
+      void handle.kill().catch(() => undefined);
+    });
+    clearTimeout(timer);
+
+    const { output } = await handle.currentOutput();
+    const exitCode = exit.exitCode ?? null;
+    const signal = exit.signal ?? null;
+    const display: ToolDisplay = {
+      ...baseDisplay,
+      rawOutput: { exitCode, signal },
+    };
+
+    if (timedOut) {
+      return {
+        content: `bash: timed out after ${timeout}ms\n${output}`,
+        isError: true,
+        display,
+      };
+    }
+    if (exitCode === 0 && signal === null) {
+      return { content: output, display };
+    }
+    return {
+      content: `exit ${exitCode ?? signal}\n${output}`,
+      isError: true,
+      display,
+    };
+  } catch (err) {
+    clearTimeout(timer);
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      content: `bash: ${message}`,
+      isError: true,
+      display: baseDisplay,
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -387,6 +550,32 @@ function pickEnv(names: readonly string[]): NodeJS.ProcessEnv {
       if (v === undefined) continue;
       if (prefixes.some((p) => name.startsWith(p))) out[name] = v;
     }
+  }
+  return out;
+}
+
+/**
+ * Render a one-line, length-capped title for this invocation. Used
+ * as the `tool_call_update` title so the IDE shows the actual
+ * command rather than the bare tool name.
+ */
+function describeCommand(cmd: string): string {
+  const oneLine = cmd.replace(/\s+/g, " ").trim();
+  const max = 60;
+  const truncated =
+    oneLine.length > max ? oneLine.slice(0, max - 1) + "\u2026" : oneLine;
+  return `bash: ${truncated}`;
+}
+
+/**
+ * Convert a `NodeJS.ProcessEnv` (our internal shape, with possibly
+ * undefined values) into the ACP `EnvVariable[]` array the terminal
+ * API expects. Undefined values are dropped silently.
+ */
+function toEnvVariables(env: NodeJS.ProcessEnv): EnvVariable[] {
+  const out: EnvVariable[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (typeof value === "string") out.push({ name, value });
   }
   return out;
 }

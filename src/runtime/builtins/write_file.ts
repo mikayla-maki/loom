@@ -1,6 +1,12 @@
 /**
  * `write_file` — write a UTF-8 file, restricted to the granted paths.
  *
+ * This tool writes the FULL file contents. Use it to create new
+ * files or wholesale-replace existing ones. For targeted changes to
+ * an existing file, use `edit_file` instead — it's far more
+ * efficient (no need to repeat the unchanged bulk of the file) and
+ * surfaces a diff in IDE clients.
+ *
  * Capability kinds:
  *   optional: ["paths"]
  *
@@ -14,10 +20,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
+import type { ToolCallContent } from "../../types/acp.js";
 import type {
   Tool,
   ToolConfig,
   ToolContext,
+  ToolDisplay,
   ToolResult,
 } from "../../types/interfaces.js";
 import type { CapabilitySet } from "../../types/manifest.js";
@@ -32,10 +40,6 @@ import {
   resolvedPaths,
 } from "./_path.js";
 
-/**
- * Input schema. `ToolTable` validates against this before dispatch —
- * `execute()` may trust the shape.
- */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["path", "content"],
@@ -78,16 +82,18 @@ export class WriteFileTool implements Tool {
     this.capabilities = capabilities ?? {};
     this.fromDefault = paths(this.capabilities) === null;
     this.granted = resolvedPaths(this.capabilities);
-    this.description = `Write a UTF-8 file (${describePaths(this.granted, this.fromDefault)}).`;
+    this.description =
+      `Write a UTF-8 file in full (${describePaths(this.granted, this.fromDefault)}). ` +
+      `Use this to create new files or wholesale-replace existing ones. ` +
+      `For targeted changes to an existing file, use \`edit_file\` instead — ` +
+      `it's more efficient and produces a diff for review.`;
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
     const i = input as WriteFileInput;
     const target = path.resolve(i.path);
     // Effective path set = manifest grant ∪ session trusted paths
-    // with write access (`"write"` or `"read-write"`). A skills
-    // session that advertises `~/.skills/` as read-only therefore
-    // does NOT let the agent write there — the access level matters.
+    // with write access (`"write"` or `"read-write"`).
     const trusted = await collectTrustedPaths(ctx);
     const effective = effectivePaths(this.granted, trusted, "write");
     if (!pathAllowed(target, effective)) {
@@ -96,20 +102,93 @@ export class WriteFileTool implements Tool {
         isError: true,
       };
     }
+
+    // Try to capture the pre-write content so we can render a Diff
+    // block. Best-effort: a missing-file ENOENT is the common case
+    // for new-file writes, and we want a `null` oldText in that case.
+    let priorContent: string | null = null;
     try {
-      if (i.create_dirs) {
-        await fs.mkdir(path.dirname(target), { recursive: true });
-      }
-      if (i.append) {
-        await fs.appendFile(target, i.content, "utf8");
+      if (ctx.client?.readTextFile) {
+        priorContent = await ctx.client.readTextFile({ path: target });
       } else {
-        await fs.writeFile(target, i.content, "utf8");
+        priorContent = await fs.readFile(target, "utf8");
       }
-      return {
-        content: `wrote ${i.content.length} bytes to ${i.path}`,
-      };
-    } catch (e) {
-      return { content: `write_file: ${(e as Error).message}`, isError: true };
+    } catch {
+      priorContent = null;
     }
+
+    // ── ACP path: client renders the edit in the editor with diff UI ──
+    // ACP `fs/writeTextFile` is full-file replacement; we can't satisfy
+    // append-mode or create_dirs via the bridge, so fall through to
+    // local fs in those cases.
+    const useClient = ctx.client?.writeTextFile && !i.append && !i.create_dirs;
+
+    try {
+      if (useClient) {
+        await ctx.client!.writeTextFile!({
+          path: target,
+          content: i.content,
+        });
+      } else {
+        if (i.create_dirs) {
+          await fs.mkdir(path.dirname(target), { recursive: true });
+        }
+        if (i.append) {
+          await fs.appendFile(target, i.content, "utf8");
+        } else {
+          await fs.writeFile(target, i.content, "utf8");
+        }
+      }
+    } catch (e) {
+      return {
+        content: `write_file: ${(e as Error).message}`,
+        isError: true,
+        display: failureDisplay(target, i),
+      };
+    }
+
+    // What did the file end up containing? In overwrite mode, that's
+    // `i.content`. In append mode, it's `priorContent + i.content`
+    // (or just `i.content` when the file didn't exist before).
+    const finalContent = i.append
+      ? (priorContent ?? "") + i.content
+      : i.content;
+
+    const diff: ToolCallContent = {
+      type: "diff",
+      path: target,
+      oldText: priorContent,
+      newText: finalContent,
+    };
+    const display: ToolDisplay = {
+      title: describeTitle(target, priorContent !== null, i.append === true),
+      kind: "edit",
+      locations: [{ path: target }],
+      content: [diff],
+    };
+
+    return {
+      content: `wrote ${i.content.length} bytes to ${i.path}`,
+      display,
+    };
   }
+}
+
+function describeTitle(
+  target: string,
+  existed: boolean,
+  append: boolean,
+): string {
+  const base = path.basename(target);
+  if (append) return `Appended to ${base}`;
+  if (existed) return `Wrote ${base}`;
+  return `Created ${base}`;
+}
+
+function failureDisplay(target: string, _i: WriteFileInput): ToolDisplay {
+  return {
+    title: `Failed to write ${path.basename(target)}`,
+    kind: "edit",
+    locations: [{ path: target }],
+  };
 }

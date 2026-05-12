@@ -33,7 +33,7 @@ import { DEFAULT_CLIENT_ACP_CAPABILITIES } from "../runtime/acp-capabilities.js"
 import {
   McpServerTools,
   mcpServerToolsFactory,
-} from "../builtins/provider/mcp.js";
+} from "../builtins/tools/mcp.js";
 import { parseAgentManifest } from "../manifest/parser.js";
 import { transientStorage } from "../runtime/storage.js";
 import type { FactoryContext, InitArgs } from "../types/interfaces.js";

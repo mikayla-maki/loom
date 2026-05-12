@@ -73,7 +73,11 @@ describe("runAgent runtime audit", () => {
     const tool = makeTool({
       name: "broken",
       audit: () => [
-        { severity: "error", message: "missing dep XYZ", remediation: "brew install xyz" },
+        {
+          severity: "error",
+          message: "missing dep XYZ",
+          remediation: "brew install xyz",
+        },
       ],
     });
     let caught: unknown;
@@ -147,27 +151,28 @@ describe("runAgent runtime audit", () => {
     }
   });
 
-  it("non-error findings without onAuditFinding are silently dropped", async () => {
-    const tool = makeTool({
+  it("boot succeeds when there's nothing to throw on (no audit + non-error findings without a callback)", async () => {
+    // Two no-throw cases in one: a tool without audit() at all, and
+    // a tool whose audit() returns only ok/warning findings with no
+    // onAuditFinding callback to surface them. Both must complete
+    // boot cleanly.
+    const plain = makeTool({ name: "plain" });
+    const a1 = await runAgent(manifestWith(plain), {
+      providers: [provider(plain)],
+    });
+    await a1.close();
+
+    const noisy = makeTool({
       name: "noisy",
       audit: () => [
         { severity: "warning", message: "running degraded" },
         { severity: "ok", message: "all good" },
       ],
     });
-    // No onAuditFinding option → boot still succeeds, no throw.
-    const agent = await runAgent(manifestWith(tool), {
-      providers: [provider(tool)],
+    const a2 = await runAgent(manifestWith(noisy), {
+      providers: [provider(noisy)],
     });
-    await agent.close();
-  });
-
-  it("tools without audit() are ignored (no findings)", async () => {
-    const tool = makeTool({ name: "plain" });
-    const agent = await runAgent(manifestWith(tool), {
-      providers: [provider(tool)],
-    });
-    await agent.close();
+    await a2.close();
   });
 
   it("an audit() that throws is treated as a single error finding", async () => {

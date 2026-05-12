@@ -178,10 +178,10 @@ describe("CompactingSession", () => {
     await session.pull?.([]);
     // Fake a context-fresh: no compaction expected.
     await compactor.prepareTurn({
+      manifest: { name: "t", harness: { provider: "test" } },
       harness: { run: async () => ({ stopReason: "end_turn" }) },
       session,
       systemPromptCore: "",
-      agentName: "t",
     });
     expect(compactions).toHaveLength(0);
     // Now report a usage that crosses the bar — compaction trips.
@@ -192,10 +192,10 @@ describe("CompactingSession", () => {
     });
     await session.pull?.([]);
     await compactor.prepareTurn({
+      manifest: { name: "t", harness: { provider: "test" } },
       harness: { run: async () => ({ stopReason: "end_turn" }) },
       session,
       systemPromptCore: "",
-      agentName: "t",
     });
     expect(compactions).toHaveLength(1);
   });

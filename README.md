@@ -23,21 +23,24 @@ model    = "claude-sonnet-4-5"
 [session]
 layers = ["skills", "compacting", "in-memory"]
 
- # Default tools come built in
+ # The four FS / shell tools auto-load when `[tools]` is absent;
+ # `find` is built-in but opt-in. 
 [tools]
 bash       = "builtin"
 read_file  = "builtin"
 write_file = "builtin"
+edit_file  = "builtin"
 find       = "builtin"
 
 # Use capabilities to define a flexible security model that fits your needs
-[capabilities] 
+[capabilities]
 # Read files in this directory and another
-read_file  = { paths = ["./", "../other-files",] } 
-find       = { paths = ["./", "../other-files"] } 
-# Writing files is restricted to the current directory
+read_file  = { paths = ["./", "../other-files"] }
+find       = { paths = ["./", "../other-files"] }
+# Writing + editing files is restricted to the current directory
 bash       = { subprocess = "*", paths = ["./"] } # Sandboxed by default, no network access
 write_file = { paths = ["./"] }
+edit_file  = { paths = ["./"] }
 ```
 
 ```sh
@@ -76,7 +79,7 @@ Loom cannot, and does not attempt to, protect you from supply chain attacks. Thi
 
 Loom is intended to allow you to safely run agents without monitoring the output for misbehavior. Loom does this by using capability security to control which resources each tool has access to _before_ it's been instantiated. Each tool uses a contextually appropriate capability scheme, defined and enforced by the tool itself. For example, a `bash` tool needs to be sandboxed to run safely. However, for a `read_discord_messages` tool, a sandbox is a distraction. The tool implicitly needs access to a network, and its capabilities are better described in terms of user or channel IDs. By defining capabilities at the tool level, both of these tools can coexist in the same agent harness without contradiction.
 
-The capabilities declaration in the manifest forms a ceiling. In general, Loom goes for explicit and declarative configuration over implicit behavior. If you don't include _any_ value, Loom will attempt to use a smart and safe default. For example, if your manifest doesn't include a `[tools]` block, Loom will automatically add the same tools as [Pi](https://pi.dev): read_file, write_file, find, and bash, each scoped to the current working directory. However, as soon as you do include a `[tools]` block, Loom will only add the tools you specify, and any tools added by a provider.
+The capabilities declaration in the manifest specifies the highest capabilities possible to grant. In general, Loom goes for explicit and declarative configuration over implicit behavior. If you don't include _any_ value, Loom will attempt to use a smart and safe default. For example, if your manifest doesn't include a `[tools]` block, Loom will automatically add the same tools as [Pi](https://pi.dev): read_file, write_file, edit_file, and bash, each scoped to the current working directory. However, as soon as you do include a `[tools]` block, Loom will only add the tools you specify, and any tools added by a provider.
 
 To see the full list of providers, harnesses, sessions, tools, capabilities, and secrets that an agent manifest will use, run `loom audit <agent.toml>`
 
@@ -311,10 +314,10 @@ and those it may use if granted (`optional`). The manifest's
 
 ```toml
 [capabilities]
-bash       = { subprocess = "*", paths = ["./"], env = ["PATH", "HOME"] }
-read_file  = { paths = ["./"] }
-write_file = "*"                # whole-tool unrestricted
-fetch_url  = "*"
+bash      = { subprocess = "*", paths = ["./"], env = ["PATH", "HOME"] }
+read_file = { paths = ["./"] }
+edit_file = "*"                # whole-tool unrestricted
+fetch_url = "*"
 ```
 
 ### Grant shapes
@@ -329,7 +332,7 @@ fetch_url  = "*"
 
 | Kind         | Used by | Semantics |
 |---|---|---|
-| `paths`      | `read_file`, `write_file`, `find`, `bash` | `"*"` any FS; `["./"]` allowlist; absent → smart default |
+| `paths`      | `read_file`, `write_file`, `edit_file`, `find`, `bash` | `"*"` any FS; `["./"]` allowlist; absent → smart default |
 | `subprocess` | `bash` | `"*"` allow exec; absent → deny |
 | `network`    | `bash` | `"*"` allow; absent → deny |
 | `env`        | `bash` | Two-tier inheritance — see below |
@@ -365,25 +368,433 @@ before they hit at runtime.
 
 ## What's in the box
 
-**Harnesses:** `anthropic`, `openai`, `test`, `small-model-of-parent`
+Loom ships four built-in registries: harness factories, session
+factories, Tools meta-factories, and native tools. Everything below
+is available with no install step; manifests reference them by
+name, the SDK exposes the underlying classes for direct
+construction.
 
-**Sessions:** `in-memory`, `file`, `compacting`, `skills`,
-`fork-of-parent`
+### Harnesses
 
-**Tools:** `bash` (with macOS sandbox-exec / Linux bwrap profile
-derivation), `read_file`, `write_file`, `find`, `spawn_subagent`
+Referenced as `[harness].provider = "<name>"` (TOML) or
+`{ provider: "<name>", ...config }` / `new XxxHarness(...)` (SDK).
+Every harness factory declares the secrets it needs at boot via the
+standard secrets pipeline.
 
-**Tools meta-factories:** `mcp-server` (any MCP server via the
-configured-factory `[providers]` form; see the MCP section below)
+#### `anthropic`
 
-**Secret stores** (chained, in order): a caller-supplied store, env
-vars, XDG-spec `$XDG_CONFIG_HOME/loom/secrets`, the OS keychain (when
-available), and a `.loom-secrets` file next to the manifest.
+Claude via the Anthropic Messages API. Streams when `stream = true`
+(default). Tool calls are dispatched through the runtime; the
+harness handles the `tool_use` / `tool_result` round-trip.
 
-**Per-agent storage:** every agent gets one directory Loom guarantees
-exists, surfaced to every plugin via `FactoryContext.storage`. Plugins
-decide what to put there — cached tool lists, journals, notes files,
-PID files — with no key-value abstraction layered on top. Layout:
+| Config key | Default | Notes |
+|---|---|---|
+| `model` | `claude-sonnet-4-5-latest` | Any Anthropic model id. |
+| `apiBase` | `https://api.anthropic.com` | Override for proxies / self-hosted. |
+| `maxTokens` | `4096` | Per-response output cap. |
+| `maxTurnRequests` | `16` | Tool-call round-trip safety limit per turn. |
+| `stream` | `true` | When false, the response arrives as one block. |
+
+- **Secrets:** `ANTHROPIC_API_KEY` (required).
+- **ACP capabilities:** advertises `promptCapabilities.image` and
+  `promptCapabilities.embeddedContext` at `initialize` time, so
+  ACP clients know they can attach images and embedded resources.
+- **SDK class:** `AnthropicHarness` (also implements `withModel(id)`
+  and `smallModel()` for use under `small-model-of-parent`).
+
+#### `openai`
+
+OpenAI via the Responses API (the streaming successor to Chat
+Completions). Same tool-dispatch shape as Anthropic.
+
+| Config key | Default | Notes |
+|---|---|---|
+| `model` | `gpt-5.1` | Any OpenAI Responses-API-compatible model. |
+| `apiBase` | `https://api.openai.com/v1` | Override for proxies / Azure / self-hosted. |
+| `maxOutputTokens` | unset | Per-response output cap; omit to use server default. |
+| `maxTurnRequests` | `16` | Tool-call round-trip safety limit per turn. |
+| `stream` | `true` | When false, the response arrives as one block. |
+
+- **Secrets:** `OPENAI_API_KEY` (required).
+- **ACP capabilities:** same as `anthropic` (image + embeddedContext).
+- **SDK class:** `OpenAIHarness` (also implements `withModel(id)`
+  and `smallModel()`).
+
+#### `small-model-of-parent`
+
+**Sub-agent only.** Clones the parent agent's harness, swapping in
+a cheaper / smaller model. Lets the parent reach into the runtime
+for a routing decision or a one-off summary without burning the
+full frontier model.
+
+| Config key | Default | Notes |
+|---|---|---|
+| `model` | parent's `smallModel()` | Explicit id wins; otherwise the parent harness's recommendation is used. |
+
+- **Secrets:** inherited from the parent's harness (no separate secret slot).
+- **Requires:** parent harness must implement the optional
+  `Harness.withModel(modelId)` method. Both built-in `AnthropicHarness`
+  and `OpenAIHarness` do; third-party harnesses opt in by adding the method.
+- **Boots only as a sub-agent** — used at the top level it fails at
+  resolve time with a clear error.
+
+#### `test`
+
+A deterministic, scripted harness for testing the runtime and tool
+plumbing without an LLM. Two modes:
+
+- **Scripted:** `script: TurnStep[][]` (or a function returning
+  `TurnStep[]`). Each turn consumes one inner script. Steps are
+  `{ say }` / `{ think }` / `{ call: { tool, input } }` / `{ stop }`.
+- **Echo:** `{ echo: true }` — replays the latest user message as an
+  agent message and ends the turn. Useful for smoke tests.
+
+- **Secrets:** none.
+- **SDK class:** `TestHarness` (used heavily by Loom's own test
+  suite — see `test/` for working examples).
+
+### Sessions
+
+Referenced as `[session].provider = "<name>"`, `[[session.layers]]`
+entries, `{ provider: "<name>", ...config }`, bare strings in the
+`session: [...]` array, or `new XxxSession(...)` (SDK).
+
+When `manifest.session` is absent entirely, the runtime applies the
+default chain `skills → compacting → in-memory` — bounded growth
+and `~/.skills` auto-loading out of the box, with `skills` silently
+no-opping when the directory is missing.
+
+#### `in-memory`
+
+The canonical leaf storage layer. Events live in a process-local
+array; nothing is persisted. No config; every instance starts
+empty. Use this as the innermost (bottom) link in a chain when you
+don't need durability.
+
+- **SDK class:** `InMemorySession`.
+
+#### `file`
+
+JSONL append log. Coalesces consecutive same-kind chunks
+(`agent_message_chunk`, `agent_thought_chunk`, `user_message_chunk`)
+into single events before writing, so the on-disk log stays compact
+and readable.
+
+| Config key | Default | Notes |
+|---|---|---|
+| `path` | **required** | Absolute or relative to manifest dir. |
+
+Use as a drop-in replacement for `in-memory` when you want the
+conversation to survive process exit.
+
+- **SDK class:** `FileSession`.
+
+#### `compacting`
+
+A pull-side transform that summarises older events past a threshold.
+Designed to sit **above** a storage layer in a chain. On push it's
+a passthrough (events flow down to be stored) but it swallows
+`usage_update` events so token usage stays as in-memory metadata
+instead of cluttering the durable log.
+
+| Config key | Default | Notes |
+|---|---|---|
+| `threshold` | `40` | Event-count threshold that trips compaction. |
+| `tokenThreshold` | unset (SDK only) | Token-count threshold (uses latest `usage_update.used`); takes priority over `threshold` when usage data is available. |
+| `keep` | `10` | Most recent events that survive verbatim. |
+| `compactor` | `heuristicCompactor` (SDK only) | Replace with `modelCompactor()` for model-driven summarisation. |
+| `onCompact` | none (SDK only) | Diagnostic callback fired after each successful compaction. |
+
+Exports `compactingMemorySession()` and `compactingFileSession()`
+as SDK helpers for the common chains. Hold a reference to the
+`CompactingSession` instance (via the heterogeneous-array shape
+above) to drive `compactNow()` imperatively from a slash command.
+
+- **SDK class:** `CompactingSession`.
+- **Pairs well with:** `modelCompactor({ instruction, systemPrompt, fallback })`.
+
+#### `skills`
+
+Discovers [Agent Skills](https://agentskills.io) folders (directories
+with a `SKILL.md` YAML-frontmatter file) and contributes them to the
+agent in three ways: a system-prompt section listing the available
+skills, trusted-path entries for each root (so read-oriented tools
+can see them without an explicit grant), and aggregated required-tool
+requests.
+
+| Config key | Default | Notes |
+|---|---|---|
+| `root` / `roots` | `~/.skills` | One root or many. Relative paths resolve against manifest dir; `~` expands to OS home; missing roots are silently skipped. |
+| `default_tools` | `["bash"]` | Tools registered for skills that don't declare `metadata.loom.required-tools`. Pass `[]` to opt out. |
+
+Rescans roots each turn so mid-conversation additions are picked
+up. Skills with malformed frontmatter are skipped quietly so boot
+stays resilient.
+
+- **SDK class:** `SkillsSession`.
+
+#### `fork-of-parent`
+
+**Sub-agent only.** Snapshots the parent's events into a fresh
+`InMemorySession` at fork time. Subsequent appends on either side
+don't bleed across — the sub-agent gets the parent's context as a
+starting point and writes its own log from there. No config.
+
+### Tools meta-factories
+
+Referenced in `[providers].<handle> = { provider = "<name>", ... }`.
+A meta-factory is a Tools provider the runtime can instantiate by
+name (no on-disk package needed). The same instance can back many
+`[tools.X]` entries.
+
+#### `mcp-server`
+
+Any [Model Context Protocol](https://modelcontextprotocol.io) server
+— stdio transport, spawned + adapted. One `[providers]` entry per
+server instance; one `[tools.X]` entry per exposed tool. Tools can
+be renamed (`mcp_tool = "original_name"`), narrowed (capability
+grant binds args), and constrained by enum (array grant). See the
+full section below for the integration tour.
+
+| Config key | Default | Notes |
+|---|---|---|
+| `command` + `args` | required (or `npm`) | Generic stdio launcher. |
+| `npm` | required (or `command`) | Shorthand for npm-distributed servers. Equivalent to `command = "npx"` + `args = ["-y", "<pkg>"]`. |
+| `env` | none | Static env vars passed to the spawned process. |
+| `secrets` | `{}` | Map of `LOOM_SECRET_NAME = "ENV_VAR_NAME"`. Each LHS is resolved through Loom's secret store and injected into the child's env under the RHS name. Per-instance, marked as required at Phase 1. |
+
+Use `loom mcp inspect <spec>` to discover a server's tool list as
+paste-and-prune TOML (see CLI reference).
+
+### Native tools
+
+Referenced as `[tools.<name>] = "builtin"` or omitted entirely (the
+four file-system tools are auto-loaded with default capabilities
+when `[tools]` is absent). Every tool has a static capability
+requires/optional contract; manifest grants must cover the
+`requires` set for boot to succeed.
+
+#### `bash`
+
+Execute a shell command via `/bin/bash -c`. Engages the platform
+sandbox (`sandbox-exec` on macOS, `bwrap` on Linux) when the grant
+is structured, with the profile derived from the same grant the
+model sees — one source of truth for both the model's mental model
+and the OS-level confinement.
+
+| Input field | Type | Notes |
+|---|---|---|
+| `command` | string (required) | The command to run. |
+| `cwd` | string | Working directory; must be inside an allowed path. |
+| `timeout_ms` | number | Default 30000. |
+
+- **Capability kinds:** requires `subprocess`; optional `paths`, `network`, `env`.
+- **Sandbox profile** is derived from the grant — a structured
+  grant engages the sandbox; `"*"` opts out (no confinement).
+
+#### `read_file`
+
+Read a file's contents as UTF-8.
+
+| Input field | Type | Notes |
+|---|---|---|
+| `path` | string (required) | Resolved against cwd unless absolute. Must be inside an allowed path. |
+
+- **Capability kinds:** optional `paths` (defaults to `["./"]` when
+  `[tools]` is omitted entirely; otherwise an explicit grant is
+  required).
+
+#### `write_file`
+
+Write a UTF-8 file in full. Use this to **create new files** or
+**wholesale-replace** existing ones. For targeted changes to an
+existing file, prefer `edit_file` — it's much more efficient (no
+need to repeat the unchanged bulk of the file) and produces a diff
+in the wire `tool_call_update` for IDE-client rendering.
+
+| Input field | Type | Notes |
+|---|---|---|
+| `path` | string (required) | Resolved against cwd unless absolute. |
+| `content` | string (required) | Full file contents. |
+| `append` | bool | Append instead of overwriting. Default false. |
+| `create_dirs` | bool | Create missing parent dirs. Default false. |
+
+- **Capability kinds:** optional `paths`.
+- **ACP routing:** when the client advertises `fs.writeTextFile`,
+  the write goes through the editor (surfaces as an in-editor change
+  with diff + approval UI). `append` / `create_dirs` fall back to
+  local `fs` since ACP's `fs/writeTextFile` is full-file-replacement
+  only.
+
+#### `edit_file`
+
+Modify an existing UTF-8 file by exact text replacement. The model
+passes one or more `{ old_text, new_text }` pairs; each `old_text`
+must match a **unique** substring of the file's current content.
+All replacements apply against the *original* file, not
+incrementally — the model doesn't have to reason about how earlier
+edits shifted positions. Overlapping or nested matches are
+rejected. The wire `tool_call_update` carries an ACP `Diff` content
+block so IDE clients render an inline before/after view.
+
+| Input field | Type | Notes |
+|---|---|---|
+| `path` | string (required) | Resolved against cwd unless absolute. Must exist. |
+| `edits` | `{ old_text, new_text }[]` (required, non-empty) | Each `old_text` unique in the file. |
+
+- **Capability kinds:** optional `paths`.
+- **No file creation.** `edit_file` refuses to create new files; use
+  `write_file` (or `bash` with a heredoc) when the file doesn't yet
+  exist. Keeps the model's mental model simple — a missing file is a
+  clear error rather than a silent new-file creation.
+
+#### `find`
+
+Glob-walk a directory tree. Opt-in built-in — list `find = "builtin"`
+in `[tools]` to pull it in (`bash` covers most of what you'd reach
+for `find` for, so the default set leaves it out).
+
+| Input field | Type | Notes |
+|---|---|---|
+| `pattern` | string (required) | Glob (`**/*.ts`, `src/*.md`, etc.). `*` matches non-`/` chars; `**` matches any depth. |
+| `root` | string | Root to walk. Default `.`. |
+| `limit` | number | Max results. Default 200. |
+
+- **Capability kinds:** optional `paths`.
+- The wire `tool_call_update` is annotated with `kind: "search"`
+  and a per-invocation title (`find <pattern>`) so IDE clients
+  render the right icon.
+
+#### `spawn_subagent`
+
+Run a sub-agent for one turn and return its final assistant
+message. Two modes:
+
+1. **Self-copy** (default, no config). The sub-agent is a structural
+   copy of the owning agent's manifest, with `spawn_subagent` itself
+   stripped from `[tools]` and `[capabilities]` so the recursion
+   bottoms out one level deep. Each spawned copy shares storage with
+   the parent by default (same `name` / `storageId`). This is the
+   simplest way to give an agent a "think harder / fan out" verb —
+   the clone runs with the same harness, session config, and tools.
+2. **Configured sub-manifest** (explicit). The sub-agent's manifest
+   lives in the tool's config; the clone is whatever you wrote.
+
+Either way, the resolved sub-manifest is recorded in
+`tool.dependencies.subagents` so `loom audit` walks it (audit cycle
+detection handles trivial loops; self-copy avoids them by stripping
+`spawn_subagent` from the clone). The runtime enforces the
+capability ceiling — the sub-agent's `[capabilities]` must be a
+subset of the parent's grant for every tool the sub-agent uses
+(trivially satisfied for self-copies).
+
+| Input field | Type | Notes |
+|---|---|---|
+| `prompt` | string (required) | The user message to send to the sub-agent. |
+
+- **Config (TOML):** omit entirely (or `spawn_subagent = "builtin"`)
+  for the self-copy default; or `[tools.spawn_subagent] manifest = "./sub.toml"` /
+  inline `manifest = { ... }` for an explicit sub-manifest.
+- **No capability requirements of its own** — the ceiling check
+  bounds what the sub-agent's tools can do, regardless of what
+  `spawn_subagent` is granted.
+
+Example (self-copy):
+
+```toml
+[tools]
+spawn_subagent = "builtin"
+bash           = "builtin"
+
+[capabilities]
+spawn_subagent = "*"
+bash           = { subprocess = "*", paths = ["./"] }
+```
+
+With that manifest, calling `spawn_subagent({ prompt: "..." })`
+spawns a fresh copy of the same agent (with `bash` still available
+to the copy, but no further `spawn_subagent` so it can't fork
+recursively).
+
+#### `web_search`
+
+Search the web via the [Brave LLM Context API](https://api-dashboard.search.brave.com/documentation/services/llm-context).
+Returns pre-extracted, snippet-formatted results designed for LLM
+grounding — no scraping, no token-budget surprises. Rendered as
+markdown the model can consume directly (one section per result,
+plus dedicated POI/Places sections when local recall is on).
+
+| Input field | Type | Notes |
+|---|---|---|
+| `query` | string (required) | Max 400 chars, ~50 words. Natural language; the API ranks for grounding, not keyword match. |
+| `freshness` | string | `pd` (24h), `pw` (7d), `pm` (31d), `py` (365d), or `YYYY-MM-DDtoYYYY-MM-DD`. Overrides the configured default. |
+| `count` | integer (1-50) | How many results to consider. Overrides the configured default. |
+
+- **Secrets:** requires `BRAVE_SEARCH_API_KEY` (the secret name is
+  overridable via the `secret_name` config).
+- **No capability kinds.** The tool only ever talks to one host
+  (`api.search.brave.com`), so there's no useful manifest-grant
+  surface. Tunables live in `[tools.web_search]` instead.
+- **Defaults:** with no `[tools.web_search]` block, only `q` is sent
+  and Brave's server-side defaults apply (`count=20`,
+  `maximum_number_of_tokens=8192`, `context_threshold_mode=balanced`,
+  `country=us`, `search_lang=en`, no freshness filter).
+
+| Config key | Maps to Brave param | Range |
+|---|---|---|
+| `count` | `count` | 1-50 |
+| `freshness` | `freshness` | `pd` / `pw` / `pm` / `py` / `YYYY-MM-DDtoYYYY-MM-DD` |
+| `country` | `country` | 2-char code |
+| `search_lang` | `search_lang` | 2+ char code |
+| `max_urls` | `maximum_number_of_urls` | 1-50 |
+| `max_tokens` | `maximum_number_of_tokens` | 1024-32768 |
+| `max_snippets` | `maximum_number_of_snippets` | 1-100 |
+| `max_tokens_per_url` | `maximum_number_of_tokens_per_url` | 512-8192 |
+| `max_snippets_per_url` | `maximum_number_of_snippets_per_url` | 1-100 |
+| `threshold_mode` | `context_threshold_mode` | `strict` / `balanced` / `lenient` / `disabled` |
+| `enable_local` | `enable_local` | bool |
+| `goggles` | `goggles` | URL or inline definition |
+| `endpoint` | — | Override the API endpoint (useful for tests). |
+| `secret_name` | — | Secret to read the API key from (default `BRAVE_SEARCH_API_KEY`). |
+
+Example:
+
+```toml
+[tools]
+web_search = "builtin"
+
+[tools.web_search]
+provider       = "builtin"
+count          = 10
+freshness      = "pm"
+threshold_mode = "strict"
+max_tokens     = 4096
+```
+
+```sh
+BRAVE_SEARCH_API_KEY=... loom run agent.toml
+```
+
+### Secret stores
+
+Chained in order; the first store with a hit wins:
+
+1. **Caller-supplied store** — `runAgent(manifest, { secrets })`.
+2. **Environment variables** — `process.env[NAME]`.
+3. **XDG file** — `$XDG_CONFIG_HOME/loom/secrets` (KEY=value lines).
+4. **OS keychain** — macOS Keychain / libsecret / Windows Credential Manager.
+5. **Per-manifest file** — `.loom-secrets` next to the manifest.
+
+The SDK exports each layer (`EnvSecretsStore`, `FileSecretsStore`,
+`XDGSecretsStore`, `KeychainSecretsStore`, `StaticSecretsStore`,
+`ChainedSecretsStore`) so you can compose your own pipeline.
+
+### Per-agent storage
+
+Every agent gets one directory Loom guarantees exists, surfaced to
+every plugin via `FactoryContext.storage`. Plugins decide what to
+put there — cached tool lists, journals, notes files, PID files —
+with no key-value abstraction layered on top. Layout:
 
 | Platform | Path |
 |---|---|

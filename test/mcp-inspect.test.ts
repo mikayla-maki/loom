@@ -9,7 +9,6 @@
 import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 
 import {
   inspectMcpServer,
@@ -17,11 +16,14 @@ import {
   suggestHandle,
 } from "../src/cli/mcp-inspect.js";
 import { LoomError } from "../src/errors.js";
+import { useTmpDir } from "./helpers/tmp.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 const ECHO_SERVER = path.join(FIXTURES, "mcp/echo-server.mjs");
 
 describe("loom mcp inspect — provider-spec resolution", () => {
+  const tmp = useTmpDir("loom-inspect-");
+
   it("treats `./foo` and `/abs/foo.js` as path shorthand", async () => {
     const r1 = await resolveProviderSpec("./bin/server.mjs");
     expect(r1.config).toMatchObject({
@@ -51,36 +53,47 @@ describe("loom mcp inspect — provider-spec resolution", () => {
   });
 
   it("resolves bare handles against the manifest's [providers] table", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inspect-h-"));
-    try {
-      const p = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        p,
-        `[agent]
+    const p = path.join(tmp(), "agent.toml");
+    await fs.writeFile(
+      p,
+      `[agent]
 name = "x"
 [harness]
 provider = "test"
 [providers]
 my_handle = { provider = "mcp-server", command = "node", args = ["./server.mjs"] }
 `,
-        "utf8",
-      );
-      const r = await resolveProviderSpec("my_handle", { manifestPath: p });
-      expect(r.config).toEqual({
-        command: "node",
-        args: ["./server.mjs"],
-      });
-      expect(r.source).toBe("manifest:my_handle");
-      expect(r.manifestDir).toBe(path.dirname(path.resolve(p)));
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+      "utf8",
+    );
+    const r = await resolveProviderSpec("my_handle", { manifestPath: p });
+    expect(r.config).toEqual({
+      command: "node",
+      args: ["./server.mjs"],
+    });
+    expect(r.source).toBe("manifest:my_handle");
+    expect(r.manifestDir).toBe(path.dirname(path.resolve(p)));
   });
 
-  it("rejects bare handles pointing at non-mcp-server [providers] entries", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inspect-h2-"));
-    try {
-      const p = path.join(dir, "agent.toml");
+  // Variants of "bare handle rejected because the [providers] entry
+  // isn't a usable mcp-server entry". Each row writes a single
+  // [providers] entry and asserts the diagnostic.
+  it.each([
+    {
+      label: "non-mcp-server factory",
+      entry: `other = { provider = "some-other-factory" }`,
+      handle: "other",
+      message: /not 'mcp-server'/,
+    },
+    {
+      label: "SourceSpec entry",
+      entry: `local = { path = "./somepkg" }`,
+      handle: "local",
+      message: /SourceSpec, not a/,
+    },
+  ])(
+    "rejects bare handles pointing at $label",
+    async ({ entry, handle, message }) => {
+      const p = path.join(tmp(), "agent.toml");
       await fs.writeFile(
         p,
         `[agent]
@@ -88,40 +101,15 @@ name = "x"
 [harness]
 provider = "test"
 [providers]
-other = { provider = "some-other-factory" }
+${entry}
 `,
         "utf8",
       );
       await expect(
-        resolveProviderSpec("other", { manifestPath: p }),
-      ).rejects.toThrow(/not 'mcp-server'/);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects bare handles pointing at SourceSpec [providers] entries", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inspect-h3-"));
-    try {
-      const p = path.join(dir, "agent.toml");
-      await fs.writeFile(
-        p,
-        `[agent]
-name = "x"
-[harness]
-provider = "test"
-[providers]
-local = { path = "./somepkg" }
-`,
-        "utf8",
-      );
-      await expect(
-        resolveProviderSpec("local", { manifestPath: p }),
-      ).rejects.toThrow(/SourceSpec, not a/);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
+        resolveProviderSpec(handle, { manifestPath: p }),
+      ).rejects.toThrow(message);
+    },
+  );
 });
 
 describe("loom mcp inspect — handle suggestion", () => {
@@ -144,6 +132,8 @@ describe("loom mcp inspect — handle suggestion", () => {
 });
 
 describe("loom mcp inspect — end-to-end against the echo fixture", () => {
+  const tmp = useTmpDir("loom-inspect-rt-");
+
   it("spawns the fixture, lists its tools, and emits a paste-and-prune TOML snippet", async () => {
     const r = await inspectMcpServer(ECHO_SERVER);
     expect(r.serverName).toBe("loom-test-mcp-echo");
@@ -171,27 +161,22 @@ describe("loom mcp inspect — end-to-end against the echo fixture", () => {
     const r = await inspectMcpServer(ECHO_SERVER, {
       suggestedHandle: "echo_mcp",
     });
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inspect-rt-"));
-    try {
-      const p = path.join(dir, "agent.toml");
-      // Wrap the snippet with the minimum manifest scaffolding.
-      const manifest = `[agent]
+    const p = path.join(tmp(), "agent.toml");
+    // Wrap the snippet with the minimum manifest scaffolding.
+    const manifest = `[agent]
 name = "rt"
 [harness]
 provider = "test"
 ${r.toml}`;
-      await fs.writeFile(p, manifest, "utf8");
-      const { parseAgentManifest } = await import("../src/manifest/parser.js");
-      const m = await parseAgentManifest(p);
-      // The provider entry parses as the configured-factory form.
-      expect(m.providers?.echo_mcp).toMatchObject({
-        provider: "mcp-server",
-      });
-      // Both tools appear with the right handle.
-      expect(m.tools?.echo).toEqual({ provider: "echo_mcp" });
-      expect(m.tools?.add).toEqual({ provider: "echo_mcp" });
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    await fs.writeFile(p, manifest, "utf8");
+    const { parseAgentManifest } = await import("../src/manifest/parser.js");
+    const m = await parseAgentManifest(p);
+    // The provider entry parses as the configured-factory form.
+    expect(m.providers?.echo_mcp).toMatchObject({
+      provider: "mcp-server",
+    });
+    // Both tools appear with the right handle.
+    expect(m.tools?.echo).toEqual({ provider: "echo_mcp" });
+    expect(m.tools?.add).toEqual({ provider: "echo_mcp" });
   });
 });

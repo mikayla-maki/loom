@@ -35,8 +35,11 @@ import {
   type PromptResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type SessionConfigOption,
   type SessionId,
   type SessionUpdate as ACPSessionUpdate,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type StopReason,
   type Stream,
 } from "@agentclientprotocol/sdk";
@@ -46,8 +49,12 @@ import type { RunAgentOptions } from "../sdk/run-agent.js";
 import { LOOM_VERSION } from "../sdk/run-agent.js";
 import { DEFAULT_CLIENT_ACP_CAPABILITIES } from "../runtime/acp-capabilities.js";
 import type { ClientAcpCapabilities } from "../runtime/acp-capabilities.js";
-import { lastAgentMessage } from "../runtime/extract-message.js";
+import type { ClientBridge } from "../runtime/client-bridge.js";
+import type { HarnessModel } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
+
+/** Strip `readonly` modifiers off every property of `T`. */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
 /** Protocol version Loom speaks. */
 export const ACP_PROTOCOL_VERSION = 1;
@@ -74,6 +81,20 @@ interface SessionEntry {
   agent: RunningAgent;
   updateForwarder: Promise<void>;
   forwarderDone: AbortController;
+  /**
+   * The current model override, if the client set one via
+   * `session/set_config_option`. Passed as `RunParameters.model`
+   * on every subsequent `prompt()` so the harness routes to that
+   * model instead of its default. `null` = use the harness's
+   * configured default.
+   */
+  selectedModel: string | null;
+  /**
+   * Cached `configOptions` payload (the full list, with current
+   * values reflected). Recomputed lazily on first request and on
+   * every `setSessionConfigOption`.
+   */
+  configOptions: SessionConfigOption[];
 }
 
 /**
@@ -163,7 +184,21 @@ class LoomAcpAgent implements ACPAgent {
     const agent = await this.factory(params.cwd);
     const sessionId = this.allocateSessionId();
     this.bindSession(sessionId, agent);
-    return { sessionId };
+    // `bindSession` just inserted this entry under `sessionId`, so the
+    // lookup is guaranteed to hit. Guard so a future refactor can't
+    // silently produce `undefined`.
+    const entry = this.sessions.get(sessionId);
+    if (!entry) {
+      throw new Error(
+        `acp: session ${sessionId} missing after bindSession (internal invariant violated)`,
+      );
+    }
+    entry.configOptions = await this.buildConfigOptions(entry);
+    const response: NewSessionResponse = { sessionId };
+    if (entry.configOptions.length > 0) {
+      response.configOptions = entry.configOptions;
+    }
+    return response;
   }
 
   async loadSession(p: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -198,12 +233,25 @@ class LoomAcpAgent implements ACPAgent {
         `unknown sessionId: ${params.sessionId}`,
       );
     }
-    const result = await entry.agent.prompt(params.prompt as ContentBlock[]);
+    // If the client picked a model via `session/set_config_option`,
+    // pass it through as a per-turn override. The harness sees it via
+    // `RunParameters.model` and routes the API call accordingly.
+    const runParams = entry.selectedModel
+      ? { model: entry.selectedModel }
+      : undefined;
+    const result = await entry.agent.prompt(
+      params.prompt as ContentBlock[],
+      runParams,
+    );
     // Loom uses "error" as an internal-only stop reason; map it to a
     // JSON-RPC error response rather than emit an out-of-spec value.
+    // The harness puts the cause on `result.error.message`; the session
+    // log is intentionally clean (no error chunk persisted).
     if (result.stopReason === "error") {
-      const tail = await lastAgentMessage(entry.agent.session);
-      throw RequestError.internalError(undefined, tail || "agent error");
+      throw RequestError.internalError(
+        undefined,
+        result.error?.message ?? "agent error",
+      );
     }
     return {
       stopReason: result.stopReason as StopReason,
@@ -214,6 +262,96 @@ class LoomAcpAgent implements ACPAgent {
   async cancel(params: CancelNotification): Promise<void> {
     const entry = this.sessions.get(params.sessionId);
     if (entry) await entry.agent.cancel();
+  }
+
+  /**
+   * Handle `session/set_config_option`. Today we recognize one
+   * option id: `"model"` (drives `entry.selectedModel`). Unknown
+   * option ids are rejected with `invalidParams` per spec. The
+   * response carries the full updated `configOptions` array —
+   * changing one option may affect the available values of others,
+   * even though we currently only have the one.
+   */
+  async setSessionConfigOption(
+    params: SetSessionConfigOptionRequest,
+  ): Promise<SetSessionConfigOptionResponse> {
+    const entry = this.sessions.get(params.sessionId);
+    if (!entry) {
+      throw RequestError.invalidParams(
+        { sessionId: params.sessionId },
+        `unknown sessionId: ${params.sessionId}`,
+      );
+    }
+
+    if (params.configId === "model") {
+      const value = (params as { value?: unknown }).value;
+      if (typeof value !== "string" || !value) {
+        throw RequestError.invalidParams(
+          { configId: params.configId, value },
+          `setSessionConfigOption: 'model' requires a string value`,
+        );
+      }
+      entry.selectedModel = value;
+      entry.configOptions = await this.buildConfigOptions(entry);
+      return { configOptions: entry.configOptions };
+    }
+
+    throw RequestError.invalidParams(
+      { configId: params.configId },
+      `setSessionConfigOption: unknown configId '${params.configId}'`,
+    );
+  }
+
+  /**
+   * Compute the `configOptions` array for a session. Right now we
+   * expose exactly one option — the harness's model selector —
+   * when the harness has populated `models()` AND returned a
+   * non-empty list. Skipped silently when the harness can't surface
+   * a list (test harnesses, harnesses behind misconfigured creds,
+   * etc.) so the agent still boots.
+   */
+  private async buildConfigOptions(
+    entry: SessionEntry,
+  ): Promise<SessionConfigOption[]> {
+    const harness = entry.agent.harness;
+    if (!harness.models || !harness.currentModel) return [];
+    let models: HarnessModel[] = [];
+    try {
+      models = await Promise.resolve(harness.models());
+    } catch {
+      // Defensive: harness errors during model listing shouldn't
+      // tear down session/new. Surface nothing instead.
+      return [];
+    }
+    if (models.length === 0) return [];
+    const current = entry.selectedModel ?? harness.currentModel();
+    const options = models.map((m) => ({
+      value: m.id,
+      name: m.name ?? m.id,
+      ...(m.description ? { description: m.description } : {}),
+    }));
+    // The harness's default model id is often an alias (e.g.
+    // `claude-sonnet-4-5-latest`) that the underlying API resolves to
+    // a dated canonical id (`claude-sonnet-4-5-20250929`). The
+    // `models.list()` endpoint returns the canonical id only, so the
+    // alias isn't in `options`. If we leave it that way, ACP clients
+    // render the dropdown as "Unknown" because the `currentValue`
+    // doesn't match any option. Prepend a synthetic option for the
+    // current value so the dropdown always reflects what's actually
+    // in use.
+    if (!options.some((o) => o.value === current)) {
+      options.unshift({ value: current, name: current });
+    }
+    return [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        category: "model",
+        currentValue: current,
+        options,
+      },
+    ];
   }
 
   /** Allocate a fresh routing sessionId. */
@@ -232,6 +370,7 @@ class LoomAcpAgent implements ACPAgent {
       return;
     }
     agent.setPermissionHandler(this.makeForwardingPermissionHandler(sessionId));
+    agent.setClientBridge(this.makeClientBridge(sessionId));
     const ctl = new AbortController();
     const updateForwarder = this.startUpdateForwarder(
       sessionId,
@@ -242,6 +381,8 @@ class LoomAcpAgent implements ACPAgent {
       agent,
       updateForwarder,
       forwarderDone: ctl,
+      selectedModel: null,
+      configOptions: [],
     });
   }
 
@@ -267,6 +408,40 @@ class LoomAcpAgent implements ACPAgent {
         return { outcome: { outcome: "cancelled" } };
       }
     };
+  }
+
+  /**
+   * Build a `ClientBridge` over the ACP connection for one session.
+   * Each method is only attached when the client advertised the
+   * matching capability — tools structurally pattern-match on method
+   * presence (`if (ctx.client?.readTextFile)`) rather than checking
+   * a capability flag.
+   *
+   * `sessionId` is captured here and injected into every outbound
+   * request so tools never have to thread it.
+   */
+  private makeClientBridge(sessionId: SessionId): ClientBridge {
+    const conn = this.connection;
+    const caps = this.clientCapabilities;
+
+    const bridge: ClientBridge = { capabilities: caps };
+
+    if (caps.fs?.readTextFile) {
+      (bridge as Mutable<ClientBridge>).readTextFile = async (params) => {
+        const res = await conn.readTextFile({ ...params, sessionId });
+        return res.content;
+      };
+    }
+    if (caps.fs?.writeTextFile) {
+      (bridge as Mutable<ClientBridge>).writeTextFile = async (params) => {
+        await conn.writeTextFile({ ...params, sessionId });
+      };
+    }
+    if (caps.terminal) {
+      (bridge as Mutable<ClientBridge>).createTerminal = (params) =>
+        conn.createTerminal({ ...params, sessionId });
+    }
+    return bridge;
   }
 
   /**

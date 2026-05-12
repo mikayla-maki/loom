@@ -8,7 +8,7 @@ import type {
   Session,
   Tool,
 } from "../src/types/interfaces.js";
-import type { SessionUpdate, StopReason } from "../src/types/acp.js";
+import type { SessionUpdate } from "../src/types/acp.js";
 
 /**
  * Verifies that `runAgent` accepts pre-built `Harness` / `Session` /

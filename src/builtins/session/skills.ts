@@ -244,10 +244,7 @@ export function parseFrontmatter(yaml: string): SkillFrontmatter {
   // recommendation for client-specific fields. Presence of the key
   // (even with an empty string) signals an explicit decision; absence
   // means "fall back to the session default".
-  if (
-    metadata &&
-    Object.prototype.hasOwnProperty.call(metadata, REQUIRED_TOOLS_KEY)
-  ) {
+  if (metadata && Object.hasOwn(metadata, REQUIRED_TOOLS_KEY)) {
     fm.requiredTools = toStringList(metadata[REQUIRED_TOOLS_KEY]);
   }
 

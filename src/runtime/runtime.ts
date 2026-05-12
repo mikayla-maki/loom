@@ -11,9 +11,14 @@ import type {
   Session,
   ToolCall,
   ToolDescriptor,
+  ToolDisplay,
   ToolResult,
 } from "../types/interfaces.js";
-import type { SessionUpdate } from "../types/acp.js";
+import type {
+  SessionUpdate,
+  ToolCallId,
+  ToolCallStatus,
+} from "../types/acp.js";
 
 import type { AgentState } from "./agent-state.js";
 import { assembleSystemPrompt } from "./system-prompt.js";
@@ -87,5 +92,52 @@ export class RuntimeImpl implements Runtime {
   executeTool(call: ToolCall): Promise<ToolResult> {
     if (!call.id) call.id = randomUUID();
     return this.opts.state.toolTable.execute(call);
+  }
+
+  async emitToolResult(args: {
+    toolCallId: ToolCallId;
+    status: ToolCallStatus;
+    modelContent: string;
+    display?: ToolDisplay;
+  }): Promise<void> {
+    // ── Session record: text-only, what the model replays ──
+    // The harness's `eventsToMessages` (or equivalent) reads back
+    // these stored updates and builds tool_result blocks for the
+    // next API call. We always wrap the model-facing string as a
+    // single text block so that extraction is trivial and the
+    // model never reads an empty result — even if `display` carried
+    // a terminal embed or a diff that an ACP client would render
+    // but the model wouldn't understand.
+    const sessionUpdate: SessionUpdate = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: args.toolCallId,
+      status: args.status,
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: args.modelContent },
+        },
+      ],
+    };
+    await Promise.resolve(this.opts.session.push?.(sessionUpdate) ?? []);
+
+    // ── Client display: rich, what the IDE/REPL renders ──
+    // Falls back to the session update's text block when no
+    // `display` was provided (preserves the current single-text
+    // behaviour for tools that don't opt in to rich rendering).
+    const display = args.display;
+    const clientUpdate: SessionUpdate = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: args.toolCallId,
+      status: args.status,
+      content: display?.content ?? sessionUpdate.content,
+      ...(display?.title ? { title: display.title } : {}),
+      ...(display?.kind ? { kind: display.kind } : {}),
+      ...(display?.locations ? { locations: display.locations } : {}),
+      ...(display?.rawOutput !== undefined
+        ? { rawOutput: display.rawOutput }
+        : {}),
+    };
+    this.opts.updateSink.emit(clientUpdate);
   }
 }

@@ -28,7 +28,7 @@ import TOML from "@iarna/toml";
 import { LoomError } from "../errors.js";
 import { parseAgentManifest } from "../manifest/parser.js";
 import { resolveManifest, sourceSpecKey } from "../manifest/resolver.js";
-import { nativeBuiltinNames } from "../builtins/provider/native.js";
+import { nativeBuiltinNames } from "../builtins/tools/native.js";
 import type { AgentManifest, SourceSpec } from "../types/manifest.js";
 
 const exec = promisify(execFile);

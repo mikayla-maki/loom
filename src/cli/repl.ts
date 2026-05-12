@@ -261,7 +261,13 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
       const result = opts.onPrompt
         ? await opts.onPrompt(text)
         : await agent.prompt(text, opts.runParameters);
-      if (result.stopReason !== "end_turn") {
+      if (result.stopReason === "error") {
+        // Harness signalled a fatal turn error out-of-band; surface it
+        // here rather than letting the user wonder why "(stopped: error)"
+        // appeared with no context.
+        const msg = result.error?.message ?? "agent error";
+        stderr.write(`${s.red}error:${s.reset} ${msg}\n`);
+      } else if (result.stopReason !== "end_turn") {
         stdout.write(`${s.dim}(stopped: ${result.stopReason})${s.reset}\n`);
       }
     } catch (e) {
@@ -438,7 +444,10 @@ function renderArgs(input: unknown): string {
   const obj = input as Record<string, unknown>;
   const keys = Object.keys(obj);
   if (keys.length === 0) return "";
-  if (keys.length === 1) return formatScalar(obj[keys[0]!]);
+  if (keys.length === 1) {
+    const [firstKey] = keys as [string];
+    return formatScalar(obj[firstKey]);
+  }
   return keys.map((k) => `${k}=${formatScalar(obj[k])}`).join(", ");
 }
 

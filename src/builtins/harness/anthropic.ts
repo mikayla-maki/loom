@@ -64,6 +64,7 @@ import type {
   FactoryContext,
   Harness,
   HarnessFactory,
+  HarnessModel,
   RunParameters,
   Runtime,
   SummariseArgs,
@@ -154,6 +155,55 @@ export class AnthropicHarness implements Harness {
   }
 
   /**
+   * Implements `Harness.currentModel` — the model id this harness
+   * is currently configured to route to.
+   */
+  currentModel(): string {
+    return this.model;
+  }
+
+  /**
+   * Lazy cache of `client.models.list()`. Populated on first call;
+   * a failed list call caches `[]` so the ACP server doesn't spin
+   * on retries.
+   */
+  private modelsListCache: HarnessModel[] | null = null;
+  private modelsListInflight: Promise<HarnessModel[]> | null = null;
+
+  /**
+   * Implements `Harness.models` — returns the list of models the
+   * Anthropic API advertises for this account, mapped to the
+   * Loom-shaped `HarnessModel`. Cached after the first successful
+   * call. The ACP server uses this to populate the `model` entry
+   * in `configOptions` at `session/new` time.
+   */
+  async models(): Promise<HarnessModel[]> {
+    if (this.modelsListCache !== null) return this.modelsListCache;
+    if (this.modelsListInflight) return this.modelsListInflight;
+    this.modelsListInflight = (async (): Promise<HarnessModel[]> => {
+      try {
+        const out: HarnessModel[] = [];
+        for await (const m of this.client.models.list()) {
+          out.push({
+            id: m.id,
+            ...(m.display_name ? { name: m.display_name } : {}),
+          });
+        }
+        this.modelsListCache = out;
+        return out;
+      } catch {
+        // Cache the empty result so we don't retry on every call.
+        // Callers tolerate an empty array ("no model selector").
+        this.modelsListCache = [];
+        return [];
+      } finally {
+        this.modelsListInflight = null;
+      }
+    })();
+    return this.modelsListInflight;
+  }
+
+  /**
    * Native summarisation. The Messages API with no tools and a single
    * combined prompt is exactly the shape we want, and skips the
    * synthetic-runtime indirection that `summariseViaRun` would do.
@@ -241,15 +291,14 @@ export class AnthropicHarness implements Harness {
           });
           return this.finishTurn("cancelled");
         }
-        await runtime.update({
-          sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `[anthropic error] ${(e as Error).message}`,
-          },
-        });
+        // Don't pollute the session log with the error text — it isn't
+        // an assistant utterance. Stop with `error`; the runtime's
+        // consumer (ACP server, CLI REPL, SDK caller) renders
+        // `result.error.message` however it likes.
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
-        return this.finishTurn("error");
+        return this.finishTurn("error", {
+          message: `[anthropic] ${(e as Error).message}`,
+        });
       }
 
       // Usage first, so the indicator reflects the true post-response state.
@@ -313,16 +362,15 @@ export class AnthropicHarness implements Harness {
           const status: ToolCallStatus = result.isError
             ? "failed"
             : "completed";
-          await runtime.update({
-            sessionUpdate: "tool_call_update",
+          // Split: session stores the text-only model-facing record;
+          // ACP clients receive the rich `display` payload (terminal
+          // blocks, diff blocks, kind, locations). See
+          // `Runtime.emitToolResult` for the rationale.
+          await runtime.emitToolResult({
             toolCallId: tu.id,
             status,
-            content: [
-              {
-                type: "content",
-                content: { type: "text", text: result.content },
-              },
-            ],
+            modelContent: result.content,
+            ...(result.display ? { display: result.display } : {}),
           });
         }),
       );
@@ -401,11 +449,18 @@ export class AnthropicHarness implements Harness {
     return final;
   }
 
-  /** Wrap a stop reason with the turn's accumulated usage (if any). */
-  private finishTurn(stopReason: StopReason): TurnResult {
-    return this.turnUsage
-      ? { stopReason, usage: this.turnUsage }
-      : { stopReason };
+  /**
+   * Wrap a stop reason with the turn's accumulated usage (if any) and
+   * the optional error message (when `stopReason === "error"`).
+   */
+  private finishTurn(
+    stopReason: StopReason,
+    error?: { message: string },
+  ): TurnResult {
+    const result: TurnResult = { stopReason };
+    if (this.turnUsage) result.usage = this.turnUsage;
+    if (error) result.error = error;
+    return result;
   }
 
   /** Fold a per-request usage payload into the turn's cumulative tally. */

@@ -331,6 +331,7 @@ describe("skillsSessionFactory", () => {
         agentName: "x",
         loomVersion: "test",
         clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+        storage: TMP,
       },
       {},
     );
@@ -348,6 +349,7 @@ describe("skillsSessionFactory", () => {
         agentName: "x",
         loomVersion: "test",
         clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+        storage: TMP,
       },
       {},
     );
@@ -367,6 +369,7 @@ describe("skillsSessionFactory", () => {
           agentName: "x",
           loomVersion: "test",
           clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+          storage: TMP,
         },
         {},
       );
@@ -388,6 +391,7 @@ describe("skillsSessionFactory", () => {
           agentName: "x",
           loomVersion: "test",
           clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+          storage: TMP,
         },
         {},
       ),
@@ -401,7 +405,7 @@ describe("skillsSessionFactory", () => {
 
 describe("Skills session via runAgent", () => {
   it("registers skill-required tools alongside manifest tools", async () => {
-    // Two skills: one explicitly asks for write_file, the other says
+    // Two skills: one explicitly asks for edit_file, the other says
     // nothing and so falls back to the session's default_tools (bash).
     // Together with the manifest's read_file, all three should land.
     await writeSkill(
@@ -410,7 +414,7 @@ describe("Skills session via runAgent", () => {
         "name: writer",
         "description: Writes files.",
         "metadata:",
-        '  loom.required-tools: "write_file"',
+        '  loom.required-tools: "edit_file"',
       ].join("\n"),
     );
     await writeSkill(
@@ -429,7 +433,7 @@ describe("Skills session via runAgent", () => {
       tools: { read_file: "builtin" },
       capabilities: {
         read_file: { paths: ["./"] },
-        write_file: { paths: ["./"] },
+        edit_file: { paths: ["./"] },
         bash: { subprocess: "*", paths: ["./"] },
       },
       session: { provider: "skills", root: TMP, default_tools: ["bash"] },
@@ -439,7 +443,7 @@ describe("Skills session via runAgent", () => {
     try {
       const names = agent.agentState.toolTable.list().map((t) => t.name);
       expect(names).toContain("read_file"); // from manifest
-      expect(names).toContain("write_file"); // from `writer` skill
+      expect(names).toContain("edit_file"); // from `writer` skill
       expect(names).toContain("bash"); // from `defaulter`'s fallback
     } finally {
       await agent.close();

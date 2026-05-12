@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -157,20 +157,30 @@ async function spawnLoomAcp(args: {
   };
 }
 
+const CLI_ENTRY = path.resolve("dist/cli/main.js");
+let CLI_AVAILABLE = false;
+
 describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
-  it("drives the sample agent end-to-end via stdio", async () => {
-    const cliEntry = path.resolve("dist/cli/main.js");
+  beforeAll(async () => {
     try {
-      await fs.access(cliEntry);
+      await fs.access(CLI_ENTRY);
+      CLI_AVAILABLE = true;
     } catch {
       console.warn(
-        `[acp.test] skipping subprocess test: ${cliEntry} not found. Run \`npm run build\` first.`,
+        `[acp.test] skipping subprocess tests: ${CLI_ENTRY} not found. Run \`npm run build\` first.`,
       );
-      return;
     }
+  });
 
-    const { spawn } = await import("node:child_process");
+  /** `it` variant that silently skips when the CLI bundle is missing. */
+  const sit = (name: string, fn: () => Promise<void>): void => {
+    it(name, async () => {
+      if (!CLI_AVAILABLE) return;
+      await fn();
+    });
+  };
 
+  sit("drives the sample agent end-to-end via stdio", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-cli-"));
     try {
       const agentDir = path.join(tmp, "agent");
@@ -197,7 +207,7 @@ path = "./session.jsonl"
       );
 
       const { client, shutdown } = await spawnLoomAcp({
-        cliEntry,
+        cliEntry: CLI_ENTRY,
         manifestPath: path.join(agentDir, "agent.toml"),
       });
       try {
@@ -221,17 +231,7 @@ path = "./session.jsonl"
     }
   });
 
-  it("honors the client's `cwd` for tool path resolution", async () => {
-    const cliEntry = path.resolve("dist/cli/main.js");
-    try {
-      await fs.access(cliEntry);
-    } catch {
-      console.warn(
-        `[acp.test] skipping cwd test: ${cliEntry} not found. Run \`npm run build\` first.`,
-      );
-      return;
-    }
-
+  sit("honors the client's `cwd` for tool path resolution", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-cwd-"));
     try {
       // Two distinct directories: the agent definition lives in one,
@@ -267,7 +267,7 @@ script = [ [ { call = { tool = "read_file", input = { path = "hello.txt" } }, su
       );
 
       const { client, collected, shutdown } = await spawnLoomAcp({
-        cliEntry,
+        cliEntry: CLI_ENTRY,
         manifestPath: path.join(agentDir, "agent.toml"),
         spawnCwd: os.tmpdir(),
       });
@@ -302,13 +302,7 @@ script = [ [ { call = { tool = "read_file", input = { path = "hello.txt" } }, su
     }
   });
 
-  it("rejects `session/new` with a relative `cwd`", async () => {
-    const cliEntry = path.resolve("dist/cli/main.js");
-    try {
-      await fs.access(cliEntry);
-    } catch {
-      return;
-    }
+  sit("rejects `session/new` with a relative `cwd`", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-cwd-rel-"));
     try {
       const agentDir = path.join(tmp, "agent");
@@ -326,7 +320,7 @@ echo = true
 `,
       );
       const { client, shutdown } = await spawnLoomAcp({
-        cliEntry,
+        cliEntry: CLI_ENTRY,
         manifestPath: path.join(agentDir, "agent.toml"),
       });
       try {
@@ -342,13 +336,7 @@ echo = true
     }
   });
 
-  it("rejects `session/new` with non-empty `mcpServers`", async () => {
-    const cliEntry = path.resolve("dist/cli/main.js");
-    try {
-      await fs.access(cliEntry);
-    } catch {
-      return;
-    }
+  sit("rejects `session/new` with non-empty `mcpServers`", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-mcp-"));
     try {
       const agentDir = path.join(tmp, "agent");
@@ -366,7 +354,7 @@ echo = true
 `,
       );
       const { client, shutdown } = await spawnLoomAcp({
-        cliEntry,
+        cliEntry: CLI_ENTRY,
         manifestPath: path.join(agentDir, "agent.toml"),
       });
       try {

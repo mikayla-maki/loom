@@ -16,13 +16,14 @@ import { setTimeout as wait } from "node:timers/promises";
 import {
   McpServerTools,
   mcpServerToolsFactory,
-} from "../src/builtins/provider/mcp.js";
+} from "../src/builtins/tools/mcp.js";
 import { DEFAULT_CLIENT_ACP_CAPABILITIES } from "../src/runtime/acp-capabilities.js";
 import { ManifestError } from "../src/errors.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { FactoryContext, InitArgs } from "../src/types/interfaces.js";
 import type { AgentManifest } from "../src/types/manifest.js";
+import { defined } from "./helpers/assert.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 const ECHO_SERVER = path.join(FIXTURES, "mcp/echo-server.mjs");
@@ -34,6 +35,7 @@ function ctx(overrides: Partial<FactoryContext> = {}): FactoryContext {
     agentName: "test-agent",
     loomVersion: "0.0.0-test",
     clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    storage: path.join(process.cwd(), ".loom-test-storage"),
     ...overrides,
   };
 }
@@ -129,7 +131,7 @@ describe("mcp-server factory — config parsing", () => {
 });
 
 describe("mcp-server factory — lifecycle", () => {
-  it("spawns the server, completes the handshake, and shuts it down on close()", async () => {
+  it("spawns the server, completes the handshake, surfaces serverInfo, and reaps the child on close()", async () => {
     const tools = mcpServerToolsFactory.create(
       { command: process.execPath, args: [ECHO_SERVER] },
       ctx(),
@@ -137,27 +139,29 @@ describe("mcp-server factory — lifecycle", () => {
       undefined,
     ) as McpServerTools;
 
-    await tools.init!(
+    await tools.init(
       initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
     );
 
     // The initialize handshake populated the serverInfo cache.
-    expect(tools.serverInfo).toBeDefined();
-    expect(tools.serverInfo!.name).toBe("loom-test-mcp-echo");
-    expect(tools.serverInfo!.version).toBe("0.0.1");
-    expect(tools.serverInfo!.capabilities).toMatchObject({ tools: {} });
+    const info = defined(tools.serverInfo, "serverInfo not populated");
+    expect(info.name).toBe("loom-test-mcp-echo");
+    expect(info.version).toBe("0.0.1");
+    expect(info.capabilities).toMatchObject({ tools: {} });
 
     // Resolve the child PID through the transport's internals (the
     // factory does the same trick to enforce graceful shutdown).
     const proc = (tools.transport as unknown as { _process?: { pid?: number } })
       ._process;
-    expect(proc).toBeDefined();
-    const pid = proc!.pid!;
+    const pid = defined(
+      defined(proc, "transport._process missing").pid,
+      "process pid missing",
+    );
     expect(typeof pid).toBe("number");
     expect(isAlive(pid)).toBe(true);
 
-    // resolveTool returns null for unknown names. (Tool discovery
-    // + execute behaviour gets its own dedicated suite below.)
+    // resolveTool returns null for unknown names. (Discovery +
+    // execute behaviour gets its own dedicated suite below.)
     expect(
       tools.resolveTool("not_a_real_tool", {}, {} as never, undefined),
     ).toBeNull();
@@ -172,26 +176,13 @@ describe("mcp-server factory — lifecycle", () => {
       alive = isAlive(pid);
     }
     expect(alive).toBe(false);
-  });
 
-  it("close() is idempotent", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    await tools.init!(
-      initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
-    );
-
-    await tools.close();
-    // Should resolve, not throw or hang.
+    // close() is idempotent: subsequent calls resolve cleanly.
     await tools.close();
     await tools.close();
   });
 
-  it("close() before init() doesn't throw", async () => {
+  it("close() before init() is a no-op", async () => {
     const tools = mcpServerToolsFactory.create(
       { command: process.execPath, args: [ECHO_SERVER] },
       ctx(),
@@ -211,18 +202,20 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       undefined,
     ) as McpServerTools;
     try {
-      await tools.init!(
+      await tools.init(
         initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
       );
       // The cache reflects exactly what `tools/list` returned.
       expect([...tools.toolsCache.keys()].sort()).toEqual(["add", "echo"]);
-      const t = tools.resolveTool("echo", {}, {} as never, undefined);
-      expect(t).not.toBeNull();
-      expect(t!.name).toBe("echo");
-      expect(t!.description).toMatch(/Return the input verbatim/);
+      const t = defined(
+        tools.resolveTool("echo", {}, {} as never, undefined),
+        "resolveTool('echo') returned null",
+      );
+      expect(t.name).toBe("echo");
+      expect(t.description).toMatch(/Return the input verbatim/);
       // The MCP-side schema flows through verbatim (Chunk 5 will
       // narrow it; for now we mirror it).
-      expect((t!.inputSchema as { properties?: unknown }).properties).toEqual({
+      expect((t.inputSchema as { properties?: unknown }).properties).toEqual({
         text: expect.objectContaining({ type: "string" }),
       });
     } finally {
@@ -230,24 +223,8 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("returns null for names the MCP server didn't advertise", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    try {
-      await tools.init!(
-        initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
-      );
-      expect(
-        tools.resolveTool("not_a_real_tool", {}, {} as never, undefined),
-      ).toBeNull();
-    } finally {
-      await tools.close();
-    }
-  });
+  // (`resolveTool` returning null for unknown names is covered by
+  // the lifecycle suite above; no need to duplicate the spawn here.)
 
   it("execute() runs the MCP tool and surfaces text content as a Loom ToolResult", async () => {
     const tools = mcpServerToolsFactory.create(
@@ -257,10 +234,13 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       undefined,
     ) as McpServerTools;
     try {
-      await tools.init!(
+      await tools.init(
         initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
       );
-      const echo = tools.resolveTool("echo", {}, {} as never, undefined)!;
+      const echo = defined(
+        tools.resolveTool("echo", {}, {} as never, undefined),
+        "resolveTool('echo') returned null",
+      );
       const result = await echo.execute({ text: "hello loom" }, {} as never);
       expect(result.isError).toBeUndefined();
       expect(result.content).toBe("hello loom");
@@ -277,18 +257,15 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       undefined,
     ) as McpServerTools;
     try {
-      await tools.init!(
+      await tools.init(
         initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
       );
       // `say` is the model-facing name; the underlying MCP tool is
       // still `echo`.
-      const say = tools.resolveTool(
-        "say",
-        { mcp_tool: "echo" },
-        {} as never,
-        undefined,
-      )!;
-      expect(say).not.toBeNull();
+      const say = defined(
+        tools.resolveTool("say", { mcp_tool: "echo" }, {} as never, undefined),
+        "resolveTool('say') returned null",
+      );
       expect(say.name).toBe("say");
       const result = await say.execute({ text: "renamed!" }, {} as never);
       expect(result.content).toBe("renamed!");
@@ -397,19 +374,25 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       undefined,
     ) as McpServerTools;
     try {
-      await tools.init!(
+      await tools.init(
         initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
       );
       // No grant → no annotation; the original description flows through.
-      const plain = tools.resolveTool("add", {}, {} as never, undefined)!;
+      const plain = defined(
+        tools.resolveTool("add", {}, {} as never, undefined),
+        "resolveTool('add', no grant) returned null",
+      );
       expect(plain.description).toBe("Add two integers.");
       expect(plain.description).not.toContain("Host note");
 
       // Literal binding on `a` → annotation surfaces.
-      const bound = tools.resolveTool("add", {}, {} as never, {
-        a: 10,
-        b: "*",
-      })!;
+      const bound = defined(
+        tools.resolveTool("add", {}, {} as never, {
+          a: 10,
+          b: "*",
+        }),
+        "resolveTool('add', bound a) returned null",
+      );
       expect(bound.description).toContain("Add two integers.");
       expect(bound.description).toContain("Host note");
       expect(bound.description).toContain("`a`");
@@ -418,16 +401,22 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       expect(bound.description).not.toContain("10");
 
       // Multiple bound args → list both, use plural phrasing.
-      const bound2 = tools.resolveTool("add", {}, {} as never, {
-        a: 10,
-        b: 20,
-      })!;
+      const bound2 = defined(
+        tools.resolveTool("add", {}, {} as never, {
+          a: 10,
+          b: 20,
+        }),
+        "resolveTool('add', bound a+b) returned null",
+      );
       expect(bound2.description).toContain("`a`");
       expect(bound2.description).toContain("`b`");
       expect(bound2.description).toMatch(/arguments are/);
 
       // Whole-tool `"*"` grant → no narrowing, no annotation.
-      const starred = tools.resolveTool("add", {}, {} as never, "*")!;
+      const starred = defined(
+        tools.resolveTool("add", {}, {} as never, "*"),
+        "resolveTool('add', '*' grant) returned null",
+      );
       expect(starred.description).not.toContain("Host note");
     } finally {
       await tools.close();
@@ -461,7 +450,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     try {
       const list = agent.agentState.toolTable.list();
       expect(list).toHaveLength(1);
-      const t = list[0]!;
+      const t = defined(list[0], "toolTable.list() returned empty");
       // The narrowed schema hides `a` from the model.
       const props = (t.inputSchema as { properties: Record<string, unknown> })
         .properties;
@@ -698,7 +687,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       undefined,
     ) as McpServerTools;
     try {
-      await tools.init!(
+      await tools.init(
         initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
       );
       expect(() =>

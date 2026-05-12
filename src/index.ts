@@ -52,6 +52,11 @@ export { FileSession } from "./builtins/session/file.js";
 export { SkillsSession } from "./builtins/session/skills.js";
 export { ChainedSession } from "./runtime/session-chain.js";
 export type {
+  ClientBridge,
+  CreateTerminalParams,
+} from "./runtime/client-bridge.js";
+export { raceAbort } from "./runtime/client-bridge.js";
+export type {
   Compactor,
   CompactingSessionOptions,
   ModelCompactorOptions,
@@ -93,7 +98,7 @@ export type {
   LoadOptions as ProviderLoadOptions,
 } from "./providers/loader.js";
 
-export { buildNativeTools } from "./builtins/provider/native.js";
+export { buildNativeTools } from "./builtins/tools/native.js";
 
 export { auditAgent, formatCapabilityTree } from "./audit/audit.js";
 export type { CapabilityTree } from "./audit/audit.js";

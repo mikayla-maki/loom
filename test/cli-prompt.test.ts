@@ -341,43 +341,76 @@ describe("applyTextModeAugmentation", () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // End-to-end: runPromptCommand with an inline harness
-// ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
 describe("runPromptCommand (end-to-end)", () => {
-  it("text mode: no-tool turn → stdout = answer + \\n, exit 0", async () => {
+  /**
+   * Drives `runPromptCommand` with a recording harness that replays
+   * `updates`. Returns the captured streams, the recorded
+   * `systemPromptCore`, and the exit code.
+   */
+  async function runScenario(opts: {
+    updates: SessionUpdate[];
+    format: "text" | "trace" | "jsonl";
+    text?: string;
+    systemPrompt?: string;
+    name?: string;
+  }): Promise<{
+    code: number;
+    stdout: string;
+    stderr: string;
+    systemPromptCore: string | null;
+  }> {
     const cap = captureStreams();
-    const harness = makeRecordingHarness(async () => [
-      {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "4" },
-      },
-      { sessionUpdate: "stop", stopReason: "end_turn" },
-    ]);
+    const harness = makeRecordingHarness(async () => opts.updates);
     const manifest: AgentManifest = {
-      name: "txt-no-tool",
-      systemPrompt: "You answer math.",
+      name: opts.name ?? "scenario",
+      ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
       tools: {},
       harness,
     };
     const code = await runPromptCommand({
       manifest,
-      text: "2+2",
-      format: "text",
+      text: opts.text ?? "hi",
+      format: opts.format,
       streams: cap.streams,
     });
-    expect(code).toBe(0);
-    expect(cap.stdout()).toBe("4\n");
-    expect(cap.stderr()).toBe("");
+    return {
+      code,
+      stdout: cap.stdout(),
+      stderr: cap.stderr(),
+      systemPromptCore: harness.systemPromptCore,
+    };
+  }
+
+  it("text mode: no-tool turn → stdout = answer + \\n, exit 0", async () => {
+    const r = await runScenario({
+      updates: [
+        {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "4" },
+        },
+        { sessionUpdate: "stop", stopReason: "end_turn" },
+      ],
+      format: "text",
+      text: "2+2",
+      systemPrompt: "You answer math.",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("4\n");
+    expect(r.stderr).toBe("");
   });
 
   it("text mode: multi-segment turn with a tool → only the final answer reaches stdout", async () => {
-    const cap = captureStreams();
     // Emit the same SessionUpdate sequence a real tool dispatch
     // produces, without actually wiring a tool registration —
     // we're testing the renderer's coalescing behaviour, not the
-    // tool table.
+    // tool table. Uses an inline harness (not runScenario) because
+    // we need a custom `run()` rather than `makeRecordingHarness`'s
+    // replay shape.
+    const cap = captureStreams();
     const harness: Harness = {
       async run(rt: Runtime) {
         await rt.update({
@@ -406,18 +439,11 @@ describe("runPromptCommand (end-to-end)", () => {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Result: 42." },
         });
-        await rt.update({
-          sessionUpdate: "stop",
-          stopReason: "end_turn",
-        });
+        await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
         return { stopReason: "end_turn" as const };
       },
     };
-    const manifest: AgentManifest = {
-      name: "txt-tools",
-      tools: {},
-      harness,
-    };
+    const manifest: AgentManifest = { name: "txt-tools", tools: {}, harness };
     const code = await runPromptCommand({
       manifest,
       text: "go",
@@ -430,119 +456,79 @@ describe("runPromptCommand (end-to-end)", () => {
   });
 
   it("text mode: final message with image → stderr placeholder", async () => {
-    const cap = captureStreams();
-    const harness = makeRecordingHarness(async () => [
-      {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "see:" },
-      },
-      {
-        sessionUpdate: "agent_message_chunk",
-        content: {
-          type: "image",
-          data: "AAAA",
-          mimeType: "image/png",
+    const r = await runScenario({
+      updates: [
+        {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "see:" },
         },
-      },
-      { sessionUpdate: "stop", stopReason: "end_turn" },
-    ]);
-    const manifest: AgentManifest = {
-      name: "txt-image",
-      tools: {},
-      harness,
-    };
-    const code = await runPromptCommand({
-      manifest,
-      text: "show",
+        {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "image", data: "AAAA", mimeType: "image/png" },
+        },
+        { sessionUpdate: "stop", stopReason: "end_turn" },
+      ],
       format: "text",
-      streams: cap.streams,
+      text: "show",
     });
-    expect(code).toBe(0);
-    expect(cap.stdout()).toBe("see:\n");
-    expect(cap.stderr()).toMatch(/\[image: image\/png/);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("see:\n");
+    expect(r.stderr).toMatch(/\[image: image\/png/);
   });
 
   it("text mode: system prompt augmentation reaches the harness", async () => {
-    const cap = captureStreams();
-    const harness = makeRecordingHarness(async () => [
-      {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "ok" },
-      },
-      { sessionUpdate: "stop", stopReason: "end_turn" },
-    ]);
-    const manifest: AgentManifest = {
-      name: "txt-augment",
-      systemPrompt: "You are helpful.",
-      tools: {},
-      harness,
-    };
-    const code = await runPromptCommand({
-      manifest,
-      text: "hi",
+    const r = await runScenario({
+      updates: [
+        {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "ok" },
+        },
+        { sessionUpdate: "stop", stopReason: "end_turn" },
+      ],
       format: "text",
-      streams: cap.streams,
+      systemPrompt: "You are helpful.",
     });
-    expect(code).toBe(0);
-    expect(harness.systemPromptCore).not.toBeNull();
-    expect(harness.systemPromptCore).toContain("You are helpful.");
-    expect(harness.systemPromptCore).toContain(TEXT_MODE_PROMPT_AUGMENTATION);
+    expect(r.code).toBe(0);
+    expect(r.systemPromptCore).not.toBeNull();
+    expect(r.systemPromptCore).toContain("You are helpful.");
+    expect(r.systemPromptCore).toContain(TEXT_MODE_PROMPT_AUGMENTATION);
   });
 
   it("trace mode: does NOT augment the system prompt", async () => {
-    const cap = captureStreams();
-    const harness = makeRecordingHarness(async () => [
-      {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "ok" },
-      },
-      { sessionUpdate: "stop", stopReason: "end_turn" },
-    ]);
-    const manifest: AgentManifest = {
-      name: "trace-noaug",
-      systemPrompt: "You are helpful.",
-      tools: {},
-      harness,
-    };
-    const code = await runPromptCommand({
-      manifest,
-      text: "hi",
+    const r = await runScenario({
+      updates: [
+        {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "ok" },
+        },
+        { sessionUpdate: "stop", stopReason: "end_turn" },
+      ],
       format: "trace",
-      streams: cap.streams,
+      systemPrompt: "You are helpful.",
     });
-    expect(code).toBe(0);
-    expect(harness.systemPromptCore).toBe("You are helpful.");
+    expect(r.code).toBe(0);
+    expect(r.systemPromptCore).toBe("You are helpful.");
     // The user echo and agent message both appear, plus stop:
-    const out = cap.stdout();
-    expect(out).toContain("[user] hi");
-    expect(out).toContain("[agent] ok");
-    expect(out).toContain("[stop] end_turn");
+    expect(r.stdout).toContain("[user] hi");
+    expect(r.stdout).toContain("[agent] ok");
+    expect(r.stdout).toContain("[stop] end_turn");
   });
 
   it("jsonl mode: each event on its own line; no augmentation", async () => {
-    const cap = captureStreams();
-    const harness = makeRecordingHarness(async () => [
-      {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "ok" },
-      },
-      { sessionUpdate: "stop", stopReason: "end_turn" },
-    ]);
-    const manifest: AgentManifest = {
-      name: "jsonl",
-      systemPrompt: "You are helpful.",
-      tools: {},
-      harness,
-    };
-    const code = await runPromptCommand({
-      manifest,
-      text: "hi",
+    const r = await runScenario({
+      updates: [
+        {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "ok" },
+        },
+        { sessionUpdate: "stop", stopReason: "end_turn" },
+      ],
       format: "jsonl",
-      streams: cap.streams,
+      systemPrompt: "You are helpful.",
     });
-    expect(code).toBe(0);
-    expect(harness.systemPromptCore).toBe("You are helpful.");
-    const lines = cap.stdout().trimEnd().split("\n");
+    expect(r.code).toBe(0);
+    expect(r.systemPromptCore).toBe("You are helpful.");
+    const lines = r.stdout.trimEnd().split("\n");
     for (const l of lines) expect(() => JSON.parse(l)).not.toThrow();
     // sanity: includes user, agent, stop
     const kinds = lines.map((l) => JSON.parse(l).sessionUpdate);
@@ -551,41 +537,15 @@ describe("runPromptCommand (end-to-end)", () => {
     expect(kinds).toContain("stop");
   });
 
-  it("max_turn_requests stop → exit 1", async () => {
-    const cap = captureStreams();
-    const harness = makeRecordingHarness(async () => [
-      { sessionUpdate: "stop", stopReason: "max_turn_requests" },
-    ]);
-    const manifest: AgentManifest = {
-      name: "maxturns",
-      tools: {},
-      harness,
-    };
-    const code = await runPromptCommand({
-      manifest,
-      text: "go",
+  it.each<[number, "max_turn_requests" | "cancelled"]>([
+    [1, "max_turn_requests"],
+    [130, "cancelled"],
+  ])("stop reason '%s' → exit %i", async (code, stopReason) => {
+    const r = await runScenario({
+      updates: [{ sessionUpdate: "stop", stopReason }],
       format: "text",
-      streams: cap.streams,
-    });
-    expect(code).toBe(1);
-  });
-
-  it("cancelled stop → exit 130", async () => {
-    const cap = captureStreams();
-    const harness = makeRecordingHarness(async () => [
-      { sessionUpdate: "stop", stopReason: "cancelled" },
-    ]);
-    const manifest: AgentManifest = {
-      name: "cancelled",
-      tools: {},
-      harness,
-    };
-    const code = await runPromptCommand({
-      manifest,
       text: "go",
-      format: "text",
-      streams: cap.streams,
     });
-    expect(code).toBe(130);
+    expect(r.code).toBe(code);
   });
 });

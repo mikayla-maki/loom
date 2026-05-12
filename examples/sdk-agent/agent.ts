@@ -122,8 +122,10 @@ const manifest: AgentManifest = {
     "system prompt includes notes from previous sessions. When the user " +
     "tells you something worth keeping — preferences, project " +
     "conventions, names, recurring context — call the `remember` tool " +
-    "with a short declarative fact. Use bash/read_file/write_file/find " +
-    "for real work.",
+    "with a short declarative fact. Use bash, read_file, write_file, " +
+    "edit_file, and find for real work — prefer edit_file over " +
+    "write_file for changes to existing files (much more efficient " +
+    "and produces a diff for review).",
 
   providers: {
     notes: { path: "../notes-provider" },
@@ -143,6 +145,7 @@ const manifest: AgentManifest = {
     bash: "builtin",
     read_file: "builtin",
     write_file: "builtin",
+    edit_file: "builtin",
     find: "builtin",
   },
 
@@ -150,6 +153,7 @@ const manifest: AgentManifest = {
     bash: { subprocess: "*", paths: ["./"] },
     read_file: { paths: ["./"] },
     write_file: { paths: ["./"] },
+    edit_file: { paths: ["./"] },
     find: { paths: ["./"] },
     remember: "*",
   },
@@ -210,7 +214,16 @@ async function main(): Promise<void> {
       }
 
       try {
-        await agent.prompt(trimmed);
+        const result = await agent.prompt(trimmed);
+        if (result.stopReason === "error") {
+          // Harness signalled a fatal turn error out-of-band; surface it
+          // explicitly so it doesn't get lost in the stream.
+          process.stderr.write(
+            `error: ${result.error?.message ?? "agent error"}\n`,
+          );
+        } else if (result.stopReason !== "end_turn") {
+          process.stdout.write(`[stopped: ${result.stopReason}]\n`);
+        }
       } catch (e) {
         process.stderr.write(`error: ${(e as Error).message}\n`);
       }

@@ -53,7 +53,7 @@ import type {
 import { createRequire } from "node:module";
 import * as path from "node:path";
 
-import { LoomError, ManifestError, SecretError } from "../../errors.js";
+import { ManifestError, SecretError } from "../../errors.js";
 import { applyArgGrant } from "../../manifest/capabilities.js";
 import type { ContributionRegistration } from "../../providers/loader.js";
 import type {
@@ -213,7 +213,7 @@ export class McpServerTools implements Tools {
             };
           }
         )._process;
-        if (proc && proc.pid && proc.killed !== true) {
+        if (proc?.pid && proc.killed !== true) {
           await graceful(proc);
         }
       } catch {
@@ -533,7 +533,7 @@ function buildLoomTool(args: {
       // when the server's schema is strict, but MCP servers vary;
       // explicit guard keeps the contract intact regardless.
       for (const k of Object.keys(modelArgs)) {
-        if (Object.prototype.hasOwnProperty.call(applied.bound, k)) {
+        if (Object.hasOwn(applied.bound, k)) {
           return {
             content:
               `MCP tool '${mcpName}': argument '${k}' is bound by ` +

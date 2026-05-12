@@ -1,18 +1,37 @@
 import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 
 import {
+  isPreBuiltSessionLayer,
   resolveManifest,
   resolveSystemPrompt,
+  type ResolvedSessionLayer,
+  type SessionBinding,
 } from "../src/manifest/resolver.js";
+import { withTmpDir } from "./helpers/tmp.js";
+import { defined } from "./helpers/assert.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { CapabilityError, ResolutionError } from "../src/errors.js";
 import { InMemorySession } from "../src/builtins/session/memory.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 
 const FIXTURES = path.resolve("test/fixtures");
+
+/**
+ * Narrow a `ResolvedSessionLayer` (which may be either a
+ * `SessionBinding` or a pre-built instance) to a `SessionBinding`,
+ * failing the test if the layer turned out to be pre-built. Keeps
+ * the assertions below readable.
+ */
+function asSessionBinding(
+  layer: ResolvedSessionLayer | undefined,
+): SessionBinding {
+  if (!layer || isPreBuiltSessionLayer(layer)) {
+    throw new Error("expected a factory-backed SessionBinding");
+  }
+  return layer;
+}
 
 describe("manifest walk via runAgent", () => {
   it("resolves the sample agent end-to-end", async () => {
@@ -24,7 +43,12 @@ describe("manifest walk via runAgent", () => {
     );
     try {
       const tools = agent.agentState.toolTable.list().map((t) => t.name);
-      expect(tools.sort()).toEqual(["find", "read_file", "write_file"]);
+      expect(tools.sort()).toEqual([
+        "edit_file",
+        "find",
+        "read_file",
+        "write_file",
+      ]);
       // The agent surfaces the granted caps from [capabilities].
       expect(agent.capabilities.read_file).toEqual({ paths: ["./"] });
     } finally {
@@ -82,9 +106,11 @@ describe("manifest walk via runAgent", () => {
     const r = resolveManifest(spec);
     expect(Array.isArray(r.session)).toBe(true);
     expect(r.session).toHaveLength(2);
-    expect(r.session![0]!.factoryName).toBe("compacting");
-    expect(r.session![0]!.config).toEqual({ threshold: 60 });
-    expect(r.session![1]!.factoryName).toBe("in-memory");
+    const layer0 = asSessionBinding(r.session?.[0]);
+    const layer1 = asSessionBinding(r.session?.[1]);
+    expect(layer0.factoryName).toBe("compacting");
+    expect(layer0.config).toEqual({ threshold: 60 });
+    expect(layer1.factoryName).toBe("in-memory");
   });
 
   it("wraps singleton SessionSpec into a length-1 binding array", () => {
@@ -96,7 +122,7 @@ describe("manifest walk via runAgent", () => {
     };
     const r = resolveManifest(spec);
     expect(r.session).toHaveLength(1);
-    expect(r.session![0]!.factoryName).toBe("in-memory");
+    expect(asSessionBinding(r.session?.[0]).factoryName).toBe("in-memory");
   });
 
   it("pre-built Session instance leaves resolved.session undefined", () => {
@@ -147,24 +173,26 @@ describe("manifest walk via runAgent", () => {
     // (the configured-factory entry is shared by dedup on
     // (factoryName, mergedConfig)).
     expect(r.tools).toHaveLength(2);
-    expect(r.tools[0]!.toolName).toBe("read_text_file");
-    expect(r.tools[1]!.toolName).toBe("list_directory");
-    expect(r.tools[0]!.providerInstanceId).toBe(r.tools[1]!.providerInstanceId);
+    const t0 = defined(r.tools[0]);
+    const t1 = defined(r.tools[1]);
+    expect(t0.toolName).toBe("read_text_file");
+    expect(t1.toolName).toBe("list_directory");
+    expect(t0.providerInstanceId).toBe(t1.providerInstanceId);
 
     // The instance is factory-backed with no source.
-    const instance = r.providers.find(
-      (p) => p.id === r.tools[0]!.providerInstanceId,
+    const instance = defined(
+      r.providers.find((p) => p.id === t0.providerInstanceId),
+      "provider instance not found",
     );
-    expect(instance).toBeDefined();
-    expect(instance!.kind).toBe("provider");
-    expect(instance!.source).toBeUndefined();
-    expect(instance!.factoryName).toBe("test-meta");
-    expect(instance!.providerHandle).toBe("fs_mcp");
+    expect(instance.kind).toBe("provider");
+    expect(instance.source).toBeUndefined();
+    expect(instance.factoryName).toBe("test-meta");
+    expect(instance.providerHandle).toBe("fs_mcp");
     // Per-handle config carried through verbatim (no tool config to
     // merge in this case).
-    expect(instance!.config).toEqual({ npm: "@example/mcp-fs" });
+    expect(instance.config).toEqual({ npm: "@example/mcp-fs" });
     // Origin reflects the configured-factory shape.
-    expect(instance!.origin).toEqual({
+    expect(instance.origin).toEqual({
       kind: "handle-factory",
       providerHandle: "fs_mcp",
       factoryName: "test-meta",
@@ -194,12 +222,15 @@ describe("manifest walk via runAgent", () => {
       },
     };
     const r = resolveManifest(spec);
+    const t0 = defined(r.tools[0]);
+    const t1 = defined(r.tools[1]);
 
     // Both tools share ONE provider instance (one MCP connection).
-    expect(r.tools[0]!.providerInstanceId).toBe(r.tools[1]!.providerInstanceId);
-    const instance = r.providers.find(
-      (p) => p.id === r.tools[0]!.providerInstanceId,
-    )!;
+    expect(t0.providerInstanceId).toBe(t1.providerInstanceId);
+    const instance = defined(
+      r.providers.find((p) => p.id === t0.providerInstanceId),
+      "provider instance not found",
+    );
     // Instance config = [providers] config only. No per-tool keys.
     expect(instance.config).toEqual({
       npm: "@example/mcp-fs",
@@ -208,8 +239,8 @@ describe("manifest walk via runAgent", () => {
 
     // ToolBinding.toolConfig keeps the tool's own config, which is
     // what the factory's `resolveTool(name, config, ...)` receives.
-    expect(r.tools[0]!.toolConfig).toEqual({ flavour: "vanilla" });
-    expect(r.tools[1]!.toolConfig).toEqual({ shared: "from-tool" });
+    expect(t0.toolConfig).toEqual({ flavour: "vanilla" });
+    expect(t1.toolConfig).toEqual({ shared: "from-tool" });
   });
 
   it("dedupes tools pointing at the same configured-factory handle, even with different per-tool config", () => {
@@ -274,12 +305,16 @@ describe("manifest walk via runAgent", () => {
       },
     };
     const r = resolveManifest(spec);
-    const loaded = r.providers.find(
-      (p) => p.id === r.tools[0]!.providerInstanceId,
-    )!;
-    const configured = r.providers.find(
-      (p) => p.id === r.tools[1]!.providerInstanceId,
-    )!;
+    const t0 = defined(r.tools[0]);
+    const t1 = defined(r.tools[1]);
+    const loaded = defined(
+      r.providers.find((p) => p.id === t0.providerInstanceId),
+      "loaded provider instance not found",
+    );
+    const configured = defined(
+      r.providers.find((p) => p.id === t1.providerInstanceId),
+      "configured provider instance not found",
+    );
 
     // Source-form binding: `source` set, `factoryName` undefined.
     expect(loaded.source).toEqual({ path: "./loaded-provider" });
@@ -293,8 +328,7 @@ describe("manifest walk via runAgent", () => {
   it("resolves [agent].system_prompt as a file when path-like", async () => {
     // Path-like system_prompt is a file-on-disk feature; the inline
     // path stays a literal string. This test must remain file-based.
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sp-path-"));
-    try {
+    await withTmpDir("loom-sp-path-", async (dir) => {
       const agentDir = path.join(dir, "agent");
       await fs.mkdir(agentDir, { recursive: true });
       await fs.writeFile(
@@ -320,8 +354,6 @@ provider = "in-memory"
       );
       const sp = await resolveSystemPrompt(manifest, agentDir);
       expect(sp).toMatch(/be brief/);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    });
   });
 });

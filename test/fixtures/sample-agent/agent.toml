@@ -14,9 +14,11 @@ path = "./session.jsonl"
 [tools]
 read_file  = "builtin"
 write_file = "builtin"
+edit_file  = "builtin"
 find       = "builtin"
 
 [capabilities]
 read_file  = { paths = ["./"] }
 write_file = { paths = ["./"] }
+edit_file  = { paths = ["./"] }
 find       = { paths = ["./"] }

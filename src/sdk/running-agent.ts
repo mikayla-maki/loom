@@ -18,6 +18,7 @@ import type {
   TurnResult,
 } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
+import type { ClientBridge } from "../runtime/client-bridge.js";
 import type { AgentManifest, Capabilities } from "../types/manifest.js";
 import type { Ref } from "../internal/util.js";
 
@@ -42,6 +43,12 @@ export interface RunningAgent {
   cancel(): Promise<void>;
   updates(opts?: { capacity?: number }): AsyncIterableIterator<SessionUpdate>;
   readonly session: Session;
+  /**
+   * The harness driving this agent. Exposed (read-only) so SDK
+   * consumers can call `harness.models()`, `harness.currentModel()`,
+   * etc. — typically for surfacing a model picker in the host UI.
+   */
+  readonly harness: Harness;
   /** Source manifest (diagnostics only). */
   readonly manifest: AgentManifest;
   /** Resolved `[agent].system_prompt` content. */
@@ -54,6 +61,13 @@ export interface RunningAgent {
   readonly agentState: AgentState;
   /** Attach/replace the user-consent handler. Pass `null` to clear. */
   setPermissionHandler(handler: PermissionHandler | null): void;
+  /**
+   * Attach/replace the ACP client bridge. Pass `null` to clear.
+   * Visible to every subsequent tool call via `ToolContext.client`.
+   * The ACP server calls this from `bindSession`; CLI / SDK-direct
+   * consumers leave it null (and tools fall back to local paths).
+   */
+  setClientBridge(bridge: ClientBridge | null): void;
   close(): Promise<void>;
 }
 
@@ -73,6 +87,12 @@ interface RunningAgentImplOptions {
    * `setPermissionHandler()` is visible to tools mid-turn.
    */
   permissionHolder: Ref<PermissionHandler | null>;
+  /**
+   * Shared mutable holder for the active ACP client bridge. The
+   * RunningAgent and runtime services share this reference so
+   * `setClientBridge()` is visible to tools mid-turn.
+   */
+  clientBridgeHolder: Ref<ClientBridge | null>;
   /** Receives `setAbortSignal` each turn. */
   runtimeServices: RuntimeServicesImpl;
   now?: () => Date;
@@ -83,13 +103,13 @@ export class RunningAgentImpl implements RunningAgent {
   public readonly systemPrompt: string;
   public readonly capabilities: Capabilities;
   public readonly session: Session;
+  public readonly harness: Harness;
   public readonly secretNames: string[];
-
-  private readonly harness: Harness;
   private readonly state: AgentState;
   private readonly updateSink: UpdateSink;
   private readonly providers: Tools[];
   private readonly permissionHolder: Ref<PermissionHandler | null>;
+  private readonly clientBridgeHolder: Ref<ClientBridge | null>;
   private readonly runtimeServices: RuntimeServicesImpl;
   private readonly now: (() => Date) | undefined;
 
@@ -107,6 +127,7 @@ export class RunningAgentImpl implements RunningAgent {
     this.updateSink = opts.updateSink;
     this.providers = opts.providers;
     this.permissionHolder = opts.permissionHolder;
+    this.clientBridgeHolder = opts.clientBridgeHolder;
     this.runtimeServices = opts.runtimeServices;
     this.secretNames = Object.keys(opts.secrets);
     this.now = opts.now;
@@ -120,13 +141,29 @@ export class RunningAgentImpl implements RunningAgent {
     this.permissionHolder.current = handler ?? null;
   }
 
+  setClientBridge(bridge: ClientBridge | null): void {
+    this.clientBridgeHolder.current = bridge ?? null;
+  }
+
   async prompt(
     prompt: string | ContentBlock[],
     params?: RunParameters,
   ): Promise<TurnResult> {
     if (this.closed) throw new Error("Agent has been closed");
     if (this.inflight) {
-      // Serialise turns.
+      // Cancel-and-restart. A new prompt arriving mid-turn (user
+      // sends another message while the agent is still responding)
+      // supersedes the in-flight turn rather than queueing behind
+      // it — that matches Zed-style "interrupt by typing" UX, and
+      // is also what happens implicitly if the client sends
+      // `session/cancel` + `session/prompt` in sequence (we just
+      // don't depend on it).
+      //
+      // The aborted turn resolves with `stopReason: "cancelled"`;
+      // any pending ACP `prompt` JSON-RPC response carries that
+      // value back to the client. Then we proceed with the new
+      // turn here.
+      this.currentAbortCtl?.abort();
       await this.inflight.catch(() => undefined);
     }
     const blocks: ContentBlock[] =
@@ -150,13 +187,10 @@ export class RunningAgentImpl implements RunningAgent {
     // Per-turn Agent ref; session gets a fresh one each turn.
     // `agentForSession` scopes `spawnSubagent` to the session's deps.
     const baseAgent: Agent = {
+      manifest: this.manifest,
       harness: this.harness,
       session: this.session,
       systemPromptCore: this.systemPrompt,
-      agentName: this.manifest.name,
-      ...(this.manifest.description
-        ? { agentDescription: this.manifest.description }
-        : {}),
     };
     const agentRef = agentForSession(baseAgent, this.session);
     if (this.session.prepareTurn) {

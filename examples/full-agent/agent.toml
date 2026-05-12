@@ -1,9 +1,9 @@
 # ───────────────────────────────────────────────────────────────────────────
-# Loom minimal-agent example — demonstrates the full v5 provider surface
+# Loom full-agent example — demonstrates the full v5 provider surface
 # ───────────────────────────────────────────────────────────────────────────
 #
-# Run:           loom run examples/minimal-agent/agent.toml
-# Audit:         loom audit examples/minimal-agent/agent.toml
+# Run:           loom run examples/full-agent/agent.toml
+# Audit:         loom audit examples/full-agent/agent.toml
 #
 # This is the declarative shape. For the same agent constructed in
 # TypeScript — hand-building the `CompactingSession` so it can
@@ -42,7 +42,9 @@ You are a helpful assistant who keeps notes across sessions. The
 system prompt includes notes from previous sessions. When the user
 tells you something worth keeping — preferences, project conventions,
 names, recurring context — call the `remember` tool with a short
-declarative fact. Use bash/read_file/write_file/find for real work.
+declarative fact. Use bash, read_file, write_file, edit_file, and find
+for real work — prefer edit_file over write_file for changes to existing
+files (much more efficient and produces a diff for review).
 """
 
 [providers]
@@ -77,6 +79,7 @@ provider = "in-memory"
 bash = "builtin"
 read_file = "builtin"
 write_file = "builtin"
+edit_file = "builtin"
 find = "builtin"
 # `remember` isn't listed here — the `demo` session contributes it
 # and owns the implementation. The runtime registers it on the agent's
@@ -87,5 +90,6 @@ find = "builtin"
 bash = { subprocess = "*", paths = ["./"] }
 read_file = { paths = ["./"] }
 write_file = { paths = ["./"] }
+edit_file = { paths = ["./"] }
 find = { paths = ["./"] }
 remember = "*"   # the session writes to its own configured file

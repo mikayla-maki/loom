@@ -499,7 +499,9 @@ function parseSourceSpecTable(
       `agent.toml at ${where}: ${label} has multiple source kinds (${present.join(", ")}); pick one`,
     );
   }
-  const kind = present[0]!;
+  // We just checked `present.length === 0` and `present.length > 1`,
+  // so exactly one entry remains here.
+  const [kind] = present as [(typeof sourceKeys)[number]];
   if (kind === "npm") {
     if (typeof obj.npm !== "string" || !obj.npm) {
       throw new ManifestError(

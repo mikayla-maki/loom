@@ -496,7 +496,10 @@ export function resolveManifest(
   };
 }
 
-const DEFAULT_BUILTIN_TOOLS = ["bash", "read_file", "write_file", "find"];
+// Tools auto-loaded when `[tools]` is absent. `find` is a built-in
+// too, but opt-in only — list `find = "builtin"` in `[tools]` to
+// pull it in. Same with `spawn_subagent`.
+const DEFAULT_BUILTIN_TOOLS = ["bash", "read_file", "write_file", "edit_file"];
 
 // ─── Internal: [providers] ─────────────────────────────────────────────────
 

@@ -21,6 +21,7 @@ import type {
   Tool,
   ToolConfig,
   ToolContext,
+  ToolDisplay,
   ToolResult,
 } from "../../types/interfaces.js";
 import type { CapabilitySet } from "../../types/manifest.js";
@@ -117,7 +118,11 @@ export class FindTool implements Tool {
     const re = globToRegex(pattern);
     const matches: string[] = [];
     await walk(root, root, re, matches, limit);
-    return { content: matches.join("\n") };
+    const display: ToolDisplay = {
+      title: `find ${pattern}`,
+      kind: "search",
+    };
+    return { content: matches.join("\n"), display };
   }
 }
 

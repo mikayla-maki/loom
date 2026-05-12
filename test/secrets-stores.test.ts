@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 import {
@@ -12,23 +11,21 @@ import {
   XDGSecretsStore,
 } from "../src/runtime/secrets.js";
 import { SecretError } from "../src/errors.js";
+import { useTmpDir } from "./helpers/tmp.js";
 
 describe("XDGSecretsStore", () => {
+  const tmp = useTmpDir("loom-xdg-");
+
   it("reads a flat key→value TOML file", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-xdg-"));
-    try {
-      const p = path.join(dir, "secrets.toml");
-      await fs.writeFile(
-        p,
-        `# top-level secrets\nANTHROPIC_API_KEY = "sk-test"\nFOO = "bar"\n`,
-      );
-      const s = new XDGSecretsStore({ path: p });
-      expect(await s.get("ANTHROPIC_API_KEY")).toBe("sk-test");
-      expect(await s.get("FOO")).toBe("bar");
-      expect(await s.get("MISSING")).toBeNull();
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    const p = path.join(tmp(), "secrets.toml");
+    await fs.writeFile(
+      p,
+      `# top-level secrets\nANTHROPIC_API_KEY = "sk-test"\nFOO = "bar"\n`,
+    );
+    const s = new XDGSecretsStore({ path: p });
+    expect(await s.get("ANTHROPIC_API_KEY")).toBe("sk-test");
+    expect(await s.get("FOO")).toBe("bar");
+    expect(await s.get("MISSING")).toBeNull();
   });
 
   it("returns null when the file is missing (silent)", async () => {
@@ -39,33 +36,20 @@ describe("XDGSecretsStore", () => {
   });
 
   it("throws SecretError on malformed TOML", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-xdg-bad-"));
-    try {
-      const p = path.join(dir, "secrets.toml");
-      await fs.writeFile(p, `[[[ not toml\n`);
-      const s = new XDGSecretsStore({ path: p });
-      await expect(s.get("X")).rejects.toBeInstanceOf(SecretError);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    const p = path.join(tmp(), "secrets.toml");
+    await fs.writeFile(p, `[[[ not toml\n`);
+    const s = new XDGSecretsStore({ path: p });
+    await expect(s.get("X")).rejects.toBeInstanceOf(SecretError);
   });
 
   it("ignores non-string TOML values (tables, numbers, arrays)", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-xdg-mixed-"));
-    try {
-      const p = path.join(dir, "secrets.toml");
-      await fs.writeFile(
-        p,
-        `S = "ok"\nN = 42\nA = ["x"]\n[t]\nnested = "v"\n`,
-      );
-      const s = new XDGSecretsStore({ path: p });
-      expect(await s.get("S")).toBe("ok");
-      expect(await s.get("N")).toBeNull();
-      expect(await s.get("A")).toBeNull();
-      expect(await s.get("t")).toBeNull();
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    const p = path.join(tmp(), "secrets.toml");
+    await fs.writeFile(p, `S = "ok"\nN = 42\nA = ["x"]\n[t]\nnested = "v"\n`);
+    const s = new XDGSecretsStore({ path: p });
+    expect(await s.get("S")).toBe("ok");
+    expect(await s.get("N")).toBeNull();
+    expect(await s.get("A")).toBeNull();
+    expect(await s.get("t")).toBeNull();
   });
 });
 
@@ -91,47 +75,47 @@ describe("KeychainSecretsStore", () => {
 });
 
 describe("ChainedSecretsStore default-chain priority", () => {
+  const tmp = useTmpDir("loom-chain-");
+
   /**
    * Wires up the same chain `runAgent` builds (caller → env → XDG →
    * keychain → file) and asserts each tier wins when its predecessors
    * miss.
    */
   it("first hit wins; later tiers don't get queried for the same name", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-chain-"));
-    try {
-      const xdgPath = path.join(dir, "xdg.toml");
-      const filePath = path.join(dir, ".loom-secrets");
-      await fs.writeFile(xdgPath, `XDG_ONLY = "from-xdg"\nSHARED = "xdg-shared"\n`);
-      await fs.writeFile(filePath, `FILE_ONLY=from-file\nSHARED=file-shared\n`);
+    const xdgPath = path.join(tmp(), "xdg.toml");
+    const filePath = path.join(tmp(), ".loom-secrets");
+    await fs.writeFile(
+      xdgPath,
+      `XDG_ONLY = "from-xdg"\nSHARED = "xdg-shared"\n`,
+    );
+    await fs.writeFile(filePath, `FILE_ONLY=from-file\nSHARED=file-shared\n`);
 
-      let keychainCalls = 0;
-      const chain = new ChainedSecretsStore([
-        new StaticSecretsStore({ STATIC_ONLY: "from-caller" }),
-        new EnvSecretsStore({ ENV_ONLY: "from-env" }),
-        new XDGSecretsStore({ path: xdgPath }),
-        new KeychainSecretsStore({
-          lookup: async (n) => {
-            keychainCalls += 1;
-            return n === "KEYCHAIN_ONLY" ? "from-keychain" : null;
-          },
-          forcePlatform: "darwin",
-        }),
-        new FileSecretsStore(filePath),
-      ]);
+    let keychainCalls = 0;
+    const chain = new ChainedSecretsStore([
+      new StaticSecretsStore({ STATIC_ONLY: "from-caller" }),
+      new EnvSecretsStore({ ENV_ONLY: "from-env" }),
+      new XDGSecretsStore({ path: xdgPath }),
+      new KeychainSecretsStore({
+        lookup: async (n) => {
+          keychainCalls += 1;
+          return n === "KEYCHAIN_ONLY" ? "from-keychain" : null;
+        },
+        forcePlatform: "darwin",
+      }),
+      new FileSecretsStore(filePath),
+    ]);
 
-      expect(await chain.get("STATIC_ONLY")).toBe("from-caller");
-      expect(await chain.get("ENV_ONLY")).toBe("from-env");
-      expect(await chain.get("XDG_ONLY")).toBe("from-xdg");
-      expect(await chain.get("KEYCHAIN_ONLY")).toBe("from-keychain");
-      expect(await chain.get("FILE_ONLY")).toBe("from-file");
+    expect(await chain.get("STATIC_ONLY")).toBe("from-caller");
+    expect(await chain.get("ENV_ONLY")).toBe("from-env");
+    expect(await chain.get("XDG_ONLY")).toBe("from-xdg");
+    expect(await chain.get("KEYCHAIN_ONLY")).toBe("from-keychain");
+    expect(await chain.get("FILE_ONLY")).toBe("from-file");
 
-      // SHARED hits XDG before file: XDG value wins.
-      expect(await chain.get("SHARED")).toBe("xdg-shared");
+    // SHARED hits XDG before file: XDG value wins.
+    expect(await chain.get("SHARED")).toBe("xdg-shared");
 
-      // STATIC/ENV/XDG hits don't touch the keychain.
-      expect(keychainCalls).toBe(2); // KEYCHAIN_ONLY + SHARED-miss
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    // STATIC/ENV/XDG hits don't touch the keychain.
+    expect(keychainCalls).toBe(2); // KEYCHAIN_ONLY + SHARED-miss
   });
 });

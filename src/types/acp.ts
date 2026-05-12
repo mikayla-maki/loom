@@ -17,17 +17,31 @@ import type {
 
 export type {
   ContentBlock,
+  EnvVariable,
   Plan,
   PlanEntry,
   PlanEntryPriority,
   PlanEntryStatus,
+  ReadTextFileRequest,
+  ReadTextFileResponse,
+  SessionConfigId,
+  SessionConfigOption,
+  SessionConfigOptionCategory,
+  SessionConfigValueId,
+  SetSessionConfigOptionRequest,
+  SetSessionConfigOptionResponse,
+  TerminalExitStatus,
+  TerminalOutputResponse,
   ToolCallContent,
   ToolCallId,
+  ToolCallLocation,
   ToolCallStatus,
   ToolCallUpdate,
   ToolKind,
   Usage,
   UsageUpdate,
+  WriteTextFileRequest,
+  WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 
 // Note: the SDK's `ToolCall` (wire shape) is intentionally NOT
@@ -36,6 +50,13 @@ export type {
 // `import type { ToolCall } from "@agentclientprotocol/sdk"` if you
 // need the wire shape (e.g. when constructing a `SessionUpdate`).
 export type { ToolCall as WireToolCall } from "@agentclientprotocol/sdk";
+
+// `TerminalHandle` is a class — re-exported here as the canonical type
+// for ACP terminals. Loom's `ClientBridge.createTerminal` resolves to
+// one of these. Tools call `currentOutput()` / `waitForExit()` /
+// `kill()` / `release()` on the handle; the SDK owns the JSON-RPC
+// plumbing underneath.
+export { TerminalHandle } from "@agentclientprotocol/sdk";
 
 import type { Usage } from "@agentclientprotocol/sdk";
 

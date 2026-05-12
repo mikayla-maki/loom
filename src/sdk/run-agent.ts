@@ -27,7 +27,7 @@ import {
   getHarnessFactory,
   getSessionFactory,
 } from "../builtins/index.js";
-import { type LoadOptions } from "../providers/loader.js";
+import type { LoadOptions } from "../providers/loader.js";
 import {
   DEFAULT_CLIENT_ACP_CAPABILITIES,
   type ClientAcpCapabilities,
@@ -35,7 +35,7 @@ import {
 import {
   buildNativeTools,
   nativeBuiltinNames,
-} from "../builtins/provider/native.js";
+} from "../builtins/tools/native.js";
 import {
   isPreBuiltSessionLayer,
   resolveManifest,
@@ -92,6 +92,7 @@ import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "../types/permissions.js";
+import type { ClientBridge } from "../runtime/client-bridge.js";
 import type {
   AgentManifest,
   Capabilities,
@@ -123,12 +124,17 @@ const DEFAULT_SESSION_CHAIN: SessionSpec[] = [
   { provider: "in-memory" },
 ];
 
-/** Default capability grants applied when both `[tools]` and `[capabilities]` are absent. */
+/**
+ * Default capability grants applied when both `[tools]` and
+ * `[capabilities]` are absent. Paired with `DEFAULT_BUILTIN_TOOLS`.
+ * Opt-in builtins like `find` and `spawn_subagent` carry their own
+ * per-tool grants in the manifest when listed explicitly.
+ */
 const DEFAULT_TOP_LEVEL_CAPABILITIES = {
   bash: { subprocess: "*", paths: ["./"] },
   read_file: { paths: ["./"] },
   write_file: { paths: ["./"] },
-  find: { paths: ["./"] },
+  edit_file: { paths: ["./"] },
 } as const satisfies Record<string, CapabilitySet>;
 
 export interface RunAgentOptions {
@@ -183,12 +189,19 @@ export async function runAgent(
     : process.cwd();
   const systemPrompt = await resolveSystemPrompt(manifest, baseDir);
   // Resolve the storage root and surface any collision warnings
-  // via console.warn. (Audit surfaces them on its tree; the runtime
-  // doesn't have a dedicated diagnostic channel yet, so stderr
-  // is the conservative default.)
+  // via console.warn for top-level runs only. Sub-agents (spawned
+  // via `spawn_subagent` / `agent.spawnSubagent`) inherit their
+  // identity from a parent that already opened the same storage,
+  // so the collision warning has nothing actionable to say at the
+  // sub-agent level — it'd just spam stderr on every spawn.
+  // (Audit surfaces them on its tree; the runtime doesn't have a
+  // dedicated diagnostic channel yet, so stderr is the conservative
+  // default.)
   const storage = await resolveAgentStorage(manifest);
-  for (const w of storage.warnings) {
-    console.warn(`loom storage: ${w}`);
+  if (!options.parent) {
+    for (const w of storage.warnings) {
+      console.warn(`loom storage: ${w}`);
+    }
   }
   const factoryCtx: FactoryContext = {
     manifestDir: baseDir,
@@ -220,8 +233,8 @@ export async function runAgent(
   // Runtime is strict: any provider load failure aborts boot. (Audit
   // collects these errors and keeps going.)
   if (loadErrors.size > 0) {
-    const first = [...loadErrors.entries()][0]!;
-    throw first[1];
+    const [first] = loadErrors.values();
+    if (first) throw first;
   }
 
   // 4. Secrets store + phase-1 needs (harness + session + provider-
@@ -240,7 +253,7 @@ export async function runAgent(
   const harness =
     "provider" in manifest.harness
       ? await instantiateHarness(
-          resolved.harness!,
+          requireHarnessBinding(resolved.harness),
           factoryCtx,
           phase1Secrets,
           options.parent,
@@ -261,11 +274,18 @@ export async function runAgent(
         );
   const ownAgent = buildOwnAgent(harness, session, systemPrompt, manifest);
 
-  // 6. Runtime services (per-turn abort + permission handler).
+  // 6. Runtime services (per-turn abort + permission handler +
+  //    ACP client bridge). Both handler-shaped slots are `Ref`s so
+  //    the ACP server's `bindSession` can install them after
+  //    `runAgent` has returned.
   const permissionHolder = ref<PermissionHandler | null>(
     options.permissionHandler ?? null,
   );
-  const runtimeServices = new RuntimeServicesImpl(permissionHolder);
+  const clientBridgeHolder = ref<ClientBridge | null>(null);
+  const runtimeServices = new RuntimeServicesImpl(
+    permissionHolder,
+    clientBridgeHolder,
+  );
 
   // 7. Materialise + init each Tools instance the resolver asked for.
   //    SDK-supplied Tools instances are appended afterwards under a
@@ -338,6 +358,7 @@ export async function runAgent(
     secrets: allSecrets,
     providers: instances.map((i) => i.tools),
     permissionHolder,
+    clientBridgeHolder,
     runtimeServices,
     ...(options.now ? { now: options.now } : {}),
   });
@@ -362,11 +383,10 @@ function buildOwnAgent(
   manifest: AgentManifest,
 ): Agent {
   return {
+    manifest,
     harness,
     session,
     systemPromptCore: systemPrompt,
-    agentName: manifest.name,
-    ...(manifest.description ? { agentDescription: manifest.description } : {}),
   };
 }
 
@@ -741,8 +761,26 @@ async function instantiateSession(
   }
   // Length-1 chains return the inner session directly: keeps the
   // trivial case cheap and avoids a no-op ChainedSession wrapper.
-  if (instances.length === 1) return instances[0]!;
+  if (instances.length === 1) {
+    const [only] = instances as [Session];
+    return only;
+  }
   return new ChainedSession(instances);
+}
+
+function requireHarnessBinding(
+  binding: HarnessBinding | undefined,
+): HarnessBinding {
+  if (!binding) {
+    // The caller already proved `"provider" in manifest.harness`, so
+    // resolveManifest must have produced a binding. The runtime
+    // guard turns any future drift into a loud failure instead of a
+    // silent crash on the call below.
+    throw new Error(
+      "runAgent: harness binding missing despite spec-form manifest.harness",
+    );
+  }
+  return binding;
 }
 
 // ─── 4 + 9. secrets pipeline ──────────────────────────────────────────────
@@ -1012,12 +1050,16 @@ function buildToolTable(
     })),
     secrets: allSecrets,
     contextFactory: {
-      build: ({ tool }) => ({
-        secrets: {}, // overridden by ToolTable per-call
-        abortSignal: runtimeServices.currentAbortSignal(),
-        requestPermission: (req) => runtimeServices.requestPermission(req),
-        agent: agentForTool(ownAgent, tool),
-      }),
+      build: ({ tool }) => {
+        const bridge = runtimeServices.currentClientBridge();
+        return {
+          secrets: {}, // overridden by ToolTable per-call
+          abortSignal: runtimeServices.currentAbortSignal(),
+          requestPermission: (req) => runtimeServices.requestPermission(req),
+          agent: agentForTool(ownAgent, tool),
+          ...(bridge ? { client: bridge } : {}),
+        };
+      },
     },
   });
 }
@@ -1077,6 +1119,7 @@ class RuntimeServicesImpl implements RuntimePrimitives {
 
   constructor(
     private readonly permissionHolder: Ref<PermissionHandler | null>,
+    private readonly clientBridgeHolder: Ref<ClientBridge | null>,
   ) {}
 
   setAbortSignal(signal: AbortSignal): void {
@@ -1093,6 +1136,11 @@ class RuntimeServicesImpl implements RuntimePrimitives {
     const handler = this.permissionHolder.current;
     if (!handler) return Promise.resolve({ outcome: { outcome: "cancelled" } });
     return Promise.resolve(handler(req));
+  }
+
+  /** Current `ClientBridge` (null in CLI / SDK-direct / test modes). */
+  currentClientBridge(): ClientBridge | null {
+    return this.clientBridgeHolder.current;
   }
 }
 
@@ -1122,7 +1170,7 @@ function agentForTool(base: Agent, tool: Tool): Agent {
 export function agentForSession(base: Agent, session: Session): Agent {
   return agentWithScopedSpawn(base, {
     declared: session.dependencies?.subagents ?? [],
-    who: `Session '${base.agentName}'`,
+    who: `Session '${base.manifest.name}'`,
   });
 }
 

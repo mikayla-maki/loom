@@ -68,6 +68,7 @@ import type {
   FactoryContext,
   Harness,
   HarnessFactory,
+  HarnessModel,
   RunParameters,
   Runtime,
   SummariseArgs,
@@ -130,6 +131,51 @@ export class OpenAIHarness implements Harness {
     if (m.includes("gpt-4o")) return "gpt-4o-mini";
     if (m.startsWith("gpt-4")) return "gpt-4o-mini";
     return "gpt-4o-mini";
+  }
+
+  /**
+   * Implements `Harness.currentModel` — the model id this harness
+   * is currently configured to route to.
+   */
+  currentModel(): string {
+    return this.model;
+  }
+
+  /** Lazy cache of `client.models.list()`; see Anthropic harness. */
+  private modelsListCache: HarnessModel[] | null = null;
+  private modelsListInflight: Promise<HarnessModel[]> | null = null;
+
+  /**
+   * Implements `Harness.models` — returns the list of models the
+   * OpenAI API advertises for this account. The OpenAI list is
+   * deeply heterogeneous (chat, embeddings, audio, image, fine-tunes,
+   * etc.); we filter to ids that look like text-generation models
+   * (`gpt-*`, `o*`, `chatgpt-*`) since those are the only ones a
+   * Responses-API-driven harness can swap to.
+   */
+  async models(): Promise<HarnessModel[]> {
+    if (this.modelsListCache !== null) return this.modelsListCache;
+    if (this.modelsListInflight) return this.modelsListInflight;
+    this.modelsListInflight = (async (): Promise<HarnessModel[]> => {
+      try {
+        const out: HarnessModel[] = [];
+        for await (const m of this.client.models.list()) {
+          if (!isResponsesApiModel(m.id)) continue;
+          out.push({ id: m.id });
+        }
+        // Sort newest-first by id heuristic; the API doesn't return
+        // a stable sort order across calls.
+        out.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+        this.modelsListCache = out;
+        return out;
+      } catch {
+        this.modelsListCache = [];
+        return [];
+      } finally {
+        this.modelsListInflight = null;
+      }
+    })();
+    return this.modelsListInflight;
   }
 
   /**
@@ -214,15 +260,14 @@ export class OpenAIHarness implements Harness {
           });
           return this.finishTurn("cancelled");
         }
-        await runtime.update({
-          sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `[openai error] ${(e as Error).message}`,
-          },
-        });
+        // Don't pollute the session log with the error text — it isn't
+        // an assistant utterance. Stop with `error`; the runtime's
+        // consumer (ACP server, CLI REPL, SDK caller) renders
+        // `result.error.message` however it likes.
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
-        return this.finishTurn("error");
+        return this.finishTurn("error", {
+          message: `[openai] ${(e as Error).message}`,
+        });
       }
 
       if (response.usage) {
@@ -267,26 +312,18 @@ export class OpenAIHarness implements Harness {
       }
       if (response.status === "incomplete") {
         // Other incomplete reasons (content_filter, etc.) — surface as error.
-        await runtime.update({
-          sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `[openai incomplete] ${response.incomplete_details?.reason ?? "unknown"}`,
-          },
-        });
+        const reason = response.incomplete_details?.reason ?? "unknown";
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
-        return this.finishTurn("error");
+        return this.finishTurn("error", {
+          message: `[openai incomplete] ${reason}`,
+        });
       }
       if (response.status === "failed") {
-        await runtime.update({
-          sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `[openai failed] ${response.error?.message ?? "unknown"}`,
-          },
-        });
+        const message = response.error?.message ?? "unknown";
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
-        return this.finishTurn("error");
+        return this.finishTurn("error", {
+          message: `[openai failed] ${message}`,
+        });
       }
 
       if (toolCalls.length === 0) {
@@ -310,16 +347,13 @@ export class OpenAIHarness implements Harness {
           const status: ToolCallStatus = result.isError
             ? "failed"
             : "completed";
-          await runtime.update({
-            sessionUpdate: "tool_call_update",
+          // Split-channel emit (see `Runtime.emitToolResult` and
+          // anthropic.ts for the rationale).
+          await runtime.emitToolResult({
             toolCallId: tc.call_id,
             status,
-            content: [
-              {
-                type: "content",
-                content: { type: "text", text: result.content },
-              },
-            ],
+            modelContent: result.content,
+            ...(result.display ? { display: result.display } : {}),
           });
         }),
       );
@@ -425,11 +459,18 @@ export class OpenAIHarness implements Harness {
     return final;
   }
 
-  /** Wrap a stop reason with the turn's accumulated usage (if any). */
-  private finishTurn(stopReason: StopReason): TurnResult {
-    return this.turnUsage
-      ? { stopReason, usage: this.turnUsage }
-      : { stopReason };
+  /**
+   * Wrap a stop reason with the turn's accumulated usage (if any) and
+   * the optional error message (when `stopReason === "error"`).
+   */
+  private finishTurn(
+    stopReason: StopReason,
+    error?: { message: string },
+  ): TurnResult {
+    const result: TurnResult = { stopReason };
+    if (this.turnUsage) result.usage = this.turnUsage;
+    if (error) result.error = error;
+    return result;
   }
 
   /** Fold a per-request usage payload into the turn's cumulative tally. */
@@ -612,6 +653,23 @@ export class OpenAIHarness implements Harness {
  * `params.effort` is set, we map it to `reasoning.effort`. Loom's
  * `"max"` is an Anthropic-only level; on OpenAI it maps to `"xhigh"`.
  */
+/**
+ * Heuristic filter for OpenAI's `models.list()`: keep only ids that
+ * a Responses-API-driven harness can actually swap to. The list
+ * returns embeddings, audio, image, moderation, fine-tunes, etc.;
+ * we don't want any of those in a `model` config selector.
+ */
+function isResponsesApiModel(id: string): boolean {
+  // Text-generation families. Conservative — if a new family ships
+  // we'd rather omit it from the picker than confuse the user.
+  if (id.startsWith("gpt-")) return true;
+  if (id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4")) {
+    return true;
+  }
+  if (id.startsWith("chatgpt-")) return true;
+  return false;
+}
+
 function buildReasoning(
   params: RunParameters | undefined,
 ): Reasoning | undefined {

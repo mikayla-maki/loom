@@ -1,8 +1,10 @@
-# Minimal agent — declarative shape
+# Full agent — declarative shape
 
 A complete, runnable Loom agent described as a TOML manifest. This is
 the recommended starting point: edit a file, run `loom audit` to see
-what would happen, then `loom run` to actually drive a model.
+what would happen, then `loom run` to actually drive a model — or
+wire it into Zed (or any other ACP-speaking editor) for an in-IDE
+experience.
 
 This example is a **notes-taking assistant with persistent recall
 across sessions**. It depends on the sibling provider package at
@@ -19,12 +21,12 @@ hand-held `CompactingSession` instance driving `/compact` and
 ## Layout
 
 ```
-minimal-agent/
+full-agent/
 ├── README.md
 └── agent.toml          # the manifest; refs ../notes-provider
 ```
 
-## Run it
+## Run it in a terminal
 
 From the repo root (`loom/`):
 
@@ -36,10 +38,10 @@ npm run build
 # Audit prints the full resolved capability tree — every provider,
 # every tool, every grant — without ever calling the model. No API
 # key needed.
-node dist/cli/main.js audit examples/minimal-agent/agent.toml
+node dist/cli/main.js audit examples/full-agent/agent.toml
 
 # Run it for real.
-ANTHROPIC_API_KEY=... node dist/cli/main.js run examples/minimal-agent/agent.toml
+ANTHROPIC_API_KEY=... node dist/cli/main.js run examples/full-agent/agent.toml
 ```
 
 In the REPL, tell the agent to remember something — a preference, a
@@ -48,7 +50,7 @@ ask what it knows about you. The notes from the previous session
 are loaded into the prompt automatically.
 
 ```
-$ loom run examples/minimal-agent/agent.toml
+$ loom run examples/full-agent/agent.toml
 > please remember that I'm working in TypeScript
 [remember] {"fact":"User is working in TypeScript"}
 [completed]
@@ -56,16 +58,61 @@ Noted — I'll keep that in mind.
 
 > /q
 
-$ loom run examples/minimal-agent/agent.toml
+$ loom run examples/full-agent/agent.toml
 > what do you know about me?
 You're working in TypeScript.
 ```
 
+## Run it in Zed (over ACP)
+
+Loom ships with a built-in [Agent Client Protocol](https://agentclientprotocol.com)
+server (`loom acp serve`). Zed has native ACP support, so this
+agent can run inside Zed's agent panel just like the built-in
+agents — with streaming responses, in-IDE tool-call rendering,
+permission prompts, and the rest.
+
+Add to `~/.config/zed/settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "Loom (full-agent demo)": {
+      "type": "custom",
+      "command": "node",
+      "args": [
+        "/absolute/path/to/loom/dist/cli/main.js",
+        "acp",
+        "serve",
+        "/absolute/path/to/loom/examples/full-agent/agent.toml"
+      ],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-..."
+      }
+    }
+  }
+}
+```
+
+Replace both `/absolute/path/to/loom/` with the absolute path on
+your machine (Zed's `settings.json` doesn't expand `~`), and put a
+real API key in `env`.
+
+Then `cmd-?` to open the agent panel, click `+` ("New Thread"),
+and select "Loom (full-agent demo)" from the list. Stream-back
+streams; `remember` calls render as tool-call cards; errors land
+as proper error toasts. The `dev: open acp logs` command palette
+entry shows every JSON-RPC frame in both directions for debugging.
+
+The notes file lives at the resolved storage path (`loom audit`
+prints it at the top — typically
+`~/Library/Application Support/Loom/agents/loom-demo/notes.md` on
+macOS). It persists across both `loom run` and Zed sessions.
+
 The notes themselves are stored under Loom's per-agent data
-directory by default (`<loom-data-home>/agents/loom-demo/notes.md`).
-Set `LOOM_DATA_HOME=./scratch` to relocate it for a one-off run, or
-add `file = "./somewhere.md"` to the `[[session.layers]]` block for
-`notes` to pin the file next to the manifest.
+directory by default. Set `LOOM_DATA_HOME=./scratch` to relocate
+it for a one-off run, or add `file = "./somewhere.md"` to the
+`[[session.layers]]` block for `notes` to pin the file next to
+the manifest.
 
 ## What it shows
 
@@ -74,7 +121,7 @@ add `file = "./somewhere.md"` to the `[[session.layers]]` block for
 | `[providers]` | Declaring a **local handle** for an external provider (`./../notes-provider`). |
 | `[harness]`   | Picking a built-in harness factory (`anthropic`) and tightening tokens / turn budget. |
 | `[session]`   | A **layered session**, outer-to-inner: bounded growth via `compacting`, persistent cross-session notes via the `notes` provider, raw event storage via `in-memory`. |
-| `[tools]`     | Mixing **built-in tools** (`bash`, `read_file`, `write_file`, `find`) with names **contributed by the session itself** (`remember` — no explicit entry needed). |
+| `[tools]`     | Mixing **built-in tools** (`bash`, `read_file`, `write_file`, `edit_file`, `find`) with names **contributed by the session itself** (`remember` — no explicit entry needed). |
 | `[capabilities]` | The transitive ceiling: paths + subprocess allow-lists per tool, plus `remember = "*"` to permit the session-owned verb. |
 
 The middle session layer is the interesting one — it loads notes

@@ -139,6 +139,43 @@ export interface Harness {
    * specify the model explicitly.
    */
   smallModel?(): string;
+
+  /**
+   * The currently-configured model id. When implemented alongside
+   * {@link Harness.models}, lets a client surface the active model
+   * (e.g. in an ACP `configOptions` selector) and drive
+   * {@link Harness.withModel} to swap.
+   *
+   * Optional. Harnesses that don't expose a model id (e.g. the
+   * scripted `test` harness) may omit it.
+   */
+  currentModel?(): string;
+
+  /**
+   * The set of models this harness can route to. Used by the ACP
+   * server to advertise a `model` config option at `session/new`
+   * time, and by SDK consumers building model-picker UIs.
+   *
+   * Implementations may return a static list (built-in well-known
+   * model ids), a dynamically-fetched list (the underlying provider's
+   * `/models` endpoint), or a mix. Promise-returning so harnesses
+   * that hit the network for it don't need to cache eagerly.
+   *
+   * Optional. Harnesses that don't have a model concept (scripted
+   * tests, parent-derived) may omit this; ACP clients will see no
+   * model selector for those agents.
+   */
+  models?(): Promise<HarnessModel[]> | HarnessModel[];
+}
+
+/** One entry in {@link Harness.models}. */
+export interface HarnessModel {
+  /** Provider-side model id (e.g. `claude-sonnet-4-5`). */
+  id: string;
+  /** Human-readable label for UIs. Defaults to `id` if omitted. */
+  name?: string;
+  /** One-line description shown alongside the name. */
+  description?: string;
 }
 
 export interface Tool extends ToolDescriptor {
@@ -219,15 +256,42 @@ export interface ToolRef {
 // ─── Agent ───────────────────────────────────────────────────────────────
 
 /**
- * The runtime triple: harness + session + identity
+ * The runtime triple: a source `AgentManifest` plus its resolved
+ * counterparts (harness instance, session instance, loaded system
+ * prompt text). Conceptually `Agent === resolved AgentManifest` —
+ * the slots the manifest leaves as specs are bound here as concrete
+ * instances, and the system prompt is loaded from disk if the
+ * manifest pointed at a `{ path }`. Read identity off
+ * `agent.manifest.name` / `agent.manifest.description`; the source
+ * manifest is also where tools find `tools`, `capabilities`,
+ * `providers`, `secrets`, `storageId`, and `manifestPath`.
  */
 export interface Agent {
+  /**
+   * The source manifest this agent was constructed from. Always
+   * populated by the runtime; tools and factories may introspect it.
+   * The runtime treats the manifest as immutable — do not mutate it.
+   * If you need a derived shape, clone first.
+   */
+  manifest: AgentManifest;
+  /**
+   * Materialised harness instance. `manifest.harness` may be a
+   * `HarnessSpec` *or* a pre-built `Harness`; this is always the
+   * constructed instance.
+   */
   harness: Harness;
+  /**
+   * Materialised session instance (possibly the outer `ChainedSession`
+   * wrapping a layered config). `manifest.session` may be specs or
+   * a `Session` instance; this is always the constructed instance.
+   */
   session: Session;
-  /** Unassembled `[agent].system_prompt` content. */
+  /**
+   * Loaded `[agent].system_prompt` text. `manifest.systemPrompt` may
+   * be inline content or `{ path }`; this is always the resolved
+   * string. Empty when the manifest omits a system prompt.
+   */
   systemPromptCore: string;
-  agentName: string;
-  agentDescription?: string;
   /**
    * Spawn a sub-agent. String form looks up by name in the caller's
    * own `dependencies.subagents`; manifest form runs the supplied
@@ -260,6 +324,60 @@ export interface ToolResult {
   content: string;
   /** True if the tool failed. */
   isError?: boolean;
+  /**
+   * Optional rendering metadata the harness folds into the wire
+   * `tool_call_update`. Tools opt in for nicer ACP-client UX (icon
+   * kind, per-invocation title, file locations for click-to-jump,
+   * rich content blocks). Ignored by non-ACP consumers — if you
+   * never populate this, your tool still works everywhere.
+   */
+  display?: ToolDisplay;
+}
+
+/**
+ * Optional ACP-flavoured rendering metadata a tool may attach to
+ * its `ToolResult`. Every field is folded into the
+ * `tool_call_update` the harness emits for this call.
+ *
+ * This is the "light ACP" surface: tools opt in to better
+ * rendering in IDE clients without taking on the more involved
+ * `ClientBridge` integration. See `src/runtime/client-bridge.ts`
+ * for the "heavy ACP" surface (route reads/writes/terminals
+ * through the client).
+ */
+export interface ToolDisplay {
+  /**
+   * Per-invocation title override. e.g. `"bash: \`ls -la\`"`
+   * instead of the bare tool name. The harness's initial
+   * `tool_call` emits the tool's name as the title; this update
+   * replaces it once the tool knows what it's actually doing.
+   */
+  title?: string;
+  /**
+   * ACP semantic category — drives icon / placement in the client.
+   * One of `"read" | "edit" | "delete" | "move" | "search" |
+   * "execute" | "think" | "fetch" | "switch_mode" | "other"`.
+   */
+  kind?: import("./acp.js").ToolKind;
+  /**
+   * File locations this call touched. Enables click-to-jump and
+   * "follow along" features in IDE clients. Read- and edit-shaped
+   * tools should populate this with the paths they accessed.
+   */
+  locations?: import("./acp.js").ToolCallLocation[];
+  /**
+   * Rich content blocks the client renders for this tool call.
+   * Overrides the harness's default of wrapping `content` (the
+   * model-facing string) as a single text block. Use this to embed
+   * terminals, diffs, or richer formatted output.
+   */
+  content?: import("./acp.js").ToolCallContent[];
+  /**
+   * Raw output surfaced alongside the raw input the harness already
+   * emitted on `tool_call`. Free-form JSON; the client may display
+   * it in a "raw output" inspector.
+   */
+  rawOutput?: unknown;
 }
 
 /**
@@ -295,6 +413,24 @@ export interface ToolContext {
   ): Promise<RequestPermissionResponse>;
   /** The owning agent. `spawnSubagent` is scoped to this tool's deps. */
   agent: Agent;
+  /**
+   * Optional bridge to the ACP client driving this agent. Present
+   * only when Loom is being driven over ACP (`loom acp serve`); in
+   * CLI / SDK-direct / test contexts the bridge is `undefined` and
+   * tools fall back to local `node:fs` / `child_process` paths.
+   *
+   * Used by built-in tools for IDE-aware behavior: `read_file` /
+   * `write_file` / `edit_file` route through the client's filesystem
+   * so edits surface in the editor; `bash` spawns through
+   * `terminal/create` so the user sees a live terminal pane. Third-party tools may
+   * opt in by inspecting `client?.<method>` (each method is present
+   * iff the client advertised the corresponding capability), but
+   * doing so is optional — ignoring this field keeps your tool
+   * portable across all four execution modes.
+   *
+   * See `src/runtime/client-bridge.ts` for the full surface.
+   */
+  client?: import("../runtime/client-bridge.js").ClientBridge;
 }
 
 // ─── Runtime — what Harness.run() sees ───────────────────────────────────
@@ -318,6 +454,36 @@ export interface Runtime {
   listTools(): ToolDescriptor[];
   executeTool(call: ToolCall): Promise<ToolResult>;
 
+  /**
+   * Emit a tool-call result, splitting the model-facing record from
+   * the rich client display.
+   *
+   * The session stores a `tool_call_update` whose `content` is
+   * `modelContent` wrapped as a single text block — that's what the
+   * harness sees on the next turn when it converts session events
+   * back into API messages, so the model always reads a clean text
+   * `tool_result`.
+   *
+   * The update sink fans out a separate `tool_call_update` carrying
+   * the rich `display` payload (terminal blocks, diff blocks, kind,
+   * title, locations, rawOutput) — that's what an ACP client renders.
+   *
+   * Use this instead of `update(tool_call_update)` whenever a tool's
+   * output has different shapes for the two audiences — e.g., bash
+   * output is text for the model but a terminal embed for the user;
+   * file edits are a status string for the model but a diff for the
+   * user. Falls back to a single text block on both sides when
+   * `display` is absent.
+   */
+  emitToolResult(args: {
+    toolCallId: import("./acp.js").ToolCallId;
+    status: import("./acp.js").ToolCallStatus;
+    /** What the model sees on replay. */
+    modelContent: string;
+    /** Optional rich rendering metadata for ACP clients. */
+    display?: ToolDisplay;
+  }): Promise<void>;
+
   /** Flips when the client cancels. */
   readonly abortSignal: AbortSignal;
 }
@@ -328,6 +494,15 @@ export interface TurnResult {
   stopReason: StopReason;
   /** Cumulative usage for this turn. Absent on harnesses that don't track. */
   usage?: TurnUsage;
+  /**
+   * Carrier for a fatal turn error. Present only when
+   * `stopReason === "error"`. The harness uses this slot to signal the
+   * cause out-of-band; consumers (ACP server, CLI REPL, SDK callers)
+   * decide how to surface it. The error must NOT also be emitted as an
+   * `agent_message_chunk` — errors are protocol-level events, not
+   * assistant utterances that belong in the session log.
+   */
+  error?: { message: string };
 }
 
 /**

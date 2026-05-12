@@ -23,7 +23,7 @@ import {
   isPreBuiltSessionLayer,
   resolveManifest,
 } from "../manifest/resolver.js";
-import { nativeBuiltinNames } from "../builtins/provider/native.js";
+import { nativeBuiltinNames } from "../builtins/tools/native.js";
 import { loadManifestProviders } from "./boot.js";
 import { transientStorage } from "./storage.js";
 import { LOOM_VERSION } from "../sdk/run-agent.js";
