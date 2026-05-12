@@ -34,11 +34,7 @@ beforeEach(async () => {
   TMP_FORBIDDEN = await fs.mkdtemp(path.join(os.tmpdir(), "loom-forbid-"));
   await fs.writeFile(path.join(TMP_GRANTED, "ok.txt"), "from-grant", "utf8");
   await fs.writeFile(path.join(TMP_TRUSTED, "skill.md"), "from-trust", "utf8");
-  await fs.writeFile(
-    path.join(TMP_FORBIDDEN, "secret.txt"),
-    "private",
-    "utf8",
-  );
+  await fs.writeFile(path.join(TMP_FORBIDDEN, "secret.txt"), "private", "utf8");
 });
 
 afterEach(async () => {
@@ -59,7 +55,10 @@ function makeCtx(session: Session): ToolContext {
   return {
     secrets: {},
     abortSignal: new AbortController().signal,
-    requestPermission: async () => ({ decision: "deny" as const }),
+    // Deny every permission request (no handler matches the option list).
+    requestPermission: async () => ({
+      outcome: { outcome: "cancelled" as const },
+    }),
     agent,
   };
 }
@@ -88,9 +87,7 @@ describe("read_file honours session.trustedPaths()", () => {
 
   it("still rejects paths outside both the grant and trusted set", async () => {
     const tool = new ReadFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(
-      sessionWith([{ path: TMP_TRUSTED, access: "read" }]),
-    );
+    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
     const result = await tool.execute(
       { path: path.join(TMP_FORBIDDEN, "secret.txt") },
       ctx,
@@ -103,9 +100,7 @@ describe("read_file honours session.trustedPaths()", () => {
     // A trusted path with `write` access still permits reads
     // (write implies the ability to read).
     const tool = new ReadFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(
-      sessionWith([{ path: TMP_TRUSTED, access: "write" }]),
-    );
+    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "write" }]));
     const result = await tool.execute(
       { path: path.join(TMP_TRUSTED, "skill.md") },
       ctx,
@@ -154,9 +149,7 @@ describe("read_file honours session.trustedPaths()", () => {
     // `paths: []` is the explicit-no-access form. Trusted paths still
     // extend it (skills + locked-down manifest is a valid combo).
     const tool = new ReadFileTool({}, { paths: [] });
-    const ctx = makeCtx(
-      sessionWith([{ path: TMP_TRUSTED, access: "read" }]),
-    );
+    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
     const ok = await tool.execute(
       { path: path.join(TMP_TRUSTED, "skill.md") },
       ctx,
@@ -201,9 +194,7 @@ describe("write_file honours session.trustedPaths() with write-access filtering"
 
   it("allows writes to trusted paths advertised with write access", async () => {
     const tool = new WriteFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(
-      sessionWith([{ path: TMP_TRUSTED, access: "write" }]),
-    );
+    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "write" }]));
     const result = await tool.execute(
       {
         path: path.join(TMP_TRUSTED, "new.txt"),
@@ -238,9 +229,7 @@ describe("write_file honours session.trustedPaths() with write-access filtering"
 describe("find honours session.trustedPaths()", () => {
   it("allows listing inside a trusted directory", async () => {
     const tool = new FindTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(
-      sessionWith([{ path: TMP_TRUSTED, access: "read" }]),
-    );
+    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
     const result = await tool.execute(
       { pattern: "*.md", root: TMP_TRUSTED },
       ctx,
@@ -251,9 +240,7 @@ describe("find honours session.trustedPaths()", () => {
 
   it("rejects roots outside both the grant and trusted set", async () => {
     const tool = new FindTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(
-      sessionWith([{ path: TMP_TRUSTED, access: "read" }]),
-    );
+    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
     const result = await tool.execute(
       { pattern: "*", root: TMP_FORBIDDEN },
       ctx,

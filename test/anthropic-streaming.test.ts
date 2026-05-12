@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
+import { InMemorySession } from "../src/builtins/session/memory.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
@@ -184,6 +185,10 @@ describe("AnthropicHarness streaming", () => {
         name: "stream-test",
         tools: {},
         harness: { provider: "anthropic", model: "x" },
+        // The default chain (compacting+memory) swallows usage_update
+        // events; pin to a plain memory session so the test can
+        // inspect them in pull() output.
+        session: new InMemorySession(),
       },
       { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
     );
@@ -344,6 +349,8 @@ describe("AnthropicHarness streaming", () => {
         name: "nostream",
         tools: {},
         harness: { provider: "anthropic", model: "x", stream: false },
+        // See comment above re: usage_update visibility.
+        session: new InMemorySession(),
       },
       { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
     );

@@ -56,12 +56,9 @@ export async function parseAgentManifest(
     abs,
   );
 
-  let session: SessionSpec | undefined;
+  let session: SessionSpec | SessionSpec[] | undefined;
   if (raw.session !== undefined) {
-    session = parseSessionSpec(
-      ensureObject(raw.session, "[session]", abs),
-      abs,
-    );
+    session = parseSessionField(raw.session, abs);
   }
 
   const tools =
@@ -217,18 +214,121 @@ function parseHarnessSpec(
   return { provider, ...config };
 }
 
+/**
+ * Parse the `session` field. A manifest has exactly one session;
+ * that session is either a single layer (singleton) or a layered
+ * composition. Both forms live under one `[session]` block:
+ *
+ *   - **Singleton.** `[session]` carries a `provider` key. The rest
+ *     of the block is its config. This is the trivial one-layer
+ *     session.
+ *
+ *   - **Composition.** `[session]` carries a `layers` key. The value
+ *     is an array of layer specs, outer-to-inner. Each entry is
+ *     either a string (sugar for `{ provider = "<string>" }`) or an
+ *     inline table with its own `provider` + config. TOML's
+ *     dotted-key array-of-tables `[[session.layers]]` produces the
+ *     same shape and is interchangeable.
+ *
+ * `provider` and `layers` are mutually exclusive; neither one is an
+ * error. The old top-level `[[session]]` form is rejected with a
+ * pointer at `[session].layers`.
+ */
+function parseSessionField(
+  v: unknown,
+  where: string,
+): SessionSpec | SessionSpec[] {
+  if (Array.isArray(v)) {
+    throw new ManifestError(
+      `agent.toml at ${where}: top-level [[session]] (array-of-tables) is no longer accepted. ` +
+        `Use [session] with a 'layers' array instead:\n\n` +
+        `  [session]\n  layers = ["compacting", "memory"]\n\n` +
+        `or the dotted-key array-of-tables form:\n\n` +
+        `  [[session.layers]]\n  provider = "compacting"\n  threshold = 60`,
+    );
+  }
+  const obj = ensureObject(v, "[session]", where);
+  const hasProvider = obj.provider !== undefined;
+  const hasLayers = obj.layers !== undefined;
+
+  if (hasProvider && hasLayers) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [session] has both 'provider' and 'layers'. ` +
+        `Pick one: 'provider' for a singleton session, 'layers' for a chain.`,
+    );
+  }
+  if (!hasProvider && !hasLayers) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [session] is missing both 'provider' and 'layers'. ` +
+        `A singleton needs 'provider = "<name>"'; a chain needs 'layers = [...]' ` +
+        `(or [[session.layers]] entries). Omit the [session] block entirely to ` +
+        `use the default chain.`,
+    );
+  }
+
+  if (hasLayers) {
+    return parseSessionLayers(obj.layers, where);
+  }
+  return parseSessionSpec(obj, where);
+}
+
+function parseSessionLayers(v: unknown, where: string): SessionSpec[] {
+  if (!Array.isArray(v)) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [session].layers must be an array of layer ` +
+        `entries (strings or inline tables). Got ${typeof v}.`,
+    );
+  }
+  if (v.length === 0) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [session].layers is empty. A layered session ` +
+        `needs at least one entry; omit the [session] block to use the default chain.`,
+    );
+  }
+  return v.map((entry, i) => parseLayerEntry(entry, i, where));
+}
+
+function parseLayerEntry(
+  v: unknown,
+  index: number,
+  where: string,
+): SessionSpec {
+  // String shorthand: equivalent to `{ provider = "<string>" }`.
+  if (typeof v === "string") {
+    if (v.length === 0) {
+      throw new ManifestError(
+        `agent.toml at ${where}: [session].layers entry ${index} is an empty string`,
+      );
+    }
+    validateReferenceString(v, `[session].layers (entry ${index})`, where);
+    return { provider: v };
+  }
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    return parseSessionSpec(
+      v as Record<string, unknown>,
+      where,
+      `[session].layers (entry ${index})`,
+    );
+  }
+  throw new ManifestError(
+    `agent.toml at ${where}: [session].layers entry ${index} must be a string ` +
+      `or an inline table with a 'provider' field; got ${typeof v}.`,
+  );
+}
+
 function parseSessionSpec(
   raw: Record<string, unknown>,
   where: string,
+  label = "[session]",
 ): SessionSpec {
   if (raw.provider === undefined) {
     throw new ManifestError(
-      `agent.toml at ${where}: [session] is missing required 'provider' field ` +
-        `(a built-in session name like "file", a [providers] handle, ` +
+      `agent.toml at ${where}: ${label} is missing required 'provider' field ` +
+        `(a built-in session name like "memory", a [providers] handle, ` +
         `or an inline SourceSpec)`,
     );
   }
-  const provider = parseReference(raw.provider, "[session].provider", where);
+  const provider = parseReference(raw.provider, `${label}.provider`, where);
   const { provider: _p, ...config } = raw;
   void _p;
   return { provider, ...config };

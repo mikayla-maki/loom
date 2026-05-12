@@ -214,12 +214,251 @@ system_prompt = "You are a friendly demo agent."
 [harness]
 provider = "test"
 [session]
-provider = "memory"
+provider = "in-memory"
 `,
         "utf8",
       );
       const m = await parseAgentManifest(p);
       expect(m.systemPrompt).toBe("You are a friendly demo agent.");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses [[session.layers]] (dotted-key array-of-tables) into a layered session", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-layers-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "layered"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[[session.layers]]
+provider = "compacting"
+threshold = 60
+
+[[session.layers]]
+provider = "in-memory"
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      expect(Array.isArray(m.session)).toBe(true);
+      const layers = m.session as Array<{
+        provider: unknown;
+        [k: string]: unknown;
+      }>;
+      expect(layers).toHaveLength(2);
+      expect(layers[0]).toMatchObject({
+        provider: "compacting",
+        threshold: 60,
+      });
+      expect(layers[1]).toMatchObject({ provider: "in-memory" });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses inline [session].layers with all-string shorthand", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inline-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "inline-layered"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = ["skills", "compacting", "in-memory"]
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      const layers = m.session as Array<{
+        provider: unknown;
+        [k: string]: unknown;
+      }>;
+      expect(layers).toHaveLength(3);
+      // String shorthand expands to `{ provider: "<string>" }`.
+      expect(layers[0]).toEqual({ provider: "skills" });
+      expect(layers[1]).toEqual({ provider: "compacting" });
+      expect(layers[2]).toEqual({ provider: "in-memory" });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses inline [session].layers with all-table form (config per layer)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-inline-tables-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "inline-tables"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = [
+  { provider = "compacting", threshold = 60 },
+  { provider = "file", path = "./s.jsonl" },
+]
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      const layers = m.session as Array<{
+        provider: unknown;
+        [k: string]: unknown;
+      }>;
+      expect(layers).toHaveLength(2);
+      expect(layers[0]).toMatchObject({
+        provider: "compacting",
+        threshold: 60,
+      });
+      expect(layers[1]).toMatchObject({
+        provider: "file",
+        path: "./s.jsonl",
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("singleton [session] (provider only) still parses as a single SessionSpec", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-single-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "single"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+provider = "in-memory"
+`,
+        "utf8",
+      );
+      const m = await parseAgentManifest(p);
+      // Singleton stays as a plain table (not an array).
+      expect(Array.isArray(m.session)).toBe(false);
+      if (m.session && "provider" in m.session) {
+        expect(m.session.provider).toBe("in-memory");
+      } else {
+        throw new Error("expected SessionSpec");
+      }
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects empty [session].layers", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-empty-layers-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "empty"
+system_prompt = "x"
+[harness]
+provider = "test"
+[session]
+layers = []
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /\[session\]\.layers is empty/,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects [session] with both 'provider' and 'layers'", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-both-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "both"
+system_prompt = "x"
+[harness]
+provider = "test"
+[session]
+provider = "in-memory"
+layers = ["compacting", "in-memory"]
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /has both 'provider' and 'layers'/,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects [session] with neither 'provider' nor 'layers'", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-neither-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "neither"
+system_prompt = "x"
+[harness]
+provider = "test"
+[session]
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /missing both 'provider' and 'layers'/,
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects the old top-level [[session]] form with a pointer at [session].layers", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-old-chain-"));
+    try {
+      const p = path.join(dir, "agent.toml");
+      await fs.writeFile(
+        p,
+        `[agent]
+name = "old-chain"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[[session]]
+provider = "compacting"
+
+[[session]]
+provider = "in-memory"
+`,
+        "utf8",
+      );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /\[session\] with a 'layers' array/,
+      );
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
@@ -239,7 +478,7 @@ system_prompt = "./prompt.md"
 [harness]
 provider = "test"
 [session]
-provider = "memory"
+provider = "in-memory"
 `,
         "utf8",
       );

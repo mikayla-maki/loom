@@ -110,6 +110,53 @@ describe("auditAgent", () => {
     }
   });
 
+  it("renders each layer of a layered session under one heading", async () => {
+    const spec: AgentManifest = {
+      name: "audit-layered",
+      systemPrompt: "x",
+      tools: {},
+      harness: { provider: "test" },
+      session: [
+        { provider: "compacting", threshold: 60 },
+        { provider: "in-memory" },
+      ],
+    };
+    const tree = await auditAgent(spec);
+    // sessionLayers carries one summary per layer, outer-to-inner.
+    expect(tree.sessionLayers).toBeDefined();
+    expect(tree.sessionLayers!.map((s) => s.factoryName)).toEqual([
+      "compacting",
+      "in-memory",
+    ]);
+    // The back-compat single-`session` field describes the outermost layer.
+    expect(tree.session?.factoryName).toBe("compacting");
+
+    const printed = formatCapabilityTree(tree, { color: false });
+    // Multi-layer session shows the summary line, both layers, and
+    // their provider sub-lines.
+    expect(printed).toMatch(/session:\s*2 layers, outer→inner/);
+    expect(printed).toContain("[0]");
+    expect(printed).toContain("compacting");
+    expect(printed).toContain("[1]");
+    expect(printed).toContain("in-memory");
+  });
+
+  it("renders a length-1 layered session identically to the singleton form", async () => {
+    const spec: AgentManifest = {
+      name: "audit-singleton",
+      systemPrompt: "x",
+      tools: {},
+      harness: { provider: "test" },
+      session: { provider: "in-memory" },
+    };
+    const tree = await auditAgent(spec);
+    const printed = formatCapabilityTree(tree, { color: false });
+    // No "N layers" header on the singleton path.
+    expect(printed).not.toMatch(/\d+ layers, outer→inner/);
+    // The session: heading still appears with the provider name.
+    expect(printed).toMatch(/session:\s*in-memory/);
+  });
+
   it("--strict throws when any source is unresolved", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-audit-strict-"));
     try {

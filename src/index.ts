@@ -32,7 +32,7 @@ export {
   anthropicHarnessFactory,
   openaiHarnessFactory,
   smallModelOfParentHarnessFactory,
-  memorySessionFactory,
+  inMemorySessionFactory,
   fileSessionFactory,
   compactingSessionFactory,
   forkOfParentSessionFactory,
@@ -41,14 +41,13 @@ export {
 
 export {
   CompactingSession,
-  ChainedSession,
   compactingMemorySession,
   compactingFileSession,
   heuristicCompactor,
   modelCompactor,
   adjustForToolPairs,
 } from "./builtins/session/compacting.js";
-export { MemorySession } from "./builtins/session/memory.js";
+export { InMemorySession } from "./builtins/session/memory.js";
 export { FileSession } from "./builtins/session/file.js";
 export { SkillsSession } from "./builtins/session/skills.js";
 export type {

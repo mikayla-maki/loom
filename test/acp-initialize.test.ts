@@ -120,9 +120,7 @@ describe("ACP initialize handshake", () => {
     };
     const agent = await runAgent(spec);
 
-    const { closeAll } = serveOverStream(async () => agent, serverStream, {
-      fixedManifestPath: "<inline>",
-    });
+    const { closeAll } = serveOverStream(async () => agent, serverStream);
 
     const conn = makeClient(clientStream);
     const result = await conn.initialize({
@@ -152,9 +150,7 @@ describe("ACP initialize handshake", () => {
       capabilities: {},
     };
     const agent = await runAgent(spec);
-    const { closeAll } = serveOverStream(async () => agent, serverStream, {
-      fixedManifestPath: "<inline>",
-    });
+    const { closeAll } = serveOverStream(async () => agent, serverStream);
     const conn = makeClient(clientStream);
 
     await expect(

@@ -246,11 +246,13 @@ export interface ResolvedManifest {
    */
   harness?: HarnessBinding;
   /**
-   * Resolved session factory binding. Undefined when the manifest
-   * omits `[session]` *or* when `manifest.session` is a pre-built
-   * `Session` instance.
+   * Resolved session chain. Each entry is a link in the composition
+   * pipeline (outer-to-inner order); a length-1 array is the trivial
+   * singleton case (matches a `[session]` table on disk). Undefined
+   * when the manifest omits the session section *or* when
+   * `manifest.session` is a pre-built `Session` instance.
    */
-  session?: SessionBinding;
+  session?: SessionBinding[];
   /**
    * All distinct SourceSpecs the manifest references, keyed by
    * {@link sourceSpecKey}. Used by `loom install` and audit.
@@ -380,10 +382,30 @@ export function resolveManifest(
       : undefined;
 
   // ─── Session ────────────────────────────────────────────
-  const session =
-    manifest.session && "provider" in manifest.session
-      ? resolveSessionSpec(manifest.session, providerSources, sources)
-      : undefined;
+  // Three input shapes:
+  //   * undefined → default chain applied later by the runtime
+  //   * pre-built `Session` instance → bypass resolution
+  //   * `SessionSpec` (singleton) → length-1 binding array
+  //   * `SessionSpec[]` (chain) → one binding per entry, in order
+  let session: SessionBinding[] | undefined;
+  if (manifest.session !== undefined) {
+    if (Array.isArray(manifest.session)) {
+      session = manifest.session.map((spec, i) =>
+        resolveSessionSpec(spec, providerSources, sources, i),
+      );
+    } else if ("provider" in manifest.session) {
+      session = [
+        resolveSessionSpec(
+          manifest.session,
+          providerSources,
+          sources,
+          undefined,
+        ),
+      ];
+    }
+    // else: pre-built `Session` instance — leave `session` undefined
+    // and let the runtime use the instance directly.
+  }
 
   return {
     providers,
@@ -565,9 +587,10 @@ function resolveHarnessSpec(
 }
 
 function resolveSessionSpec(
-  spec: AgentManifest["session"],
+  spec: SessionSpec,
   providerSources: Map<string, SourceSpec>,
   sources: Map<string, ResolvedSource>,
+  chainIndex: number | undefined,
 ): SessionBinding {
   if (!spec || !("provider" in spec)) {
     throw new ManifestError(
@@ -575,13 +598,17 @@ function resolveSessionSpec(
         `this path is only for SessionSpec values (with a 'provider' field).`,
     );
   }
-  const { provider, ...config } = spec as SessionSpec;
+  const { provider, ...config } = spec;
+  const label =
+    chainIndex === undefined
+      ? "[session]"
+      : `[session].layers (entry ${chainIndex})`;
   return resolveFactoryReference(
     provider,
     config,
     providerSources,
     sources,
-    "[session]",
+    label,
   );
 }
 

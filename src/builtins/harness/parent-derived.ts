@@ -7,16 +7,16 @@
  * `runAgent`.
  *
  * Currently shipped:
- *   - `small-model-of-parent`: clones the parent's `AnthropicHarness`
- *     with a different model id (cheaper / faster routing).
+ *   - `small-model-of-parent`: clones the parent's harness with a
+ *     different model id. Works with any harness that implements the
+ *     optional `Harness.withModel(modelId)` method.
  *
- * Each such factory is a tiny adapter; the heavy lifting (actually
- * cloning the harness) lives on the harness class as a `withModel`
- * (or analogous) method. New parent-derived shapes should follow the
- * same pattern: factory + harness method.
+ * To support a new derivation shape, add the corresponding optional
+ * method to the `Harness` interface (e.g. `withTemperature`), have
+ * the harness classes implement it, and wire a factory here that
+ * dispatches through the method.
  */
 
-import { AnthropicHarness } from "./anthropic.js";
 import { ResolutionError } from "../../errors.js";
 import type {
   Agent,
@@ -26,7 +26,12 @@ import type {
 } from "../../types/interfaces.js";
 
 interface SmallModelOfParentConfig {
-  /** Model id to route to. Required. */
+  /**
+   * Model id to route to. Optional: if omitted, the factory falls
+   * back to the parent harness's `smallModel()` recommendation. The
+   * harness must implement either `smallModel()` or accept an
+   * explicit `model` config (or both).
+   */
   model?: string;
 }
 
@@ -46,17 +51,28 @@ export const smallModelOfParentHarnessFactory: HarnessFactory = {
         "small-model-of-parent harness was instantiated without a parent agent",
       );
     }
+    // Dispatch through the optional `Harness.withModel` API. Any
+    // harness that implements it (Anthropic, OpenAI, and any
+    // third-party harness following the same convention) works
+    // without a special case here.
+    if (typeof parent.harness.withModel !== "function") {
+      throw new ResolutionError(
+        `small-model-of-parent harness requires the parent harness to implement the optional ` +
+          `withModel(modelId) method. ${parent.harness.constructor.name} doesn't — ` +
+          `add the method to support being used as a parent of this factory.`,
+      );
+    }
+    // Resolve the model id: explicit config wins; otherwise the
+    // parent harness's `smallModel()` recommendation is used.
     const c = config as SmallModelOfParentConfig;
-    if (!c.model) {
+    const model = c.model ?? parent.harness.smallModel?.();
+    if (!model) {
       throw new ResolutionError(
-        "small-model-of-parent harness requires a `model` field naming the smaller model id",
+        `small-model-of-parent harness needs a model id. Either pass \`model = "..."\` ` +
+          `in the [harness] block, or use a parent harness that implements the optional ` +
+          `smallModel() method (${parent.harness.constructor.name} doesn't).`,
       );
     }
-    if (!(parent.harness instanceof AnthropicHarness)) {
-      throw new ResolutionError(
-        `small-model-of-parent harness requires the parent to use AnthropicHarness; got ${parent.harness.constructor.name}. (To support other providers, add a withModel() method on the harness class.)`,
-      );
-    }
-    return parent.harness.withModel(c.model);
+    return parent.harness.withModel(model);
   },
 };

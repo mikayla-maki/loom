@@ -44,6 +44,7 @@ import {
   materialiseTools as bootMaterialiseTools,
   defaultProviderName as bootDefaultProviderName,
 } from "../runtime/boot.js";
+import { ChainedSession } from "../runtime/session-chain.js";
 import { LoomError } from "../errors.js";
 import { parseAgentManifest } from "../manifest/parser.js";
 import { defaultContains } from "../manifest/capabilities.js";
@@ -192,12 +193,25 @@ export interface CapabilityTree {
    */
   harness: FactoryAuditSummary;
   /**
-   * Session summary — present whenever the manifest declares a
-   * `[session]` block or carries a pre-built `Session` instance.
-   * (Absent when the manifest omits session entirely, meaning the
-   * runtime will use the default in-memory session.)
+   * Session summary for the outermost layer (or the pre-built
+   * `Session` instance). Present whenever the manifest declares a
+   * `[session]` block or carries a pre-built instance. Absent when
+   * the session is omitted entirely (the runtime applies the default
+   * chain).
+   *
+   * For a multi-layer session this describes only the outermost
+   * layer; inspect {@link sessionLayers} to walk every layer.
    */
   session?: SessionAuditSummary;
+  /**
+   * Every layer of the session, outer-to-inner. Present whenever
+   * {@link session} is present. Length 1 for the singleton
+   * `[session]` form or a pre-built instance; length ≥ 1 for the
+   * `[session].layers` form. Each layer carries its own
+   * `contributedTools` / `trustedPaths` so audit consumers can see
+   * which layer contributed what.
+   */
+  sessionLayers?: SessionAuditSummary[];
   /**
    * @deprecated Read `session.trustedPaths` instead. Kept at the top
    * level for back-compat; mirrors `session?.trustedPaths ?? []`.
@@ -354,57 +368,111 @@ async function auditAgentInner(
     return (a.handle ?? a.key).localeCompare(b.handle ?? b.key);
   });
 
-  // ─── session construction (best-effort) ───────────────
+  // ─── session construction (best-effort) ────────────────
+  // Instantiate every chain link individually so we can attribute
+  // contributed tools and trusted paths to the link that produced
+  // them. We also compose them via ChainedSession when there's more
+  // than one so the rest of the audit can interact with a uniform
+  // session interface (the same way the runtime would). Per-link
+  // construction errors are recorded; we continue with the links
+  // that did succeed.
   const trustedPaths: TrustedPath[] = [];
   let auditSession: Session | null = null;
   let sessionConstructionError: string | undefined;
-  if (resolved.session) {
+  const sessionBindings = resolved.session ?? [];
+  /** Tools + trusted paths each link contributed. Aligned with `sessionBindings`. */
+  const perLinkContributions: Array<{
+    contributedTools: string[];
+    trustedPaths: TrustedPath[];
+    constructionError?: string;
+  }> = [];
+  const auditedSessionLinks: Session[] = [];
+  for (const [i, binding] of sessionBindings.entries()) {
+    let linkInstance: Session | null = null;
+    let linkError: string | undefined;
     try {
-      // Shared with runAgent: factory lookup with package-name
-      // fallback + requiresParent check + create. Audit passes `{}`
-      // for secrets and no parent.
       const { instance } = await instantiateFromBinding<Session>(
-        resolved.session,
+        binding,
         getSessionFactory,
         factoryCtx,
         {},
         undefined,
         "session",
       );
-      auditSession = instance;
+      linkInstance = instance;
+      auditedSessionLinks.push(instance);
     } catch (e) {
-      sessionConstructionError = (e as Error).message;
+      linkError = (e as Error).message;
+      const linkLabel =
+        sessionBindings.length === 1
+          ? "session"
+          : `session link ${i} ('${binding.factoryName}')`;
+      sessionConstructionError =
+        (sessionConstructionError ? sessionConstructionError + "; " : "") +
+        `${linkLabel}: ${linkError}`;
     }
+    perLinkContributions.push({
+      contributedTools: [],
+      trustedPaths: [],
+      ...(linkError ? { constructionError: linkError } : {}),
+    });
+    void linkInstance; // populated below from per-link queries
+  }
+  if (auditedSessionLinks.length === 1) {
+    auditSession = auditedSessionLinks[0]!;
+  } else if (auditedSessionLinks.length > 1) {
+    auditSession = new ChainedSession(auditedSessionLinks);
   }
 
-  // Pull session-contributed tool bindings.
+  // Per-link tool / trusted-path discovery. Querying per link lets us
+  // attribute contributions to the layer that produced them.
   const sessionToolBindings: typeof resolved.tools = [];
-  if (auditSession) {
+  const claimedSessionTools = new Set(resolved.tools.map((b) => b.toolName));
+  let cursor = 0;
+  for (const [i, binding] of sessionBindings.entries()) {
+    // Find the i'th binding's instance among auditedSessionLinks.
+    // perLinkContributions[i].constructionError set ⇒ no instance
+    // was created and `cursor` skips it.
+    const slot = perLinkContributions[i]!;
+    if (slot.constructionError) continue;
+    const linkInstance = auditedSessionLinks[cursor++]!;
+    const originLabel =
+      sessionBindings.length === 1
+        ? `(session: ${binding.factoryName})`
+        : `(session link ${i}: ${binding.factoryName})`;
     try {
-      const sessionTools = (await auditSession.tools?.()) ?? [];
-      const claimed = new Set(resolved.tools.map((b) => b.toolName));
-      for (const ref of sessionTools) {
-        if (claimed.has(ref.name)) continue;
-        claimed.add(ref.name);
+      const refs = (await linkInstance.tools?.()) ?? [];
+      for (const ref of refs) {
+        slot.contributedTools.push(ref.name);
+        if (claimedSessionTools.has(ref.name)) continue;
+        claimedSessionTools.add(ref.name);
         sessionToolBindings.push({
           toolName: ref.name,
-          providerInstanceId: "native",
+          // Route through the synthetic `"(session)"` Tools instance
+          // (added below) so sessions with their own `resolveTool` get
+          // first shot; skills-style sessions fall back to native.
+          providerInstanceId: "(session)",
           toolConfig: typeof ref.config === "string" ? {} : ref.config,
-          origin: `(session: ${resolved.session?.factoryName ?? "?"})`,
+          origin: originLabel,
         });
       }
     } catch (e) {
       sessionConstructionError =
         (sessionConstructionError ? sessionConstructionError + "; " : "") +
-        `session.tools() threw: ${(e as Error).message}`;
+        `session link ${i} ('${binding.factoryName}') .tools() threw: ${
+          (e as Error).message
+        }`;
     }
     try {
-      const tp = (await auditSession.trustedPaths?.()) ?? [];
+      const tp = (await linkInstance.trustedPaths?.()) ?? [];
+      slot.trustedPaths.push(...tp);
       trustedPaths.push(...tp);
     } catch (e) {
       sessionConstructionError =
         (sessionConstructionError ? sessionConstructionError + "; " : "") +
-        `session.trustedPaths() threw: ${(e as Error).message}`;
+        `session link ${i} ('${binding.factoryName}') .trustedPaths() threw: ${
+          (e as Error).message
+        }`;
     }
   }
 
@@ -454,6 +522,22 @@ async function auditAgentInner(
     }
   }
 
+  // Mirror the runtime's synthetic `"(session)"` Tools instance.
+  // Sessions with `resolveTool` own the tools they advertise; the
+  // skills pattern (advertise without own implementation) falls
+  // through to native below.
+  if (auditSession) {
+    const sess = auditSession;
+    providerByInstanceId.set("(session)", {
+      async resolveTool(name, config, agent, capabilities) {
+        if (!sess.resolveTool) return null;
+        return Promise.resolve(
+          sess.resolveTool(name, config, agent, capabilities),
+        );
+      },
+    });
+  }
+
   // Index resolved Tools instances by id, so we can attribute each
   // tool to its source provider (when not native).
   const instanceById = new Map<string, (typeof resolved.providers)[number]>();
@@ -489,6 +573,22 @@ async function auditAgentInner(
       // surface as unresolved for audit (the runtime will throw clearer).
       t = null;
     }
+    // Mirror the runtime's `"(session)"` → native fallback so the
+    // audit sees the same Tool shape the runtime would resolve.
+    if (!t && binding.providerInstanceId === "(session)") {
+      try {
+        t = await Promise.resolve(
+          native.resolveTool(
+            binding.toolName,
+            binding.toolConfig,
+            auditAgentRef,
+            grant,
+          ),
+        );
+      } catch {
+        t = null;
+      }
+    }
     if (!t) {
       unresolvedTools.push({
         name: binding.toolName,
@@ -521,12 +621,34 @@ async function auditAgentInner(
     }
     // Attribute the tool to its provider, if any. Native tools have
     // no provider attribution.
-    const instance = instanceById.get(binding.providerInstanceId);
-    const providerKey =
-      instance && instance.kind === "provider" && instance.source
-        ? sourceSpecKey(instance.source)
-        : undefined;
-    const providerHandle = instance?.providerHandle;
+    let providerKey: string | undefined;
+    let providerHandle: string | undefined;
+    if (binding.providerInstanceId === "(session)") {
+      // Session-contributed tool. Find which layer claimed it by
+      // checking each link's contributedTools list, then borrow that
+      // layer's source/handle for the attribution. Without this the
+      // tool would render as `provider: builtin` even when a provider
+      // package's session owns the implementation.
+      const layerIdx = perLinkContributions.findIndex((slot) =>
+        slot.contributedTools.includes(binding.toolName),
+      );
+      const layerBinding =
+        layerIdx >= 0 ? sessionBindings[layerIdx] : undefined;
+      if (layerBinding?.source) {
+        providerKey = sourceSpecKey(layerBinding.source);
+      }
+      if (layerBinding?.providerHandle) {
+        providerHandle = layerBinding.providerHandle;
+      }
+    } else {
+      const instance = instanceById.get(binding.providerInstanceId);
+      if (instance && instance.kind === "provider" && instance.source) {
+        providerKey = sourceSpecKey(instance.source);
+      }
+      if (instance?.providerHandle) {
+        providerHandle = instance.providerHandle;
+      }
+    }
     tools.push({
       name: binding.toolName,
       requires,
@@ -562,8 +684,14 @@ async function auditAgentInner(
   const secrets = collectSecrets(manifest, resolved, resolvedTools);
 
   // ─── session-declared subagents (pre-built instance form only) ──
+  // Arrays are SessionSpec[] chains; only the non-array, no-provider
+  // shape is a pre-built `Session` instance.
   const sessionSubagents: CapabilityTree[] = [];
-  if (manifest.session && !("provider" in manifest.session)) {
+  if (
+    manifest.session &&
+    !Array.isArray(manifest.session) &&
+    !("provider" in manifest.session)
+  ) {
     const sess = manifest.session as Session;
     for (const sub of sess.dependencies?.subagents ?? []) {
       const subTree = await auditAgentInner(sub, nextSeen);
@@ -572,15 +700,15 @@ async function auditAgentInner(
     }
   }
 
-  // ─── harness / session summaries ─────────────────────────────
+  // ─── harness / session summaries ────────────────────────
   const harnessSummary = buildHarnessSummary(manifest, resolved);
-  const sessionSummary = buildSessionSummary(
+  const sessionLayerSummaries = buildSessionLayerSummaries(
     manifest,
     resolved,
-    sessionToolBindings.map((b) => b.toolName),
-    trustedPaths,
+    perLinkContributions,
     sessionConstructionError,
   );
+  const sessionSummary = sessionLayerSummaries?.[0];
 
   // ─── §1.6: capability-ceiling check ─────────────────────────────
   const capabilityCeilingViolations = checkCapabilityCeiling(
@@ -600,6 +728,7 @@ async function auditAgentInner(
     providers,
     harness: harnessSummary,
     ...(sessionSummary ? { session: sessionSummary } : {}),
+    ...(sessionLayerSummaries ? { sessionLayers: sessionLayerSummaries } : {}),
     tools,
     secrets,
     sessionSubagents,
@@ -665,71 +794,94 @@ function buildHarnessSummary(
   };
 }
 
-function buildSessionSummary(
+/**
+ * Build one audit summary per session layer (or a single-element
+ * array for a pre-built `Session` instance). Returns undefined when
+ * the manifest has no `[session]` block at all — the runtime applies
+ * the default chain implicitly, which the audit reflects by omission.
+ */
+function buildSessionLayerSummaries(
   manifest: AgentManifest,
   resolved: ReturnType<typeof resolveManifest>,
-  contributedTools: string[],
-  trustedPaths: TrustedPath[],
-  constructionError: string | undefined,
-): SessionAuditSummary | undefined {
-  // No `[session]` block and no pre-built instance — the runtime
-  // will use the default in-memory session. We surface that
-  // implicitly (omit the summary) so the audit reflects what the
-  // user wrote.
+  perLinkContributions: ReadonlyArray<{
+    contributedTools: string[];
+    trustedPaths: TrustedPath[];
+    constructionError?: string;
+  }>,
+  topLevelConstructionError: string | undefined,
+): SessionAuditSummary[] | undefined {
   if (!manifest.session) return undefined;
 
-  if (!("provider" in manifest.session)) {
-    return {
-      display: "<pre-built Session instance>",
-      config: {},
-      resolved: true,
-      preBuilt: true,
-      contributedTools,
-      trustedPaths,
-      ...(constructionError ? { constructionError } : {}),
-    };
+  // Pre-built `Session` instance — single-link summary.
+  if (!Array.isArray(manifest.session) && !("provider" in manifest.session)) {
+    return [
+      {
+        display: "<pre-built Session instance>",
+        config: {},
+        resolved: true,
+        preBuilt: true,
+        contributedTools: [],
+        trustedPaths: [],
+        ...(topLevelConstructionError
+          ? { constructionError: topLevelConstructionError }
+          : {}),
+      },
+    ];
   }
 
-  const binding = resolved.session;
-  if (!binding) {
-    return {
-      display: "<unknown>",
-      config: {},
-      resolved: false,
-      preBuilt: false,
-      contributedTools,
-      trustedPaths,
-      ...(constructionError ? { constructionError } : {}),
-    };
+  const bindings = resolved.session ?? [];
+  if (bindings.length === 0) {
+    return [
+      {
+        display: "<unknown>",
+        config: {},
+        resolved: false,
+        preBuilt: false,
+        contributedTools: [],
+        trustedPaths: [],
+        ...(topLevelConstructionError
+          ? { constructionError: topLevelConstructionError }
+          : {}),
+      },
+    ];
   }
-  let registryHit = false;
-  try {
-    getSessionFactory(binding.factoryName);
-    registryHit = true;
-  } catch {
-    if (binding.source) {
-      try {
-        getSessionFactory(defaultProviderName(binding.source));
-        registryHit = true;
-      } catch {
-        /* unresolved */
+
+  return bindings.map((binding, i) => {
+    const slot = perLinkContributions[i] ?? {
+      contributedTools: [],
+      trustedPaths: [],
+    };
+    let registryHit = false;
+    try {
+      getSessionFactory(binding.factoryName);
+      registryHit = true;
+    } catch {
+      if (binding.source) {
+        try {
+          getSessionFactory(defaultProviderName(binding.source));
+          registryHit = true;
+        } catch {
+          /* unresolved */
+        }
       }
     }
-  }
-  return {
-    display: binding.providerHandle ?? binding.factoryName,
-    factoryName: binding.factoryName,
-    config: binding.config,
-    ...(binding.source ? { providerKey: sourceSpecKey(binding.source) } : {}),
-    ...(binding.providerHandle
-      ? { providerHandle: binding.providerHandle }
-      : {}),
-    resolved: registryHit,
-    preBuilt: false,
-    contributedTools,
-    trustedPaths,
-    ...(constructionError ? { constructionError } : {}),
-  };
+    return {
+      display: binding.providerHandle ?? binding.factoryName,
+      factoryName: binding.factoryName,
+      config: binding.config,
+      ...(binding.source ? { providerKey: sourceSpecKey(binding.source) } : {}),
+      ...(binding.providerHandle
+        ? { providerHandle: binding.providerHandle }
+        : {}),
+      resolved: registryHit,
+      preBuilt: false,
+      contributedTools: [...slot.contributedTools],
+      trustedPaths: [...slot.trustedPaths],
+      ...(slot.constructionError
+        ? { constructionError: slot.constructionError }
+        : {}),
+    };
+  });
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
@@ -834,12 +986,12 @@ function collectSecrets(
       /* unknown harness — skip */
     }
   }
-  // Session factory needs.
-  if (resolved.session) {
+  // Session factory needs (per chain link).
+  for (const link of resolved.session ?? []) {
     try {
       const f = lookupFactoryByBinding(
-        resolved.session.factoryName,
-        resolved.session.source,
+        link.factoryName,
+        link.source,
         getSessionFactory,
       );
       addNeeds(f.secrets, `session:${f.name}`);
@@ -969,40 +1121,31 @@ export function formatCapabilityTree(
     }
   }
 
-  // Session.
-  if (tree.session) {
-    const s = tree.session;
-    const status = s.resolved
-      ? ""
-      : `  ${p.yellow("⚠ not registered at audit time")}`;
-    lines.push(`${pad}  ${p.bold("session:")} ${p.cyan(s.display)}${status}`);
-    lines.push(`${pad}    ${p.dim("provider:")} ${factoryProviderLabel(s, p)}`);
-    const cfgKeys = Object.keys(s.config);
-    if (cfgKeys.length > 0) {
+  // Session. Renders the layers as N indented blocks under a single
+  // `session:` heading. Singleton sessions (no `layers`) produce the
+  // same one-block output as before.
+  const layers = tree.sessionLayers ?? (tree.session ? [tree.session] : []);
+  if (layers.length > 0) {
+    if (layers.length === 1) {
+      const s = layers[0]!;
+      const status = s.resolved
+        ? ""
+        : `  ${p.yellow("⚠ not registered at audit time")}`;
+      lines.push(`${pad}  ${p.bold("session:")} ${p.cyan(s.display)}${status}`);
+      formatSessionLayerBody(s, pad, p, lines, /*layerIndent*/ "    ");
+    } else {
       lines.push(
-        `${pad}    ${p.dim("config:")} ${p.dim(formatConfig(s.config))}`,
+        `${pad}  ${p.bold("session:")} ${p.dim(`${layers.length} layers, outer→inner`)}`,
       );
-    }
-    if (s.contributedTools.length > 0) {
-      lines.push(
-        `${pad}    ${p.dim("contributes tools:")} ${s.contributedTools
-          .map((t) => p.yellow(t))
-          .join(", ")}`,
-      );
-    }
-    if (s.trustedPaths.length > 0) {
-      lines.push(`${pad}    ${p.dim("trusted paths:")}`);
-      for (const tp of s.trustedPaths) {
-        const reason = tp.reason ? p.dim(` — ${tp.reason}`) : "";
+      for (const [i, s] of layers.entries()) {
+        const status = s.resolved
+          ? ""
+          : `  ${p.yellow("⚠ not registered at audit time")}`;
         lines.push(
-          `${pad}      ${p.dim("-")} ${tp.path} ${p.magenta(`[${tp.access}]`)}${reason}`,
+          `${pad}    ${p.dim(`[${i}]`)} ${p.cyan(s.display)}${status}`,
         );
+        formatSessionLayerBody(s, pad, p, lines, /*layerIndent*/ "      ");
       }
-    }
-    if (s.constructionError) {
-      lines.push(
-        `${pad}    ${p.yellow(`⚠ construction error: ${s.constructionError}`)}`,
-      );
     }
   }
 
@@ -1135,6 +1278,46 @@ export function formatCapabilityTree(
   }
 
   return lines.join("\n");
+}
+
+/** Print one session layer's body (everything under its heading). */
+function formatSessionLayerBody(
+  s: SessionAuditSummary,
+  pad: string,
+  p: ReturnType<typeof makePainter>,
+  lines: string[],
+  layerIndent: string,
+): void {
+  lines.push(
+    `${pad}${layerIndent}${p.dim("provider:")} ${factoryProviderLabel(s, p)}`,
+  );
+  const cfgKeys = Object.keys(s.config);
+  if (cfgKeys.length > 0) {
+    lines.push(
+      `${pad}${layerIndent}${p.dim("config:")} ${p.dim(formatConfig(s.config))}`,
+    );
+  }
+  if (s.contributedTools.length > 0) {
+    lines.push(
+      `${pad}${layerIndent}${p.dim("contributes tools:")} ${s.contributedTools
+        .map((t) => p.yellow(t))
+        .join(", ")}`,
+    );
+  }
+  if (s.trustedPaths.length > 0) {
+    lines.push(`${pad}${layerIndent}${p.dim("trusted paths:")}`);
+    for (const tp of s.trustedPaths) {
+      const reason = tp.reason ? p.dim(` — ${tp.reason}`) : "";
+      lines.push(
+        `${pad}${layerIndent}  ${p.dim("-")} ${tp.path} ${p.magenta(`[${tp.access}]`)}${reason}`,
+      );
+    }
+  }
+  if (s.constructionError) {
+    lines.push(
+      `${pad}${layerIndent}${p.yellow(`⚠ construction error: ${s.constructionError}`)}`,
+    );
+  }
 }
 
 function formatGrant(v: CapabilitySet | undefined): string {

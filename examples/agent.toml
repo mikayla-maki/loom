@@ -5,24 +5,43 @@
 # Run:           loom run examples/agent.toml
 # Audit:         loom audit examples/agent.toml
 #
+# This is the declarative shape. For the imperative shape — same
+# agent constructed in TypeScript — see `examples/agent.ts`.
+#
 # What this example shows:
 #   - `[providers]` declares a local handle for an external provider.
 #   - `[harness]`   picks a built-in factory.
-#   - `[session]`   picks a provider-backed factory by handle.
-#   - `[tools]`     mixes built-in tools, a handle-anonymous reference,
-#                   and an inline-anonymous reference. Both `shout` and
-#                   `whisper` route through the same provider (the
-#                   runtime dedupes by (source, config) so distinct
-#                   configs get distinct Tools instances).
-#   - `[capabilities]` is a transitive ceiling
+#   - `[session]`   declares the agent's session as a layered
+#                   composition (outer-to-inner): bounded growth via
+#                   `compacting`, persistent cross-session notes via
+#                   the `notes` provider's `NotesSession`, raw event
+#                   storage via `in-memory`. The middle layer is the
+#                   interesting one — it loads notes from a markdown
+#                   file into the system prompt AND owns the `remember`
+#                   verb the model uses to save new ones. See
+#                   `loom-notes-provider/index.ts`.
+#   - `[tools]`     mixes built-in tools with names contributed by
+#                   the session itself (here: `remember`). When a
+#                   session contributes a tool, the runtime treats
+#                   the session as the implicit provider — no
+#                   `[tools.remember]` entry is needed.
+#   - `[capabilities]` is a transitive ceiling. `remember` doesn't
+#                   need a grant because the demo session writes to
+#                   its own configured file, not user-pickable paths.
 # ───────────────────────────────────────────────────────────────────────────
 
 [agent]
 name = "loom-demo"
-system_prompt = "You are a helpful assistant. Use the echo tool to confirm wiring; use bash/read_file/write_file/find for real work."
+system_prompt = """
+You are a helpful assistant who keeps notes across sessions. The
+system prompt includes notes from previous sessions. When the user
+tells you something worth keeping — preferences, project conventions,
+names, recurring context — call the `remember` tool with a short
+declarative fact. Use bash/read_file/write_file/find for real work.
+"""
 
 [providers]
-demo = { path = "./loom-demo-provider" }
+notes = { path = "./loom-notes-provider" }
 
 [harness]
 provider = "anthropic"
@@ -31,25 +50,35 @@ maxTokens = 4096
 maxTurnRequests = 16
 stream = true
 
-[session]
-provider = "demo"
-tag = "showpiece"
+# Layered session (outer-to-inner). The dotted-key array-of-tables
+# form is the right shape when layers carry config; for all-default
+# chains, the inline form
+# `[session] layers = ["skills", "compacting", "in-memory"]` is shorter.
+[[session.layers]]
+provider = "compacting"
+threshold = 60
+
+[[session.layers]]
+provider = "notes"
+file = "./loom-notes.md"   # markdown bullets, human-editable
+# Optional: max_notes = 50  # FIFO eviction once exceeded
+
+[[session.layers]]
+provider = "in-memory"
 
 [tools]
 bash = "builtin"
 read_file = "builtin"
 write_file = "builtin"
 find = "builtin"
-shout = { provider = "demo", prefix = "📢" }
-
-[tools.whisper]
-provider = "demo"
-prefix = "🤫"
+# `remember` isn't listed here — the `demo` session contributes it
+# and owns the implementation. The runtime registers it on the agent's
+# tool table automatically. Granting capabilities for it still works
+# below.
 
 [capabilities]
 bash = { subprocess = "*", paths = ["./"] }
 read_file = { paths = ["./"] }
 write_file = { paths = ["./"] }
 find = { paths = ["./"] }
-shout = "*"
-whisper = "*"
+remember = "*"   # the session writes to its own configured file

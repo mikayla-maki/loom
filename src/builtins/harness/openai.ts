@@ -100,9 +100,10 @@ export class OpenAIHarness implements Harness {
   }
 
   /**
-   * Build a sibling harness with the same credentials/config but a
-   * different model id. Mirrors `AnthropicHarness.withModel`; used by
-   * parent-derived harness factories.
+   * Implements the optional `Harness.withModel` API — returns a
+   * sibling harness with the same credentials/transport but a
+   * different model id. Used by parent-derived harness factories
+   * (e.g. `small-model-of-parent`).
    */
   withModel(modelId: string): OpenAIHarness {
     return new OpenAIHarness(
@@ -113,6 +114,22 @@ export class OpenAIHarness implements Harness {
       this.maxTurnRequests,
       this.stream,
     );
+  }
+
+  /**
+   * Implements the optional `Harness.smallModel` API — returns the
+   * id of a smaller/faster sibling of the currently-configured
+   * model. Pattern-matches the known `mini` families; falls back to
+   * `gpt-4o-mini` for unrecognised model ids.
+   */
+  smallModel(): string {
+    const m = this.model;
+    if (m.includes("mini")) return m;
+    if (m.startsWith("o3")) return "o3-mini";
+    if (m.startsWith("o1")) return "o1-mini";
+    if (m.includes("gpt-4o")) return "gpt-4o-mini";
+    if (m.startsWith("gpt-4")) return "gpt-4o-mini";
+    return "gpt-4o-mini";
   }
 
   /**

@@ -4,7 +4,8 @@ import {
   CompactingSession,
   modelCompactor,
 } from "../src/builtins/session/compacting.js";
-import { MemorySession } from "../src/builtins/session/memory.js";
+import { InMemorySession } from "../src/builtins/session/memory.js";
+import { ChainedSession } from "../src/runtime/session-chain.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { summarise, summariseViaRun } from "../src/sdk/session-utils.js";
 import type {
@@ -14,6 +15,20 @@ import type {
   Session,
 } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
+
+/**
+ * Build a fresh compacting-on-memory chain. Returns the composed
+ * `Session` plus its component `compactor` so tests can call
+ * `compactor.prepareTurn(...)` / `compactor.compactNow()` directly.
+ */
+function freshCompactingChain(
+  opts: ConstructorParameters<typeof CompactingSession>[0] = {},
+) {
+  const memory = new InMemorySession();
+  const compactor = new CompactingSession(opts);
+  const session: Session = new ChainedSession([compactor, memory]);
+  return { session, compactor, memory };
+}
 
 function userMsg(text: string): SessionUpdate {
   return {
@@ -68,15 +83,17 @@ describe("modelCompactor + Session.prepareTurn", () => {
         return "everything is fine, carry on";
       },
     };
-    const session = new CompactingSession(new MemorySession(), {
+    const { session, compactor } = freshCompactingChain({
       threshold: 6,
       keep: 2,
       compactor: modelCompactor(),
     });
-    for (let i = 0; i < 8; i++) await session.push(userMsg(`m${i}`));
-    await session.prepareTurn(fakeAgent(harness, session));
+    for (let i = 0; i < 8; i++) await session.push?.(userMsg(`m${i}`));
+    // Pull so the compactor sees `below`.
+    await session.pull?.([]);
+    await compactor.prepareTurn(fakeAgent(harness, session));
     expect(called).toBe(true);
-    const out = await session.pull([]);
+    const out = (await session.pull?.([])) ?? [];
     const body = out[1];
     if (
       body &&
@@ -91,14 +108,15 @@ describe("modelCompactor + Session.prepareTurn", () => {
 
   it("falls back to summariseViaRun when harness has no native summarise", async () => {
     const harness = fixedTextHarness("VIA_RUN_SUMMARY");
-    const session = new CompactingSession(new MemorySession(), {
+    const { session, compactor } = freshCompactingChain({
       threshold: 6,
       keep: 2,
       compactor: modelCompactor(),
     });
-    for (let i = 0; i < 8; i++) await session.push(userMsg(`m${i}`));
-    await session.prepareTurn(fakeAgent(harness, session));
-    const out = await session.pull([]);
+    for (let i = 0; i < 8; i++) await session.push?.(userMsg(`m${i}`));
+    await session.pull?.([]);
+    await compactor.prepareTurn(fakeAgent(harness, session));
+    const out = (await session.pull?.([])) ?? [];
     const body = out[1];
     if (
       body &&
@@ -112,18 +130,19 @@ describe("modelCompactor + Session.prepareTurn", () => {
   });
 
   it("falls back to the heuristic compactor when ctx is null", async () => {
-    const session = new CompactingSession(new MemorySession(), {
+    const { session, compactor } = freshCompactingChain({
       threshold: 6,
       keep: 2,
       compactor: modelCompactor(),
     });
     for (let i = 0; i < 8; i++) {
-      await session.push(userMsg(`hello ${i}`));
+      await session.push?.(userMsg(`hello ${i}`));
     }
     // Force compaction with no context — modelCompactor should fall
-    // back to heuristic.
-    await session.compactNow();
-    const out = await session.pull([]);
+    // back to heuristic. Pull first so the compactor sees `below`.
+    await session.pull?.([]);
+    await compactor.compactNow();
+    const out = (await session.pull?.([])) ?? [];
     const body = out[1];
     if (
       body &&
@@ -141,13 +160,14 @@ describe("modelCompactor + Session.prepareTurn", () => {
     const seenHarnesses: Harness[] = [];
     const harness = fixedTextHarness("ack");
 
-    const session = new CompactingSession(new MemorySession(), {
+    const { session, compactor } = freshCompactingChain({
       threshold: 1000,
       keep: 2,
     });
-    // Wrap prepareTurn so we can observe what loom passed in.
-    const realPrepare = session.prepareTurn.bind(session);
-    session.prepareTurn = async (agent: Agent) => {
+    // Wrap the compactor's prepareTurn so we can observe what loom
+    // passed in. ChainedSession invokes prepareTurn on each child.
+    const realPrepare = compactor.prepareTurn.bind(compactor);
+    compactor.prepareTurn = async (agent: Agent) => {
       seenHarnesses.push(agent.harness);
       expect(agent.session).toBe(session);
       expect(agent.agentName).toBe("turn-test");

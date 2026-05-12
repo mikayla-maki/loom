@@ -43,7 +43,7 @@ shape (`register<X>` returns an `X`).
 | `[agent]` | yes | name, description, system prompt, secrets allowlist |
 | `[providers]` | no | local handles for code sources (npm / path / git) |
 | `[harness]` | yes | which harness this agent runs |
-| `[session]` | no (defaults) | which session this agent uses |
+| `[session]` | no (defaults) | the agent's session: a singleton (`provider`) or a layered composition (`layers`) |
 | `[tools]` | no (defaults) | model-facing verbs |
 | `[capabilities]` | no | per-tool / per-subagent permission ceiling |
 
@@ -61,11 +61,15 @@ of:
 | `{ git = "...", rev? = "..." }` | inline `SourceSpec` table (future) | auto-load |
 
 `provider` is **required** on every `[tools.X]`, `[harness]`, and
-`[session]` entry. For built-in tools use the string shorthand:
-`bash = "builtin"` is sugar for `bash = { provider = "builtin" }`.
-Empty `{}` is not accepted — every table form must name a provider.
-A completely absent `[tools]` table still auto-loads the default
-builtin set.
+every `[session]` (singleton) or `[[session.layers]]` (layered) entry.
+For built-in tools use the string shorthand: `bash = "builtin"` is
+sugar for `bash = { provider = "builtin" }`. Inside `[session].layers`
+the same string shorthand applies (a bare string entry expands to
+`{ provider = "<string>" }`). Empty `{}` is not accepted — every
+table form must name a provider. A completely absent `[tools]` table
+still auto-loads the default builtin set. A completely absent
+`[session]` block auto-loads the default chain `skills → compacting
+→ memory`.
 
 Resolution is field-agnostic except for the *built-in registry*
 consulted: `[harness].provider` consults the harness registry,
@@ -95,8 +99,15 @@ provider = "anthropic"
 model = "claude-sonnet-4-5"
 maxTokens = 4096
 
-[session]
-# Same rule. `file` is built in.
+# Session is layered (outer-to-inner). Each `[[session.layers]]`
+# entry is one layer. `compacting` is built in (a pull-side
+# summariser); `file` is built in (JSONL on disk). See §1.7 for
+# the layer protocol.
+[[session.layers]]
+provider = "compacting"
+threshold = 60
+
+[[session.layers]]
 provider = "file"
 path = "./session.jsonl"
 
@@ -184,6 +195,107 @@ Carried over from v4 §1.6 unchanged. Briefly:
 `[capabilities]` entries do **not** require matching local `[tools]` —
 a parent grants `read_database = { db = "primary" }` so a subagent
 spawned later can use it, even if the parent has no such tool itself.
+
+### 1.7 Layered sessions — the universal composition shape
+
+Every other field in the manifest resolves to a singleton (one
+harness, one Tools instance per `(source, config)` tuple). Sessions
+are different: the agent has one session, but that session may
+itself be composed of N layers stacked outer-to-inner. The `[session]`
+block describes either form:
+
+- **Singleton.** `[session]` carries a `provider` key. That's the
+  whole session — one factory.
+- **Layered.** `[session]` carries a `layers` key whose value is an
+  array of layer specs. Or equivalently `[[session.layers]]` as a
+  TOML dotted-key array-of-tables. Outer-to-inner ordering.
+
+#### The layer protocol
+
+The `Session` interface's transport methods *are* the composition
+protocol. Each layer is itself a `Session`; the composition is a
+`Session`. Self-similar.
+
+- **`push(event) → SessionUpdate[]`** flows **top-to-bottom**. Each
+  layer receives the event, may transform / drop / fan it out, and
+  returns what the next layer below should see. The bottom-most
+  layer typically owns durable storage.
+- **`pull(below) → SessionUpdate[]`** flows **bottom-to-top**. Each
+  layer receives the events that the layers below it produced (the
+  bottom layer's `below` is the caller's argument, usually `[]`)
+  and may rewrite them before returning. What pops out at the top
+  is the prompt the harness sees.
+
+Everything else aggregates across all layers: `prepareTurn`,
+`systemPromptSection`, `tools`, `trustedPaths`,
+`dependencies.subagents`, and `close`. There is no "primary" layer
+for these — each layer contributes, the runtime concatenates.
+
+#### Manifest forms
+
+```toml
+# Singleton. One factory; the agent's whole session is this layer.
+[session]
+provider = "in-memory"
+```
+
+```toml
+# Layered, dotted-key array-of-tables. Best when layers carry config.
+[[session.layers]]
+provider = "compacting"
+threshold = 60
+
+[[session.layers]]
+provider = "in-memory"
+```
+
+```toml
+# Layered, inline form. Best when no layer needs config.
+[session]
+layers = ["skills", "compacting", "in-memory"]
+```
+
+The inline form's array entries are either bare strings (sugar for
+`{ provider = "<string>" }`) or inline tables. Note: `@iarna/toml`
+implements TOML 0.5, which requires homogeneous arrays — mixed
+string-and-table entries trip the parser. If any layer needs config,
+use the `[[session.layers]]` dotted-key form for the whole chain.
+
+The parser enforces these rules:
+- `[session]` must carry exactly one of `provider` or `layers`.
+- `layers` must be a non-empty array.
+- The old top-level `[[session]]` form is rejected with a pointer at
+  `[[session.layers]]`.
+
+#### Default-when-absent
+
+If the manifest declares no `[session]` block, the runtime applies
+**`skills → compacting → in-memory`** as the implicit chain.
+`skills` scans `~/.skills` (silently no-op when the directory is
+missing), `compacting` bounds prompt growth, `in-memory` owns
+volatile storage. Bounded growth and skill auto-loading out of the
+box; users who want different policy write `[session]` explicitly.
+
+Note: this is the agent's OS-level user home directory, not the
+project directory. Auto-detecting `./skills/` (project-relative) is
+deliberately not done — magic FS scans of the project surprise
+people; reading from a known user-managed location does not.
+
+#### SDK / pre-built instances
+
+From the SDK, `AgentManifest.session` accepts three shapes:
+
+1. A single `SessionSpec` (singleton).
+2. A `SessionSpec[]` (layered).
+3. A pre-built `Session` instance — used as-is, no resolution.
+   This is the escape hatch for SDK consumers who want a direct
+   reference to the layers (e.g. to wire `CompactingSession.compactNow()`
+   to a `/compact` slash command). Construct it via
+   `new ChainedSession([...])` if multiple layers are needed.
+
+`ChainedSession` is not part of the public SDK surface — it's the
+runtime's composition vehicle. Users compose via the manifest or
+via pre-built layered instances.
 
 ---
 
@@ -387,9 +499,9 @@ internally through the same `registerHarness` / `registerSession` /
 for built-ins; they're registered eagerly before any agent boots.
 
 Built-in names today: `anthropic`, `openai`, `test`,
-`small-model-of-parent` (harnesses); `memory`, `file`, `compacting`,
-`fork-of-parent`, `skills` (sessions); `builtin` (the tool provider
-that yields `bash`, `read_file`, `write_file`, `find`,
+`small-model-of-parent` (harnesses); `in-memory`, `file`,
+`compacting`, `fork-of-parent`, `skills` (sessions); `builtin` (the
+tool provider that yields `bash`, `read_file`, `write_file`, `find`,
 `spawn_subagent`).
 
 A manifest references a built-in identically to a plugin:

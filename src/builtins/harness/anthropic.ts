@@ -121,7 +121,8 @@ export class AnthropicHarness implements Harness {
   }
 
   /**
-   * Build a sibling harness with the same credentials/config but a
+   * Implements the optional `Harness.withModel` API — returns a
+   * sibling harness with the same credentials/transport but a
    * different model id. Used by parent-derived harness factories
    * (e.g. `small-model-of-parent`) that want to reuse the parent's
    * API key + transport but route to a cheaper or faster model.
@@ -135,6 +136,21 @@ export class AnthropicHarness implements Harness {
       this.maxTurnRequests,
       this.stream,
     );
+  }
+
+  /**
+   * Implements the optional `Harness.smallModel` API — returns the
+   * id of a smaller/faster sibling of the currently-configured
+   * model. Pattern-matches `sonnet`/`opus` → `haiku` in-family;
+   * falls back to a known fast default (`claude-haiku-4-5`) when
+   * the current model id doesn't match a known pattern.
+   */
+  smallModel(): string {
+    const m = this.model;
+    if (m.includes("haiku")) return m;
+    if (m.includes("sonnet")) return m.replace("sonnet", "haiku");
+    if (m.includes("opus")) return m.replace("opus", "haiku");
+    return "claude-haiku-4-5";
   }
 
   /**

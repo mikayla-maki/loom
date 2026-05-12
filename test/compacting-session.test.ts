@@ -5,8 +5,10 @@ import {
   adjustForToolPairs,
   heuristicCompactor,
 } from "../src/builtins/session/compacting.js";
-import { MemorySession } from "../src/builtins/session/memory.js";
+import { InMemorySession } from "../src/builtins/session/memory.js";
+import { ChainedSession } from "../src/runtime/session-chain.js";
 import { runAgent } from "../src/sdk/run-agent.js";
+import type { Session } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 
 function userMsg(text: string): SessionUpdate {
@@ -27,7 +29,7 @@ function toolCall(id: string, name: string): SessionUpdate {
     toolCallId: id,
     title: name,
     status: "in_progress",
-    input: {},
+    rawInput: {},
   };
 }
 function toolUpdate(id: string): SessionUpdate {
@@ -39,36 +41,45 @@ function toolUpdate(id: string): SessionUpdate {
   };
 }
 
-/** Build a fresh CompactingSession wrapping a MemorySession. */
+/**
+ * Build a fresh compacting-on-memory chain for tests. Returns the
+ * composed `Session` alongside its component `compactor` and
+ * `memory` instances so tests can inspect the layers individually.
+ */
 function freshCompacting(
-  opts: ConstructorParameters<typeof CompactingSession>[1] = {},
+  opts: ConstructorParameters<typeof CompactingSession>[0] = {},
 ) {
-  return new CompactingSession(new MemorySession(), opts);
+  const memory = new InMemorySession();
+  const compactor = new CompactingSession(opts);
+  const session: Session = new ChainedSession([compactor, memory]);
+  return { session, compactor, memory };
 }
 
 describe("CompactingSession", () => {
   it("appends without compacting under threshold", async () => {
-    const s = freshCompacting({ threshold: 10, keep: 4 });
-    for (let i = 0; i < 5; i++) await s.push(userMsg(`m${i}`));
-    const events = await s.pull([]);
+    const { session } = freshCompacting({ threshold: 10, keep: 4 });
+    for (let i = 0; i < 5; i++) await session.push?.(userMsg(`m${i}`));
+    const events = (await session.pull?.([])) ?? [];
     expect(events).toHaveLength(5);
   });
 
   it("compacts on threshold and keeps tail intact", async () => {
     const events: { before: number; after: number }[] = [];
-    const s = freshCompacting({
+    const { session, compactor } = freshCompacting({
       threshold: 10,
       keep: 4,
       onCompact: (info) => events.push(info),
     });
     for (let i = 0; i < 12; i++) {
-      await s.push(i % 2 === 0 ? userMsg(`u${i}`) : agentMsg(`a${i}`));
+      await session.push?.(i % 2 === 0 ? userMsg(`u${i}`) : agentMsg(`a${i}`));
     }
     // Auto-compaction is per-turn (via prepareTurn). Standalone use
+    // pulls once (so the compactor sees the events below) and then
     // calls compactNow() to trigger.
-    await s.compactNow();
+    await session.pull?.([]);
+    await compactor.compactNow();
     expect(events.length).toBeGreaterThanOrEqual(1);
-    const out = await s.pull([]);
+    const out = (await session.pull?.([])) ?? [];
     // Head is the synthetic summary pair we inject (2 events).
     const head = out[0];
     const body = out[1];
@@ -112,67 +123,77 @@ describe("CompactingSession", () => {
   });
 
   it("holds last usage in memory and filters from the durable log", async () => {
-    const s = freshCompacting({ threshold: 1000, keep: 2 });
-    await s.push(userMsg("hi"));
-    await s.push({
+    const { session, compactor, memory } = freshCompacting({
+      threshold: 1000,
+      keep: 2,
+    });
+    await session.push?.(userMsg("hi"));
+    await session.push?.({
       sessionUpdate: "usage_update",
       used: 1234,
       size: 200000,
     });
-    await s.push(agentMsg("there"));
-    await s.push({
+    await session.push?.(agentMsg("there"));
+    await session.push?.({
       sessionUpdate: "usage_update",
       used: 1500,
       size: 200000,
     });
-    // The pulled view reflects only the durable log — usage_update events
-    // don't pollute the inner session.
-    const events = await s.pull([]);
+    // The pulled view reflects only the durable log — usage_update
+    // events were swallowed by the compactor and never reached memory.
+    const events = (await session.pull?.([])) ?? [];
     expect(events).toHaveLength(2);
     expect(
       events.find((e) => e.sessionUpdate === "usage_update"),
     ).toBeUndefined();
-    // Most-recent usage values are exposed via getters.
-    expect(s.tokensInContext).toBe(1500);
-    expect(s.contextWindow).toBe(200000);
+    expect(
+      (await memory.pull([])).find((e) => e.sessionUpdate === "usage_update"),
+    ).toBeUndefined();
+    // Most-recent usage values are exposed via getters on the compactor.
+    expect(compactor.tokensInContext).toBe(1500);
+    expect(compactor.contextWindow).toBe(200000);
   });
 
   it("compacts on tokenThreshold when usage data is present", async () => {
     const compactions: { before: number; after: number }[] = [];
-    const s = freshCompacting({
+    const { session, compactor } = freshCompacting({
       threshold: 1000, // event-count threshold; not reached
       tokenThreshold: 500,
       keep: 2,
       onCompact: (info) => compactions.push(info),
     });
     // Append a few events and a usage_update under the bar — no compaction.
-    await s.push(userMsg("a"));
-    await s.push(agentMsg("b"));
-    await s.push(userMsg("c"));
-    await s.push(agentMsg("d"));
-    await s.push(userMsg("e"));
-    await s.push({
+    await session.push?.(userMsg("a"));
+    await session.push?.(agentMsg("b"));
+    await session.push?.(userMsg("c"));
+    await session.push?.(agentMsg("d"));
+    await session.push?.(userMsg("e"));
+    await session.push?.({
       sessionUpdate: "usage_update",
       used: 100,
       size: 200000,
     });
+    // Pull so the compactor sees the events below it (the runtime does
+    // this every turn when assembling the prompt).
+    await session.pull?.([]);
     // Fake a context-fresh: no compaction expected.
-    await s.prepareTurn({
+    await compactor.prepareTurn({
       harness: { run: async () => ({ stopReason: "end_turn" }) },
-      session: s,
+      session,
       systemPromptCore: "",
       agentName: "t",
     });
     expect(compactions).toHaveLength(0);
     // Now report a usage that crosses the bar — compaction trips.
-    await s.push({
+    await session.push?.({
       sessionUpdate: "usage_update",
       used: 600,
       size: 200000,
     });
-    await s.prepareTurn({
+    await session.pull?.([]);
+    await compactor.prepareTurn({
       harness: { run: async () => ({ stopReason: "end_turn" }) },
-      session: s,
+      session,
       systemPromptCore: "",
       agentName: "t",
     });
@@ -180,11 +201,16 @@ describe("CompactingSession", () => {
   });
 
   it("force compactNow works regardless of threshold", async () => {
-    const s = freshCompacting({ threshold: 1000, keep: 2 });
-    for (let i = 0; i < 8; i++) await s.push(userMsg(`m${i}`));
-    const info = await s.compactNow();
+    const { session, compactor } = freshCompacting({
+      threshold: 1000,
+      keep: 2,
+    });
+    for (let i = 0; i < 8; i++) await session.push?.(userMsg(`m${i}`));
+    // Pull populates the compactor's view of `below`.
+    await session.pull?.([]);
+    const info = await compactor.compactNow();
     expect(info).not.toBeNull();
-    const out = await s.pull([]);
+    const out = (await session.pull?.([])) ?? [];
     expect(out.length).toBeLessThan(8);
   });
 
@@ -215,7 +241,7 @@ describe("CompactingSession", () => {
   });
 
   it("plugs into runAgent as a Session instance", async () => {
-    const s = freshCompacting({ threshold: 6, keep: 2 });
+    const { session } = freshCompacting({ threshold: 6, keep: 2 });
     const agent = await runAgent({
       name: "compact-test",
       tools: {},
@@ -228,7 +254,7 @@ describe("CompactingSession", () => {
           [{ say: "ack" }, { stop: "end_turn" }],
         ],
       },
-      session: s,
+      session,
     });
     try {
       await agent.prompt("p1");

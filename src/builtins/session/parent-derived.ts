@@ -2,11 +2,11 @@
  * Parent-derived session factories. Sub-agent only (enforced by
  * `requiresParent: true`).
  *
- *   `fork-of-parent`: snapshot parent's events into a new `MemorySession`
+ *   `fork-of-parent`: snapshot parent's events into a new `InMemorySession`
  *   at fork time; subsequent appends on either side don't bleed.
  */
 
-import { MemorySession } from "./memory.js";
+import { InMemorySession } from "./memory.js";
 import { ResolutionError } from "../../errors.js";
 import type {
   Agent,
@@ -29,7 +29,7 @@ export const forkOfParentSessionFactory: SessionFactory = {
         "fork-of-parent session was instantiated without a parent agent",
       );
     }
-    const session = new MemorySession();
+    const session = new InMemorySession();
     const events = (await parent.session.pull?.([])) ?? [];
     for (const e of events) await session.push(e);
     return session;

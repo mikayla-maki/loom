@@ -56,7 +56,8 @@ function makeCtx(): ToolContext {
   return {
     secrets: {},
     abortSignal: new AbortController().signal,
-    requestPermission: async () => ({ decision: "deny" }),
+    // Deny every permission request (no handler matches the option list).
+    requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
     agent: stubAgent,
   };
 }

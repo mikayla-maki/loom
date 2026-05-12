@@ -1,8 +1,19 @@
 /**
- * CompactingSession — wraps an inner Session and summarises older events
- * past a threshold. Wraps rather than chains because the summary is
- * cached and updated on its own schedule (a pull-side transform would
- * recompute on every read).
+ * CompactingSession — a pull-side session transform that summarises
+ * older events past a threshold. Sits above a storage layer in a
+ * `ChainedSession`; the storage layer keeps the raw event log
+ * unchanged, while this layer presents a compacted view to the layers
+ * above it.
+ *
+ * On `push`, this layer is a passthrough — it lets every non-metadata
+ * event flow downward to be stored. It *does* swallow `usage_update`
+ * events so token usage stays in-memory metadata and never pollutes
+ * the durable log.
+ *
+ * On `pull(below)`, it returns either `below` verbatim (no cached
+ * summary) or `[...cachedSummary, ...below.slice(summarizedThrough)]`
+ * (cache active). The cache is built when the event-count or token
+ * thresholds trip, either inside `prepareTurn` or via `compactNow()`.
  *
  * Default compactor is a deterministic heuristic. Use `modelCompactor()`
  * for model-driven summarisation. Compaction never splits a tool_call
@@ -16,13 +27,11 @@ import type {
   Harness,
   Session,
   SessionFactory,
-  ToolRef,
-  TrustedPath,
 } from "../../types/interfaces.js";
 import type { SessionUpdate } from "../../types/acp.js";
-import type { AgentManifest } from "../../types/manifest.js";
 import { summarise } from "../../sdk/session-utils.js";
-import { MemorySession } from "./memory.js";
+import { ChainedSession } from "../../runtime/session-chain.js";
+import { InMemorySession } from "./memory.js";
 import { FileSession } from "./file.js";
 
 export interface Compactor {
@@ -53,7 +62,11 @@ export interface CompactingSessionOptions {
   onCompact?: (info: { before: number; after: number }) => void;
 }
 
-/** Wraps an inner session and summarises older events past a threshold. */
+/**
+ * A pull-side transform that summarises older events past a threshold.
+ * Designed to live in a `ChainedSession` above a storage layer (e.g.
+ * `InMemorySession` or `FileSession`).
+ */
 export class CompactingSession implements Session {
   /** Cached summary events covering events `[0, summarizedThrough)`. */
   private cachedSummary: SessionUpdate[] | null = null;
@@ -62,6 +75,14 @@ export class CompactingSession implements Session {
   /** Most recent `used`/`size` from a `usage_update` event. */
   private lastUsed: number | null = null;
   private lastSize: number | null = null;
+  /**
+   * Snapshot of `below` from the most recent `pull(below)` call.
+   * Used by `prepareTurn` and `compactNow` to inspect what the chain
+   * below us currently holds. Stays empty until the first pull —
+   * which is fine, because the runtime calls `pull` before every
+   * turn when assembling the prompt.
+   */
+  private latestBelow: SessionUpdate[] = [];
   private readonly threshold: number;
   private readonly tokenThreshold: number | null;
   private readonly keep: number;
@@ -71,10 +92,7 @@ export class CompactingSession implements Session {
     after: number;
   }) => void;
 
-  constructor(
-    private readonly inner: Session,
-    opts: CompactingSessionOptions = {},
-  ) {
+  constructor(opts: CompactingSessionOptions = {}) {
     this.threshold = opts.threshold ?? 40;
     this.tokenThreshold = opts.tokenThreshold ?? null;
     this.keep = opts.keep ?? 10;
@@ -88,22 +106,24 @@ export class CompactingSession implements Session {
 
   async push(update: SessionUpdate): Promise<SessionUpdate[]> {
     if (update.sessionUpdate === "usage_update") {
-      // Track in memory; don't pollute the inner log with metadata.
+      // Track in memory; don't pollute the storage layer with metadata.
       this.lastUsed = update.used;
       this.lastSize = update.size;
       return [];
     }
-    return await (this.inner.push?.(update) ?? [update]);
+    // Pass everything else through unchanged. The layer(s) below us
+    // own storage.
+    return [update];
   }
 
-  async pull(_below: SessionUpdate[]): Promise<SessionUpdate[]> {
-    // Wrapping: ignore `_below` and pull from inner directly.
-    const innerEvents = await (this.inner.pull?.([]) ?? []);
+  async pull(below: SessionUpdate[]): Promise<SessionUpdate[]> {
+    // Snapshot a fresh array so later layers can't mutate our view.
+    this.latestBelow = below.slice();
     if (this.cachedSummary && this.summarizedThrough > 0) {
-      const recent = innerEvents.slice(this.summarizedThrough);
+      const recent = below.slice(this.summarizedThrough);
       return [...this.cachedSummary, ...recent];
     }
-    return innerEvents;
+    return below;
   }
 
   /** Most recent `used` value seen on a `usage_update`, or null. */
@@ -118,20 +138,39 @@ export class CompactingSession implements Session {
 
   /** Per-turn hook. Compacts if token- or event-threshold is met. */
   async prepareTurn(agent: Agent): Promise<void> {
-    if (await this.shouldCompact()) {
+    // Refresh our view of events below us before checking thresholds.
+    // ChainedSession.pull cascades down to the storage layer and back
+    // up through us, populating `latestBelow` along the way. Doing
+    // this here — instead of relying on whoever last pulled — keeps
+    // the per-turn compaction decision based on the current event
+    // count, matching the pre-chain behaviour where `inner.pull([])`
+    // was always live.
+    if (agent.session?.pull) {
+      try {
+        await agent.session.pull([]);
+      } catch {
+        // If the chain isn't accessible, fall back to the cached
+        // `latestBelow` snapshot (token-threshold checks still work
+        // regardless).
+      }
+    }
+    if (this.shouldCompact()) {
       await this.runCompaction(agent.harness, false);
     }
   }
 
-  private async shouldCompact(): Promise<boolean> {
+  private shouldCompact(): boolean {
     if (this.tokenThreshold !== null && this.lastUsed !== null) {
       return this.lastUsed >= this.tokenThreshold;
     }
-    const innerEvents = await (this.inner.pull?.([]) ?? []);
-    return innerEvents.length >= this.threshold;
+    return this.latestBelow.length >= this.threshold;
   }
 
-  /** Force a compaction pass regardless of the threshold. */
+  /**
+   * Force a compaction pass regardless of the threshold. Uses the
+   * event snapshot from the most recent `pull(below)` call. If no
+   * pull has happened yet, returns null (no events to compact).
+   */
   async compactNow(
     harness: Harness | null = null,
   ): Promise<{ before: number; after: number } | null> {
@@ -143,16 +182,16 @@ export class CompactingSession implements Session {
     force: boolean,
   ): Promise<{ before: number; after: number } | null> {
     if (this.compacting) return null;
-    const innerEvents = await (this.inner.pull?.([]) ?? []);
-    const before = innerEvents.length;
+    const events = this.latestBelow;
+    const before = events.length;
     let cutoff = before - this.keep;
     if (!force && cutoff < 2) return null;
-    cutoff = adjustForToolPairs(innerEvents, cutoff);
+    cutoff = adjustForToolPairs(events, cutoff);
     if (cutoff < 1) return null;
 
     this.compacting = true;
     try {
-      const slice = innerEvents.slice(0, cutoff);
+      const slice = events.slice(0, cutoff);
       const replacement = await Promise.resolve(this.compactor(slice, harness));
       this.cachedSummary = replacement;
       this.summarizedThrough = cutoff;
@@ -334,107 +373,58 @@ function previewJson(v: unknown): string {
   }
 }
 
-// ─── Convenience builders ────────────────────────────────────────────────
+// ─── Convenience builders ───────────────────────────────────────
 
-/** Compacting session backed by an in-memory log. */
+/**
+ * Sugar for the common "compacting on top of in-memory storage" chain.
+ * Returns a composed `Session` ready to pass to `runAgent`.
+ *
+ * SDK consumers who want access to the `CompactingSession` instance
+ * (e.g. to wire `compactNow()` to a `/compact` slash command) should
+ * construct the chain explicitly instead:
+ *
+ * ```ts
+ * const compactor = new CompactingSession(opts);
+ * const storage = new InMemorySession();
+ * const session = new ChainedSession([compactor, storage]);
+ * ```
+ */
 export function compactingMemorySession(
   opts: CompactingSessionOptions = {},
-): CompactingSession {
-  return new CompactingSession(new MemorySession(), opts);
+): Session {
+  return new ChainedSession([
+    new CompactingSession(opts),
+    new InMemorySession(),
+  ]);
 }
 
-/** Compacting session backed by a file log. */
+/** Compacting session backed by a file log. See {@link compactingMemorySession}. */
 export function compactingFileSession(
   filePath: string,
   opts: CompactingSessionOptions = {},
-): CompactingSession {
-  return new CompactingSession(new FileSession(filePath), opts);
-}
-
-// ─── ChainedSession — chain composition primitive ────────────────────────
-
-/**
- * Composes N sessions as a pipeline. `push` flows top-to-bottom (each
- * child may transform/drop/fan-out); `pull` flows bottom-to-top.
- * Other hooks (prepareTurn, systemPromptSection, tools, trustedPaths,
- * dependencies, close) are aggregated across children.
- */
-export class ChainedSession implements Session {
-  constructor(private readonly children: readonly Session[]) {}
-
-  async push(event: SessionUpdate): Promise<SessionUpdate[]> {
-    let events: SessionUpdate[] = [event];
-    for (const child of this.children) {
-      const out: SessionUpdate[] = [];
-      for (const e of events) {
-        const forwarded = (await child.push?.(e)) ?? [e];
-        out.push(...forwarded);
-      }
-      events = out;
-      if (events.length === 0) break;
-    }
-    return events;
-  }
-
-  async pull(below: SessionUpdate[]): Promise<SessionUpdate[]> {
-    let events = below;
-    for (const child of [...this.children].reverse()) {
-      events = (await child.pull?.(events)) ?? events;
-    }
-    return events;
-  }
-
-  async prepareTurn(agent: Agent): Promise<void> {
-    for (const c of this.children) await c.prepareTurn?.(agent);
-  }
-
-  async systemPromptSection(agent: Agent): Promise<string> {
-    const parts: string[] = [];
-    for (const c of this.children) {
-      const part = await c.systemPromptSection?.(agent);
-      if (part) parts.push(part);
-    }
-    return parts.join("\n\n");
-  }
-
-  async tools(): Promise<ToolRef[]> {
-    const all: ToolRef[] = [];
-    for (const c of this.children) {
-      const ts = (await c.tools?.()) ?? [];
-      all.push(...ts);
-    }
-    return all;
-  }
-
-  async trustedPaths(): Promise<TrustedPath[]> {
-    // Concat without dedup; the audit/consuming layer merges duplicates.
-    const all: TrustedPath[] = [];
-    for (const c of this.children) {
-      const ps = (await c.trustedPaths?.()) ?? [];
-      all.push(...ps);
-    }
-    return all;
-  }
-
-  get dependencies(): { subagents?: AgentManifest[] } {
-    const subagents: AgentManifest[] = [];
-    for (const c of this.children) {
-      subagents.push(...(c.dependencies?.subagents ?? []));
-    }
-    return subagents.length > 0 ? { subagents } : {};
-  }
-
-  async close(): Promise<void> {
-    for (const c of this.children) await c.close?.();
-  }
+): Session {
+  return new ChainedSession([
+    new CompactingSession(opts),
+    new FileSession(filePath),
+  ]);
 }
 
 // ─── Factories ───────────────────────────────────────────────────────────
 
 /**
- * Config (all optional): `threshold`, `keep`. Wraps `MemorySession` by
- * default; SDK consumers needing other backends should construct
- * `CompactingSession` directly.
+ * Config (all optional): `threshold`, `keep`. Builds a pull-side
+ * compacting transform. In v5 manifests this is meant to be a layer
+ * in a `[session].layers` composition; the layer(s) below it own
+ * storage. For example:
+ *
+ * ```toml
+ * [session]
+ * layers = ["compacting", "memory"]
+ * ```
+ *
+ * Using `compacting` alone (singleton `[session]`) yields a no-op
+ * transform with no storage layer below — events pass through and
+ * are not retained.
  */
 export const compactingSessionFactory: SessionFactory = {
   name: "compacting",
@@ -446,6 +436,6 @@ export const compactingSessionFactory: SessionFactory = {
     const opts: CompactingSessionOptions = {};
     if (typeof config.threshold === "number") opts.threshold = config.threshold;
     if (typeof config.keep === "number") opts.keep = config.keep;
-    return new CompactingSession(new MemorySession(), opts);
+    return new CompactingSession(opts);
   },
 };

@@ -192,8 +192,27 @@ export interface AgentManifest {
    */
   harness: HarnessSpec | Harness;
 
-  /** Same shape rules as harness. Defaults to memory session if absent. */
-  session?: SessionSpec | Session;
+  /**
+   * The agent's session. One of three forms:
+   *
+   *   - **Singleton** — a single `SessionSpec`. TOML form is
+   *     `[session]` with a `provider` field. The trivial one-layer
+   *     session.
+   *   - **Layered** — a `SessionSpec[]` describing a composition,
+   *     outer-to-inner. TOML form is `[session]` with a `layers`
+   *     array (or the dotted-key array-of-tables
+   *     `[[session.layers]]`). `push` flows top-to-bottom, `pull`
+   *     flows bottom-to-top; other hooks (`tools`, `prepareTurn`,
+   *     `systemPromptSection`, etc.) aggregate across layers.
+   *   - **Pre-built instance** — a constructed `Session` the runtime
+   *     uses directly. Bypasses manifest resolution; useful when you
+   *     want a direct reference to the underlying layers from SDK
+   *     code.
+   *
+   * Absent → runtime uses the default chain `skills → compacting →
+   * memory` (skills silently no-op when `~/.skills` is missing).
+   */
+  session?: SessionSpec | SessionSpec[] | Session;
 
   /**
    * Top-level tools, model-facing name → entry. Absent → loom

@@ -92,11 +92,29 @@ import type {
   SessionSpec,
 } from "../types/manifest.js";
 
+import { ChainedSession } from "../runtime/session-chain.js";
+
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 
 export const LOOM_VERSION = "0.1.0";
 
-const DEFAULT_SESSION: SessionSpec = { provider: "memory" };
+/**
+ * Default session chain applied when the manifest omits the
+ * `[session]` block entirely. Outer-to-inner: `skills` auto-loads
+ * any agent skills under `~/.skills` (silently no-op when the
+ * directory is absent); `compacting` bounds context growth;
+ * `in-memory` owns volatile storage. Users who want different
+ * policy write a `[session]` block explicitly.
+ *
+ * All three layers use their factories' built-in defaults
+ * (`skills` scans `~/.skills`; `compacting` threshold 40 / keep 10
+ * with the heuristic compactor; `in-memory` is stateless).
+ */
+const DEFAULT_SESSION_CHAIN: SessionSpec[] = [
+  { provider: "skills" },
+  { provider: "compacting" },
+  { provider: "in-memory" },
+];
 
 /** Default capability grants applied when both `[tools]` and `[capabilities]` are absent. */
 const DEFAULT_TOP_LEVEL_CAPABILITIES = {
@@ -212,8 +230,12 @@ export async function runAgent(
           options.parent,
         )
       : (manifest.harness as Harness);
+  // Detect pre-built `Session` instance: not an array (arrays are
+  // `SessionSpec[]` chains) and not carrying a `provider` field.
   const session =
-    manifest.session && !("provider" in manifest.session)
+    manifest.session &&
+    !Array.isArray(manifest.session) &&
+    !("provider" in manifest.session)
       ? (manifest.session as Session)
       : await instantiateSession(
           resolved.session,
@@ -238,6 +260,7 @@ export async function runAgent(
     resolved,
     toolsIndex,
     sdkTools: options.providers ?? [],
+    session,
     manifest,
     factoryCtx,
     phase1Secrets,
@@ -363,10 +386,31 @@ interface MaterialisedTools {
   contributionName: string;
 }
 
+/**
+ * Adapt a `Session` (typically the composed `ChainedSession`) into
+ * the `Tools` interface so the rest of the binding flow can route
+ * session-contributed tool names through it uniformly. The session
+ * is reachable in the materialised list under the synthetic id
+ * `"(session)"`. Sessions without `resolveTool` produce a Tools
+ * whose `resolveTool` always returns null — the binding flow's
+ * existing fallback chain (native → SDK) takes over.
+ */
+function sessionAsTools(session: Session): Tools {
+  return {
+    async resolveTool(name, config, agent, capabilities) {
+      if (!session.resolveTool) return null;
+      return Promise.resolve(
+        session.resolveTool(name, config, agent, capabilities),
+      );
+    },
+  };
+}
+
 async function materialiseTools_all(args: {
   resolved: ResolvedManifest;
   toolsIndex: ToolsIndex;
   sdkTools: Tools[];
+  session: Session;
   manifest: AgentManifest;
   factoryCtx: FactoryContext;
   phase1Secrets: Record<string, string>;
@@ -421,6 +465,18 @@ async function materialiseTools_all(args: {
       contributionName: contribution.name,
     });
   }
+
+  // The agent's session, adapted to the Tools interface. Routes
+  // session-contributed tool names through `session.resolveTool` (or
+  // returns null when the session doesn't implement it, in which case
+  // the binding flow's native+SDK fallback kicks in).
+  out.push({
+    id: "(session)",
+    tools: sessionAsTools(args.session),
+    config: {},
+    secrets: {},
+    contributionName: "(session)",
+  });
 
   // SDK-supplied Tools instances are appended; they're addressable only
   // by SDK-direct callers (not by manifest [tools] entries).
@@ -494,6 +550,7 @@ async function bindTools(
   // names get claimed by the SDK Tools) without requiring per-tool
   // bindings.
   const sdkChain = instances.filter((m) => m.id.startsWith("(sdk-"));
+  const nativeInstance = instances.find((m) => m.id === "native");
 
   const resolved = new Map<string, Tool>();
   for (const binding of bindings) {
@@ -514,13 +571,23 @@ async function bindTools(
         grant,
       ),
     );
-    // Fallback: when the assigned Tools instance declines (likely the
-    // native Tools being asked for a non-builtin tool name), walk the
-    // SDK-supplied Tools as a chain.
-    if (!tool && binding.providerInstanceId === "native") {
-      for (const sdk of sdkChain) {
+    // Fallback chain. Two cases:
+    //   * native bindings fall back to SDK-supplied Tools.
+    //   * session-contributed bindings (`(session)`) fall back to
+    //     native first, then SDK — this is how skills-style sessions
+    //     (advertise `bash` without owning it) keep working alongside
+    //     self-implementing sessions (own their own tools' impls).
+    if (!tool) {
+      const fallbackChain: MaterialisedTools[] = [];
+      if (binding.providerInstanceId === "(session)") {
+        if (nativeInstance) fallbackChain.push(nativeInstance);
+        fallbackChain.push(...sdkChain);
+      } else if (binding.providerInstanceId === "native") {
+        fallbackChain.push(...sdkChain);
+      }
+      for (const fallback of fallbackChain) {
         tool = await Promise.resolve(
-          sdk.tools.resolveTool(
+          fallback.tools.resolveTool(
             binding.toolName,
             binding.toolConfig,
             ownAgent,
@@ -550,9 +617,14 @@ async function collectSessionToolBindings(
   session: Session,
 ): Promise<ToolBinding[]> {
   const tools = (await session.tools?.()) ?? [];
+  // Route session-contributed names through the synthetic
+  // `"(session)"` Tools instance materialised in `materialiseTools_all`.
+  // That instance's `resolveTool` calls back into the session's own
+  // `resolveTool` if it has one; if not (skills pattern) it returns
+  // null and the fallback chain in `bindTools` kicks over to native.
   return tools.map((ref) => ({
     toolName: ref.name,
-    providerInstanceId: "native",
+    providerInstanceId: "(session)",
     toolConfig: typeof ref.config === "string" ? {} : ref.config,
     origin: "(session)",
   }));
@@ -587,30 +659,43 @@ async function instantiateHarness(
 }
 
 async function instantiateSession(
-  binding: SessionBinding | undefined,
+  bindings: SessionBinding[] | undefined,
   factoryCtx: FactoryContext,
   phase1Secrets: Record<string, string>,
   parent: Agent | undefined,
 ): Promise<Session> {
-  // Default session is the in-process `memory` factory.
-  const effective: SessionBinding = binding ?? {
-    factoryName: "memory",
-    config: {},
-  };
-  const factory = lookupFactoryByBinding(
-    effective.factoryName,
-    effective.source,
-    getSessionFactory,
-  );
-  const { instance } = await instantiateFromBinding<Session>(
-    effective,
-    () => factory,
-    factoryCtx,
-    secretsFor(phase1Secrets, factory.secrets),
-    parent,
-    "session",
-  );
-  return instance;
+  // Default chain when the manifest omits the session section: build
+  // bindings from DEFAULT_SESSION_CHAIN. Each spec has only a
+  // `provider` field, so config is empty.
+  const effective: SessionBinding[] =
+    bindings && bindings.length > 0
+      ? bindings
+      : DEFAULT_SESSION_CHAIN.map((spec) => ({
+          factoryName: spec.provider as string,
+          config: {},
+        }));
+
+  const instances: Session[] = [];
+  for (const binding of effective) {
+    const factory = lookupFactoryByBinding(
+      binding.factoryName,
+      binding.source,
+      getSessionFactory,
+    );
+    const { instance } = await instantiateFromBinding<Session>(
+      binding,
+      () => factory,
+      factoryCtx,
+      secretsFor(phase1Secrets, factory.secrets),
+      parent,
+      "session",
+    );
+    instances.push(instance);
+  }
+  // Length-1 chains return the inner session directly: keeps the
+  // trivial case cheap and avoids a no-op ChainedSession wrapper.
+  if (instances.length === 1) return instances[0]!;
+  return new ChainedSession(instances);
 }
 
 // ─── 4 + 9. secrets pipeline ──────────────────────────────────────────────
@@ -656,10 +741,10 @@ function collectPhase1SecretNeeds(
       // Surfaced later by instantiateHarness.
     }
   }
-  // Session factory needs.
-  if (resolved.session) {
+  // Session factory needs (per chain link).
+  for (const link of resolved.session ?? []) {
     try {
-      const f = getSessionFactory(resolved.session.factoryName);
+      const f = getSessionFactory(link.factoryName);
       pushNeeds(out, f.secrets, `session:${f.name}`);
     } catch {
       // Surfaced later by instantiateSession.

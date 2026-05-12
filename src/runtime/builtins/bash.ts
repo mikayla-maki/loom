@@ -20,24 +20,38 @@
  * sandbox availability.
  *
  * Env semantics (asymmetric with paths/network on purpose — see below):
- *   env absent          → SAFE-DEFAULTS subset of process.env (PATH,
- *                         HOME, USER, TERM, locale, etc.) is passed
- *                         through. NO credentials, tokens, or secrets.
- *                         The exact list is `SAFE_DEFAULT_ENV_NAMES`
- *                         below; tools that want strict no-env should
- *                         set `env = []` explicitly.
+ *
+ * The env is built from two tiers, both drawn from `process.env`:
+ *
+ *   - **Tier 1 — ALWAYS_INHERITED_ENV.** Identity + terminal + locale
+ *     plumbing (HOME, USER, LANG, TERM, TZ, …). Always present in the
+ *     child env regardless of grant. Even `env = []` keeps these —
+ *     a hermetic shell with broken locale and no `$HOME` isn't
+ *     hermetic, it's broken. None of these names can redirect what
+ *     code executes.
+ *   - **Tier 2 — DEFAULT_INHERITED_ENV.** Useful-but-overrideable
+ *     defaults (PATH, PWD, TMPDIR, EDITOR, VISUAL, PAGER). Included
+ *     when the grant doesn't specify `env`; dropped when `env` is
+ *     an explicit list. Users who want to substitute their own PATH
+ *     write `env = ["PATH"]` (or set PATH inside the bash command).
+ *
+ * Full grant table:
+ *
+ *   env absent          → Tier 1 + Tier 2 (the typical convenient case).
  *   env = "*"           → process.env passed through unfiltered.
- *   env = []            → empty env (explicit opt-out of safe defaults).
- *   env = ["NAME"]      → exact name from process.env.
- *   env = ["AWS_*"]     → prefix match — every name starting with
- *                         `AWS_`. Trailing `*` only; no other glob
- *                         metacharacters. Mixable with exact names:
+ *   env = []            → Tier 1 only (hermetic-but-functional shell).
+ *   env = ["NAME"]      → Tier 1 + exact name from process.env.
+ *   env = ["AWS_*"]     → Tier 1 + prefix match — every name starting
+ *                         with `AWS_`. Trailing `*` only; no other
+ *                         glob metacharacters. Mixable with exact:
  *                         `env = ["AWS_*", "PATH"]`.
  *
  * The asymmetry: absent = denied is the right default for `paths` and
- * `network` (less access is safer). For `env`, absent = empty would
+ * `network` (less access is safer). For `env`, absent = nothing would
  * break command resolution entirely, which would push users toward
- * `"*"` (full leak). Smart defaults is the actually-safe middle.
+ * `"*"` (full leak). Smart defaults is the actually-safe middle, and
+ * Tier 1's always-on guarantee means an explicit list never
+ * accidentally strips terminal sanity.
  */
 
 import { spawn } from "node:child_process";
@@ -66,26 +80,50 @@ import {
 import { describePaths, paths, resolvedPaths } from "./_path.js";
 
 /**
- * Curated env names passed through to bash when `env` is not
- * explicitly granted. Conservative: things shells need to function
- * (PATH, locale, terminal info) and nothing that looks like a
- * credential. Exported so audit + description rendering can show the
- * exact list.
+ * Always passed through to bash, regardless of the `env` capability.
+ * Identity, terminal, and locale plumbing — you cannot run a sane
+ * shell without these and none of them can redirect what code
+ * executes (no PATH-like effects, no preload-attack vectors).
  */
-export const SAFE_DEFAULT_ENV_NAMES = [
-  "PATH",
+export const ALWAYS_INHERITED_ENV = [
   "HOME",
   "USER",
   "LOGNAME",
   "SHELL",
-  "PWD",
   "TERM",
   "COLORTERM",
   "LANG",
   "LC_ALL",
   "LC_CTYPE",
   "TZ",
+] as const;
+
+/**
+ * Passed through when `env` is absent from the grant. Replaced (not
+ * extended) when `env` is an explicit list — if you write `env = []`
+ * you get only Tier 1; if you write `env = ["FOO"]` you get Tier 1
+ * + FOO. These are useful-by-default but plausibly overrideable: PATH
+ * controls command resolution, TMPDIR controls temp-file location,
+ * EDITOR/VISUAL/PAGER influence which program a tool spawns when it
+ * wants to defer to user preference.
+ */
+export const DEFAULT_INHERITED_ENV = [
+  "PATH",
+  "PWD",
   "TMPDIR",
+  "EDITOR",
+  "VISUAL",
+  "PAGER",
+] as const;
+
+/**
+ * Union of Tier 1 + Tier 2 — what `env`-absent gets. Exported for
+ * audit / description rendering so docs and the help text stay in
+ * lockstep with the code.
+ */
+export const SAFE_DEFAULT_ENV_NAMES = [
+  ...ALWAYS_INHERITED_ENV,
+  ...DEFAULT_INHERITED_ENV,
 ] as const;
 
 /**
@@ -303,15 +341,23 @@ export class BashTool implements Tool {
 }
 
 /** Build the env passed to spawn() from the grant. See top-of-file for semantics. */
-function buildEnv(grant: CapabilitySet): NodeJS.ProcessEnv {
+export function buildEnv(grant: CapabilitySet): NodeJS.ProcessEnv {
   if (grant === "*") return process.env;
   const e = grant.env;
-  if (e === undefined) return pickEnv(SAFE_DEFAULT_ENV_NAMES);
   if (e === "*") return process.env;
-  if (Array.isArray(e)) {
-    return pickEnv(e.filter((n): n is string => typeof n === "string"));
+  if (e === undefined) {
+    // Convenient default: Tier 1 (always-on) + Tier 2 (overrideable).
+    return pickEnv([...ALWAYS_INHERITED_ENV, ...DEFAULT_INHERITED_ENV]);
   }
-  return {};
+  if (Array.isArray(e)) {
+    // Explicit grant: Tier 1 stays, Tier 2 dropped, plus whatever the
+    // user listed. Tier 1 always wins on dedup since pickEnv keys by name.
+    const requested = e.filter((n): n is string => typeof n === "string");
+    return pickEnv([...ALWAYS_INHERITED_ENV, ...requested]);
+  }
+  // Object form (richer per-kind structure, currently unused for env):
+  // treat as Tier 1 only.
+  return pickEnv(ALWAYS_INHERITED_ENV);
 }
 
 /**
@@ -365,19 +411,21 @@ function describeBash(grant: CapabilitySet): string {
         : `Network: limited to ${net.join(", ")}.`,
     );
   }
-  // Env
+  // Env. Tier 1 is always present, so describe what's *added* on top.
   const env = grant.env;
+  const tier1 = ALWAYS_INHERITED_ENV.join(", ");
   if (env === undefined) {
+    const tier2 = DEFAULT_INHERITED_ENV.join(", ");
     lines.push(
-      `Environment: safe defaults (${SAFE_DEFAULT_ENV_NAMES.join(", ")}); no credentials.`,
+      `Environment: always inherited (${tier1}) plus defaults (${tier2}); no credentials.`,
     );
   } else if (env === "*") {
     lines.push("Environment: full passthrough (every process env var).");
   } else if (Array.isArray(env)) {
     lines.push(
       env.length === 0
-        ? "Environment: empty."
-        : `Environment: ${env.join(", ")} only.`,
+        ? `Environment: always inherited only (${tier1}).`
+        : `Environment: always inherited (${tier1}) plus ${env.join(", ")}.`,
     );
   }
   return lines.join(" ");

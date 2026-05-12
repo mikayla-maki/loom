@@ -112,7 +112,7 @@ describe("FileSession", () => {
         toolCallId: "t1",
         title: "bash",
         status: "in_progress",
-        input: { command: "pwd" },
+        rawInput: { command: "pwd" },
       });
       await s.push({
         sessionUpdate: "agent_message_chunk",

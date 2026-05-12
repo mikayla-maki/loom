@@ -14,8 +14,12 @@
   // peer/dev dependency.
   "compilerOptions": {
     "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    // Aligned with the main loom tsconfig so type-only imports into
+    // the loom source tree (which uses CJS interop via `esModuleInterop`)
+    // resolve consistently. NodeNext is stricter about CJS default
+    // imports than the main project's settings and trips on Ajv.
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

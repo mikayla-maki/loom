@@ -57,7 +57,6 @@ describe("ACP round-trip (in-process streams)", () => {
     const { connection: serverConn, closeAll } = serveOverStream(
       async () => agent,
       serverStream,
-      { fixedManifestPath: "<inline>" },
     );
 
     // Build a minimal Client implementation that records the updates

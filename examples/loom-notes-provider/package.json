@@ -1,10 +1,10 @@
 {
-  "name": "loom-demo-provider",
+  "name": "loom-notes-provider",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "main": "./index.js",
-  "description": "Example Loom provider — contributes an echo Tools registration and a tagged-memory session contribution.",
+  "description": "Example Loom provider — contributes a NotesSession with a `remember` tool for persistent cross-session recall.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch",

@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  ChainedSession,
   CompactingSession,
   compactingMemorySession,
 } from "../src/builtins/session/compacting.js";
-import { MemorySession } from "../src/builtins/session/memory.js";
+import { ChainedSession } from "../src/runtime/session-chain.js";
+import { InMemorySession } from "../src/builtins/session/memory.js";
 import { runAgent } from "../src/sdk/run-agent.js";
+import type { TurnStep } from "../src/builtins/harness/test.js";
 import type {
   Agent,
   Runtime,
@@ -37,7 +38,7 @@ describe("Session push/pull semantics", () => {
     const promptOnly: Session = {
       systemPromptSection: () => "# Custom Section",
     };
-    const log = new MemorySession();
+    const log = new InMemorySession();
     const chained = new ChainedSession([log, promptOnly]);
 
     await chained.push(userMsg("hello"));
@@ -66,7 +67,7 @@ describe("Session push/pull semantics", () => {
         return [event];
       },
     };
-    const log = new MemorySession();
+    const log = new InMemorySession();
     const chained = new ChainedSession([fanout, log]);
 
     await chained.push(userMsg("test"));
@@ -84,7 +85,7 @@ describe("Session push/pull semantics", () => {
         return [event];
       },
     };
-    const log = new MemorySession();
+    const log = new InMemorySession();
     const chained = new ChainedSession([redactor, log]);
 
     await chained.push(userMsg("secret"));
@@ -100,7 +101,7 @@ describe("Session push/pull semantics", () => {
   it("pull chain: bottom-to-top transformation", async () => {
     // Three sessions: a leaf log, a session that doubles every text
     // event on pull, and a session that adds a synthetic prefix event.
-    const log = new MemorySession();
+    const log = new InMemorySession();
     const doubler: Session = {
       async pull(below) {
         // Duplicate every event — pulled events are doubled.
@@ -134,7 +135,7 @@ describe("Session push/pull semantics", () => {
     //     log.pull([prefix, prefix]) → [a]  (log ignores upstream)
     //   = [a]
     // Hmm, log replaces because it's a leaf that produces from internal state.
-    // Verify: leaf MemorySession ignores `below`.
+    // Verify: leaf InMemorySession ignores `below`.
     expect(events).toHaveLength(1);
     expect(events[0]?.sessionUpdate).toBe("user_message_chunk");
   });
@@ -241,62 +242,70 @@ describe("Session push/pull semantics", () => {
   });
 });
 
-describe("CompactingSession (wrapping pattern)", () => {
-  it("forwards push to the inner session", async () => {
-    const inner = new MemorySession();
-    const c = new CompactingSession(inner, { threshold: 100, keep: 10 });
-    await c.push(userMsg("a"));
-    await c.push(agentMsg("b"));
+describe("CompactingSession (chain transform)", () => {
+  it("passes pushed events through to the storage layer below", async () => {
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({ threshold: 100, keep: 10 });
+    const session = new ChainedSession([compactor, memory]);
 
-    // Inner sees the events.
-    const innerEvents = await inner.pull([]);
-    expect(innerEvents).toHaveLength(2);
+    await session.push(userMsg("a"));
+    await session.push(agentMsg("b"));
+
+    // Storage layer sees the raw events.
+    const stored = await memory.pull([]);
+    expect(stored).toHaveLength(2);
   });
 
   it("compactNow caches summary and shrinks the pull view", async () => {
-    const inner = new MemorySession();
-    const c = new CompactingSession(inner, { threshold: 100, keep: 2 });
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({ threshold: 100, keep: 2 });
+    const session = new ChainedSession([compactor, memory]);
     for (let i = 0; i < 8; i++) {
-      await c.push(i % 2 === 0 ? userMsg(`u${i}`) : agentMsg(`a${i}`));
+      await session.push(i % 2 === 0 ? userMsg(`u${i}`) : agentMsg(`a${i}`));
     }
 
     // Before compaction, pull returns all 8.
-    expect(await c.pull([])).toHaveLength(8);
+    expect(await session.pull([])).toHaveLength(8);
 
-    await c.compactNow();
+    await compactor.compactNow();
 
     // After compaction: 2 summary events + 2 kept = 4.
-    const after = await c.pull([]);
+    const after = await session.pull([]);
     expect(after).toHaveLength(4);
-    // Inner is unchanged — we only cache the summary.
-    expect(await inner.pull([])).toHaveLength(8);
+    // Storage layer is unchanged — we only cache the summary in the
+    // compactor.
+    expect(await memory.pull([])).toHaveLength(8);
   });
 
-  it("usage_update events don't pollute the inner session", async () => {
-    const inner = new MemorySession();
-    const c = new CompactingSession(inner, { threshold: 100, keep: 2 });
-    await c.push(userMsg("hi"));
-    await c.push({
+  it("usage_update events don't pollute the storage layer", async () => {
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({ threshold: 100, keep: 2 });
+    const session = new ChainedSession([compactor, memory]);
+
+    await session.push(userMsg("hi"));
+    await session.push({
       sessionUpdate: "usage_update",
       used: 1234,
       size: 200000,
     });
-    await c.push(agentMsg("bye"));
+    await session.push(agentMsg("bye"));
 
-    const events = await inner.pull([]);
-    // Inner only sees the two real messages.
-    expect(events).toHaveLength(2);
-    expect(c.tokensInContext).toBe(1234);
-    expect(c.contextWindow).toBe(200000);
+    const stored = await memory.pull([]);
+    // Storage only sees the two real messages.
+    expect(stored).toHaveLength(2);
+    expect(compactor.tokensInContext).toBe(1234);
+    expect(compactor.contextWindow).toBe(200000);
   });
 });
 
 describe("Convenience builders", () => {
-  it("compactingMemorySession returns a CompactingSession wrapping MemorySession", async () => {
+  it("compactingMemorySession returns a composed chain", async () => {
     const s = compactingMemorySession({ threshold: 5, keep: 2 });
-    expect(s).toBeInstanceOf(CompactingSession);
-    await s.push(userMsg("test"));
-    const events = await s.pull([]);
+    // Helper returns the chain wrapper, not a raw CompactingSession.
+    expect(s).toBeInstanceOf(ChainedSession);
+    expect(s).not.toBeInstanceOf(CompactingSession);
+    await s.push?.(userMsg("test"));
+    const events = (await s.pull?.([])) ?? [];
     expect(events).toHaveLength(1);
   });
 });
@@ -323,7 +332,7 @@ describe("End-to-end: ChainedSession through runAgent", () => {
           return [{ stop: "end_turn" }];
         },
       },
-      session: new ChainedSession([new MemorySession()]),
+      session: new ChainedSession([new InMemorySession()]),
     });
     try {
       await agent.prompt("hello world");
@@ -331,6 +340,87 @@ describe("End-to-end: ChainedSession through runAgent", () => {
     } finally {
       await agent.close();
     }
+  });
+
+  it("manifest-form SessionSpec[] chain (compacting + memory) actually compacts", async () => {
+    // End-to-end: declare a chain via SessionSpec[] on the manifest;
+    // runAgent assembles a ChainedSession internally; compaction
+    // fires once enough events accrue.
+    const turns: TurnStep[][] = [];
+    for (let i = 0; i < 6; i++)
+      turns.push([{ say: "ack" }, { stop: "end_turn" }]);
+    const agent = await runAgent({
+      name: "chain-runs",
+      systemPrompt: "x",
+      tools: {},
+      harness: { provider: "test", script: turns },
+      // Aggressive thresholds so the test can drive compaction in a
+      // small number of turns.
+      session: [
+        { provider: "compacting", threshold: 6, keep: 2 },
+        { provider: "in-memory" },
+      ],
+    });
+    try {
+      for (let i = 0; i < 6; i++) await agent.prompt(`p${i}`);
+      const events = (await agent.session.pull?.([])) ?? [];
+      const first = events[0];
+      if (
+        first &&
+        first.sessionUpdate === "user_message_chunk" &&
+        first.content.type === "text"
+      ) {
+        // Heuristic compactor's summary always opens with this banner.
+        expect(first.content.text).toMatch(/summary/i);
+      } else {
+        throw new Error("expected first event to be the synthetic summary");
+      }
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("manifest-form chain order is honoured (outer-to-inner)", async () => {
+    // Two pass-through layers that mark events on the way through;
+    // chain order should be reflected in the prompt order.
+    const order: string[] = [];
+    const layerA: Session = {
+      async push(e) {
+        order.push("A:push");
+        return [e];
+      },
+      async pull(below) {
+        order.push("A:pull");
+        return below;
+      },
+    };
+    const layerB: Session = {
+      async push(e) {
+        order.push("B:push");
+        return [e];
+      },
+      async pull(below) {
+        order.push("B:pull");
+        return below;
+      },
+    };
+    const chain = new ChainedSession([layerA, layerB, new InMemorySession()]);
+    await chain.push(userMsg("hi"));
+    await chain.pull([]);
+    // push: outer→inner → A then B (memory has no push hook → defaults to passthrough).
+    // pull: inner→outer → B then A (memory has its own pull that ignores below).
+    expect(order.filter((s) => s.startsWith("A"))).toEqual([
+      "A:push",
+      "A:pull",
+    ]);
+    expect(order.filter((s) => s.startsWith("B"))).toEqual([
+      "B:push",
+      "B:pull",
+    ]);
+    // Outer-to-inner ordering on push.
+    expect(order.indexOf("A:push")).toBeLessThan(order.indexOf("B:push"));
+    // Inner-to-outer ordering on pull.
+    expect(order.indexOf("B:pull")).toBeLessThan(order.indexOf("A:pull"));
   });
 
   it("a session contributing tools via tools() registers them at boot", async () => {
@@ -351,6 +441,76 @@ describe("End-to-end: ChainedSession through runAgent", () => {
     try {
       const tools = agent.agentState.toolTable.list().map((t) => t.name);
       expect(tools).toContain("echo");
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("a session that implements resolveTool owns its contributed tools' implementations", async () => {
+    // The full self-implementing pattern: session both advertises a
+    // tool name (via tools()) AND owns its impl (via resolveTool). No
+    // separate Tools registration; no [tools.X] entry in the manifest.
+    let executed = 0;
+    const selfImplementingSession: Session = {
+      tools: () => [{ name: "ping", config: {} }],
+      resolveTool(name, _config, _agent, _capabilities) {
+        if (name !== "ping") return null;
+        return {
+          name: "ping",
+          description: "Returns pong.",
+          inputSchema: { type: "object", additionalProperties: false },
+          async execute() {
+            executed++;
+            return { content: "pong" };
+          },
+        };
+      },
+    };
+    const agent = await runAgent({
+      name: "self-impl-session",
+      systemPrompt: "x",
+      tools: {},
+      capabilities: { ping: "*" },
+      harness: { provider: "test" },
+      session: selfImplementingSession,
+    });
+    try {
+      const tools = agent.agentState.toolTable.list().map((t) => t.name);
+      expect(tools).toContain("ping");
+      // Execute the tool through the table to confirm the resolveTool
+      // path actually wires up the implementation.
+      const result = await agent.agentState.toolTable.execute({
+        id: "call-1",
+        name: "ping",
+        input: {},
+      });
+      expect(result.content).toBe("pong");
+      expect(executed).toBe(1);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("session-contributed names without resolveTool fall back to native (skills pattern)", async () => {
+    // SkillsSession-style: contribute a tool name whose implementation
+    // lives in the native provider. The session itself has no
+    // resolveTool; the runtime's `(session) → native` fallback chain
+    // makes this work.
+    const skillsStyle: Session = {
+      tools: () => [{ name: "read_file", config: {} }],
+      // No resolveTool. read_file lives in native.
+    };
+    const agent = await runAgent({
+      name: "skills-style",
+      systemPrompt: "x",
+      tools: {},
+      capabilities: { read_file: { paths: ["./"] } },
+      harness: { provider: "test" },
+      session: skillsStyle,
+    });
+    try {
+      const tools = agent.agentState.toolTable.list().map((t) => t.name);
+      expect(tools).toContain("read_file");
     } finally {
       await agent.close();
     }

@@ -16,7 +16,7 @@ import { testHarnessFactory } from "./harness/test.js";
 
 import { compactingSessionFactory } from "./session/compacting.js";
 import { fileSessionFactory } from "./session/file.js";
-import { memorySessionFactory } from "./session/memory.js";
+import { inMemorySessionFactory } from "./session/memory.js";
 import { forkOfParentSessionFactory } from "./session/parent-derived.js";
 import { skillsSessionFactory } from "./session/skills.js";
 
@@ -61,7 +61,7 @@ registerHarness(testHarnessFactory);
 registerHarness(anthropicHarnessFactory);
 registerHarness(openaiHarnessFactory);
 registerHarness(smallModelOfParentHarnessFactory);
-registerSession(memorySessionFactory);
+registerSession(inMemorySessionFactory);
 registerSession(fileSessionFactory);
 registerSession(compactingSessionFactory);
 registerSession(forkOfParentSessionFactory);
@@ -72,7 +72,7 @@ export {
   anthropicHarnessFactory,
   openaiHarnessFactory,
   smallModelOfParentHarnessFactory,
-  memorySessionFactory,
+  inMemorySessionFactory,
   fileSessionFactory,
   compactingSessionFactory,
   forkOfParentSessionFactory,

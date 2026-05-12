@@ -13,10 +13,6 @@
     "./acp": {
       "import": "./dist/acp/index.js",
       "types": "./dist/acp/index.d.ts"
-    },
-    "./extensions": {
-      "import": "./dist/extensions/index.js",
-      "types": "./dist/extensions/index.d.ts"
     }
   },
   "bin": {
@@ -35,7 +31,9 @@
     "llm",
     "harness",
     "acp",
-    "skills"
+    "anthropic",
+    "openai",
+    "claude"
   ],
   "license": "MIT",
   "engines": {

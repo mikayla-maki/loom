@@ -112,14 +112,13 @@ export async function probeAcpCapabilitiesFromManifest(
     }
   }
 
-  // Session contribution. A manifest without `[session]` falls back to
-  // the in-process `memory` factory which contributes nothing.
-  if (resolved.session) {
+  // Session contribution. A manifest without a session section falls
+  // back to the default chain; absent links contribute nothing here.
+  // For a multi-link chain, every link gets a chance to contribute.
+  for (const link of resolved.session ?? []) {
     try {
-      const factory: SessionFactory = getSessionFactory(
-        resolved.session.factoryName,
-      );
-      const c = factory.acpCapabilities?.(resolved.session.config);
+      const factory: SessionFactory = getSessionFactory(link.factoryName);
+      const c = factory.acpCapabilities?.(link.config);
       if (c) contributions.push(c);
     } catch {
       // see above

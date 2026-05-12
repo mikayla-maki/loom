@@ -49,6 +49,31 @@ export interface Session {
   /** Tools this session adds to the agent's tool table. */
   tools?(): Promise<ToolRef[]> | ToolRef[];
 
+  /**
+   * Optional inline tool resolver. A Session that contributes tool
+   * names via {@link Session.tools} can ALSO own their
+   * implementations by implementing this method — the runtime treats
+   * the session as an implicit Tools provider for the names it lists.
+   *
+   * Resolution order at bind time for session-contributed names:
+   *   1. `session.resolveTool(name, config, agent, capabilities)`.
+   *   2. The native built-in Tools (the SkillsSession pattern —
+   *      names like `bash` whose implementation lives in native).
+   *   3. SDK-supplied Tools, if any.
+   *
+   * Returning `null` says "I don't own this one, fall through."
+   *
+   * Composition note: `ChainedSession` aggregates this across layers
+   * — each child's `resolveTool` is tried in declaration order until
+   * one returns non-null.
+   */
+  resolveTool?(
+    name: string,
+    config: ToolConfig,
+    agent: Agent,
+    capabilities: CapabilitySet | undefined,
+  ): Promise<Tool | null> | Tool | null;
+
   /** Sub-agents this session may spawn. Self-declared for audit. */
   dependencies?: { subagents?: AgentManifest[] };
 
@@ -83,6 +108,37 @@ export interface Harness {
    * against a synthetic Runtime when omitted.
    */
   summarise?(args: SummariseArgs): Promise<string>;
+
+  /**
+   * Build a sibling harness with the same credentials/transport but
+   * a different model id. Implementations should reuse the API key,
+   * base URL, and other connection state — only the model id
+   * changes. Used by parent-derived sub-agent harness factories
+   * (e.g. `small-model-of-parent`) to route a sub-agent through a
+   * cheaper or faster model without re-authenticating.
+   *
+   * Optional. Harnesses that have no concept of swappable models
+   * (e.g. the scripted `test` harness) may omit it; consumers must
+   * tolerate `undefined`.
+   */
+  withModel?(modelId: string): Harness;
+
+  /**
+   * The harness's recommendation for a smaller / cheaper / faster
+   * sibling of the currently-configured model. Used as the default
+   * by parent-derived factories (e.g. `small-model-of-parent`) when
+   * the manifest doesn't pin a specific model.
+   *
+   * Implementations typically pattern-match the current model id
+   * (`claude-sonnet-*` → `claude-haiku-*`, `gpt-4o` → `gpt-4o-mini`)
+   * and fall back to a known fast default when the pattern doesn't
+   * match.
+   *
+   * Optional. Harnesses that don't expose a small variant can omit
+   * it; consumers tolerate `undefined` and require the manifest to
+   * specify the model explicitly.
+   */
+  smallModel?(): string;
 }
 
 export interface Tool extends ToolDescriptor {
@@ -148,7 +204,13 @@ export interface TrustedPath {
   reason?: string;
 }
 
-/** A `(name, config)` tool reference. */
+/**
+ * A reference to a tool the runtime should add to the agent's tool
+ * table. The runtime routes `name` through a provider — either the
+ * native built-ins, whichever Tools contribution claims it, or the
+ * Session itself if it implements `resolveTool` (see
+ * {@link Session.resolveTool}).
+ */
 export interface ToolRef {
   name: string;
   config: ToolConfig;

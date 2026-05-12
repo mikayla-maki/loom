@@ -4,7 +4,8 @@ import { runAgent } from "../src/sdk/run-agent.js";
 import { auditAgent, formatCapabilityTree } from "../src/audit/audit.js";
 import { SpawnSubagentTool } from "../src/runtime/builtins/spawn_subagent.js";
 import { AnthropicHarness } from "../src/builtins/harness/anthropic.js";
-import { MemorySession } from "../src/builtins/session/memory.js";
+import { OpenAIHarness } from "../src/builtins/harness/openai.js";
+import { InMemorySession } from "../src/builtins/session/memory.js";
 import { forkOfParentSessionFactory } from "../src/builtins/session/parent-derived.js";
 import { smallModelOfParentHarnessFactory } from "../src/builtins/harness/parent-derived.js";
 import type { AgentManifest } from "../src/types/manifest.js";
@@ -78,7 +79,7 @@ describe("spawn_subagent builtin tool", () => {
 
 describe("fork-of-parent session", () => {
   it("seeds a fresh in-memory session with the parent's events at fork time", async () => {
-    const parentSession = new MemorySession();
+    const parentSession = new InMemorySession();
     const u: SessionUpdate = {
       sessionUpdate: "user_message_chunk",
       content: { type: "text", text: "earlier" },
@@ -157,7 +158,7 @@ describe("small-model-of-parent harness", () => {
     );
     const parent: Agent = {
       harness: parentHarness,
-      session: new MemorySession(),
+      session: new InMemorySession(),
       systemPromptCore: "x",
       agentName: "parent",
     };
@@ -186,10 +187,48 @@ describe("small-model-of-parent harness", () => {
     expect(childKey).toBe(parentKey);
   });
 
-  it("rejects parents that aren't AnthropicHarness with a helpful error", async () => {
+  it("works with any harness that implements the optional withModel() API", async () => {
+    // OpenAIHarness implements `withModel` too, so the factory should
+    // succeed with it as the parent — no special-case needed.
+    const parentHarness = new OpenAIHarness(
+      "gpt-4o",
+      "fake-api-key",
+      "https://api.openai.com/v1",
+      4096,
+      16,
+      true,
+    );
+    const parent: Agent = {
+      harness: parentHarness,
+      session: new InMemorySession(),
+      systemPromptCore: "x",
+      agentName: "parent",
+    };
+    const ctx: FactoryContext = {
+      manifestDir: process.cwd(),
+      agentName: "child",
+      loomVersion: "test",
+      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    };
+    const child = (await smallModelOfParentHarnessFactory.create(
+      { model: "gpt-4o-mini" },
+      ctx,
+      {},
+      parent,
+    )) as OpenAIHarness;
+
+    expect(child).toBeInstanceOf(OpenAIHarness);
+    expect(child).not.toBe(parentHarness);
+    const childModel = (child as unknown as { model: string }).model;
+    expect(childModel).toBe("gpt-4o-mini");
+  });
+
+  it("rejects parents whose harness has no withModel() method", async () => {
+    // A bare Harness-shape object that satisfies the required `run`
+    // method but doesn't implement the optional `withModel` API.
     const parent: Agent = {
       harness: { run: async () => ({ stopReason: "end_turn" as const }) },
-      session: new MemorySession(),
+      session: new InMemorySession(),
       systemPromptCore: "x",
       agentName: "parent",
     };
@@ -201,20 +240,59 @@ describe("small-model-of-parent harness", () => {
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({ model: "x" }, ctx, {}, parent),
-    ).rejects.toThrow(/AnthropicHarness/);
+    ).rejects.toThrow(/withModel/);
   });
 
-  it("rejects missing model config with a helpful error", async () => {
+  it("falls back to the parent harness's smallModel() when no `model` is configured", async () => {
+    // Parent uses claude-sonnet-4-5. The Anthropic harness's
+    // smallModel() returns the in-family haiku variant, so the
+    // sub-agent should boot without the manifest needing to specify
+    // a model.
+    const parentHarness = new AnthropicHarness(
+      "claude-sonnet-4-5",
+      "fake-api-key",
+      "https://api.anthropic.com",
+      4096,
+      16,
+      true,
+    );
     const parent: Agent = {
-      harness: new AnthropicHarness(
-        "claude",
-        "fake-api-key",
-        "https://api.anthropic.com",
-        4096,
-        16,
-        true,
-      ),
-      session: new MemorySession(),
+      harness: parentHarness,
+      session: new InMemorySession(),
+      systemPromptCore: "x",
+      agentName: "parent",
+    };
+    const ctx: FactoryContext = {
+      manifestDir: process.cwd(),
+      agentName: "child",
+      loomVersion: "test",
+      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    };
+    const child = (await smallModelOfParentHarnessFactory.create(
+      {},
+      ctx,
+      {},
+      parent,
+    )) as AnthropicHarness;
+    const childModel = (child as unknown as { model: string }).model;
+    expect(childModel).toBe("claude-haiku-4-5");
+  });
+
+  it("errors helpfully when neither `model` nor smallModel() is available", async () => {
+    // A bare Harness shape with `withModel` but no `smallModel`.
+    const parent: Agent = {
+      harness: {
+        run: async () => ({ stopReason: "end_turn" as const }),
+        withModel(modelId: string) {
+          return {
+            run: async () => ({ stopReason: "end_turn" as const }),
+            _model: modelId,
+          } as unknown as ReturnType<
+            NonNullable<Agent["harness"]["withModel"]>
+          >;
+        },
+      },
+      session: new InMemorySession(),
       systemPromptCore: "x",
       agentName: "parent",
     };
@@ -226,7 +304,81 @@ describe("small-model-of-parent harness", () => {
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({}, ctx, {}, parent),
-    ).rejects.toThrow(/`model`/);
+    ).rejects.toThrow(/smallModel/);
+  });
+});
+
+describe("Harness.smallModel built-in implementations", () => {
+  it("AnthropicHarness maps sonnet \u2192 haiku in-family", () => {
+    const h = new AnthropicHarness(
+      "claude-sonnet-4-5",
+      "k",
+      "https://api.anthropic.com",
+      4096,
+      16,
+      true,
+    );
+    expect(h.smallModel()).toBe("claude-haiku-4-5");
+  });
+
+  it("AnthropicHarness maps opus \u2192 haiku in-family", () => {
+    const h = new AnthropicHarness(
+      "claude-opus-4-5",
+      "k",
+      "https://api.anthropic.com",
+      4096,
+      16,
+      true,
+    );
+    expect(h.smallModel()).toBe("claude-haiku-4-5");
+  });
+
+  it("AnthropicHarness leaves haiku-family models unchanged", () => {
+    const h = new AnthropicHarness(
+      "claude-haiku-4-5",
+      "k",
+      "https://api.anthropic.com",
+      4096,
+      16,
+      true,
+    );
+    expect(h.smallModel()).toBe("claude-haiku-4-5");
+  });
+
+  it("OpenAIHarness maps gpt-4o \u2192 gpt-4o-mini", () => {
+    const h = new OpenAIHarness(
+      "gpt-4o",
+      "k",
+      "https://api.openai.com/v1",
+      4096,
+      16,
+      true,
+    );
+    expect(h.smallModel()).toBe("gpt-4o-mini");
+  });
+
+  it("OpenAIHarness maps o1 \u2192 o1-mini", () => {
+    const h = new OpenAIHarness(
+      "o1",
+      "k",
+      "https://api.openai.com/v1",
+      4096,
+      16,
+      true,
+    );
+    expect(h.smallModel()).toBe("o1-mini");
+  });
+
+  it("OpenAIHarness leaves mini-family models unchanged", () => {
+    const h = new OpenAIHarness(
+      "gpt-4o-mini",
+      "k",
+      "https://api.openai.com/v1",
+      4096,
+      16,
+      true,
+    );
+    expect(h.smallModel()).toBe("gpt-4o-mini");
   });
 });
 
