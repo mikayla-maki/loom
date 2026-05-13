@@ -330,6 +330,7 @@ describe("fork-of-parent session", () => {
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
       storage: os.tmpdir(),
+      metadata: {},
     };
     const child = await forkOfParentSessionFactory.create({}, ctx, {}, parent);
 
@@ -396,6 +397,7 @@ describe("small-model-of-parent harness", () => {
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
       storage: os.tmpdir(),
+      metadata: {},
     };
     const child = (await smallModelOfParentHarnessFactory.create(
       { model: "claude-3-5-haiku-latest" },
@@ -439,6 +441,7 @@ describe("small-model-of-parent harness", () => {
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
       storage: os.tmpdir(),
+      metadata: {},
     };
     const child = (await smallModelOfParentHarnessFactory.create(
       { model: "gpt-4o-mini" },
@@ -468,6 +471,7 @@ describe("small-model-of-parent harness", () => {
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
       storage: os.tmpdir(),
+      metadata: {},
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({ model: "x" }, ctx, {}, parent),
@@ -499,6 +503,7 @@ describe("small-model-of-parent harness", () => {
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
       storage: os.tmpdir(),
+      metadata: {},
     };
     const child = (await smallModelOfParentHarnessFactory.create(
       {},
@@ -534,6 +539,7 @@ describe("small-model-of-parent harness", () => {
       loomVersion: "test",
       clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
       storage: os.tmpdir(),
+      metadata: {},
     };
     await expect(async () =>
       smallModelOfParentHarnessFactory.create({}, ctx, {}, parent),

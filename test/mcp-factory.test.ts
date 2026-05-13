@@ -36,6 +36,7 @@ function ctx(overrides: Partial<FactoryContext> = {}): FactoryContext {
     loomVersion: "0.0.0-test",
     clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
     storage: path.join(process.cwd(), ".loom-test-storage"),
+    metadata: {},
     ...overrides,
   };
 }

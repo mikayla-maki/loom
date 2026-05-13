@@ -173,6 +173,7 @@ export async function inspectMcpServer(
     // storage would create a `loom-mcp-inspect/` dir per invocation;
     // tmpdir is the right scope for a throwaway probe.
     storage: transientStorage("loom-mcp-inspect"),
+    metadata: {},
   };
   const tools = mcpServerToolsFactory.create(
     config,

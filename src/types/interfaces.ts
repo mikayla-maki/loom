@@ -701,6 +701,18 @@ export interface FactoryContext {
    * stomping siblings, e.g. `<storage>/mcp/<handle>/cache.json`.
    */
   storage: string;
+  /**
+   * The manifest's `[agent.metadata]` table, verbatim. `{}` when
+   * the manifest didn't declare one. Forwarded by the runtime as
+   * opt-in passthrough — plugins that don't know about a key
+   * should ignore it.
+   *
+   * See {@link AgentManifest.metadata} for the design intent. The
+   * same value is also reachable as `args.manifest.metadata` inside
+   * `Tools.init()`, for tool providers that prefer to read it from
+   * the manifest directly.
+   */
+  metadata: Record<string, unknown>;
 }
 
 // ─── Tools (the runtime tool-routing instance) ───────────────────────────

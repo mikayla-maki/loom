@@ -319,6 +319,7 @@ async function listBuiltinHarnesses(): Promise<void> {
     loomVersion: "cli",
     clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
     storage: process.cwd(),
+    metadata: {},
   };
   const names = listHarnesses().sort();
   process.stdout.write("built-in harnesses:\n");

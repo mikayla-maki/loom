@@ -428,6 +428,51 @@ provider = "test"
     );
   });
 
+  it("parses [agent.metadata] as opaque passthrough", async () => {
+    const p = await writeManifest(`[agent]
+name = "meta"
+
+[agent.metadata]
+team = "platform-eng"
+release_channel = "canary"
+owners = ["alice", "bob"]
+rollout = { region = "us-east-1", percent = 25 }
+
+[harness]
+provider = "test"
+`);
+    const m = await parseAgentManifest(p);
+    expect(m.metadata).toBeDefined();
+    expect(m.metadata).toEqual({
+      team: "platform-eng",
+      release_channel: "canary",
+      owners: ["alice", "bob"],
+      rollout: { region: "us-east-1", percent: 25 },
+    });
+  });
+
+  it("omits manifest.metadata when [agent.metadata] is absent", async () => {
+    const p = await writeManifest(`[agent]
+name = "no-meta"
+[harness]
+provider = "test"
+`);
+    const m = await parseAgentManifest(p);
+    expect(m.metadata).toBeUndefined();
+  });
+
+  it("rejects scalar values for [agent].metadata", async () => {
+    const p = await writeManifest(`[agent]
+name = "bad-meta"
+metadata = "not-a-table"
+[harness]
+provider = "test"
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /\[agent\.metadata\] must be a table/,
+    );
+  });
+
   it("still rejects bare-handle strings as [providers] entries", async () => {
     const p = await writeManifest(`[agent]
 name = "prov-bare"

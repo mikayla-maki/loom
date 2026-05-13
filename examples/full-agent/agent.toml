@@ -53,6 +53,16 @@ for real work — prefer edit_file over write_file for changes to existing
 files (much more efficient and produces a diff for review).
 """
 
+# Free-form metadata: parsed verbatim, exposed to plugins as
+# `FactoryContext.metadata` (and `args.manifest.metadata` in
+# `Tools.init()`). The runtime never interprets the keys — use this
+# slot for ownership tags, ACP-client annotations, lifecycle
+# markers, anything your tooling cares about.
+[agent.metadata]
+team = "platform-eng"
+release_channel = "stable"
+owners = ["mikayla"]
+
 [providers]
 notes = { path = "../notes-provider" }
 

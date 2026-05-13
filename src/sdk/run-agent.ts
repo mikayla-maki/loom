@@ -245,6 +245,7 @@ export async function runAgent(
     clientCapabilities:
       options.clientAcpCapabilities ?? DEFAULT_CLIENT_ACP_CAPABILITIES,
     storage: storage.path,
+    metadata: manifest.metadata ?? {},
   };
 
   // 2. Resolve manifest to IR. Pure; throws on ambiguity / missing handles.

@@ -332,6 +332,7 @@ describe("skillsSessionFactory", () => {
         loomVersion: "test",
         clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
         storage: TMP,
+        metadata: {},
       },
       {},
     );
@@ -350,6 +351,7 @@ describe("skillsSessionFactory", () => {
         loomVersion: "test",
         clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
         storage: TMP,
+        metadata: {},
       },
       {},
     );
@@ -370,6 +372,7 @@ describe("skillsSessionFactory", () => {
           loomVersion: "test",
           clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
           storage: TMP,
+          metadata: {},
         },
         {},
       );
@@ -392,6 +395,7 @@ describe("skillsSessionFactory", () => {
           loomVersion: "test",
           clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
           storage: TMP,
+          metadata: {},
         },
         {},
       ),

@@ -95,6 +95,7 @@ export async function probeAcpCapabilitiesFromManifest(
     // probing doesn't side-effect a `<dataHome>/agents/<name>/`
     // directory on every boot.
     storage: transientStorage("loom-acp-probe"),
+    metadata: manifest.metadata ?? {},
   };
 
   // Provider loading is the only side-effecting step. Built-in-only

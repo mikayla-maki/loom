@@ -638,6 +638,7 @@ async function auditAgentInner(
     loomVersion: "audit",
     clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
     storage: storage.path,
+    metadata: manifest.metadata ?? {},
   };
   const { toolsIndex, loadErrors } = await loadManifestProviders(
     resolved,

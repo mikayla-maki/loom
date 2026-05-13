@@ -46,6 +46,7 @@ export async function parseAgentManifest(
   const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
   const secrets = parseSecretAllowlist(agent.secrets, abs);
   const storageId = parseStorageId(agent.storage_id, abs);
+  const metadata = parseMetadata(agent.metadata, abs);
 
   const providers =
     raw.providers === undefined
@@ -84,10 +85,36 @@ export async function parseAgentManifest(
     ...(session ? { session } : {}),
     ...(tools !== undefined ? { tools } : {}),
     ...(capabilities ? { capabilities } : {}),
+    ...(metadata ? { metadata } : {}),
   };
 }
 
-// ─── Agent-section helpers (system prompt + secrets + storage) ──────
+// ─── Agent-section helpers (system prompt + secrets + storage + metadata) ─
+
+/**
+ * Parse `[agent.metadata]`. Must be a TOML table (object); the
+ * runtime stores it verbatim and forwards it to plugins as opaque
+ * JSON. We don't recursively validate values — anything TOML
+ * accepts is fair game.
+ *
+ * Returns `undefined` when the manifest omits the table, so
+ * `manifest.metadata` only appears on the parsed shape when the
+ * user actually declared it.
+ */
+function parseMetadata(
+  v: unknown,
+  where: string,
+): Record<string, unknown> | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    throw new ManifestError(
+      `agent.toml at ${where}: [agent.metadata] must be a table (got ${
+        Array.isArray(v) ? "array" : typeof v
+      })`,
+    );
+  }
+  return v as Record<string, unknown>;
+}
 
 /**
  * Parse `[agent].storage_id`. Must be a non-empty string with no

@@ -306,4 +306,30 @@ export interface AgentManifest {
    * tree — see §1.6 of manifest-v5.md.
    */
   capabilities?: Capabilities;
+
+  /**
+   * Free-form metadata the manifest author wants associated with
+   * this agent. Parsed from `[agent.metadata]` and passed through
+   * verbatim — the runtime doesn't interpret any of the keys.
+   *
+   * Surfaced to plugins via {@link FactoryContext.metadata} (so
+   * harness / session factories see it at boot) and via
+   * `args.manifest.metadata` in `Tools.init()` (so tool providers
+   * can read it too). Use cases:
+   *
+   *   - **Ownership / lifecycle** — `team = "platform-eng"`,
+   *     `release_channel = "canary"`, `owners = ["alice", "bob"]`.
+   *   - **External tooling** — anything an ACP client, dashboard,
+   *     or CI pipeline wants to attach to the manifest without
+   *     extending Loom's schema.
+   *   - **Plugin opt-ins** — a provider package can document that
+   *     it looks for `metadata.my_plugin.X` and treat it as
+   *     configuration the user can set once globally.
+   *
+   * Values are opaque JSON — strings, numbers, booleans, arrays,
+   * nested tables. The parser accepts any TOML-valid shape and
+   * forwards it as-is; plugins are responsible for validating what
+   * they consume.
+   */
+  metadata?: Record<string, unknown>;
 }

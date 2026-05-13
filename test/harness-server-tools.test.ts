@@ -52,6 +52,7 @@ describe("AnthropicHarness server-tool catalog", () => {
           terminal: false,
         },
         storage: "/tmp/loom-test-storage",
+        metadata: {},
       },
       { ANTHROPIC_API_KEY: "k" },
     ) as Harness;

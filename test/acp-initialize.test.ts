@@ -239,4 +239,74 @@ describe("FactoryContext.clientCapabilities", () => {
       await agent.close();
     }
   });
+
+  it("surfaces [agent.metadata] to plugins via FactoryContext.metadata", async () => {
+    let captured: unknown = null;
+    const captureFactory = {
+      name: "capture-metadata",
+      create(
+        _cfg: Record<string, unknown>,
+        ctx: { metadata?: Record<string, unknown> },
+      ) {
+        captured = ctx.metadata;
+        return { push: async () => [], pull: async () => [] };
+      },
+    };
+    const { registerSession } = await import("../src/builtins/index.js");
+    registerSession(captureFactory);
+
+    const agent = await runAgent({
+      name: "metadata-roundtrip",
+      systemPrompt: "x",
+      tools: {},
+      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
+      session: { provider: "capture-metadata" },
+      capabilities: {},
+      metadata: {
+        team: "platform-eng",
+        owners: ["alice"],
+        rollout: { region: "us-east-1" },
+      },
+    });
+    try {
+      expect(captured).toEqual({
+        team: "platform-eng",
+        owners: ["alice"],
+        rollout: { region: "us-east-1" },
+      });
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("defaults FactoryContext.metadata to {} when [agent.metadata] is absent", async () => {
+    let captured: unknown = null;
+    const captureFactory = {
+      name: "capture-metadata-default",
+      create(
+        _cfg: Record<string, unknown>,
+        ctx: { metadata?: Record<string, unknown> },
+      ) {
+        captured = ctx.metadata;
+        return { push: async () => [], pull: async () => [] };
+      },
+    };
+    const { registerSession } = await import("../src/builtins/index.js");
+    registerSession(captureFactory);
+
+    const agent = await runAgent({
+      name: "metadata-default",
+      systemPrompt: "x",
+      tools: {},
+      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
+      session: { provider: "capture-metadata-default" },
+      capabilities: {},
+      // No metadata field.
+    });
+    try {
+      expect(captured).toEqual({});
+    } finally {
+      await agent.close();
+    }
+  });
 });
