@@ -234,11 +234,20 @@ export function assertSecretAllowlist(
 //   | true / false (bool)  | drop arg from properties + required | merge bound value into call |
 //   | ["a", "b"]           | narrow property to `enum`           | passed through from model   |
 //   | "*"                  | unchanged                           | passed through from model   |
-//   | (arg absent in grant)| unchanged                           | passed through from model   |
+//   | (arg absent in grant)| drop arg from properties + required | (model can't supply it)     |
+//
+// A per-arg map is a strict whitelist: any property the MCP server
+// advertises that doesn't appear as a key in the grant is removed
+// from the model-visible schema. This makes
+// `[capabilities].tool = { a = "*", b = "*" }` mean exactly "the
+// model sees a two-arg tool", regardless of what else the server
+// offers. Use whole-tool `"*"` to opt out of that and keep the
+// full schema.
 //
 // `"*"` on the whole tool means "full schema, no binding". `{}`
-// produces no binding and no narrowing — boot fails via
-// `assertRequires` when the tool has required args.
+// means "no model-visible args"; boot fails via `assertRequires`
+// when the tool has required MCP args that aren't named here
+// (literal-bound, enum-narrowed, or kept open with `"*"`).
 //
 // The default-value form (`{ default = "..." }`) hinted at in the
 // implementation prompt is a v2 stretch and intentionally NOT
@@ -298,6 +307,20 @@ export function applyArgGrant(
   const modelArgs = new Set(allProperties);
   const dropped = new Set<string>();
 
+  // Whitelist pass: anything the MCP server advertises but the grant
+  // doesn't name gets dropped from both `properties` and `required`.
+  // The model never sees it, and `assertRequires` catches the case
+  // where dropping a *required* MCP arg leaves a tool the model can't
+  // legally call (the boot guard reads `Tool.requires`, which mirrors
+  // the MCP-required list — see `buildLoomTool`).
+  for (const prop of allProperties) {
+    if (!Object.hasOwn(grant, prop)) {
+      delete narrowedProperties[prop];
+      modelArgs.delete(prop);
+      dropped.add(prop);
+    }
+  }
+
   for (const [arg, value] of Object.entries(grant)) {
     if (value === undefined) continue;
     // `"*"` per-arg: leave the property untouched.
@@ -325,7 +348,8 @@ export function applyArgGrant(
   }
 
   // Drop bound args from `required` too — they're satisfied via the
-  // merge at execute time, not by the model.
+  // merge at execute time, not by the model. (Unlisted args were
+  // already added to `dropped` above.)
   const narrowedRequired = required.filter((r) => !dropped.has(r));
 
   // Rebuild the schema object. Preserve the top-level keys we don't

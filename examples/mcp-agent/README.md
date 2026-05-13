@@ -78,11 +78,19 @@ MCP-backed tools:
 
 | Grant | Effect on the model-visible schema |
 |---|---|
-| `"*"`                  | full schema, no binding |
+| `"*"` (whole-tool)       | full schema, no binding |
+| `{}` (whole-tool)        | empty schema (boot fails if MCP has required args) |
 | `{ arg = "<literal>" }`  | arg removed from schema, merged at execute |
 | `{ arg = ["a","b"] }`    | arg constrained to enum: `["a","b"]` |
-| `{ arg = "*" }`          | arg unchanged |
-| (arg absent)             | arg unchanged |
+| `{ arg = "*" }`          | arg passed through unchanged |
+| (arg absent from a map)  | arg dropped from schema entirely |
+
+**A per-arg map is a strict whitelist of model-visible args.** If the
+MCP server advertises three args and the manifest names only two,
+the model sees a two-arg tool — the third disappears. Use
+whole-tool `"*"` if you want to inherit the upstream schema as-is.
+Boot fails (via `assertRequires`) when a required MCP arg isn't
+named somewhere in the grant (`"*"`, literal, or enum).
 
 Schema narrowing is what the model sees; binding is what's merged
 back at execute time. Validation rejects the model trying to

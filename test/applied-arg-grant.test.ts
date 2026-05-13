@@ -34,7 +34,10 @@ describe("applyArgGrant", () => {
   });
 
   it("literal-bound arg drops from properties + required and shows up in bound", () => {
-    const a = applyArgGrant(docSchema, { doc_id: "doc-123" });
+    // Explicitly whitelist `text` alongside the literal-bound
+    // `doc_id` — a per-arg map is a strict whitelist, so any arg
+    // we want the model to still see must appear as a key.
+    const a = applyArgGrant(docSchema, { doc_id: "doc-123", text: "*" });
     const props = (a.schema as { properties: Record<string, unknown> })
       .properties;
     expect(Object.keys(props).sort()).toEqual(["text"]);
@@ -42,7 +45,9 @@ describe("applyArgGrant", () => {
     expect(a.bound).toEqual({ doc_id: "doc-123" });
     expect([...a.modelArgs]).toEqual(["text"]);
     // additionalProperties metadata preserved.
-    expect((a.schema as { additionalProperties: boolean }).additionalProperties).toBe(false);
+    expect(
+      (a.schema as { additionalProperties: boolean }).additionalProperties,
+    ).toBe(false);
   });
 
   it("numeric and boolean literals are also valid bindings", () => {
@@ -90,6 +95,71 @@ describe("applyArgGrant", () => {
       required: ["doc_id", "text"],
     });
     expect(a.bound).toEqual({});
+  });
+
+  it("per-arg map is a whitelist: unlisted args are dropped from the schema", () => {
+    // The MCP server advertises three args; the grant names only two.
+    // The third must disappear from `properties` and `required`. This
+    // is the static-enumeration guarantee at the arg level.
+    const schema: JSONSchema = {
+      type: "object",
+      required: ["a"],
+      properties: {
+        a: { type: "string" },
+        b: { type: "string" },
+        c: { type: "string" },
+      },
+    };
+    const a = applyArgGrant(schema, { a: "*", b: "*" });
+    const props = (a.schema as { properties: Record<string, unknown> })
+      .properties;
+    expect(Object.keys(props).sort()).toEqual(["a", "b"]);
+    expect((a.schema as { required: string[] }).required).toEqual(["a"]);
+    expect([...a.modelArgs].sort()).toEqual(["a", "b"]);
+    expect(a.bound).toEqual({});
+  });
+
+  it("empty per-arg map drops every advertised arg (boot guard catches required-missing separately)", () => {
+    // `{}` is a whitelist of nothing. Optional MCP args vanish from
+    // the model-visible schema; if any MCP-required arg existed, the
+    // boot guard (`assertRequires`) would reject the manifest before
+    // we ever get here. This test exercises the optional-only case.
+    const schema: JSONSchema = {
+      type: "object",
+      properties: {
+        a: { type: "string" },
+        b: { type: "string" },
+      },
+    };
+    const a = applyArgGrant(schema, {});
+    expect(
+      (a.schema as { properties: Record<string, unknown> }).properties,
+    ).toEqual({});
+    expect("required" in (a.schema as Record<string, unknown>)).toBe(false);
+    expect(a.modelArgs.size).toBe(0);
+    expect(a.bound).toEqual({});
+  });
+
+  it("unlisted required args get stripped from `required` too (so the narrowed schema stays valid)", () => {
+    // If we left `required: ['c']` on a schema whose properties no
+    // longer contain `c`, downstream JSON Schema validators would
+    // complain. The boot guard surfaces the real problem (manifest
+    // forgot to grant a required arg); the narrower just ensures the
+    // schema it emits is internally consistent.
+    const schema: JSONSchema = {
+      type: "object",
+      required: ["a", "c"],
+      properties: {
+        a: { type: "string" },
+        b: { type: "string" },
+        c: { type: "string" },
+      },
+    };
+    const a = applyArgGrant(schema, { a: "*" });
+    const props = (a.schema as { properties: Record<string, unknown> })
+      .properties;
+    expect(Object.keys(props)).toEqual(["a"]);
+    expect((a.schema as { required: string[] }).required).toEqual(["a"]);
   });
 
   it("mixed grant: one bound, one enum-narrowed, one passthrough", () => {

@@ -948,7 +948,12 @@ supplies `path` transparently on every call. Same MCP tool can be
 exposed under multiple model-facing names with different bindings
 (`mcp_tool` rename + per-tool grant). Array grants narrow an arg
 to an enum (`status = ["online", "away"]` → model can pick those
-two only); `"*"` keeps an arg open; absent leaves it open too.
+two only); `"*"` keeps an arg open. **A per-arg map is a strict
+whitelist** — anything the MCP server advertises but the manifest
+doesn't name disappears from the model-visible schema. Use
+whole-tool `"*"` to inherit the upstream schema as-is; `assertRequires`
+rejects boot when a required MCP arg isn't satisfied (literal-bound,
+enum-narrowed, or kept open with `"*"`).
 
 **Secrets in env.** Put `secrets = { LOOM_NAME = "ENV_VAR_NAME" }`
 on the `[providers]` entry. The factory looks each key up in

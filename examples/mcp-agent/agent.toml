@@ -58,16 +58,21 @@ send_alert       = { provider = "mock_server" }
 #
 #   "<literal>" / number / bool  →  arg dropped from schema, merged at execute
 #   ["a", "b"]                    →  arg constrained to `enum: [...]`
-#   "*"                           →  arg unchanged
-#   (arg absent)                  →  arg unchanged
+#   "*"                           →  arg passed through unchanged
+#   (arg absent)                  →  arg dropped from schema entirely
 #
-# Whole-tool "*" keeps the full schema; `{}` denies everything (boot
-# fails if the tool has required args). Bound args are reported by
-# `loom audit`; their values are NOT shown (secrets-safe).
+# A per-arg map is a strict WHITELIST of model-visible args. Anything
+# the MCP server advertises but isn't named here disappears from the
+# tool's input schema — the model can't see it or call it. Use
+# whole-tool "*" to opt out and keep the full upstream schema.
+# `{}` denies everything (boot fails if the tool has required MCP
+# args that aren't satisfied here via literal/enum/`"*"`). Bound
+# args are reported by `loom audit`; their values are NOT shown
+# (secrets-safe).
 [capabilities]
 echo             = "*"
 read_document    = "*"
-read_welcome_doc = { doc_id = "welcome" }                          # → model sees `{ format? }`
+read_welcome_doc = { doc_id = "welcome", format = "*" }            # → model sees `{ format? }` (doc_id bound)
 query_users      = { table = "users",  limit = "*" }               # → model sees `{ limit? }`
 query_orders     = { table = "orders", limit = "*" }               # → model sees `{ limit? }`
 set_status       = { status = ["online", "away"] }                 # → enum
