@@ -1,6 +1,14 @@
 /**
- * File-backed Session — JSONL append log. Config: `path` (relative to
- * manifest dir).
+ * File-backed Session — JSONL append log.
+ *
+ * Config (all optional):
+ *   - `path`: where to write. Absolute paths are used as-is; relative
+ *     paths anchor at the manifest dir. When omitted, defaults to
+ *     `<ctx.storage>/session.jsonl` — the per-agent storage root Loom
+ *     guarantees exists, so the file follows the agent across `cd`s
+ *     and survives deletes of the manifest's containing directory.
+ *     Override with `LOOM_DATA_HOME` to relocate it for a one-off run,
+ *     or set `path = "./somewhere.jsonl"` to pin it next to the manifest.
  *
  * Chunk coalescing: consecutive same-kind chunks of `agent_message_chunk`,
  * `agent_thought_chunk`, `user_message_chunk` are buffered in memory and
@@ -20,6 +28,9 @@ import type {
   SessionFactory,
 } from "../../types/interfaces.js";
 import type { SessionUpdate } from "../../types/acp.js";
+
+/** Filename used under `ctx.storage` when no `path` is configured. */
+const DEFAULT_FILENAME = "session.jsonl";
 
 /** Text-content event kinds that get concatenated when adjacent. */
 const COALESCABLE_KINDS = new Set([
@@ -183,9 +194,17 @@ export const fileSessionFactory: SessionFactory = {
     _secrets: Record<string, string>,
   ): Session {
     const p = config.path;
+    if (p === undefined) {
+      // No explicit path — default to the per-agent storage root so
+      // the session log follows the agent's identity, not its on-disk
+      // location. Matches the convention used by `notes-provider` and
+      // other plugins that own state.
+      return new FileSession(path.join(ctx.storage, DEFAULT_FILENAME));
+    }
     if (typeof p !== "string" || !p) {
       throw new ManifestError(
-        `[session] provider 'file' requires config 'path'`,
+        `[session] provider 'file': 'path' must be a non-empty string when set ` +
+          `(omit it entirely to default to <ctx.storage>/${DEFAULT_FILENAME}).`,
       );
     }
     const abs = path.isAbsolute(p) ? p : path.resolve(ctx.manifestDir, p);
