@@ -718,7 +718,35 @@ recursively).
 
 #### `web_search`
 
-Search the web via the [Brave LLM Context API](https://api-dashboard.search.brave.com/documentation/services/llm-context).
+Two flavours ship: a portable Brave-backed builtin (works with any
+harness, billed on Brave), and harness-exposed server tools that
+ride on the model provider's own search infrastructure (currently
+Anthropic's `web_search` / `web_fetch`, billed on the Anthropic
+API). The flavours are mutually exclusive per manifest — pick one
+by setting `provider`:
+
+| `provider =` | Path | Bill | Works with |
+|---|---|---|---|
+| `"builtin"` | Brave LLM Context API | Brave (`BRAVE_SEARCH_API_KEY`) | any harness |
+| `"anthropic"` | Anthropic server tool (`web_search_20250305`) | Anthropic API | Anthropic harness only |
+
+The harness-exposed flavour is the lower-friction option when
+you're already on Claude (one less API key, model gets
+`encrypted_content` back for citation re-grounding on subsequent
+turns). Use `loom providers list` to see which harness-exposed
+server tools your installed harnesses publish; opt in via
+`provider = "<harness-name>"` in `[tools]`. See
+`examples/full-agent/agent.toml` for both flavours side-by-side.
+
+The rest of this section documents the **Brave builtin**. The
+harness-exposed variants take a tiny subset of these knobs
+(`max_uses`, plus `blocked_domains` and `user_location` for
+`web_search`; `max_uses`, `max_content_tokens`, `blocked_domains`,
+`citations` for `web_fetch`). `allowed_domains` is exposed as a
+capability on the harness path (declare it in `[capabilities]` so
+the manifest carries an explicit allow-list).
+
+Searches the web via the [Brave LLM Context API](https://api-dashboard.search.brave.com/documentation/services/llm-context).
 Returns pre-extracted, snippet-formatted results designed for LLM
 grounding — no scraping, no token-budget surprises. Rendered as
 markdown the model can consume directly (one section per result,
