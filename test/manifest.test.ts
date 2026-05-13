@@ -473,6 +473,110 @@ provider = "test"
     );
   });
 
+  // ─── env-var substitution ─────────────────────────────────────────
+  //
+  // `${VAR}` and `${VAR:-default}` are substituted at parse time so
+  // every downstream consumer (resolver, audit, runtime) sees ready-
+  // to-use values. The parser surfaces a clean `ManifestError` when
+  // a required reference is unset.
+
+  it("substitutes ${VAR} references from process.env in string values", async () => {
+    process.env.LOOM_TEST_VAULT_PATH = "/tmp/glass-vault";
+    try {
+      const p = await writeManifest(`[agent]
+name = "env-sub"
+system_prompt = "vault: \${LOOM_TEST_VAULT_PATH}"
+[harness]
+provider = "test"
+`);
+      const m = await parseAgentManifest(p);
+      expect(m.systemPrompt).toBe("vault: /tmp/glass-vault");
+    } finally {
+      delete process.env.LOOM_TEST_VAULT_PATH;
+    }
+  });
+
+  it("substitutes ${VAR} inside arrays and nested tables", async () => {
+    process.env.LOOM_TEST_PATH = "/tmp/loom-test";
+    try {
+      const p = await writeManifest(`[agent]
+name = "env-deep"
+[harness]
+provider = "test"
+[capabilities]
+read_file = { paths = ["\${LOOM_TEST_PATH}", "./local"] }
+`);
+      const m = await parseAgentManifest(p);
+      expect(m.capabilities?.read_file).toEqual({
+        paths: ["/tmp/loom-test", "./local"],
+      });
+    } finally {
+      delete process.env.LOOM_TEST_PATH;
+    }
+  });
+
+  it("honours ${VAR:-default} when the env var is unset", async () => {
+    delete process.env.LOOM_TEST_UNSET;
+    const p = await writeManifest(`[agent]
+name = "env-default"
+system_prompt = "\${LOOM_TEST_UNSET:-fallback text}"
+[harness]
+provider = "test"
+`);
+    const m = await parseAgentManifest(p);
+    expect(m.systemPrompt).toBe("fallback text");
+  });
+
+  it("prefers the env value when ${VAR:-default} resolves", async () => {
+    process.env.LOOM_TEST_SET = "real";
+    try {
+      const p = await writeManifest(`[agent]
+name = "env-set"
+system_prompt = "\${LOOM_TEST_SET:-fallback}"
+[harness]
+provider = "test"
+`);
+      const m = await parseAgentManifest(p);
+      expect(m.systemPrompt).toBe("real");
+    } finally {
+      delete process.env.LOOM_TEST_SET;
+    }
+  });
+
+  it("throws ManifestError when a required ${VAR} is unset", async () => {
+    delete process.env.LOOM_TEST_MISSING;
+    const p = await writeManifest(`[agent]
+name = "env-missing"
+system_prompt = "\${LOOM_TEST_MISSING}"
+[harness]
+provider = "test"
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /undefined env var 'LOOM_TEST_MISSING'/,
+    );
+  });
+
+  it("leaves keys unsubstituted (only values)", async () => {
+    // A literal `${...}`-shaped key shouldn't trigger substitution.
+    // If a user genuinely needs dynamic keys they construct the
+    // manifest programmatically.
+    process.env.LOOM_TEST_KEY = "oops";
+    try {
+      const p = await writeManifest(`[agent]
+name = "env-keys"
+[harness]
+provider = "test"
+[agent.metadata]
+"\${LOOM_TEST_KEY}" = "value"
+`);
+      const m = await parseAgentManifest(p);
+      // The key stays literal `${LOOM_TEST_KEY}` — NOT substituted.
+      expect(Object.keys(m.metadata ?? {})).toContain("${LOOM_TEST_KEY}");
+    } finally {
+      delete process.env.LOOM_TEST_KEY;
+    }
+  });
+
   it("still rejects bare-handle strings as [providers] entries", async () => {
     const p = await writeManifest(`[agent]
 name = "prov-bare"

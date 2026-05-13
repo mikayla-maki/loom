@@ -808,13 +808,20 @@ async function instantiateSession(
           }),
         );
 
+  // Track which factory-based layers are pass-through (declare
+  // `passThrough: true`). Pre-built layers given to us by the SDK
+  // consumer are treated as storage — we don't know what they do
+  // internally and the user clearly meant for them to be part of
+  // the chain. The validation below then asks: "is there ANY layer
+  // here that can actually retain events?"
   const instances: Session[] = [];
+  let hasStorageLayer = false;
   for (const layer of effective) {
     if (isPreBuiltSessionLayer(layer)) {
-      // Pass-through: the SDK consumer constructed this layer
-      // themselves. Secrets, factory lookup, and `requiresParent`
-      // checks are skipped — the layer is whatever they handed us.
+      // SDK-supplied instances are opaque to the storage check.
+      // Trust them.
       instances.push(layer.instance);
+      hasStorageLayer = true;
       continue;
     }
     const factory = lookupFactoryByBinding(
@@ -822,6 +829,7 @@ async function instantiateSession(
       layer.source,
       getSessionFactory,
     );
+    if (!factory.passThrough) hasStorageLayer = true;
     const { instance } = await instantiateFromBinding<Session>(
       layer,
       () => factory,
@@ -831,6 +839,29 @@ async function instantiateSession(
       "session",
     );
     instances.push(instance);
+  }
+  // Guard against the silent-loss-of-events configuration: a chain
+  // composed entirely of pass-through layers (e.g. `[skills,
+  // compacting]` with no `in-memory` or `file` at the end) has no
+  // session that actually retains events. Pushes propagate but
+  // nothing keeps them; the next `pull` returns the empty
+  // bottom, and every turn sees an empty history. The user reported
+  // this manifesting as "every invocation failed" — the harness sees
+  // no user message and the API rejects the empty request. Fail fast
+  // with a structured diagnostic instead.
+  if (!hasStorageLayer) {
+    const factoryNames = effective
+      .filter((l): l is SessionBinding => !isPreBuiltSessionLayer(l))
+      .map((l) => l.factoryName);
+    throw new ResolutionError(
+      `Every session layer in this manifest is pass-through ` +
+        `(${factoryNames.map((n) => `'${n}'`).join(", ")}). Pass-through ` +
+        `layers transform / adorn events but don't retain them; without ` +
+        `a storage layer (e.g. \`in-memory\` or \`file\`) the chain has ` +
+        `nowhere for events to live and every turn would see an empty ` +
+        `history. Add a storage layer to the end of your \`[session]\` ` +
+        `(or \`session.layers\`) block.`,
+    );
   }
   // Length-1 chains return the inner session directly: keeps the
   // trivial case cheap and avoids a no-op ChainedSession wrapper.
@@ -891,9 +922,22 @@ export function collectPhase1SecretNeeds(
   // Harness factory needs (only when a HarnessBinding is present —
   // pre-built instances bring their own state and don't need secrets
   // resolved at the SDK layer).
+  //
+  // Resolution goes through `lookupFactoryByBinding` so the
+  // package-name fallback engages — a provider-package harness
+  // registered under its primary name (the v5 convention) is
+  // reachable even when the manifest references it by a different
+  // `[providers]` handle. Without the fallback, secrets declared by
+  // such a harness silently fail to flow into the phase-1 bundle
+  // and construction errors out later complaining about an unset
+  // secret it had no chance to ask for.
   if (resolved.harness) {
     try {
-      const f = getHarnessFactory(resolved.harness.factoryName);
+      const f = lookupFactoryByBinding(
+        resolved.harness.factoryName,
+        resolved.harness.source,
+        getHarnessFactory,
+      );
       pushNeeds(out, f.secrets, `harness:${f.name}`);
     } catch {
       // Surfaced later by instantiateHarness.
@@ -901,11 +945,15 @@ export function collectPhase1SecretNeeds(
   }
   // Session factory needs (per chain link). Pre-built layers have no
   // factory to consult — their secrets, if any, are the SDK consumer's
-  // problem.
+  // problem. Same `lookupFactoryByBinding` story as the harness path.
   for (const layer of resolved.session ?? []) {
     if (isPreBuiltSessionLayer(layer)) continue;
     try {
-      const f = getSessionFactory(layer.factoryName);
+      const f = lookupFactoryByBinding(
+        layer.factoryName,
+        layer.source,
+        getSessionFactory,
+      );
       pushNeeds(out, f.secrets, `session:${f.name}`);
     } catch {
       // Surfaced later by instantiateSession.

@@ -13,6 +13,7 @@ import * as path from "node:path";
 import TOML from "@iarna/toml";
 
 import { ManifestError } from "../errors.js";
+import { substituteEnv } from "./env-substitution.js";
 import type {
   AgentManifest,
   Capabilities,
@@ -35,7 +36,14 @@ export async function parseAgentManifest(
   manifestPath: string,
 ): Promise<AgentManifest> {
   const abs = path.resolve(manifestPath);
-  const raw = await readToml(abs, "agent.toml");
+  const rawToml = await readToml(abs, "agent.toml");
+  // Apply `${VAR}` / `${VAR:-default}` substitution before structural
+  // validation so every downstream consumer sees ready-to-use values.
+  // See `env-substitution.ts` for the syntax and the rationale.
+  const raw = substituteEnv(rawToml, { context: abs }) as Record<
+    string,
+    unknown
+  >;
 
   const agent = ensureObject(raw.agent, "[agent]", abs);
   if (typeof agent.name !== "string" || !agent.name) {

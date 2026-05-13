@@ -71,6 +71,7 @@ async function main(argv: string[]): Promise<number> {
       return await cmdProviders(argv.slice(1));
     case "mcp":
       return await cmdMcp(argv.slice(1));
+
     default:
       console.error(`Unknown subcommand: ${cmd}`);
       printHelp();

@@ -346,6 +346,12 @@ function resolveRoot(raw: string, manifestDir: string): string {
  */
 export const skillsSessionFactory: SessionFactory = {
   name: "skills",
+  // SkillsSession contributes a system-prompt section and tool refs
+  // but doesn't override push/pull — events flow through untouched.
+  // It's a pure adornment layer; chains that contain only skills (or
+  // skills + compacting) need a storage layer (in-memory / file)
+  // for events to actually live somewhere.
+  passThrough: true,
   create(config: Record<string, unknown>, ctx: FactoryContext): Session {
     const rawRoots = collectRoots(config);
     const roots = rawRoots.map((r) => resolveRoot(r, ctx.manifestDir));

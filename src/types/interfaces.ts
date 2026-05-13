@@ -694,6 +694,27 @@ export interface SessionFactory {
    */
   readonly requiresParent?: boolean;
   /**
+   * If true, this session is a *pass-through* layer: it transforms,
+   * adorns, or augments events flowing through the chain but does
+   * NOT itself persist them. Examples: `compacting` (summarises but
+   * relies on an inner storage layer), `skills` (adds a system
+   * prompt section + contributes tools, no event storage).
+   *
+   * A session chain composed entirely of pass-through sessions has
+   * nowhere for events to actually live — every `push` propagates
+   * but nothing retains, and `pull` returns the empty bottom. The
+   * runtime checks at boot that at least one layer in the chain is
+   * NOT pass-through, throwing a clear `ResolutionError` when the
+   * configuration would silently swallow every turn.
+   *
+   * Default (`false` / undefined) means "this session stores events"
+   * — the conservative default for third-party sessions, which then
+   * compose freely in any chain. Sessions that intentionally don't
+   * store should opt in explicitly so misconfigurations of their
+   * chains surface loudly.
+   */
+  readonly passThrough?: boolean;
+  /**
    * Static ACP capability contribution. Called at `initialize` time
    * without instantiating a session, so factories that need to
    * decide based on config get the same config they would receive in

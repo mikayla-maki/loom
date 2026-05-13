@@ -428,6 +428,11 @@ export function compactingFileSession(
  */
 export const compactingSessionFactory: SessionFactory = {
   name: "compacting",
+  // CompactingSession reads events from inner layers via `pull` and
+  // emits summary events; it does NOT itself persist anything.
+  // Including it in a chain without an inner storage layer means
+  // events propagate through and vanish.
+  passThrough: true,
   create(
     config: Record<string, unknown>,
     _ctx: FactoryContext,

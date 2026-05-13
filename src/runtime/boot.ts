@@ -102,9 +102,30 @@ export function lookupFactoryByBinding<T extends { name: string }>(
         try {
           return lookup(fallback);
         } catch {
-          /* fall through; throw the original */
+          /* fall through; throw the augmented error below */
         }
       }
+      // Wrap the lookup failure with manifest ↔ source context so
+      // the user sees WHY both names were tried, not just "unknown
+      // factory '<handle>'". The original error's list of registered
+      // factories is preserved at the end.
+      const sourceKey = sourceSpecKey(source);
+      const orig =
+        originalError instanceof Error
+          ? originalError.message
+          : String(originalError);
+      throw new ResolutionError(
+        `Couldn't resolve factory for source '${sourceKey}'. Tried two ` +
+          `names:\n` +
+          `  - '${factoryName}' (from the manifest reference — a [providers] ` +
+          `handle or a direct provider= value)\n` +
+          `  - '${fallback}' (the package's primary name, by v5 convention)\n` +
+          `Neither is in the runtime registry. Either the package's ` +
+          `register() needs to use one of those names (the convention is ` +
+          `the primary name '${fallback}'), or the manifest needs to ` +
+          `reference a name the package actually registered.\n\n` +
+          orig,
+      );
     }
     throw originalError;
   }

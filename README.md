@@ -6,7 +6,7 @@
 > Humans, start here:
 
 Loom is a package manager and runtime for agent harnesses. Define
-your agent's features and capabilities in a `agent.toml` manifest,
+your agent's features and capabilities in an `agent.toml` manifest,
 check what it can do via  `loom audit`, then prompt it anywhere, anytime 
 via `loom prompt`:
 
@@ -246,6 +246,18 @@ on `AgentManifest.session`. A singleton `[session]` with just
 `provider = "..."` is the trivial one-layer case. The
 default-when-absent is the chain `skills → compacting → in-memory`,
 producing bounded growth and skill auto-loading out of the box.
+
+**Pass-through vs storage**. Some sessions are *pass-through*
+layers — they transform / adorn events flowing through the chain
+but don't themselves persist them (e.g. `compacting`, `skills`).
+Others actually retain events (`in-memory`, `file`). Boot fails
+with a clear error if every factory-based layer in the chain is
+pass-through (no storage anywhere) — otherwise pushes would
+propagate without anything to retain them and every turn would see
+an empty history. Add a storage layer to the end of your chain.
+Session authors flag their factories with `passThrough: true` when
+they don't store events; default is storage-class, the safe default
+for third-party sessions.
 
 A layer can also own a tool's implementation directly. A `Session`
 that advertises a tool name via `tools()` AND implements
@@ -802,6 +814,40 @@ max_tokens     = 4096
 ```sh
 BRAVE_SEARCH_API_KEY=... loom run agent.toml
 ```
+
+### Manifest env-var substitution
+
+The parser substitutes `${VAR}` and `${VAR:-default}` references in
+string values at parse time. Variable names are POSIX-shaped
+(letters / digits / underscores, can't start with a digit); braces
+are required (no bare `$VAR`).
+
+```toml
+[agent]
+name = "glass"
+system_prompt = "vault lives at ${VAULT_PATH:-~/Dropbox/glass-vault}"
+
+[harness]
+provider = "anthropic"
+model = "${MODEL_ID:-claude-sonnet-4-5}"
+
+[capabilities]
+read_file = { paths = ["${VAULT_PATH}", "./local"] }
+```
+
+An undefined required reference (`${NAME}` with no `:-default`)
+throws `ManifestError` at parse time, naming the variable. Defaults
+let you ship a manifest that works out of the box and still allow
+an operator to override per environment.
+
+**Not for secrets.** Substitution bakes values into the manifest
+object, which then flows through audit / log paths and any tooling
+that introspects the manifest — fine for paths and model ids,
+wrong for API keys. Credentials go through the secret store (next
+section), which carries per-tool filtering and no-log semantics.
+
+SDK consumers can apply the same substitution to programmatic
+manifests via `substituteEnv(manifest)` exported from `@mcmaki/loom`.
 
 ### Secret stores
 

@@ -313,4 +313,48 @@ describe("secrets pipeline", () => {
       await agent.close();
     }
   });
+
+  it("phase-1 secret collection uses the package-name fallback (regression: 0.1.4 bug)", async () => {
+    // Bug: `collectPhase1SecretNeeds` was looking up factories by
+    // their *binding* name only, skipping the package-name fallback
+    // that instantiation uses. A path-provider harness registered
+    // under its package's primary name but referenced by a different
+    // `[providers]` handle would have its secret declarations
+    // silently dropped — boot then failed with "<SECRET> not
+    // provided" because the bundle never asked for them.
+    //
+    // We register a harness under the basename of a synthetic path
+    // source and reference it via a different handle in the
+    // manifest. The captured secrets must include the declared
+    // required secret, which is only true if the fallback engages.
+    const { collectPhase1SecretNeeds } =
+      await import("../src/sdk/run-agent.js");
+    const { registerHarness: regH } = await import("../src/builtins/index.js");
+    regH({
+      name: "phase1-fallback-pkg",
+      secrets: { required: ["PHASE1_FALLBACK_SECRET"] },
+      create() {
+        return { run: async () => ({ stopReason: "end_turn" as const }) };
+      },
+    });
+
+    // Synthetic ResolvedManifest: handle 'companion', source basename
+    // 'phase1-fallback-pkg'. With the fix, the fallback resolves the
+    // factory and surfaces its declared secret.
+    const needs = collectPhase1SecretNeeds(
+      {
+        providers: [],
+        tools: [],
+        sources: new Map(),
+        harness: {
+          factoryName: "companion",
+          source: { path: "./phase1-fallback-pkg" },
+          config: {},
+        },
+      },
+      new Map(),
+    );
+    const names = needs.map((n) => n.name);
+    expect(names).toContain("PHASE1_FALLBACK_SECRET");
+  });
 });

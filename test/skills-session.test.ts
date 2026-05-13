@@ -440,7 +440,13 @@ describe("Skills session via runAgent", () => {
         edit_file: { paths: ["./"] },
         bash: { subprocess: "*", paths: ["./"] },
       },
-      session: { provider: "skills", root: TMP, default_tools: ["bash"] },
+      // skills is pass-through; pair with in-memory so the chain has
+      // a storage layer (otherwise the runtime fails with the new
+      // pass-through-only validation).
+      session: [
+        { provider: "skills", root: TMP, default_tools: ["bash"] },
+        { provider: "in-memory" },
+      ],
       harness,
     };
     const agent = await runAgent(manifest);
@@ -480,7 +486,11 @@ describe("Skills session via runAgent", () => {
         read_file: { provider: "builtin", custom_marker: "from-manifest" },
       },
       capabilities: { read_file: { paths: ["./"] } },
-      session: { provider: "skills", root: TMP, default_tools: [] },
+      // skills is pass-through; pair with in-memory for storage.
+      session: [
+        { provider: "skills", root: TMP, default_tools: [] },
+        { provider: "in-memory" },
+      ],
       harness,
     };
     const agent = await runAgent(manifest);
