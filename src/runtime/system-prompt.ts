@@ -6,7 +6,11 @@
  *   1. Manifest-owned (identity): `[agent].system_prompt` content (the
  *      core).
  *   2. Runtime-owned (structural): the tool reference.
- *   3. Per-turn (dynamic): current date and other ambient context.
+ *   3. Ambient context: current date and other slow-moving facts.
+ *      Deliberately coarse-grained (date-only, not timestamp) so the
+ *      assembled prompt stays byte-stable across a day and implicit
+ *      prompt caching can hit. Per-event timing lives on
+ *      `PersistedUpdate` and never reaches the wire.
  *   4. Session-owned (identity — retrieved memories, etc.): the section
  *      the Session contributes via `systemPromptSection()`.
  *
@@ -61,10 +65,19 @@ export function assembleSystemPrompt(inputs: SystemPromptInputs): string {
     parts.push(lines.join("\n"));
   }
 
-  // 3. Per-turn dynamic context.
+  // 3. Ambient context.
+  //
+  // Date-only (YYYY-MM-DD), deliberately not down-to-the-second. The
+  // system prompt is the longest stable prefix of every request and
+  // is what implicit prompt caching keys on; a full ISO timestamp
+  // here would change every turn and invalidate the cache for every
+  // call. Per-event timestamps DO live on `PersistedUpdate` for
+  // observability/replay, but the harness's `eventsToMessages`
+  // pipeline doesn't include them in what it sends to the model —
+  // so the request body itself stays stable across a day.
   const dyn: string[] = ["# Context"];
   const now = inputs.now ?? new Date();
-  dyn.push(`Current date: ${now.toISOString()}`);
+  dyn.push(`Current date: ${now.toISOString().slice(0, 10)}`);
   parts.push(dyn.join("\n"));
 
   // 4. Session-contributed section (memory, scoped instructions, etc.).

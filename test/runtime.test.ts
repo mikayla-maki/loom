@@ -185,4 +185,30 @@ describe("system prompt assembly", () => {
     // Skills are gone — no skill catalog section.
     expect(text).not.toContain("# Available Skills");
   });
+
+  it("emits date-only (no time, no millis) so implicit prompt caching stays warm across a day", () => {
+    // Two assemblies at different moments of the SAME day must
+    // produce byte-identical output. The system prompt is the longest
+    // stable prefix of every request; a per-turn timestamp here would
+    // defeat the upstream cache for every call. Date-only is the
+    // contract — if anyone tightens the resolution back to a
+    // timestamp, this test breaks loudly.
+    const inputs = {
+      core: "core",
+      tools: [{ name: "t", description: "t", inputSchema: {} }],
+      agentName: "tester",
+    };
+    const morning = assembleSystemPrompt({
+      ...inputs,
+      now: new Date("2026-05-13T08:15:42.123Z"),
+    });
+    const evening = assembleSystemPrompt({
+      ...inputs,
+      now: new Date("2026-05-13T22:47:09.987Z"),
+    });
+    expect(morning).toBe(evening);
+    expect(morning).toContain("Current date: 2026-05-13");
+    // And the timestamp form must NOT leak in.
+    expect(morning).not.toMatch(/Current date: \d{4}-\d{2}-\d{2}T/);
+  });
 });
