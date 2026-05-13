@@ -24,6 +24,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { ManifestError, ResolutionError } from "../errors.js";
+import { expandHome } from "../internal/util.js";
 import type { Session } from "../types/interfaces.js";
 import type {
   AgentManifest,
@@ -83,11 +84,6 @@ function looksLikePromptPath(s: string): boolean {
   );
 }
 
-function expandHome(p: string): string {
-  if (!p.startsWith("~/")) return p;
-  return path.join(process.env.HOME ?? "", p.slice(2));
-}
-
 // ─── Reference shape classification ───────────────────────────────────────
 
 /**
@@ -106,13 +102,22 @@ export function isBareHandle(s: string): boolean {
 
 /**
  * Reify a `Reference` as a `SourceSpec` when its shape is SourceSpec-like.
- * Returns null for bare handles. Strings with leading `./` / `../`
- * become `{ path }`; strings containing `/` become `{ npm }`; tables
- * are passed through.
+ * Returns null for bare handles. Strings with leading `./` / `../` /
+ * `~/` / `/` become `{ path }`; other strings containing `/`
+ * (e.g. `@org/pkg`) become `{ npm }`; tables are passed through.
+ *
+ * The `~/` prefix is classified as a path so `provider = "~/loom-providers/foo"`
+ * works. The loader expands the `~` to the user's home dir at load time.
  */
 export function referenceToSourceSpec(ref: Reference): SourceSpec | null {
   if (typeof ref === "string") {
-    if (ref.startsWith("./") || ref.startsWith("../")) {
+    if (
+      ref.startsWith("./") ||
+      ref.startsWith("../") ||
+      ref.startsWith("~/") ||
+      ref === "~" ||
+      ref.startsWith("/")
+    ) {
       return { path: ref };
     }
     if (ref.includes("/")) {

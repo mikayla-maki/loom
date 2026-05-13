@@ -84,11 +84,15 @@ function printHelp(): void {
 
 Usage:
   loom run <agent.toml>                  Interactive REPL with the agent.
-  loom prompt <agent.toml> [text] [--format <text|trace|jsonl>]
+  loom prompt <agent.toml> [text] [--format <text|trace|jsonl>] [--emit-preamble]
                                          One-shot prompt (stdin if [text] omitted).
                                          text (default): final agent message to stdout.
                                          trace: coalesced labelled debug view.
                                          jsonl: raw SessionUpdate per line.
+                                         --emit-preamble (jsonl only) emits one
+                                         { preamble: {...} } line first, capturing
+                                         the system prompt, history events, and
+                                         tool list as the model will see them.
   loom audit <agent.toml> [--json]       Print the static capability tree.
                                          Exits non-zero (with partial tree)
                                          if the manifest isn't fully resolved.
@@ -146,7 +150,7 @@ async function cmdPrompt(args: string[]): Promise<number> {
   const manifestPath = opts._[0];
   if (!manifestPath) {
     console.error(
-      "usage: loom prompt <agent.toml> [text] [--format <text|trace|jsonl>]",
+      "usage: loom prompt <agent.toml> [text] [--format <text|trace|jsonl>] [--emit-preamble]",
     );
     return 2;
   }
@@ -159,6 +163,18 @@ async function cmdPrompt(args: string[]): Promise<number> {
     return 2;
   }
   const format = rawFormat as PromptFormat;
+  // `--emit-preamble` only makes sense alongside `--format jsonl` —
+  // the preamble's a structured snapshot, and jsonl is the format
+  // that already speaks structured-line-per-event. We refuse to mix
+  // it with text / trace rather than silently produce something
+  // unparseable.
+  const emitPreamble = opts.flags["emit-preamble"] === true;
+  if (emitPreamble && format !== "jsonl") {
+    console.error(
+      `error: --emit-preamble requires --format jsonl (got "${format}")`,
+    );
+    return 2;
+  }
   let text = opts._.slice(1).join(" ");
   if (!text) text = await readStdin();
   if (!text.trim()) {
@@ -171,6 +187,7 @@ async function cmdPrompt(args: string[]): Promise<number> {
     manifest: manifestPath,
     text,
     format,
+    emitPreamble,
     permissionHandler: ttyPermissionHandler(),
     onMissingSecret: ttyMissingSecretHandler(),
     onAuditFinding: stderrAuditPrinter(),

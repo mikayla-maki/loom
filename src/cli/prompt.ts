@@ -427,6 +427,15 @@ export interface RunPromptOptions {
   manifest: string | AgentManifest;
   text: string;
   format: PromptFormat;
+  /**
+   * When true, emits one `{"preamble": {...}}` JSON line on stdout
+   * before the turn's events. Requires `format === "jsonl"` — the
+   * CLI rejects the combination otherwise. Use this to capture a
+   * full audit record for the turn (system prompt + history events
+   * + tool list as the model will see them) in the same invocation
+   * that drives the prompt.
+   */
+  emitPreamble?: boolean;
   permissionHandler?: PermissionHandler;
   onMissingSecret?: OnMissingSecret;
   onAuditFinding?: (
@@ -481,7 +490,21 @@ export async function runPromptCommand(
   let stopReason: StopReason = "end_turn";
   let runErr: unknown = null;
   try {
-    const result = await agent.prompt(opts.text);
+    const result = await agent.prompt(
+      opts.text,
+      opts.emitPreamble
+        ? {
+            onPreamble: (preamble) => {
+              // Single JSON line, distinguishable from SessionUpdates
+              // (which always carry a `sessionUpdate` field) by the
+              // top-level `preamble` key. Always emit on stdout — the
+              // CLI already constrained this to `--format jsonl`, so
+              // it composes naturally with the rest of the stream.
+              streams.stdout.write(JSON.stringify({ preamble }) + "\n");
+            },
+          }
+        : undefined,
+    );
     stopReason = result.stopReason;
   } catch (e) {
     runErr = e;

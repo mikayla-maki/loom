@@ -24,6 +24,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { expandHome } from "../../internal/util.js";
+
 import YAML from "yaml";
 
 import type {
@@ -329,19 +331,13 @@ function displayPath(p: string, home: string): string {
   return p;
 }
 
-// ─── Factory ─────────────────────────────────────────────────────────────────────
+// ─── Factory ──────────────────────────────────────────────────────────────
 
 /** Absolute pass-through; `~` expands to OS home; relative resolves against `manifestDir`. */
 function resolveRoot(raw: string, manifestDir: string): string {
-  if (raw.startsWith("~")) {
-    const home = os.homedir();
-    if (raw === "~") return home;
-    if (raw.startsWith("~" + path.sep) || raw.startsWith("~/")) {
-      return path.join(home, raw.slice(2));
-    }
-  }
-  if (path.isAbsolute(raw)) return raw;
-  return path.resolve(manifestDir, raw);
+  const expanded = expandHome(raw);
+  if (path.isAbsolute(expanded)) return expanded;
+  return path.resolve(manifestDir, expanded);
 }
 
 /**

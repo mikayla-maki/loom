@@ -54,6 +54,7 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 
 import { ManifestError, SecretError } from "../../errors.js";
+import { expandHome } from "../../internal/util.js";
 import { applyArgGrant } from "../../manifest/capabilities.js";
 import type { ContributionRegistration } from "../../providers/loader.js";
 import type {
@@ -282,7 +283,9 @@ export const mcpServerToolsFactory: ContributionRegistration<Tools> = {
     const transport = new StdioClientTransport({
       command,
       args,
-      cwd: config.cwd ?? ctx.manifestDir,
+      // Expand `~` on `cwd` so users can write `cwd = "~/projects"`
+      // without it becoming a literal `<manifestDir>/~/projects`.
+      cwd: config.cwd ? expandHome(config.cwd) : ctx.manifestDir,
       // Mix our env over the SDK default safe set.
       env: { ...defaultSdkEnv(), ...env },
       // Forward child stderr to ours so the user sees MCP server
@@ -389,11 +392,18 @@ function resolveLaunchCommand(
   c: McpServerConfig,
   ctx: FactoryContext,
 ): [string, string[]] {
+  // Expand `~` on every user-supplied path-shaped value. We don't
+  // spawn through a shell, so `~` won't be expanded by anything else
+  // — if a user writes `command = "~/bin/my-mcp"` they expect it to
+  // work the same way it does in their terminal. `expandHome` is a
+  // no-op for non-`~/`-prefixed values so non-path commands like
+  // `"node"` pass through untouched.
+  const expandArgs = (args: string[]): string[] => args.map(expandHome);
   if (c.npm) {
     const resolved = resolveNpmEntry(c.npm, ctx.manifestDir);
-    return ["node", [resolved, ...(c.args ?? [])]];
+    return ["node", [resolved, ...expandArgs(c.args ?? [])]];
   }
-  return [c.command as string, c.args ?? []];
+  return [expandHome(c.command as string), expandArgs(c.args ?? [])];
 }
 
 function resolveNpmEntry(npmName: string, manifestDir: string): string {

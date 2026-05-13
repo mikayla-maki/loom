@@ -10,6 +10,7 @@
 import type { ContentBlock, SessionUpdate } from "../types/acp.js";
 import type {
   Agent,
+  AgentPreamble,
   Harness,
   RunParameters,
   Runtime,
@@ -238,6 +239,20 @@ export class RunningAgentImpl implements RunningAgent {
 
     this.inflight = (async () => {
       try {
+        // Snapshot the preamble — system prompt, history events, tool
+        // list — if the caller wants it. Done here (not in the harness)
+        // so it doesn't depend on harness behavior; every harness that
+        // calls `runtime.systemPrompt()` / `runtime.getEvents()` /
+        // `runtime.listTools()` will see exactly these values. Errors
+        // propagate so callers can fail-fast on broken audit hooks.
+        if (params?.onPreamble) {
+          const preamble: AgentPreamble = {
+            systemPrompt: runtime.systemPrompt(),
+            events: await runtime.getEvents(),
+            tools: runtime.listTools(),
+          };
+          await Promise.resolve(params.onPreamble(preamble));
+        }
         return await this.harness.run(runtime, params);
       } finally {
         this.currentAbortCtl = null;

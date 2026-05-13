@@ -22,6 +22,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { ManifestError } from "../../errors.js";
+import { expandHome } from "../../internal/util.js";
 import type {
   FactoryContext,
   Session,
@@ -207,7 +208,12 @@ export const fileSessionFactory: SessionFactory = {
           `(omit it entirely to default to <ctx.storage>/${DEFAULT_FILENAME}).`,
       );
     }
-    const abs = path.isAbsolute(p) ? p : path.resolve(ctx.manifestDir, p);
+    // `expandHome` first so `~/path/to/file.jsonl` doesn't end up as
+    // `<manifestDir>/~/path/to/file.jsonl`.
+    const expanded = expandHome(p);
+    const abs = path.isAbsolute(expanded)
+      ? expanded
+      : path.resolve(ctx.manifestDir, expanded);
     return new FileSession(abs);
   },
 };

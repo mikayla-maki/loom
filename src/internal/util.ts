@@ -3,6 +3,9 @@
  * these exist purely to keep call sites legible.
  */
 
+import * as os from "node:os";
+import * as path from "node:path";
+
 /**
  * Exhaustiveness check for discriminated unions. Place at the end of
  * a `switch` or chain of `if`s over a closed union to turn a missed
@@ -50,4 +53,34 @@ export function stripProvider<T extends { provider?: unknown }>(
   const { provider: _p, ...rest } = obj;
   void _p;
   return rest;
+}
+
+/**
+ * Expand a leading `~/` (or bare `~`) in a path to the user's home
+ * directory. Mirrors what most shells do; centralised here because
+ * Loom does it in several places (capability path grants, system-
+ * prompt path specs, skills-session root config) and `path.resolve`
+ * by itself does NOT honour `~` — it treats the character as a
+ * literal relative segment.
+ *
+ * Uses `os.homedir()` for portability (handles macOS / Linux
+ * `$HOME` and Windows `%USERPROFILE%`). When no home directory is
+ * available, the path is returned unchanged — callers downstream
+ * will fail loudly when they try to use it, which is the right
+ * surface for that very-unusual configuration.
+ *
+ * Examples:
+ *   expandHome("~/Dropbox/foo")  →  "/Users/alice/Dropbox/foo"
+ *   expandHome("~")              →  "/Users/alice"
+ *   expandHome("./local")        →  "./local"        (unchanged)
+ *   expandHome("/abs/path")      →  "/abs/path"      (unchanged)
+ */
+export function expandHome(p: string): string {
+  if (p === "~") return os.homedir() || p;
+  if (p.startsWith("~/") || p.startsWith("~" + path.sep)) {
+    const home = os.homedir();
+    if (!home) return p;
+    return path.join(home, p.slice(2));
+  }
+  return p;
 }

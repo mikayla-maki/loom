@@ -15,6 +15,7 @@
 
 import * as path from "node:path";
 
+import { expandHome } from "../../internal/util.js";
 import type { CapabilitySet } from "../../types/manifest.js";
 import type { ToolContext, TrustedPath } from "../../types/interfaces.js";
 
@@ -36,7 +37,10 @@ export function paths(grant: CapabilitySet | undefined): "*" | string[] | null {
   if (v === undefined) return null;
   if (v === "*") return "*";
   if (Array.isArray(v) && v.every((x) => typeof x === "string")) {
-    return (v as string[]).map((p) => path.resolve(p));
+    // `~/` is expanded to the user's home directory BEFORE
+    // `path.resolve`, because `path.resolve` treats `~` as a literal
+    // segment and would otherwise produce `<cwd>/~/Dropbox/...`.
+    return (v as string[]).map((p) => path.resolve(expandHome(p)));
   }
   throw new Error('capability `paths` must be "*" or an array of strings');
 }
@@ -146,7 +150,10 @@ export function effectivePaths(
   if (granted === "*") return "*";
   const accepted = filterTrustedPaths(trusted, needs);
   if (accepted.length === 0) return granted;
-  const extras = accepted.map((t) => path.resolve(t.path));
+  // Trusted paths from sessions get the same `~/` expansion as
+  // manifest grants — sessions that produce `~/.skills` style paths
+  // should not silently produce `<cwd>/~/.skills`.
+  const extras = accepted.map((t) => path.resolve(expandHome(t.path)));
   // Dedup against existing grants (cheap; small N in practice).
   const seen = new Set(granted);
   const out = [...granted];

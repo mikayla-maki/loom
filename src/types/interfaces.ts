@@ -581,6 +581,60 @@ export interface RunParameters {
   maxOutputTokens?: number;
   /** Override the model id for this single call. */
   model?: string;
+  /**
+   * Capture the turn's preamble — the assembled system prompt,
+   * pulled session events (history), and tool list — immediately
+   * before the harness calls the model.
+   *
+   * Fires exactly once per `prompt()` invocation, after
+   * `Session.prepareTurn` and `Session.systemPromptSection` have
+   * run but before `Harness.run` dispatches anything. Synchronous
+   * or async return; the runtime awaits it before proceeding so
+   * downstream consumers can finish their I/O (writing to an audit
+   * log, for instance) before the model starts responding.
+   *
+   * Throwing from this callback aborts the turn with a `stopReason`
+   * of `"error"` — if you want best-effort recording, swallow your
+   * own exceptions.
+   */
+  onPreamble?: (preamble: AgentPreamble) => void | Promise<void>;
+}
+
+/**
+ * Snapshot of what the harness is about to send to the model for a
+ * single turn. Surfaced to consumers via {@link RunParameters.onPreamble}
+ * and `loom prompt --emit-preamble`; the primary use is per-turn
+ * audit logging (Discord bots, agent observability, etc.) where the
+ * `text`-mode answer alone doesn't tell the full story.
+ *
+ * All three fields are read-only snapshots of state the runtime
+ * already had to compute to make the API call. None of them mutate
+ * the agent.
+ */
+export interface AgentPreamble {
+  /**
+   * Fully assembled system prompt the harness will send. Includes
+   * the manifest's `[agent].system_prompt`, the agent name /
+   * description block, any session-contributed section, and the
+   * tool reference — i.e. exactly what `Runtime.systemPrompt()`
+   * returns when the harness calls it.
+   */
+  systemPrompt: string;
+  /**
+   * Events pulled from the session's view of context, in order.
+   * Each is a `SessionUpdate`; the harness converts them into the
+   * provider's message shape (Anthropic `MessageParam[]`, OpenAI
+   * input items, etc.). Includes the user message that triggered
+   * this turn.
+   */
+  events: SessionUpdate[];
+  /**
+   * Tools the harness will declare to the model: name,
+   * description, JSON schema for inputs. Harness-exposed server
+   * tools (Anthropic's `web_search`, etc.) appear here under their
+   * stub `Tool` shape.
+   */
+  tools: ToolDescriptor[];
 }
 
 /**

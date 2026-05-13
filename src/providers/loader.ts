@@ -29,6 +29,7 @@ import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 
 import { LoomError } from "../errors.js";
+import { expandHome } from "../internal/util.js";
 import type {
   Agent,
   FactoryContext,
@@ -238,9 +239,12 @@ export async function loadProviderFromSource(
     return loadProviderByName(source.npm, loadCtx, options);
   }
   if ("path" in source) {
-    const abs = path.isAbsolute(source.path)
-      ? source.path
-      : path.resolve(loadCtx.agentManifestDir, source.path);
+    // `expandHome` first so `~/loom-providers/foo` resolves to the
+    // user's home dir instead of `<manifestDir>/~/loom-providers/foo`.
+    const expanded = expandHome(source.path);
+    const abs = path.isAbsolute(expanded)
+      ? expanded
+      : path.resolve(loadCtx.agentManifestDir, expanded);
     return loadProviderFromPath(abs, loadCtx);
   }
   throw new LoomError(`Unknown SourceSpec shape: ${JSON.stringify(source)}`);
