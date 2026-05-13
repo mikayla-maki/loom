@@ -609,6 +609,185 @@ describe("anthropic web_fetch end-to-end", () => {
 
 // ─── In-session replay (encrypted content survives across turns) ─────────────
 
+// ─── Streaming order ────────────────────────────────────────────────────
+
+describe("anthropic server-tool event order during streaming", () => {
+  it("surfaces server_tool_use + result blocks BETWEEN surrounding text deltas", async () => {
+    // Regression test for the v0.1.x bug where streamed responses
+    // emitted all text deltas live but deferred the tool_call /
+    // tool_call_update emissions until `finalMessage()` resolved —
+    // so the tool call appeared AFTER the model's full text in the
+    // session log, instead of in the middle of it where Anthropic
+    // actually produced it.
+    //
+    // The stub serves an SSE stream with content blocks in this
+    // order: text → server_tool_use → web_search_tool_result → text.
+    // We expect the session events to land in the same chronological
+    // order: agent_message_chunk → tool_call → tool_call_update →
+    // agent_message_chunk.
+    const enc = new TextEncoder();
+    const sseFrame = (e: Record<string, unknown>): Uint8Array =>
+      enc.encode(`event: ${String(e.type)}\ndata: ${JSON.stringify(e)}\n\n`);
+    const eventSequence: Record<string, unknown>[] = [
+      // Header
+      {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-5-latest",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: 10,
+            output_tokens: 0,
+            cache_creation_input_tokens: null,
+            cache_read_input_tokens: null,
+            server_tool_use: null,
+            service_tier: "standard",
+            cache_creation: null,
+            inference_geo: null,
+          },
+        },
+      },
+      // Block 0: opening text
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Let me search." },
+      },
+      { type: "content_block_stop", index: 0 },
+      // Block 1: server_tool_use
+      {
+        type: "content_block_start",
+        index: 1,
+        content_block: {
+          type: "server_tool_use",
+          id: "srvr_1",
+          caller: { type: "direct" },
+          name: "web_search",
+          input: { query: "loom" },
+        },
+      },
+      {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "input_json_delta", partial_json: "" },
+      },
+      { type: "content_block_stop", index: 1 },
+      // Block 2: web_search_tool_result
+      {
+        type: "content_block_start",
+        index: 2,
+        content_block: {
+          type: "web_search_tool_result",
+          tool_use_id: "srvr_1",
+          caller: { type: "direct" },
+          content: [
+            {
+              type: "web_search_result",
+              title: "Loom",
+              url: "https://example.com/loom",
+              encrypted_content: "ENC",
+            },
+          ],
+        },
+      },
+      { type: "content_block_stop", index: 2 },
+      // Block 3: closing text
+      {
+        type: "content_block_start",
+        index: 3,
+        content_block: { type: "text", text: "" },
+      },
+      {
+        type: "content_block_delta",
+        index: 3,
+        delta: { type: "text_delta", text: "Found the README." },
+      },
+      { type: "content_block_stop", index: 3 },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 15 },
+      },
+      { type: "message_stop" },
+    ];
+    global.fetch = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/v1/models/")) {
+        return new Response(
+          JSON.stringify({
+            id: "claude-sonnet-4-5-latest",
+            type: "model",
+            display_name: "Sonnet",
+            created_at: "2024-01-01T00:00:00Z",
+            max_input_tokens: 200000,
+            max_tokens: 8192,
+            capabilities: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          for (const e of eventSequence) ctrl.enqueue(sseFrame(e));
+          ctrl.close();
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    const agent = await runAgent(
+      {
+        name: "streaming-order",
+        harness: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-5-latest",
+          stream: true,
+        },
+        session: new InMemorySession(),
+        tools: { web_search: "anthropic" },
+      },
+      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+    );
+    try {
+      await agent.prompt("search please");
+      const events = (await agent.session.pull?.([])) ?? [];
+      // Filter out usage_update / stop events and look only at the
+      // four content kinds we care about ordering between.
+      const sequenceKinds = events
+        .map((e) => e.sessionUpdate)
+        .filter(
+          (k) =>
+            k === "agent_message_chunk" ||
+            k === "tool_call" ||
+            k === "tool_call_update",
+        );
+      expect(sequenceKinds).toEqual([
+        // user_message_chunk would have been before these, but we
+        // filtered to agent-side kinds only.
+        "agent_message_chunk", // "Let me search."
+        "tool_call", // server_tool_use(web_search)
+        "tool_call_update", // web_search_tool_result
+        "agent_message_chunk", // "Found the README."
+      ]);
+    } finally {
+      await agent.close();
+    }
+  });
+});
+
 describe("anthropic server-tool replay within a session", () => {
   it("re-sends server_tool_use + web_search_tool_result on a second turn", async () => {
     // Two consecutive prompts. The first turn's response contains a

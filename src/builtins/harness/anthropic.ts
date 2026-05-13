@@ -597,25 +597,14 @@ export class AnthropicHarness implements Harness {
         );
       }
 
-      // Walk the response content to:
-      //   * collect client-side `tool_use` blocks for dispatch via
-      //     `runtime.executeTool` (the regular path), and
-      //   * surface `server_tool_use` + `*_tool_result` block pairs
-      //     as `tool_call` + `tool_call_update` events for the
-      //     session log + ACP client display, WITHOUT dispatching
-      //     them — they already ran server-side, and the result is
-      //     baked into this same assistant message.
-      //
-      // Server-tool pairing: `*_tool_result` blocks reference their
-      // originating `server_tool_use` by id (`tool_use_id`), and the
-      // model's text continues after the result in the same message,
-      // so the ACP client sees “title: web_search” → “result: …” in
-      // order alongside the surrounding text deltas.
+      // Collect client-side `tool_use` blocks for post-turn dispatch
+      // via `runtime.executeTool`. We don't emit any events from
+      // this pass — `tool_call`, `server_tool_use`, and the various
+      // `*_tool_result` blocks are all surfaced inline by
+      // `runStreaming` / `runNonStreaming` as they arrive from the
+      // API (so they interleave with the surrounding text in the
+      // order Anthropic actually produced them).
       const toolUses: Array<{ id: string; name: string; input: unknown }> = [];
-      const serverToolUses = new Map<
-        string,
-        { name: string; input: unknown }
-      >();
       for (const block of response.content) {
         if (block.type === "tool_use") {
           toolUses.push({
@@ -623,35 +612,6 @@ export class AnthropicHarness implements Harness {
             name: block.name,
             input: block.input,
           });
-          await runtime.update({
-            sessionUpdate: "tool_call",
-            toolCallId: block.id,
-            title: block.name,
-            status: "in_progress",
-            rawInput: block.input,
-          });
-        } else if (block.type === "server_tool_use") {
-          // Emit the call event so it shows up in the session log
-          // and ACP UIs alongside the eventual result. The `title`
-          // is the tool name (matches client-side tool_use). We
-          // remember the pairing so the matching result block can
-          // attach its rendered text below.
-          serverToolUses.set(block.id, {
-            name: block.name,
-            input: block.input,
-          });
-          await runtime.update({
-            sessionUpdate: "tool_call",
-            toolCallId: block.id,
-            title: block.name,
-            status: "in_progress",
-            rawInput: block.input,
-          });
-        } else if (
-          block.type === "web_search_tool_result" ||
-          block.type === "web_fetch_tool_result"
-        ) {
-          await this.emitServerToolResult(runtime, block, serverToolUses);
         }
       }
 
@@ -749,8 +709,10 @@ export class AnthropicHarness implements Harness {
   }
 
   /**
-   * Non-streaming path: one `messages.create()` call. Text and tool_use
-   * blocks land via post-response emission.
+   * Non-streaming path: one `messages.create()` call. Walks the
+   * returned content blocks in order and emits each one through
+   * {@link emitContentBlockInline}, so consumers see the same
+   * chronological interleaving they'd see from the streaming path.
    */
   private async runNonStreaming(
     body: MessageCreateParamsBase,
@@ -760,28 +722,25 @@ export class AnthropicHarness implements Harness {
       { ...body, stream: false },
       { signal: runtime.abortSignal },
     );
-    // Emit text + thinking blocks (no live streaming in this path).
+    const serverToolUses = new Map<string, { name: string; input: unknown }>();
     for (const block of response.content) {
-      if (block.type === "text" && block.text) {
-        await runtime.update({
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: block.text },
-        });
-      } else if (block.type === "thinking" && block.thinking) {
-        await runtime.update({
-          sessionUpdate: "agent_thought_chunk",
-          content: { type: "text", text: block.thinking },
-        });
-      }
+      await this.emitContentBlockInline(runtime, block, serverToolUses);
     }
     return response;
   }
 
   /**
-   * Streaming path: surface text and thinking deltas as they arrive
-   * via the SDK's high-level `MessageStream` event surface. The final
-   * `Message` is taken from `finalMessage()` and returned for the
-   * common post-response code (tool dispatch, usage, etc.).
+   * Streaming path: forwards text/thinking *deltas* as they arrive
+   * (for the live-typing UX) and hooks `contentBlock` for everything
+   * else — tool_use, server_tool_use, web_search_tool_result, etc.
+   * — so structured blocks surface at the exact point Anthropic
+   * produced them, interleaved with the surrounding text deltas.
+   *
+   * Without the `contentBlock` hook, structured blocks would only
+   * become visible after `finalMessage()` resolved, bunching them
+   * up at the end of the turn (see the v0.1.x bug report where
+   * `web_search` calls always rendered AFTER all of the model's
+   * text instead of in the middle of it).
    */
   private async runStreaming(
     body: MessageCreateParamsBase,
@@ -791,32 +750,121 @@ export class AnthropicHarness implements Harness {
       { ...body, stream: true },
       { signal: runtime.abortSignal },
     );
-    // Forward delta emissions sequentially. We don't await each emit
-    // inside the listener (the event surface is synchronous); ordering
-    // is preserved by listening to a single source.
+    // Forward emissions sequentially. The SDK event surface is
+    // synchronous, so chaining onto a single promise preserves the
+    // arrival order of `text` / `thinking` / `contentBlock` events.
+    const serverToolUses = new Map<string, { name: string; input: unknown }>();
     let emitChain: Promise<void> = Promise.resolve();
-    const enqueue = (update: SessionUpdate): void => {
-      emitChain = emitChain.then(() => runtime.update(update));
+    const enqueue = (action: () => Promise<void>): void => {
+      emitChain = emitChain.then(action).catch(() => undefined);
     };
     stream.on("text", (delta) => {
       if (delta) {
-        enqueue({
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: delta },
-        });
+        enqueue(() =>
+          runtime.update({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: delta },
+          }),
+        );
       }
     });
     stream.on("thinking", (delta) => {
       if (delta) {
-        enqueue({
-          sessionUpdate: "agent_thought_chunk",
-          content: { type: "text", text: delta },
-        });
+        enqueue(() =>
+          runtime.update({
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: delta },
+          }),
+        );
       }
     });
+    stream.on("contentBlock", (block) => {
+      // Skip text/thinking blocks here — they were already streamed
+      // as deltas above. Everything else (tool_use, server_tool_use,
+      // *_tool_result, etc.) surfaces here at the point of completion.
+      if (block.type === "text" || block.type === "thinking") return;
+      enqueue(() =>
+        this.emitContentBlockInline(runtime, block, serverToolUses),
+      );
+    });
     const final = await stream.finalMessage();
-    await emitChain; // make sure every queued delta has actually flushed
+    await emitChain; // make sure every queued event has actually flushed
     return final;
+  }
+
+  /**
+   * Emit a single API content block as a session event, in the role
+   * the block fills:
+   *   - `text`               → `agent_message_chunk`
+   *   - `thinking`           → `agent_thought_chunk`
+   *   - `tool_use`           → `tool_call`  (client-side; result emitted
+   *                                          later by `runtime.executeTool`)
+   *   - `server_tool_use`    → `tool_call`  (server-side; result is the
+   *                                          NEXT block in the stream)
+   *   - `web_search_tool_result` / `web_fetch_tool_result`
+   *                          → `tool_call_update` (server-side result)
+   *
+   * Blocks of any other shape are silently ignored — we'd rather
+   * the harness keep working than emit confusing surface for content
+   * we don't have a renderer for. (Future server tools — code
+   * execution, etc. — will need their own arms here.)
+   */
+  private async emitContentBlockInline(
+    runtime: Runtime,
+    block: AnthropicContentBlock,
+    serverToolUses: Map<string, { name: string; input: unknown }>,
+  ): Promise<void> {
+    switch (block.type) {
+      case "text":
+        if (block.text) {
+          await runtime.update({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: block.text },
+          });
+        }
+        return;
+      case "thinking":
+        if (block.thinking) {
+          await runtime.update({
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: block.thinking },
+          });
+        }
+        return;
+      case "tool_use":
+        await runtime.update({
+          sessionUpdate: "tool_call",
+          toolCallId: block.id,
+          title: block.name,
+          status: "in_progress",
+          rawInput: block.input,
+        });
+        return;
+      case "server_tool_use":
+        // Remember the (id, name, input) so the matching
+        // `*_tool_result` block can attribute itself to the same
+        // call by id.
+        serverToolUses.set(block.id, {
+          name: block.name,
+          input: block.input,
+        });
+        await runtime.update({
+          sessionUpdate: "tool_call",
+          toolCallId: block.id,
+          title: block.name,
+          status: "in_progress",
+          rawInput: block.input,
+        });
+        return;
+      case "web_search_tool_result":
+      case "web_fetch_tool_result":
+        await this.emitServerToolResult(runtime, block, serverToolUses);
+        return;
+      default:
+        // Unknown block type — ignore so the harness stays forward-
+        // compatible with future Anthropic content kinds.
+        return;
+    }
   }
 
   /**
