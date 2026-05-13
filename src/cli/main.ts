@@ -11,7 +11,7 @@
  * The CLI is intentionally minimal — the surface area is the SDK.
  */
 
-import { runAgent } from "../sdk/run-agent.js";
+import { runAgent, LOOM_VERSION } from "../sdk/run-agent.js";
 import { runPromptCommand, type PromptFormat } from "./prompt.js";
 import {
   AuditError,
@@ -48,6 +48,10 @@ function stderrAuditPrinter() {
 
 async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+    process.stdout.write(`${LOOM_VERSION}\n`);
+    return 0;
+  }
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
     printHelp();
     return 0;
@@ -76,7 +80,7 @@ async function main(argv: string[]): Promise<number> {
 
 function printHelp(): void {
   process.stdout.write(
-    `loom — A capability-secure, manifest-driven agent runtime.
+    `loom v${LOOM_VERSION} — A capability-secure, manifest-driven agent runtime.
 
 Usage:
   loom run <agent.toml>                  Interactive REPL with the agent.
@@ -95,6 +99,7 @@ Usage:
   loom providers info <name>             Show resolved metadata for a provider package.
   loom mcp inspect <provider> [--manifest <agent.toml>] [--json]
                                          Dump an MCP server's tools as TOML you can paste.
+  loom --version | -v                    Print the installed loom version and exit.
 
 In the REPL: tab to complete /commands. Built-ins:
   /quit /exit /help /audit /events [N] /tools

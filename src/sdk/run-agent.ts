@@ -20,7 +20,9 @@
  *  10. Build ToolTable + AgentState + RunningAgent.
  */
 
+import { readFileSync } from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   findToolsFactory,
@@ -104,7 +106,40 @@ import { ChainedSession } from "../runtime/session-chain.js";
 
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 
-export const LOOM_VERSION = "0.1.0";
+/**
+ * Loom's package version, read from `package.json` at module load.
+ * Surfaced to plugins via {@link FactoryContext.loomVersion},
+ * stamped into ACP `agentInfo`, and written to `lock.toml` by
+ * `loom install`. Reading it dynamically (rather than hardcoding)
+ * keeps every consumer in sync with whatever version this build
+ * shipped — no drift between `package.json` and the runtime.
+ */
+export const LOOM_VERSION: string = readLoomVersion();
+
+function readLoomVersion(): string {
+  // The compiled CLI / SDK lives at `dist/sdk/run-agent.js`, so
+  // `package.json` is three `..` up. The same path shape holds for
+  // the `src/sdk/run-agent.ts` source under vitest (it's also two
+  // directories deep inside the project root). Resolve relative
+  // to this module's URL so the lookup survives no matter what
+  // CWD the user invokes from.
+  //
+  // Errors fall back to `"0.0.0-unknown"` rather than throwing —
+  // a missing or malformed `package.json` shouldn't take down
+  // every Loom command.
+  try {
+    const thisFile = fileURLToPath(import.meta.url);
+    const pkgPath = path.resolve(thisFile, "..", "..", "..", "package.json");
+    const raw = readFileSync(pkgPath, "utf8");
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    if (typeof parsed.version === "string" && parsed.version) {
+      return parsed.version;
+    }
+  } catch {
+    /* fall through */
+  }
+  return "0.0.0-unknown";
+}
 
 /**
  * Default session chain applied when the manifest omits the
