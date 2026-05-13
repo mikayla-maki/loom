@@ -49,7 +49,12 @@ import type {
   MessageCreateParamsBase,
   MessageParam,
   Tool as AnthropicTool,
+  ToolUnion as AnthropicToolUnion,
   Usage as AnthropicUsage,
+  WebFetchTool20250910,
+  WebFetchToolResultBlock,
+  WebSearchTool20250305,
+  WebSearchToolResultBlock,
 } from "@anthropic-ai/sdk/resources/messages";
 import type { ModelInfo } from "@anthropic-ai/sdk/resources/models";
 
@@ -61,6 +66,7 @@ import type {
   TurnUsage,
 } from "../../types/acp.js";
 import type {
+  Agent,
   FactoryContext,
   Harness,
   HarnessFactory,
@@ -68,8 +74,13 @@ import type {
   RunParameters,
   Runtime,
   SummariseArgs,
+  Tool,
+  ToolConfig,
+  ToolResult,
   TurnResult,
 } from "../../types/interfaces.js";
+import type { CapabilitySet } from "../../types/manifest.js";
+import type { JSONSchema } from "../../types/schema.js";
 
 interface AnthropicConfig {
   model?: string;
@@ -77,6 +88,197 @@ interface AnthropicConfig {
   maxTokens?: number;
   maxTurnRequests?: number;
   stream?: boolean;
+}
+
+// ─── Server-tool catalog ─────────────────────────────────────────────────
+//
+// Tools the harness dispatches API-side (not through the runtime's
+// ToolTable). The manifest opts in by listing one in `[tools.<name>]`
+// with `provider = "anthropic"`; the resolver routes the binding to
+// `Harness.resolveTool`, and `run()` translates it into the API's
+// native server-tool shape on the way out.
+//
+// Pinned to the `_20250305` revision for `web_search` and the
+// `_20250910` revision for `web_fetch`. The Anthropic SDK exposes
+// newer revisions; we'll bump deliberately when their behaviour
+// surface stabilises.
+
+interface ServerToolSpec {
+  /** Model-facing name surfaced via `runtime.listTools()`. */
+  name: string;
+  /** What the tool does, for system-prompt enumeration / audit. */
+  description: string;
+  /** Input shape the model fills out. Documentation-only — the API enforces. */
+  inputSchema: JSONSchema;
+  /**
+   * Capability kinds this tool understands. Listed in the stub Tool's
+   * `optional` array so `assertKnownKinds` accepts grants like
+   * `web_search = { allowed_domains = [...] }`. Per the
+   * positive/declarative/closed-by-default convention, the allow-list
+   * surface lives here; exclusionary (`blocked_domains`) and pure-
+   * knob (`max_uses`, `user_location`) shapes stay as config.
+   */
+  capabilityKinds: string[];
+  /**
+   * Build the API-side `ToolUnion` entry from per-tool config and
+   * the granted capability set. `allowed_domains` (when present)
+   * comes from `capabilities`, never from `config`.
+   */
+  toApiTool(
+    config: ToolConfig,
+    capabilities: CapabilitySet | undefined,
+  ): AnthropicToolUnion;
+}
+
+/** Helpers for translating common config keys uniformly. */
+function stringArray(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const arr = v.filter((s): s is string => typeof s === "string");
+  return arr.length > 0 ? arr : undefined;
+}
+
+/**
+ * Read the `allowed_domains` allow-list from a capability grant.
+ * Returns undefined when the capability is missing, `"*"`, or shaped
+ * such that no narrowing applies — in which case the API call is
+ * sent without an `allowed_domains` filter (Anthropic's default of
+ * "any domain" applies).
+ */
+function allowedDomainsCapability(
+  capabilities: CapabilitySet | undefined,
+): string[] | undefined {
+  if (!capabilities || capabilities === "*") return undefined;
+  const raw = (capabilities as Record<string, unknown>).allowed_domains;
+  if (raw === "*") return undefined;
+  return stringArray(raw);
+}
+
+const SERVER_TOOLS: Record<string, ServerToolSpec> = {
+  web_search: {
+    name: "web_search",
+    description:
+      "Search the web. Anthropic runs the search server-side and " +
+      "returns results in the same response — no client-side dispatch. " +
+      "Useful for grounding answers in recent information.",
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      additionalProperties: false,
+      properties: {
+        query: {
+          type: "string",
+          minLength: 1,
+          description: "Natural-language search query.",
+        },
+      },
+    },
+    capabilityKinds: ["allowed_domains"],
+    toApiTool(
+      config: ToolConfig,
+      capabilities: CapabilitySet | undefined,
+    ): WebSearchTool20250305 {
+      const out: WebSearchTool20250305 = {
+        type: "web_search_20250305",
+        name: "web_search",
+      };
+      if (typeof config.max_uses === "number") out.max_uses = config.max_uses;
+      // `allowed_domains` is the declarative allow-list — a capability.
+      const allowed = allowedDomainsCapability(capabilities);
+      if (allowed) out.allowed_domains = allowed;
+      // `blocked_domains` is exclusionary — stays in config.
+      const blocked = stringArray(config.blocked_domains);
+      if (blocked) out.blocked_domains = blocked;
+      if (
+        config.user_location !== undefined &&
+        config.user_location !== null &&
+        typeof config.user_location === "object"
+      ) {
+        out.user_location =
+          config.user_location as WebSearchTool20250305["user_location"];
+      }
+      return out;
+    },
+  },
+  web_fetch: {
+    name: "web_fetch",
+    description:
+      "Fetch the contents of a specific URL. Anthropic retrieves " +
+      "the page server-side and returns the extracted text (or PDF) " +
+      "in the same response. Useful when you already know the URL " +
+      "and want full content rather than a search summary.",
+    inputSchema: {
+      type: "object",
+      required: ["url"],
+      additionalProperties: false,
+      properties: {
+        url: {
+          type: "string",
+          minLength: 1,
+          description: "Absolute URL to fetch (http or https).",
+        },
+      },
+    },
+    capabilityKinds: ["allowed_domains"],
+    toApiTool(
+      config: ToolConfig,
+      capabilities: CapabilitySet | undefined,
+    ): WebFetchTool20250910 {
+      const out: WebFetchTool20250910 = {
+        type: "web_fetch_20250910",
+        name: "web_fetch",
+      };
+      if (typeof config.max_uses === "number") out.max_uses = config.max_uses;
+      if (typeof config.max_content_tokens === "number") {
+        out.max_content_tokens = config.max_content_tokens;
+      }
+      const allowed = allowedDomainsCapability(capabilities);
+      if (allowed) out.allowed_domains = allowed;
+      const blocked = stringArray(config.blocked_domains);
+      if (blocked) out.blocked_domains = blocked;
+      // `citations: { enabled: true }` is the only shape worth
+      // forwarding for now; users who want richer config can pass
+      // the full object through.
+      if (
+        config.citations !== undefined &&
+        config.citations !== null &&
+        typeof config.citations === "object"
+      ) {
+        out.citations = config.citations as WebFetchTool20250910["citations"];
+      }
+      return out;
+    },
+  },
+};
+
+/** Stub Tool for harness-exposed server tools. Defensive `execute()`. */
+class AnthropicServerToolStub implements Tool {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: JSONSchema;
+  readonly capabilities: CapabilitySet | undefined;
+  readonly optional: string[];
+  constructor(spec: ServerToolSpec, capabilities: CapabilitySet | undefined) {
+    this.name = spec.name;
+    this.description = spec.description;
+    this.inputSchema = spec.inputSchema;
+    this.capabilities = capabilities;
+    // Declared so `assertKnownKinds` accepts grants like
+    // `web_search = { allowed_domains = [...] }`. None are `requires`
+    // — a missing capability just means no narrowing on the API call.
+    this.optional = [...spec.capabilityKinds];
+  }
+  async execute(): Promise<ToolResult> {
+    // The harness intercepts dispatch for server tools in its run
+    // loop, so this path should be unreachable. We return an error
+    // rather than throwing so a misrouted call surfaces cleanly.
+    return {
+      content:
+        `[anthropic] '${this.name}' is a server-side tool dispatched by ` +
+        `the harness; it shouldn't have been routed through ToolTable. ` +
+        `This is a runtime bug.`,
+      isError: true,
+    };
+  }
 }
 
 /** MIME types Anthropic accepts on `image` content blocks. */
@@ -110,6 +312,26 @@ export class AnthropicHarness implements Harness {
   /** Cumulative usage across the current turn. Reset at each `run()` start. */
   private turnUsage: TurnUsage | null = null;
 
+  /**
+   * Per-tool config for harness-exposed server tools, keyed by name.
+   * Populated by {@link resolveTool} as the runtime binds opted-in
+   * tools; read by `run()` when translating `runtime.listTools()`
+   * into the API's `ToolUnion[]`. Cleared when this harness is
+   * cloned via `withModel` because the runtime always re-binds
+   * tools for the cloned agent.
+   */
+  private serverToolConfigs = new Map<string, ToolConfig>();
+
+  /**
+   * Per-tool capability grants for harness-exposed server tools.
+   * Populated alongside {@link serverToolConfigs}. Distinct from
+   * config because the manifest's `[capabilities]` block is the
+   * source of declarative allow-lists (`allowed_domains`), kept
+   * separate from knob-style config (`max_uses`, `user_location`,
+   * `blocked_domains`).
+   */
+  private serverToolCapabilities = new Map<string, CapabilitySet | undefined>();
+
   constructor(
     private readonly model: string,
     private readonly apiKey: string,
@@ -122,11 +344,56 @@ export class AnthropicHarness implements Harness {
   }
 
   /**
+   * Implements `Harness.availableTools` — the catalog of server-
+   * side tools the manifest may opt into by listing them under
+   * `[tools.<name>] provider = "anthropic"`. Returning these here
+   * lets the resolver route those bindings to this harness rather
+   * than failing with "no matching [providers] entry or built-in".
+   *
+   * Not auto-added — see the docs on `Harness.availableTools`.
+   */
+  availableTools(): { name: string; config: ToolConfig }[] {
+    return Object.values(SERVER_TOOLS).map((s) => ({
+      name: s.name,
+      config: {},
+    }));
+  }
+
+  /**
+   * Implements `Harness.resolveTool` — returns a stub Tool for a
+   * harness-exposed name, or null when the name isn't in the
+   * catalog. The stub's `execute()` is defensive only; the harness
+   * intercepts dispatch in `run()` because server tools resolve
+   * API-side.
+   *
+   * Side effect: records the per-tool config in
+   * {@link serverToolConfigs} so `run()` can read it when building
+   * the API request body (passing through `max_uses`,
+   * `allowed_domains`, `user_location`, etc.).
+   */
+  resolveTool(
+    name: string,
+    config: ToolConfig,
+    _agent: Agent,
+    capabilities: CapabilitySet | undefined,
+  ): Tool | null {
+    const spec = SERVER_TOOLS[name];
+    if (!spec) return null;
+    this.serverToolConfigs.set(name, config);
+    this.serverToolCapabilities.set(name, capabilities);
+    return new AnthropicServerToolStub(spec, capabilities);
+  }
+
+  /**
    * Implements the optional `Harness.withModel` API — returns a
    * sibling harness with the same credentials/transport but a
    * different model id. Used by parent-derived harness factories
    * (e.g. `small-model-of-parent`) that want to reuse the parent's
    * API key + transport but route to a cheaper or faster model.
+   *
+   * Server-tool configs are NOT copied: the sub-agent gets a fresh
+   * binding pass and the runtime will call `resolveTool` again for
+   * any opt-ins it lists.
    */
   withModel(modelId: string): AnthropicHarness {
     return new AnthropicHarness(
@@ -256,11 +523,30 @@ export class AnthropicHarness implements Harness {
 
       const events = await runtime.getEvents();
       const messages = this.eventsToMessages(events);
-      const tools: AnthropicTool[] = runtime.listTools().map((t) => ({
-        name: t.name,
-        description: t.description,
-        input_schema: t.inputSchema as AnthropicTool["input_schema"],
-      }));
+      // Partition tools into:
+      //   * client-dispatched ("regular" Tools the model invokes via
+      //     `tool_use` and we run via `runtime.executeTool`), and
+      //   * harness-exposed server tools (translated into the API's
+      //     native server-tool shape; Anthropic runs them in-API
+      //     and returns `server_tool_use` + `*_tool_result` blocks).
+      // The split is by name lookup against the harness's server-
+      // tool catalog — the manifest opted into these by listing
+      // them with `provider = "anthropic"`, which routed binding
+      // through `Harness.resolveTool`.
+      const tools: AnthropicToolUnion[] = runtime.listTools().map((t) => {
+        const serverSpec = SERVER_TOOLS[t.name];
+        if (serverSpec) {
+          const cfg = this.serverToolConfigs.get(t.name) ?? {};
+          const caps = this.serverToolCapabilities.get(t.name);
+          return serverSpec.toApiTool(cfg, caps);
+        }
+        const userTool: AnthropicTool = {
+          name: t.name,
+          description: t.description,
+          input_schema: t.inputSchema as AnthropicTool["input_schema"],
+        };
+        return userTool;
+      });
 
       const body: MessageCreateParamsBase = {
         model: turnModel,
@@ -311,8 +597,25 @@ export class AnthropicHarness implements Harness {
         );
       }
 
-      // Collect tool_use blocks for dispatch.
+      // Walk the response content to:
+      //   * collect client-side `tool_use` blocks for dispatch via
+      //     `runtime.executeTool` (the regular path), and
+      //   * surface `server_tool_use` + `*_tool_result` block pairs
+      //     as `tool_call` + `tool_call_update` events for the
+      //     session log + ACP client display, WITHOUT dispatching
+      //     them — they already ran server-side, and the result is
+      //     baked into this same assistant message.
+      //
+      // Server-tool pairing: `*_tool_result` blocks reference their
+      // originating `server_tool_use` by id (`tool_use_id`), and the
+      // model's text continues after the result in the same message,
+      // so the ACP client sees “title: web_search” → “result: …” in
+      // order alongside the surrounding text deltas.
       const toolUses: Array<{ id: string; name: string; input: unknown }> = [];
+      const serverToolUses = new Map<
+        string,
+        { name: string; input: unknown }
+      >();
       for (const block of response.content) {
         if (block.type === "tool_use") {
           toolUses.push({
@@ -327,6 +630,28 @@ export class AnthropicHarness implements Harness {
             status: "in_progress",
             rawInput: block.input,
           });
+        } else if (block.type === "server_tool_use") {
+          // Emit the call event so it shows up in the session log
+          // and ACP UIs alongside the eventual result. The `title`
+          // is the tool name (matches client-side tool_use). We
+          // remember the pairing so the matching result block can
+          // attach its rendered text below.
+          serverToolUses.set(block.id, {
+            name: block.name,
+            input: block.input,
+          });
+          await runtime.update({
+            sessionUpdate: "tool_call",
+            toolCallId: block.id,
+            title: block.name,
+            status: "in_progress",
+            rawInput: block.input,
+          });
+        } else if (
+          block.type === "web_search_tool_result" ||
+          block.type === "web_fetch_tool_result"
+        ) {
+          await this.emitServerToolResult(runtime, block, serverToolUses);
         }
       }
 
@@ -352,6 +677,8 @@ export class AnthropicHarness implements Harness {
       }
 
       // Dispatch tools in parallel; surface results as tool_call_update.
+      // Note: server tools are NOT in `toolUses` — they already ran
+      // API-side and their results were emitted above.
       await Promise.all(
         toolUses.map(async (tu) => {
           const result = await runtime.executeTool({
@@ -376,6 +703,49 @@ export class AnthropicHarness implements Harness {
       );
       // Next iteration: messages include the tool_results.
     }
+  }
+
+  /**
+   * Render a server-tool result block (`web_search_tool_result` /
+   * `web_fetch_tool_result`) as a `tool_call_update` event. The
+   * model-facing text is a markdown summary; the rich `rawOutput`
+   * carries the raw Anthropic block so ACP clients can render
+   * citations / encrypted content / full document text if they want.
+   *
+   * The paired `server_tool_use` block was already emitted as a
+   * `tool_call`; we look up its name from `serverToolUses` to write
+   * a sensible title on the update.
+   */
+  private async emitServerToolResult(
+    runtime: Runtime,
+    block: WebSearchToolResultBlock | WebFetchToolResultBlock,
+    serverToolUses: Map<string, { name: string; input: unknown }>,
+  ): Promise<void> {
+    // The raw block goes on `display.rawOutput` — see `runtime.ts`,
+    // `emitToolResult`. That field now flows into the session record
+    // as well as the client emit, so `eventsToMessages` can read it
+    // back on subsequent turns to replay the proper
+    // `server_tool_use` + `*_tool_result` pair (with
+    // `encrypted_content` preserved) without keeping a parallel
+    // in-memory cache.
+    const pair = serverToolUses.get(block.tool_use_id);
+    const { text, isError } =
+      block.type === "web_search_tool_result"
+        ? renderWebSearchResult(block)
+        : renderWebFetchResult(block);
+    const name =
+      pair?.name ??
+      (block.type === "web_search_tool_result" ? "web_search" : "web_fetch");
+    await runtime.emitToolResult({
+      toolCallId: block.tool_use_id,
+      status: isError ? "failed" : "completed",
+      modelContent: text,
+      display: {
+        title: name,
+        kind: "fetch",
+        rawOutput: block,
+      },
+    });
   }
 
   /**
@@ -570,6 +940,45 @@ export class AnthropicHarness implements Harness {
       }
     };
 
+    // Identify server-tool exchanges and collect their replay
+    // payloads in one pre-pass. They're always emitted as a
+    // server_tool_use + *_tool_result pair in the assistant message;
+    // the paired `tool_call_update` event is skipped in the main
+    // pass (sending it as a user tool_result would collide with the
+    // server-tool declaration in the request `tools` array).
+    //
+    // The result block comes from `tool_call_update.rawOutput` —
+    // populated by `emitServerToolResult` and persisted into the
+    // session by `Runtime.emitToolResult` alongside the model-facing
+    // text. When `rawOutput` is missing (e.g., a compacting session
+    // dropped it, or some other path produced an update without the
+    // raw block), we emit a placeholder `error_code: "unavailable"`
+    // result — honest about the loss, structurally valid for the API.
+    const serverPayloads = new Map<
+      string,
+      {
+        name: string;
+        input: unknown;
+        rawOutput?: WebSearchToolResultBlock | WebFetchToolResultBlock;
+      }
+    >();
+    for (const e of events) {
+      if (e.sessionUpdate === "tool_call" && e.title in SERVER_TOOLS) {
+        serverPayloads.set(e.toolCallId, {
+          name: e.title,
+          input: e.rawInput,
+        });
+      } else if (
+        e.sessionUpdate === "tool_call_update" &&
+        serverPayloads.has(e.toolCallId)
+      ) {
+        const slot = serverPayloads.get(e.toolCallId);
+        if (!slot) continue;
+        const raw = (e as { rawOutput?: unknown }).rawOutput;
+        if (isServerToolResultBlock(raw)) slot.rawOutput = raw;
+      }
+    }
+
     for (const e of events) {
       switch (e.sessionUpdate) {
         case "user_message_chunk": {
@@ -590,6 +999,23 @@ export class AnthropicHarness implements Harness {
           // Thinking is one-way: we don't echo it back to the API.
           break;
         case "tool_call": {
+          const server = serverPayloads.get(e.toolCallId);
+          if (server) {
+            // Server-tool path. Always emit the pair; the result block
+            // is the persisted real one when present, else a placeholder
+            // `unavailable` block. Matching `tool_call_update` skipped
+            // below (handled by the same `serverPayloads` membership).
+            push({
+              role: "assistant",
+              content: serverToolPairAsParams(
+                e.toolCallId,
+                e.title,
+                e.rawInput,
+                server.rawOutput,
+              ),
+            });
+            break;
+          }
           push({
             role: "assistant",
             content: [
@@ -604,6 +1030,7 @@ export class AnthropicHarness implements Harness {
           break;
         }
         case "tool_call_update": {
+          if (serverPayloads.has(e.toolCallId)) break;
           const text =
             (e.content ?? [])
               .map((c) =>
@@ -633,6 +1060,162 @@ export class AnthropicHarness implements Harness {
     }
     return messages;
   }
+}
+
+/**
+ * Type guard for the result blocks the harness recognises on
+ * `tool_call_update.rawOutput`. The session field is typed `unknown`
+ * because anything can land there; we only treat it as a server-tool
+ * result when its `type` matches one of the shapes we know how to
+ * round-trip into the API.
+ */
+function isServerToolResultBlock(
+  v: unknown,
+): v is WebSearchToolResultBlock | WebFetchToolResultBlock {
+  if (typeof v !== "object" || v === null) return false;
+  const t = (v as { type?: unknown }).type;
+  return t === "web_search_tool_result" || t === "web_fetch_tool_result";
+}
+
+/**
+ * Build the assistant-content blocks for a server-tool turn: a
+ * `server_tool_use` block paired with its `*_tool_result` block,
+ * both shaped as `ContentBlockParam`s for the request side.
+ *
+ * When `result` is present, we use its response shape directly —
+ * `WebSearchToolResultBlock` / `WebFetchToolResultBlock` are
+ * structurally compatible with their Param counterparts (same
+ * fields, the Param versions just make `caller` optional and add
+ * `cache_control`). A structural cast preserves `encrypted_content`
+ * and any other opaque payload Anthropic adds in future revisions.
+ *
+ * When `result` is undefined (cache miss across harness lifetimes),
+ * we emit a placeholder result block with
+ * `error_code: "unavailable"`. The model sees the call happened but
+ * understands the content is no longer accessible. Honest and
+ * structurally valid; the API accepts it.
+ */
+function serverToolPairAsParams(
+  toolCallId: string,
+  toolName: string,
+  input: unknown,
+  result: WebSearchToolResultBlock | WebFetchToolResultBlock | undefined,
+): ContentBlockParam[] {
+  const useBlock: ContentBlockParam = {
+    type: "server_tool_use",
+    id: toolCallId,
+    name: toolName as "web_search" | "web_fetch",
+    input: (input as Record<string, unknown>) ?? {},
+  };
+  if (result) {
+    return [useBlock, result as unknown as ContentBlockParam];
+  }
+  return [useBlock, placeholderUnavailableResult(toolCallId, toolName)];
+}
+
+/**
+ * Build a placeholder result block for a server-tool call whose
+ * original result is no longer in the harness's cache. Uses the
+ * `unavailable` error code, which both `WebSearchToolResultErrorCode`
+ * and `WebFetchToolResultErrorCode` advertise for this purpose.
+ */
+function placeholderUnavailableResult(
+  toolCallId: string,
+  toolName: string,
+): ContentBlockParam {
+  if (toolName === "web_fetch") {
+    return {
+      type: "web_fetch_tool_result",
+      tool_use_id: toolCallId,
+      content: {
+        type: "web_fetch_tool_result_error",
+        error_code: "unavailable",
+      },
+    };
+  }
+  // Default to the web_search shape; any future server tool would
+  // need its own arm here.
+  return {
+    type: "web_search_tool_result",
+    tool_use_id: toolCallId,
+    content: {
+      type: "web_search_tool_result_error",
+      error_code: "unavailable",
+    },
+  };
+}
+
+/**
+ * Render a `web_search_tool_result` block as a markdown summary the
+ * model can read in its session log. Citations / encrypted content
+ * are dropped here; ACP clients that want them read `display.rawOutput`.
+ */
+function renderWebSearchResult(block: WebSearchToolResultBlock): {
+  text: string;
+  isError: boolean;
+} {
+  const c = block.content;
+  if (!Array.isArray(c)) {
+    // Error shape: `{ type: "web_search_tool_result_error", error_code }`.
+    return {
+      text: `[web_search error: ${c.error_code}]`,
+      isError: true,
+    };
+  }
+  if (c.length === 0) {
+    return { text: "[web_search returned no results]", isError: false };
+  }
+  const lines: string[] = ["# Web search results", ""];
+  for (const r of c) {
+    lines.push(`## ${r.title}`);
+    lines.push(r.url);
+    if (r.page_age) lines.push(`(${r.page_age})`);
+    lines.push("");
+  }
+  return { text: lines.join("\n").trimEnd(), isError: false };
+}
+
+/**
+ * Render a `web_fetch_tool_result` block as a markdown summary.
+ *
+ * `WebFetchBlock.content` is a `DocumentBlock` whose `source` is
+ * either:
+ *   - `PlainTextSource` — the page's extracted text. We pass it
+ *     through verbatim (the API already truncates to
+ *     `max_content_tokens`).
+ *   - `Base64PDFSource` — a fetched PDF. We don't decode it; we
+ *     just note the media type and let downstream ACP clients
+ *     handle the raw `rawOutput` if they want.
+ *
+ * Errors include `invalid_tool_input`, `url_not_allowed`,
+ * `unsupported_content_type`, etc. — surfaced verbatim.
+ */
+function renderWebFetchResult(block: WebFetchToolResultBlock): {
+  text: string;
+  isError: boolean;
+} {
+  const c = block.content;
+  if (c.type === "web_fetch_tool_result_error") {
+    return {
+      text: `[web_fetch error: ${c.error_code}]`,
+      isError: true,
+    };
+  }
+  // c.type === "web_fetch_result" — a WebFetchBlock.
+  const lines: string[] = [];
+  const title = c.content.title ?? c.url;
+  lines.push(`# ${title}`);
+  lines.push(c.url);
+  if (c.retrieved_at) lines.push(`(retrieved ${c.retrieved_at})`);
+  lines.push("");
+  const src = c.content.source;
+  if (src.type === "text") {
+    lines.push(src.data);
+  } else {
+    // base64 PDF — don't dump the bytes into the model context.
+    lines.push(`[PDF content; ${src.media_type}; see rawOutput for bytes]`);
+  }
+  return { text: lines.join("\n").trimEnd(), isError: false };
 }
 
 /**

@@ -45,11 +45,13 @@ describe("auditAgent", () => {
     // [agent].secrets allowlist surfaces in the tree.
     expect(tree.secretAllowlist).toEqual(["sample_user_name"]);
 
-    const printed = formatCapabilityTree(tree);
+    const printed = formatCapabilityTree(tree, { color: false });
     expect(printed).toContain("sample-agent");
     expect(printed).toContain("read_file");
     expect(printed).toContain("edit_file");
-    expect(printed).toContain("capabilities granted");
+    // The renderer attributes each tool with `via <provider>`; for
+    // these native builtins that's `via builtin`.
+    expect(printed).toMatch(/read_file\s+via\s+builtin/);
   });
 
   it("surfaces tool.audit() findings (bash sandbox availability)", async () => {

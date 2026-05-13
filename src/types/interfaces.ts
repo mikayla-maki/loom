@@ -166,6 +166,61 @@ export interface Harness {
    * model selector for those agents.
    */
   models?(): Promise<HarnessModel[]> | HarnessModel[];
+
+  /**
+   * The catalog of tools this harness *can* expose — typically
+   * provider-native / server-side tools that the harness dispatches
+   * internally (e.g. Anthropic's `web_search`, `web_fetch`, code
+   * execution) rather than going through the runtime's `ToolTable`.
+   *
+   * **Asymmetric with {@link Session.tools}.** These are NOT auto-
+   * added to the agent's tool table — the manifest must opt in by
+   * listing the tool in `[tools]` with `provider = "<harness-factory-name>"`
+   * (e.g. `provider = "anthropic"`). Server tools cost money on the
+   * provider's bill and introduce egress; opt-in is the safer
+   * default.
+   *
+   * The resolver uses this catalog to route `[tools.<name>]` bindings
+   * whose `provider` value matches the harness's factory name. Tools
+   * not in the catalog fall through to the usual `[providers]` /
+   * built-in resolution paths.
+   *
+   * Optional. Harnesses with no server-side tools (e.g. the scripted
+   * `test` harness) may omit this; the manifest then has no way to
+   * route tools through them.
+   */
+  availableTools?(): Promise<ToolRef[]> | ToolRef[];
+
+  /**
+   * Tool resolver for harness-exposed names. Mirrors
+   * {@link Session.resolveTool}; called by the runtime when binding
+   * a `[tools.<name>]` entry whose `provider` matches this harness's
+   * factory name.
+   *
+   * Returns a stub {@link Tool} whose `execute()` is generally never
+   * called — the harness intercepts dispatch in its own `run()`
+   * loop because server-side tools resolve API-side without a
+   * client round-trip. The stub's `name`, `description`, and
+   * `inputSchema` still matter: they appear in `runtime.listTools()`
+   * (used by the system-prompt enumerator) and `loom audit`. A
+   * defensive `execute()` should return an `isError: true` result
+   * indicating the harness should have intercepted.
+   *
+   * The `config` argument is the per-tool block from `[tools.<name>]`
+   * minus `provider` (e.g. `{ max_uses: 5, allowed_domains: [...] }`).
+   * The harness typically stashes it keyed by tool name so its
+   * `run()` loop can translate it into the API's native server-tool
+   * shape (`WebSearchTool20250305`, etc.).
+   *
+   * Returning `null` declines the binding; the runtime surfaces it
+   * as unresolved.
+   */
+  resolveTool?(
+    name: string,
+    config: ToolConfig,
+    agent: Agent,
+    capabilities: CapabilitySet | undefined,
+  ): Promise<Tool | null> | Tool | null;
 }
 
 /** One entry in {@link Harness.models}. */
@@ -455,25 +510,30 @@ export interface Runtime {
   executeTool(call: ToolCall): Promise<ToolResult>;
 
   /**
-   * Emit a tool-call result, splitting the model-facing record from
-   * the rich client display.
+   * Emit a tool-call result.
    *
-   * The session stores a `tool_call_update` whose `content` is
-   * `modelContent` wrapped as a single text block — that's what the
-   * harness sees on the next turn when it converts session events
-   * back into API messages, so the model always reads a clean text
-   * `tool_result`.
+   * Produces two `tool_call_update` events — one pushed into the
+   * session (event log), one fanned out via the update sink (ACP
+   * client). They differ in exactly one field:
    *
-   * The update sink fans out a separate `tool_call_update` carrying
-   * the rich `display` payload (terminal blocks, diff blocks, kind,
-   * title, locations, rawOutput) — that's what an ACP client renders.
+   *   - **`content`**: the session always gets `modelContent` wrapped
+   *     as a single text block (what the model replays on the next
+   *     turn). The client gets `display.content` when set — e.g.
+   *     terminal embeds, diff blocks, file-content blocks — which
+   *     aren't replayable by the model but render richly for users.
+   *
+   * Everything else — `title`, `kind`, `locations`, `rawOutput` —
+   * is shared metadata: both consumers see the same values. In
+   * particular, `display.rawOutput` lands in the session record too,
+   * which lets harnesses read back structured tool payloads on
+   * replay (Anthropic server tools rely on this to round-trip
+   * `encrypted_content` for citation re-grounding).
    *
    * Use this instead of `update(tool_call_update)` whenever a tool's
-   * output has different shapes for the two audiences — e.g., bash
-   * output is text for the model but a terminal embed for the user;
-   * file edits are a status string for the model but a diff for the
-   * user. Falls back to a single text block on both sides when
-   * `display` is absent.
+   * `content` shape differs between the model (text) and the user
+   * (terminal embed, diff). Pure-text tools can either call this or
+   * `update()` directly; the former is the cleaner default because
+   * it surfaces all the display metadata uniformly.
    */
   emitToolResult(args: {
     toolCallId: import("./acp.js").ToolCallId;

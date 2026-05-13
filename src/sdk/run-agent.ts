@@ -297,6 +297,7 @@ export async function runAgent(
     toolsIndex,
     sdkTools: options.providers ?? [],
     session,
+    harness,
     manifest,
     factoryCtx,
     phase1Secrets,
@@ -442,11 +443,33 @@ function sessionAsTools(session: Session): Tools {
   };
 }
 
+/**
+ * Adapt a `Harness` into the `Tools` interface so the binding flow
+ * can route harness-exposed tool names through it. The harness is
+ * reachable in the materialised list under the synthetic id
+ * `"(harness)"`. Harnesses without `resolveTool` produce a Tools
+ * whose `resolveTool` always returns null — the binding will then
+ * surface as unresolved (no native/SDK fallback for harness-routed
+ * bindings; if the user wrote `provider = "anthropic"` they meant
+ * the harness, not something else).
+ */
+function harnessAsTools(harness: Harness): Tools {
+  return {
+    async resolveTool(name, config, agent, capabilities) {
+      if (!harness.resolveTool) return null;
+      return Promise.resolve(
+        harness.resolveTool(name, config, agent, capabilities),
+      );
+    },
+  };
+}
+
 async function materialiseTools_all(args: {
   resolved: ResolvedManifest;
   toolsIndex: ToolsIndex;
   sdkTools: Tools[];
   session: Session;
+  harness: Harness;
   manifest: AgentManifest;
   factoryCtx: FactoryContext;
   phase1Secrets: Record<string, string>;
@@ -518,6 +541,20 @@ async function materialiseTools_all(args: {
     config: {},
     secrets: {},
     contributionName: "(session)",
+  });
+
+  // The agent's harness, adapted to the Tools interface. Routes
+  // bindings whose `provider` matches the harness factory name
+  // through `harness.resolveTool` (used for provider-native server
+  // tools like Anthropic's `web_search`). Opt-in only — the resolver
+  // emits `(harness)` bindings only when `[tools.X] provider = "..."`
+  // explicitly names the harness factory; nothing is auto-added.
+  out.push({
+    id: "(harness)",
+    tools: harnessAsTools(args.harness),
+    config: {},
+    secrets: {},
+    contributionName: "(harness)",
   });
 
   // SDK-supplied Tools instances are appended; they're addressable only

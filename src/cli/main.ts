@@ -244,18 +244,26 @@ async function cmdProviders(args: string[]): Promise<number> {
   const { listInstalledProviders, locateProviderPackage } =
     await import("../providers/loader.js");
   if (sub === "list") {
+    // Two sections — built-in harness factories (with their
+    // server-tool catalogs), then on-disk npm provider packages.
+    // The built-ins section is the discoverability path for
+    // harness-exposed server tools like Anthropic's `web_search` /
+    // `web_fetch`; `loom audit` deliberately doesn't list them per
+    // manifest, pointing users here instead.
+    await listBuiltinHarnesses();
     const items = await listInstalledProviders({});
+    process.stdout.write("\ninstalled provider packages:\n");
     if (items.length === 0) {
       process.stdout.write(
-        "(no Loom provider packages found in node_modules, npm root -g, or ~/.loom/providers)\n",
+        "  (none found in node_modules, npm root -g, or ~/.loom/providers)\n",
       );
       return 0;
     }
     for (const e of items) {
       const head = e.version ? `${e.name}@${e.version}` : e.name;
-      process.stdout.write(`${head}\n`);
-      if (e.description) process.stdout.write(`  ${e.description}\n`);
-      process.stdout.write(`  ${e.entryPath}\n`);
+      process.stdout.write(`  ${head}\n`);
+      if (e.description) process.stdout.write(`    ${e.description}\n`);
+      process.stdout.write(`    ${e.entryPath}\n`);
     }
     return 0;
   }
@@ -278,6 +286,65 @@ async function cmdProviders(args: string[]): Promise<number> {
   }
   console.error("usage: loom providers <list|info> [name]");
   return 2;
+}
+
+/**
+ * Print the built-in harness factories registered in the harness
+ * registry, plus each one's `availableTools()` catalog (when it
+ * implements the optional method). This is where reviewers find
+ * out which harness-exposed server tools exist (e.g. Anthropic's
+ * `web_search` / `web_fetch`); the per-agent audit deliberately
+ * doesn't repeat the catalog on every run.
+ *
+ * Harness construction needs secrets in principle, but the
+ * `availableTools()` catalog is a static / config-only declaration
+ * for the built-in factories we ship — so we synthesise stub
+ * values for any required-secret slot, the same way `loom audit`
+ * does. A construction failure (or a harness without the optional
+ * method) is silently treated as "no catalog".
+ */
+async function listBuiltinHarnesses(): Promise<void> {
+  const { listHarnesses, getHarnessFactory } =
+    await import("../builtins/index.js");
+  const { DEFAULT_CLIENT_ACP_CAPABILITIES } =
+    await import("../runtime/acp-capabilities.js");
+  const factoryCtx = {
+    manifestDir: process.cwd(),
+    agentName: "loom-providers-list",
+    loomVersion: "cli",
+    clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    storage: process.cwd(),
+  };
+  const names = listHarnesses().sort();
+  process.stdout.write("built-in harnesses:\n");
+  for (const name of names) {
+    let exposed: string[] = [];
+    try {
+      const factory = getHarnessFactory(name);
+      const stubSecrets: Record<string, string> = {};
+      for (const s of factory.secrets?.required ?? []) {
+        stubSecrets[s] = "providers-list-stub";
+      }
+      const harness = await Promise.resolve(
+        factory.create(
+          /*config*/ {},
+          factoryCtx,
+          stubSecrets,
+          /*parent*/ undefined,
+        ),
+      );
+      const catalog = (await Promise.resolve(harness.availableTools?.())) ?? [];
+      exposed = catalog.map((r) => r.name).sort();
+    } catch {
+      /* construction failed (e.g. requiresParent) — leave empty */
+    }
+    if (exposed.length > 0) {
+      process.stdout.write(`  ${name}\n`);
+      process.stdout.write(`    server tools: ${exposed.join(", ")}\n`);
+    } else {
+      process.stdout.write(`  ${name}\n`);
+    }
+  }
 }
 
 /**

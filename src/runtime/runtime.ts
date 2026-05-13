@@ -100,43 +100,56 @@ export class RuntimeImpl implements Runtime {
     modelContent: string;
     display?: ToolDisplay;
   }): Promise<void> {
-    // ── Session record: text-only, what the model replays ──
-    // The harness's `eventsToMessages` (or equivalent) reads back
-    // these stored updates and builds tool_result blocks for the
-    // next API call. We always wrap the model-facing string as a
-    // single text block so that extraction is trivial and the
-    // model never reads an empty result — even if `display` carried
-    // a terminal embed or a diff that an ACP client would render
-    // but the model wouldn't understand.
-    const sessionUpdate: SessionUpdate = {
-      sessionUpdate: "tool_call_update",
-      toolCallId: args.toolCallId,
-      status: args.status,
-      content: [
-        {
-          type: "content",
-          content: { type: "text", text: args.modelContent },
-        },
-      ],
-    };
-    await Promise.resolve(this.opts.session.push?.(sessionUpdate) ?? []);
-
-    // ── Client display: rich, what the IDE/REPL renders ──
-    // Falls back to the session update's text block when no
-    // `display` was provided (preserves the current single-text
-    // behaviour for tools that don't opt in to rich rendering).
+    // Two updates leave this method: one to the session (event log),
+    // one to the update sink (ACP client).
+    //
+    // The only field that differs between them is `content`. The
+    // session always gets the model-facing text block; the client
+    // gets `display.content` when set (terminal embeds, diff blocks,
+    // other client-renderable shapes that aren't replayable by the
+    // model). Everything else — `title`, `kind`, `locations`,
+    // `rawOutput` — is shared metadata that both audiences want:
+    //   - clients render `rawOutput` in raw-output inspectors and
+    //     use `title`/`kind`/`locations` for affordances;
+    //   - the harness reads `rawOutput` back on replay for tools
+    //     whose API expects structured payloads in subsequent turns
+    //     (Anthropic server tools — `web_search_tool_result` carries
+    //     `encrypted_content` the model needs to re-cite).
+    //
+    // Sessions are free to drop / transform / compact this payload
+    // like any other event field; large `rawOutput` blobs go with
+    // their parent `tool_call_update` when a compacting session
+    // summarises old turns.
     const display = args.display;
-    const clientUpdate: SessionUpdate = {
-      sessionUpdate: "tool_call_update",
-      toolCallId: args.toolCallId,
-      status: args.status,
-      content: display?.content ?? sessionUpdate.content,
+    const sharedMeta = {
       ...(display?.title ? { title: display.title } : {}),
       ...(display?.kind ? { kind: display.kind } : {}),
       ...(display?.locations ? { locations: display.locations } : {}),
       ...(display?.rawOutput !== undefined
         ? { rawOutput: display.rawOutput }
         : {}),
+    };
+    const modelTextContent = [
+      {
+        type: "content" as const,
+        content: { type: "text" as const, text: args.modelContent },
+      },
+    ];
+    const sessionUpdate: SessionUpdate = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: args.toolCallId,
+      status: args.status,
+      content: modelTextContent,
+      ...sharedMeta,
+    };
+    await Promise.resolve(this.opts.session.push?.(sessionUpdate) ?? []);
+
+    const clientUpdate: SessionUpdate = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: args.toolCallId,
+      status: args.status,
+      content: display?.content ?? modelTextContent,
+      ...sharedMeta,
     };
     this.opts.updateSink.emit(clientUpdate);
   }

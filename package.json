@@ -1,5 +1,5 @@
 {
-  "name": "loom",
+  "name": "@mcmaki/loom",
   "version": "0.1.0",
   "description": "Loom — A manifest-driven agent meta-harness",
   "type": "module",
@@ -18,13 +18,19 @@
   "bin": {
     "loom": "./dist/cli/main.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/cli/main.js",
     "dev": "tsc -p tsconfig.json --watch",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc -p tsconfig.test.json",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run lint && npm test && npm run build"
   },
   "keywords": [
     "agent",
@@ -36,6 +42,17 @@
     "claude"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikayla-maki/loom.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mikayla-maki/loom/issues"
+  },
+  "homepage": "https://github.com/mikayla-maki/loom#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20"
   },

@@ -146,6 +146,17 @@ export interface FactoryAuditSummary {
   resolved: boolean;
   /** True when the manifest carries a pre-built `Harness`/`Session` instance. */
   preBuilt: boolean;
+  /**
+   * Catalog of tool names the harness can expose via
+   * `Harness.availableTools()`. Populated for harness summaries only,
+   * when the catalog is non-empty; reviewers can compare this with
+   * the manifest's `[tools]` opt-ins (anything in the catalog but
+   * not in `[tools]` is available-but-unexposed).
+   *
+   * Sessions don't populate this field — session-contributed tools
+   * are auto-added and live on `SessionAuditSummary.contributedTools`.
+   */
+  availableTools?: string[];
 }
 
 /** Audit-level view of the manifest's session, including its contributions. */
@@ -933,6 +944,81 @@ async function auditAgentInner(
     });
   }
 
+  // Mirror the runtime's synthetic `"(harness)"` Tools instance.
+  // Resolver emits `(harness)` bindings when `[tools.X] provider = "..."`
+  // matches the harness factory name (e.g. `provider = "anthropic"`).
+  // We construct the harness best-effort here so harness-routed
+  // tool bindings can be resolved against its `availableTools` /
+  // `resolveTool`. The harness factory sees the same lenient secret
+  // bundle the rest of audit uses (real keys when present, empty
+  // when not) plus a synthetic `audit-mode` stub for required keys
+  // it didn't find — the latter keeps audit fully informative even
+  // when no API key is configured (harness construction would
+  // otherwise throw, leaving `(harness)`-routed tools dangling).
+  let auditHarness: Harness | undefined;
+  let auditHarnessAvailableTools: string[] = [];
+  if (resolved.harness) {
+    try {
+      const harnessFactory = lookupFactoryByBinding(
+        resolved.harness.factoryName,
+        resolved.harness.source,
+        getHarnessFactory,
+      );
+      // Synthesise placeholder values for required secrets the audit
+      // couldn't fetch. The audit doesn't actually call the API; it
+      // just needs the factory's constructor to succeed so we can
+      // ask the resulting harness for its `availableTools` catalog.
+      const harnessSecrets = { ...auditSecrets };
+      for (const name of harnessFactory.secrets?.required ?? []) {
+        if (harnessSecrets[name] === undefined) {
+          harnessSecrets[name] = "audit-mode-stub";
+        }
+      }
+      const { instance } = await instantiateFromBinding<Harness>(
+        resolved.harness,
+        getHarnessFactory,
+        factoryCtx,
+        harnessSecrets,
+        undefined,
+        "harness",
+      );
+      auditHarness = instance;
+      try {
+        const catalog = (await instance.availableTools?.()) ?? [];
+        auditHarnessAvailableTools = catalog.map((r) => r.name);
+      } catch {
+        /* harness availableTools threw — leave empty */
+      }
+    } catch {
+      /* harness construction failed — tools routed through it
+         will show up as unresolved, which is the right signal */
+    }
+  } else if (!("provider" in manifest.harness)) {
+    // Pre-built `Harness` instance — no factory binding, but we can
+    // still introspect it for the audit. There's no resolver-emitted
+    // `(harness)` binding to satisfy (the resolver doesn't know a
+    // factory name for pre-built instances), but `availableTools`
+    // is informational.
+    auditHarness = manifest.harness as Harness;
+    try {
+      const catalog = (await auditHarness.availableTools?.()) ?? [];
+      auditHarnessAvailableTools = catalog.map((r) => r.name);
+    } catch {
+      /* ignore */
+    }
+  }
+  if (auditHarness) {
+    const h = auditHarness;
+    providerByInstanceId.set("(harness)", {
+      async resolveTool(name, config, agent, capabilities) {
+        if (!h.resolveTool) return null;
+        return Promise.resolve(
+          h.resolveTool(name, config, agent, capabilities),
+        );
+      },
+    });
+  }
+
   // Index resolved Tools instances by id, so we can attribute each
   // tool to its source provider (when not native).
   const instanceById = new Map<string, (typeof resolved.providers)[number]>();
@@ -1024,20 +1110,39 @@ async function auditAgentInner(
       // layer's source/handle for the attribution. Without this the
       // tool would render as `provider: builtin` even when a provider
       // package's session owns the implementation.
+      //
+      // We always prefix with `session:` so the row reads symmetrically
+      // with `harness:anthropic` for harness-exposed tools — making
+      // it visually obvious which kind of indirection owns the tool.
       const layerIdx = perLinkContributions.findIndex((slot) =>
         slot.contributedTools.includes(binding.toolName),
       );
       const layerBinding =
         layerIdx >= 0 ? sessionBindings[layerIdx] : undefined;
+      const layerLabel = layerBinding
+        ? sessionLayerLabel(layerBinding)
+        : undefined;
       // Only factory-backed layers carry source/handle; pre-built
-      // instances have neither.
+      // instances have neither (we still prefix — the label says
+      // "<pre-built Session instance>" so the prefix isn't redundant).
       if (layerBinding && !isPreBuiltSessionLayer(layerBinding)) {
         if (layerBinding.source) {
           providerKey = sourceSpecKey(layerBinding.source);
         }
-        if (layerBinding.providerHandle) {
-          providerHandle = layerBinding.providerHandle;
-        }
+      }
+      providerHandle = layerLabel
+        ? `session:${layerLabel}`
+        : "session:<unknown>";
+    } else if (binding.providerInstanceId === "(harness)") {
+      // Harness-exposed server tool. Attribute it to the harness
+      // factory (e.g. "anthropic") so the audit row doesn't render
+      // as `provider: builtin` — these tools are very much not
+      // builtins; they're dispatched API-side by the harness's
+      // upstream provider.
+      if (resolved.harness?.factoryName) {
+        providerHandle = `harness:${resolved.harness.factoryName}`;
+      } else if (!("provider" in manifest.harness)) {
+        providerHandle = "harness:<pre-built>";
       }
     } else {
       const instance = instanceById.get(binding.providerInstanceId);
@@ -1141,8 +1246,12 @@ async function auditAgentInner(
     }
   }
 
-  // ─── harness / session summaries ────────────────────────
-  const harnessSummary = buildHarnessSummary(manifest, resolved);
+  // ─── harness / session summaries ──────────────────────────
+  const harnessSummary = buildHarnessSummary(
+    manifest,
+    resolved,
+    auditHarnessAvailableTools,
+  );
   const sessionLayerSummaries = buildSessionLayerSummaries(
     manifest,
     resolved,
@@ -1198,13 +1307,17 @@ async function auditAgentInner(
 function buildHarnessSummary(
   manifest: AgentManifest,
   resolved: ReturnType<typeof resolveManifest>,
+  availableTools: string[],
 ): FactoryAuditSummary {
+  const availOpt =
+    availableTools.length > 0 ? { availableTools: [...availableTools] } : {};
   if (!("provider" in manifest.harness)) {
     return {
       display: "<pre-built Harness instance>",
       config: {},
       resolved: true,
       preBuilt: true,
+      ...availOpt,
     };
   }
   const binding = resolved.harness;
@@ -1216,6 +1329,7 @@ function buildHarnessSummary(
       config: {},
       resolved: false,
       preBuilt: false,
+      ...availOpt,
     };
   }
   let registryHit = false;
@@ -1242,6 +1356,7 @@ function buildHarnessSummary(
       : {}),
     resolved: registryHit,
     preBuilt: false,
+    ...availOpt,
   };
 }
 
@@ -1688,20 +1803,29 @@ export function formatCapabilityTree(
     }
   }
 
-  // Harness.
+  // Harness. Headline reads `harness: <name> via <source>` so it
+  // mirrors the tools section's `- <name> via <provider>` format.
+  // `source` here is the source key (when factory-backed) or
+  // `builtin` (when the factory is in the built-in registry).
   {
     const h = tree.harness;
     const status = h.resolved
       ? ""
       : `  ${p.yellow("⚠ not registered at audit time")}`;
-    lines.push(`${pad}  ${p.bold("harness:")} ${p.cyan(h.display)}${status}`);
-    lines.push(`${pad}    ${p.dim("provider:")} ${factoryProviderLabel(h, p)}`);
+    lines.push(
+      `${pad}  ${p.bold("harness:")} ${p.cyan(h.display)} ${p.dim("via")} ${sourceAttribution(h, p)}${status}`,
+    );
     const cfgKeys = Object.keys(h.config);
     if (cfgKeys.length > 0) {
       lines.push(
         `${pad}    ${p.dim("config:")} ${p.dim(formatConfig(h.config))}`,
       );
     }
+    // The catalog of harness-exposed tools (`availableTools`) is
+    // intentionally NOT rendered here — it's discoverable via
+    // `loom providers list` (which surfaces built-in harnesses
+    // alongside installed npm provider packages). Keeping it out of
+    // the per-agent audit avoids a tutorial sentence on every run.
   }
 
   // Session. Renders the layers as N indented blocks under a single
@@ -1714,7 +1838,9 @@ export function formatCapabilityTree(
       const status = s.resolved
         ? ""
         : `  ${p.yellow("⚠ not registered at audit time")}`;
-      lines.push(`${pad}  ${p.bold("session:")} ${p.cyan(s.display)}${status}`);
+      lines.push(
+        `${pad}  ${p.bold("session:")} ${p.cyan(s.display)} ${p.dim("via")} ${sourceAttribution(s, p)}${status}`,
+      );
       formatSessionLayerBody(s, pad, p, lines, /*layerIndent*/ "    ");
     } else {
       lines.push(
@@ -1725,7 +1851,7 @@ export function formatCapabilityTree(
           ? ""
           : `  ${p.yellow("⚠ not registered at audit time")}`;
         lines.push(
-          `${pad}    ${p.dim(`[${i}]`)} ${p.cyan(s.display)}${status}`,
+          `${pad}    ${p.dim(`[${i}]`)} ${p.cyan(s.display)} ${p.dim("via")} ${sourceAttribution(s, p)}${status}`,
         );
         formatSessionLayerBody(s, pad, p, lines, /*layerIndent*/ "      ");
       }
@@ -1747,27 +1873,39 @@ export function formatCapabilityTree(
   if (tree.tools.length > 0) {
     lines.push(`${pad}  ${p.bold("tools:")}`);
     for (const t of tree.tools) {
+      // Headline: name + provider attribution. The `via` reads
+      // naturally and replaces the older two-line layout (where
+      // `provider:` lived on its own row). Origin (`[tools.X]` /
+      // `(session link N: layer)`) is elided because the `via`
+      // label already carries the kind+name; the per-source
+      // breakdown lives in `providers:` at the top.
+      const providerStr = ` ${p.dim("via")} ${toolProviderLabel(t, p)}`;
+      lines.push(
+        `${pad}    ${p.dim("-")} ${p.bold(p.yellow(t.name))}${providerStr}`,
+      );
+      // Capability summary on its own sub-line, with MISSING
+      // annotations folded in alongside. Elide entirely when the
+      // tool has no required/optional kinds and nothing's missing
+      // — the row collapses to a single line in that case.
       const reqStr =
         t.requires.length > 0
-          ? ` requires ${t.requires.map((r) => p.green(`'${r}'`)).join(", ")}`
+          ? `requires ${t.requires.map((r) => p.green(`'${r}'`)).join(", ")}`
           : "";
       const optStr =
         t.optional.length > 0
-          ? ` ${p.dim("optional")} ${t.optional.map((r) => p.dim(`'${r}'`)).join(", ")}`
+          ? `${reqStr ? " " : ""}${p.dim("optional")} ${t.optional.map((r) => p.dim(`'${r}'`)).join(", ")}`
           : "";
       const missingStr =
         t.missing.length > 0
-          ? `  ${p.yellow("⚠ MISSING:")} ${p.yellow(t.missing.join(", "))}`
+          ? `${reqStr || optStr ? "  " : ""}${p.yellow("⚠ MISSING:")} ${p.yellow(t.missing.join(", "))}`
           : "";
-      lines.push(
-        `${pad}    ${p.dim("-")} ${p.bold(p.yellow(t.name))} ${p.dim(`(from ${t.introducedBy})`)}:${reqStr}${optStr}${missingStr}`,
-      );
-      lines.push(
-        `${pad}      ${p.dim("provider:")} ${toolProviderLabel(t, p)}`,
-      );
-      lines.push(
-        `${pad}      ${p.dim("granted:")} ${p.dim(formatGrant(t.granted))}`,
-      );
+      const capsLine = `${reqStr}${optStr}${missingStr}`;
+      if (capsLine.length > 0) {
+        lines.push(`${pad}      ${capsLine}`);
+      }
+      // The grant itself is rendered once in the `capabilities granted:`
+      // section below — repeating it per tool just doubles the noise.
+      // Bound args render below.
       if (t.boundArgs && t.boundArgs.length > 0) {
         // Surface MCP-style pre-bindings inline so reviewers see
         // which args the model never gets to choose.
@@ -1789,18 +1927,11 @@ export function formatCapabilityTree(
     }
   }
 
-  // Grants.
-  const grantKeys = Object.keys(tree.grants);
-  if (grantKeys.length > 0) {
-    lines.push(`${pad}  ${p.bold("capabilities granted:")}`);
-    for (const [k, v] of Object.entries(tree.grants)) {
-      lines.push(
-        `${pad}    ${p.dim("-")} ${p.green(k)}: ${p.dim(formatGrant(v))}`,
-      );
-    }
-  } else {
-    lines.push(`${pad}  ${p.bold("capabilities granted:")} ${p.dim("(none)")}`);
-  }
+  // The `capabilities granted:` summary block was removed: it just
+  // restates each tool's manifest grant verbatim, which reviewers
+  // can already read in `agent.toml`. The audit's job is structural
+  // — it flags MISSING required kinds inline on each tool's caps
+  // line. Grant *values* aren't the audit's concern.
 
   // Unresolved sources.
   if (tree.unresolvedSources.length > 0) {
@@ -1853,7 +1984,9 @@ export function formatCapabilityTree(
     }
   }
 
-  // Secrets.
+  // Secrets. `requestedBy` flows inline rather than in a `(needed by ...)`
+  // parenthetical — it's the actually-informative bit for reviewers
+  // chasing who wants a secret.
   if (tree.secrets.length > 0) {
     lines.push(`${pad}  ${p.bold("secrets:")}`);
     for (const s of tree.secrets) {
@@ -1861,8 +1994,9 @@ export function formatCapabilityTree(
       const block = s.permittedByAllowlist
         ? ""
         : `  ${p.red("⚠ DENIED by [agent].secrets")}`;
+      const wanters = p.dim(s.requestedBy.join(", "));
       lines.push(
-        `${pad}    ${p.dim("-")} ${p.cyan(s.name)} ${tag} ${p.dim(`(needed by ${s.requestedBy.join(", ")})`)}${block}`,
+        `${pad}    ${p.dim("-")} ${p.cyan(s.name)} ${tag}  ${wanters}${block}`,
       );
     }
   }
@@ -1878,9 +2012,9 @@ function formatSessionLayerBody(
   lines: string[],
   layerIndent: string,
 ): void {
-  lines.push(
-    `${pad}${layerIndent}${p.dim("provider:")} ${factoryProviderLabel(s, p)}`,
-  );
+  // Source attribution now folds into the heading via `via <source>`;
+  // body just carries the layer's config, contributions, trusted
+  // paths, and any construction error.
   const cfgKeys = Object.keys(s.config);
   if (cfgKeys.length > 0) {
     lines.push(
@@ -1921,21 +2055,17 @@ function formatConfig(cfg: Record<string, unknown>): string {
 }
 
 /**
- * Label for the `provider:` line under harness/session entries:
- *   - `"builtin"` for built-in factories
- *   - `"<pre-built instance>"` for SDK-supplied instances
- *   - `"<handle> (<key>)"` when both are known
- *   - `"<handle>"` or `"<key>"` when only one is
+ * Source-only attribution for harness/session headlines: returns just
+ * the source key (when factory-backed by a package) or `builtin`
+ * (when sourced from the built-in registry). Drops the provider
+ * handle because the headline already carries it (e.g. `harness:
+ * anthropic via builtin` instead of `harness: anthropic via anthropic`).
  */
-function factoryProviderLabel(
+function sourceAttribution(
   summary: FactoryAuditSummary,
   p: ReturnType<typeof makePainter>,
 ): string {
   if (summary.preBuilt) return p.dim("<pre-built instance>");
-  if (summary.providerHandle && summary.providerKey) {
-    return `${p.cyan(summary.providerHandle)}  ${p.dim(`(${summary.providerKey})`)}`;
-  }
-  if (summary.providerHandle) return p.cyan(summary.providerHandle);
   if (summary.providerKey) return p.cyan(summary.providerKey);
   return p.dim("builtin");
 }

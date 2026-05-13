@@ -25,14 +25,20 @@
 #                   file into the system prompt AND owns the `remember`
 #                   verb the model uses to save new ones. See
 #                   `../notes-provider/index.ts`.
-#   - `[tools]`     mixes built-in tools with names contributed by
-#                   the session itself (here: `remember`). When a
-#                   session contributes a tool, the runtime treats
-#                   the session as the implicit provider — no
-#                   `[tools.remember]` entry is needed.
+#   - `[tools]`     mixes built-in tools, names contributed by
+#                   the session itself (here: `remember`), AND
+#                   harness-exposed server tools (`web_search`,
+#                   `web_fetch` — dispatched API-side by Anthropic,
+#                   not the local runtime). Sessions contributing
+#                   tools need no `[tools.X]` entry; harness-exposed
+#                   tools DO opt in via `"anthropic"` as the provider.
 #   - `[capabilities]` is a transitive ceiling. `remember` doesn't
 #                   need a grant because the demo session writes to
 #                   its own configured file, not user-pickable paths.
+#                   `web_search` and `web_fetch` accept an
+#                   `allowed_domains` allow-list — their egress is
+#                   on Anthropic's side but the manifest still
+#                   declares which domains are in-scope.
 # ───────────────────────────────────────────────────────────────────────────
 
 [agent]
@@ -57,23 +63,8 @@ maxTokens = 4096
 maxTurnRequests = 16
 stream = true
 
-# Layered session (outer-to-inner). The dotted-key array-of-tables
-# form is the right shape when layers carry config; for all-default
-# chains, the inline form
-# `[session] layers = ["skills", "compacting", "in-memory"]` is shorter.
-[[session.layers]]
-provider = "compacting"
-threshold = 60
-
-[[session.layers]]
-provider = "notes"
-# `file = "./somewhere.md"` overrides; default is
-# `<ctx.storage>/notes.md` (= `<loom-data-home>/agents/<agent-name>/notes.md`).
-# Override with LOOM_DATA_HOME to point storage elsewhere.
-# Optional: max_notes = 50  # FIFO eviction once exceeded
-
-[[session.layers]]
-provider = "in-memory"
+[session]
+layers = ["compacting", "notes", "in-memory"]
 
 [tools]
 bash = "builtin"
@@ -81,7 +72,8 @@ read_file = "builtin"
 write_file = "builtin"
 edit_file = "builtin"
 find = "builtin"
-# `remember` isn't listed here — the `demo` session contributes it
+web_search = "anthropic"
+# `remember` doesn't need to be listed here — the `notes` session contributes it
 # and owns the implementation. The runtime registers it on the agent's
 # tool table automatically. Granting capabilities for it still works
 # below.
@@ -93,3 +85,4 @@ write_file = { paths = ["./"] }
 edit_file = { paths = ["./"] }
 find = { paths = ["./"] }
 remember = "*"   # the session writes to its own configured file
+web_search = { allowed_domains = ["docs.anthropic.com", "github.com"] }

@@ -327,6 +327,20 @@ export interface ResolveOptions {
    * Defaults to the set known to the native provider at the call site.
    */
   builtinToolNames?: Set<string>;
+  /**
+   * The agent's harness factory name (e.g. `"anthropic"`). When the
+   * manifest is in spec form (`[harness] provider = "<name>"`), this
+   * lets the resolver route `[tools.<name>] provider = "<harness>"`
+   * bindings to a synthetic `(harness)` Tools instance whose
+   * `resolveTool` is the harness's `Harness.resolveTool`. Used for
+   * provider-native server tools like Anthropic's `web_search`.
+   *
+   * Undefined when the manifest carries a pre-built `Harness`
+   * instance — in that case `provider = "..."` references to the
+   * harness aren't supported via the manifest; SDK consumers wire
+   * those tools directly.
+   */
+  harnessFactoryName?: string;
 }
 
 /**
@@ -341,6 +355,14 @@ export function resolveManifest(
   options: ResolveOptions = {},
 ): ResolvedManifest {
   const builtinToolNames = options.builtinToolNames ?? new Set<string>();
+  // The harness factory name only applies when the manifest is in
+  // spec form. Pre-built Harness instances don't get a routing name
+  // — SDK consumers wire harness-exposed tools directly.
+  const harnessFactoryName =
+    options.harnessFactoryName ??
+    ("provider" in manifest.harness
+      ? deriveHarnessFactoryName(manifest.harness)
+      : undefined);
   const sources = new Map<string, ResolvedSource>();
   const providers: ProviderInstance[] = [];
   const tools: ToolBinding[] = [];
@@ -442,6 +464,7 @@ export function resolveManifest(
         entry,
         providerIndex,
         builtinToolNames,
+        harnessFactoryName,
         getOrCreateInstance,
       );
       tools.push(binding);
@@ -586,6 +609,7 @@ function resolveToolEntry(
   entry: ToolEntry,
   providerIndex: ProviderIndex,
   builtinToolNames: Set<string>,
+  harnessFactoryName: string | undefined,
   getOrCreateInstance: (
     binding:
       | { kind: "native" }
@@ -636,11 +660,14 @@ function resolveToolEntry(
     const providerSpec = providerIndex.sources.get(handle);
     const factoryRef = providerIndex.factories.get(handle);
     const isBuiltin = builtinToolNames.has(handle);
+    const isHarnessName =
+      harnessFactoryName !== undefined && handle === harnessFactoryName;
     // Collision detection: a handle that matches multiple resolution
     // targets is a fatal manifest error.
     const matches = [
       providerSpec || factoryRef ? `[providers].${handle}` : null,
       isBuiltin ? `built-in tool '${handle}'` : null,
+      isHarnessName ? `harness '${handle}'` : null,
     ].filter(Boolean) as string[];
     if (matches.length > 1) {
       throw new ResolutionError(
@@ -721,9 +748,28 @@ function resolveToolEntry(
         origin: originLabel,
       };
     }
+    if (isHarnessName) {
+      // Route through the synthetic `(harness)` Tools instance the
+      // runtime materialises from `Harness.resolveTool`. The harness
+      // owns dispatch for these (server-side / provider-native tools);
+      // the per-tool config flows verbatim into `resolveTool` so the
+      // harness can translate `max_uses` / `allowed_domains` / etc.
+      // into the API's native server-tool shape.
+      //
+      // No `ProviderInstance` is allocated for `(harness)` — it's a
+      // runtime synthetic, just like `(session)`. Boot wires the
+      // Tools adapter when materialising tool instances.
+      return {
+        toolName: name,
+        providerInstanceId: "(harness)",
+        toolConfig,
+        origin: originLabel,
+      };
+    }
     throw new ResolutionError(
       `${originLabel}.provider = "${handle}": no matching [providers] entry ` +
-        `or built-in. Declared providers: ${listOrNone([
+        `or built-in${harnessFactoryName ? `, and doesn't match the harness factory name '${harnessFactoryName}'` : ""}. ` +
+        `Declared providers: ${listOrNone([
           ...providerIndex.sources.keys(),
           ...providerIndex.factories.keys(),
         ])}.`,
@@ -911,6 +957,28 @@ function defaultFactoryNameForSource(s: SourceSpec): string {
   if ("npm" in s) return s.npm;
   if ("path" in s) return path.basename(s.path);
   return "unknown";
+}
+
+/**
+ * Derive the factory name `manifest.harness` will resolve to, used
+ * by the resolver to route `[tools.<name>] provider = "<harness>"`
+ * bindings. Mirrors what {@link resolveFactoryReference} would
+ * produce for the harness spec; we extract just the name without
+ * doing the full binding resolution (which we don't have the
+ * provider index for at the call site this is invoked from).
+ *
+ * Returns undefined when the spec is a pre-built `Harness` instance.
+ */
+function deriveHarnessFactoryName(
+  spec: AgentManifest["harness"],
+): string | undefined {
+  if (!("provider" in spec)) return undefined;
+  const ref = (spec as HarnessSpec).provider;
+  const handle = referenceToHandle(ref);
+  if (handle) return handle;
+  const src = referenceToSourceSpec(ref);
+  if (!src) return undefined;
+  return defaultFactoryNameForSource(src);
 }
 
 // ─── SourceSpec index helpers ─────────────────────────────────────────────

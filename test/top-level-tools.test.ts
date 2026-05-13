@@ -120,10 +120,14 @@ describe("top-level [tools]", () => {
     ).rejects.toThrow(/missing required.*subprocess/);
   });
 
-  it("audit: top-level tools show with a tools-table introducedBy label", async () => {
+  it("audit: top-level tools carry a tools-table introducedBy label on the tree", async () => {
     const tree = await auditAgent(buildAgent({}));
-    // v4: each tool's origin labels its `[tools.<name>]` block (or
-    // `(default builtin)` for the auto-loaded set when [tools] is absent).
+    // v4: each tool's `introducedBy` records its `[tools.<name>]`
+    // origin (or `(default builtin)` for the auto-loaded set when
+    // [tools] is absent). The formatter no longer prints the origin
+    // — the `via <provider>` attribution carries the equivalent info
+    // — but the structured field is still preserved on the tree for
+    // programmatic consumers.
     expect(
       tree.tools.every(
         (t) =>
@@ -131,8 +135,9 @@ describe("top-level [tools]", () => {
           t.introducedBy.startsWith("[tools."),
       ),
     ).toBe(true);
-    const printed = formatCapabilityTree(tree);
-    expect(printed).toMatch(/default builtin|\[tools\./);
+    const printed = formatCapabilityTree(tree, { color: false });
+    // The headline carries the provider attribution via `via X`.
+    expect(printed).toMatch(/\bbash\s+via\s+/);
   });
 
   it("system prompt: tools surface via Tool Reference", async () => {
