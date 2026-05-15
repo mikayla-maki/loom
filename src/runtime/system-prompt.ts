@@ -6,17 +6,22 @@
  *   1. Manifest-owned (identity): `[agent].system_prompt` content (the
  *      core).
  *   2. Runtime-owned (structural): the tool reference.
- *   3. Ambient context: current date and other slow-moving facts.
- *      Deliberately coarse-grained (date-only, not timestamp) so the
- *      assembled prompt stays byte-stable across a day and implicit
- *      prompt caching can hit. Per-event timing lives on
- *      `PersistedUpdate` and never reaches the wire.
- *   4. Session-owned (identity — retrieved memories, etc.): the section
+ *   3. Session-owned (identity — retrieved memories, etc.): the section
  *      the Session contributes via `systemPromptSection()`.
  *
- * Order is: core → tools → ambient context → session section. The
- * session goes last so it lands closest to the conversation history
- * — retrieved memories then sit in the model's freshest attention.
+ * Order is: core → tools → session section. The session goes last so
+ * it lands closest to the conversation history — retrieved memories
+ * then sit in the model's freshest attention.
+ *
+ * The runtime deliberately does NOT inject ambient context like the
+ * current date. "What does the model need to know about the wall
+ * clock?" is an application-specific question — some agents want a
+ * date, some want a precise timestamp, most want neither. Agents
+ * that need it should put it in their `[agent].system_prompt` (for
+ * a static answer) or contribute a session section (for a dynamic
+ * one). Keeping it out of the runtime also means the assembled
+ * prompt is byte-stable across turns, which is what implicit
+ * prompt caching keys on.
  *
  * Harness extensions consume the final string via runtime.systemPrompt().
  * They MAY override by reading components separately
@@ -30,10 +35,9 @@ export interface SystemPromptInputs {
   /** The resolved [agent].system_prompt content (manifest-owned core). */
   core: string;
   tools: ToolDescriptor[];
-  /** Per-turn context (e.g. now, agent name, agent description). */
+  /** Identity fallbacks used when `core` is empty. */
   agentName: string;
   agentDescription?: string;
-  now?: Date;
   /**
    * Section contributed by the active Session. Resolved at turn start
    * (so memory implementations can pull from the latest user message).
@@ -65,22 +69,7 @@ export function assembleSystemPrompt(inputs: SystemPromptInputs): string {
     parts.push(lines.join("\n"));
   }
 
-  // 3. Ambient context.
-  //
-  // Date-only (YYYY-MM-DD), deliberately not down-to-the-second. The
-  // system prompt is the longest stable prefix of every request and
-  // is what implicit prompt caching keys on; a full ISO timestamp
-  // here would change every turn and invalidate the cache for every
-  // call. Per-event timestamps DO live on `PersistedUpdate` for
-  // observability/replay, but the harness's `eventsToMessages`
-  // pipeline doesn't include them in what it sends to the model —
-  // so the request body itself stays stable across a day.
-  const dyn: string[] = ["# Context"];
-  const now = inputs.now ?? new Date();
-  dyn.push(`Current date: ${now.toISOString().slice(0, 10)}`);
-  parts.push(dyn.join("\n"));
-
-  // 4. Session-contributed section (memory, scoped instructions, etc.).
+  // 3. Session-contributed section (memory, scoped instructions, etc.).
   // Goes last so it's closest to the conversation history — the model's
   // recency bias works in our favour for fresh memories.
   if (inputs.sessionSection && inputs.sessionSection.trim().length > 0) {

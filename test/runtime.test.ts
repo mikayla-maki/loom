@@ -167,7 +167,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
 });
 
 describe("system prompt assembly", () => {
-  it("includes the manifest-owned core, the tool reference, and a Context block", () => {
+  it("includes the manifest-owned core and the tool reference", () => {
     const text = assembleSystemPrompt({
       core: "I am a helpful assistant.",
       tools: [
@@ -175,40 +175,40 @@ describe("system prompt assembly", () => {
         { name: "uppercase", description: "Shout", inputSchema: {} },
       ],
       agentName: "tester",
-      now: new Date("2026-01-01T00:00:00Z"),
     });
     expect(text).toContain("I am a helpful assistant.");
     expect(text).toContain("# Tool Reference");
     expect(text).toContain("`greet`");
     expect(text).toContain("`uppercase`");
-    expect(text).toContain("Current date: 2026-01-01");
     // Skills are gone — no skill catalog section.
     expect(text).not.toContain("# Available Skills");
   });
 
-  it("emits date-only (no time, no millis) so implicit prompt caching stays warm across a day", () => {
-    // Two assemblies at different moments of the SAME day must
-    // produce byte-identical output. The system prompt is the longest
-    // stable prefix of every request; a per-turn timestamp here would
-    // defeat the upstream cache for every call. Date-only is the
-    // contract — if anyone tightens the resolution back to a
-    // timestamp, this test breaks loudly.
+  it("does NOT inject ambient context like the current date — that's the agent's job", () => {
+    // "What does the model need to know about the wall clock?" is an
+    // application-specific question. The runtime stays out of it so
+    // the assembled prompt is byte-stable across turns (implicit
+    // prompt caching keys on the system prompt prefix). Agents that
+    // want a date should put it in their `[agent].system_prompt`
+    // core or contribute a session section.
+    const text = assembleSystemPrompt({
+      core: "core",
+      tools: [{ name: "t", description: "t", inputSchema: {} }],
+      agentName: "tester",
+    });
+    expect(text).not.toContain("# Context");
+    expect(text).not.toContain("Current date");
+    expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+  });
+
+  it("is byte-stable across calls when inputs don't change (cache-friendly)", () => {
+    // Same inputs → same output, no hidden per-call entropy. Two
+    // assemblies done back-to-back must hash identically.
     const inputs = {
       core: "core",
       tools: [{ name: "t", description: "t", inputSchema: {} }],
       agentName: "tester",
     };
-    const morning = assembleSystemPrompt({
-      ...inputs,
-      now: new Date("2026-05-13T08:15:42.123Z"),
-    });
-    const evening = assembleSystemPrompt({
-      ...inputs,
-      now: new Date("2026-05-13T22:47:09.987Z"),
-    });
-    expect(morning).toBe(evening);
-    expect(morning).toContain("Current date: 2026-05-13");
-    // And the timestamp form must NOT leak in.
-    expect(morning).not.toMatch(/Current date: \d{4}-\d{2}-\d{2}T/);
+    expect(assembleSystemPrompt(inputs)).toBe(assembleSystemPrompt(inputs));
   });
 });

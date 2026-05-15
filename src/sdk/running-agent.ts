@@ -96,7 +96,6 @@ interface RunningAgentImplOptions {
   clientBridgeHolder: Ref<ClientBridge | null>;
   /** Receives `setAbortSignal` each turn. */
   runtimeServices: RuntimeServicesImpl;
-  now?: () => Date;
 }
 
 export class RunningAgentImpl implements RunningAgent {
@@ -112,7 +111,6 @@ export class RunningAgentImpl implements RunningAgent {
   private readonly permissionHolder: Ref<PermissionHandler | null>;
   private readonly clientBridgeHolder: Ref<ClientBridge | null>;
   private readonly runtimeServices: RuntimeServicesImpl;
-  private readonly now: (() => Date) | undefined;
 
   private currentAbortCtl: AbortController | null = null;
   private inflight: Promise<TurnResult> | null = null;
@@ -131,7 +129,6 @@ export class RunningAgentImpl implements RunningAgent {
     this.clientBridgeHolder = opts.clientBridgeHolder;
     this.runtimeServices = opts.runtimeServices;
     this.secretNames = Object.keys(opts.secrets);
-    this.now = opts.now;
   }
 
   get agentState(): AgentState {
@@ -234,7 +231,6 @@ export class RunningAgentImpl implements RunningAgent {
         : {}),
       ...(sessionSection ? { sessionSection } : {}),
       abortSignal: ctl.signal,
-      ...(this.now ? { now: this.now } : {}),
     });
 
     this.inflight = (async () => {

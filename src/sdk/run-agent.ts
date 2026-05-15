@@ -196,8 +196,6 @@ export interface RunAgentOptions {
   skipRuntimeAudit?: boolean;
   /** Provider discovery search-path overrides (tests). */
   providerLoadOptions?: LoadOptions;
-  /** Deterministic 'now' for system-prompt assembly (tests). */
-  now?: () => Date;
   /** Parent agent when constructing a sub-agent. Undefined at top level. */
   parent?: Agent;
   /** Negotiated ACP client caps. Defaults to `DEFAULT_CLIENT_ACP_CAPABILITIES`. */
@@ -397,7 +395,6 @@ export async function runAgent(
     permissionHolder,
     clientBridgeHolder,
     runtimeServices,
-    ...(options.now ? { now: options.now } : {}),
   });
 }
 

@@ -39,8 +39,6 @@ export interface RuntimeImplOptions {
    * `systemPrompt()` here stays sync.
    */
   sessionSection?: string;
-  /** Test hook: deterministic "now" used in system-prompt assembly. */
-  now?: () => Date;
 }
 
 export class RuntimeImpl implements Runtime {
@@ -77,7 +75,6 @@ export class RuntimeImpl implements Runtime {
       ...(this.opts.sessionSection
         ? { sessionSection: this.opts.sessionSection }
         : {}),
-      now: this.opts.now ? this.opts.now() : new Date(),
     });
   }
 
