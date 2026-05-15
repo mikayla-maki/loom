@@ -33,7 +33,11 @@ import {
   type ResolvedSessionLayer,
   type ResolvedSource,
 } from "../manifest/resolver.js";
-import { getHarnessFactory, getSessionFactory } from "../builtins/index.js";
+import {
+  findToolsFactory,
+  getHarnessFactory,
+  getSessionFactory,
+} from "../builtins/index.js";
 import {
   buildNativeTools,
   nativeBuiltinNames,
@@ -45,6 +49,7 @@ import {
   lookupFactoryByBinding as bootLookupFactoryByBinding,
   materialiseTools as bootMaterialiseTools,
   defaultProviderName as bootDefaultProviderName,
+  type ToolsIndex,
 } from "../runtime/boot.js";
 import {
   buildSecretStore,
@@ -1228,7 +1233,7 @@ async function auditAgentInner(
   }
 
   // ─── secrets ────────────────────────────────────────────────────
-  const secrets = collectSecrets(manifest, resolved, resolvedTools);
+  const secrets = collectSecrets(manifest, resolved, resolvedTools, toolsIndex);
 
   // ─── session-declared subagents (pre-built instance form only) ──
   // Arrays are SessionSpec[] chains; only the non-array, no-provider
@@ -1536,15 +1541,20 @@ function checkCapabilityCeiling(
  *   - harness factory's `secrets` (when reachable from the registry)
  *   - session factory's `secrets`
  *   - every native-resolved tool's `secrets`
+ *   - every provider-Tools contribution's static `secrets` AND
+ *     per-instance `instanceSecretNeeds(config)` (the MCP factory's
+ *     `secrets = { LOOM_NAME = "ENV_VAR" }` map flows through this
+ *     path)
  *
- * Provider-contributed Tools-registration secrets aren't included
- * because audit doesn't materialise them per-instance — the audit
- * surface is intentionally conservative.
+ * The provider walk mirrors the runtime's `collectPhase1SecretNeeds`
+ * so reviewers see the same set of names the SDK would actually
+ * pull from the secret store at boot.
  */
 function collectSecrets(
   manifest: AgentManifest,
   resolved: ReturnType<typeof resolveManifest>,
   tools: Map<string, Tool>,
+  toolsIndex: ToolsIndex,
 ): SecretRequest[] {
   const required = new Map<string, Set<string>>();
   const optional = new Map<string, Set<string>>();
@@ -1595,6 +1605,48 @@ function collectSecrets(
   // Tool needs.
   for (const [name, tool] of tools) {
     addNeeds(tool.secrets, `tool:${name}`);
+  }
+
+  // Provider-Tools contribution needs. Walk every materialised
+  // provider instance, locate its contribution registration (via
+  // the source-indexed `toolsIndex` for source-backed providers, or
+  // the built-in/SDK Tools-factory registry for configured-factory
+  // entries), and capture both the static `secrets` field and the
+  // per-instance `instanceSecretNeeds(config)` map. This is what
+  // surfaces e.g. an MCP server's `secrets = { MOCK_API_KEY = "…" }`
+  // on the audit tree without having to call into the live process.
+  for (const instance of resolved.providers) {
+    if (instance.kind !== "provider") continue;
+    let contribution:
+      | {
+          name: string;
+          secrets?: { required?: string[]; optional?: string[] };
+          instanceSecretNeeds?(
+            config: Record<string, unknown>,
+          ): { required?: string[]; optional?: string[] } | undefined;
+        }
+      | undefined;
+    if (instance.source) {
+      const srcKey = sourceSpecKey(instance.source);
+      for (const [key, c] of toolsIndex) {
+        if (!key.startsWith(`${srcKey}::`)) continue;
+        contribution = c;
+        break;
+      }
+    } else if (instance.factoryName) {
+      contribution = findToolsFactory(instance.factoryName);
+    }
+    if (!contribution) continue;
+    // Label: prefer the user-declared `[providers]` handle when
+    // present so reviewers can trace a secret back to the manifest
+    // entry that asked for it; fall back to the contribution name.
+    const label = instance.providerHandle
+      ? `provider:${instance.providerHandle}`
+      : `provider:${contribution.name}`;
+    addNeeds(contribution.secrets, label);
+    if (contribution.instanceSecretNeeds) {
+      addNeeds(contribution.instanceSecretNeeds(instance.config), label);
+    }
   }
 
   for (const k of required.keys()) optional.delete(k);

@@ -120,6 +120,50 @@ describe("audit: MCP-backed providers", () => {
     expect(err!.health.unresolvedTools).toBeGreaterThanOrEqual(1);
   });
 
+  it("surfaces per-instance secret needs from the mcp-server config", async () => {
+    // The MCP factory's `instanceSecretNeeds(config)` reads the keys
+    // of `secrets = { LOOM_NAME = "ENV_VAR" }` and reports them as
+    // required. The audit's secrets roll-up MUST include those so
+    // reviewers can see what the server will pull from the store.
+    // Make the secret resolvable so the server actually starts and
+    // the audit comes back clean.
+    const prev = process.env.MOCK_API_KEY;
+    process.env.MOCK_API_KEY = "test-value";
+    let tree;
+    try {
+      const spec: AgentManifest = {
+        name: "audit-mcp-secrets",
+        systemPrompt: "x",
+        harness: { provider: "test" },
+        providers: {
+          echo_mcp: {
+            provider: "mcp-server",
+            command: process.execPath,
+            args: [ECHO_SERVER],
+            secrets: { MOCK_API_KEY: "MOCK_API_KEY" },
+          },
+        },
+        tools: { echo: { provider: "echo_mcp" } },
+        capabilities: { echo: "*" },
+      };
+      tree = await auditAgent(spec);
+    } finally {
+      if (prev === undefined) delete process.env.MOCK_API_KEY;
+      else process.env.MOCK_API_KEY = prev;
+    }
+    const entry = tree.secrets.find((s) => s.name === "MOCK_API_KEY");
+    expect(entry).toBeDefined();
+    expect(entry!.required).toBe(true);
+    // The label uses the `[providers]` handle so reviewers can trace
+    // the secret back to the manifest entry that asked for it.
+    expect(entry!.requestedBy).toContain("provider:echo_mcp");
+    // And the rendered text surfaces it under the secrets section.
+    const { formatCapabilityTree } = await import("../src/audit/audit.js");
+    const text = formatCapabilityTree(tree, { color: false });
+    expect(text).toContain("MOCK_API_KEY");
+    expect(text).toContain("provider:echo_mcp");
+  });
+
   it("formatCapabilityTree includes MCP server name + pre-bound args in the text output", async () => {
     const spec: AgentManifest = {
       name: "audit-format-mcp",
