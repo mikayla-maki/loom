@@ -164,14 +164,29 @@ export class CompactingSession implements Session {
         version?: number;
         summarizedThrough?: number;
         cachedSummary?: SessionUpdate[];
+        lastUsed?: number | null;
+        lastSize?: number | null;
       };
-      if (
-        parsed.version === 1 &&
-        typeof parsed.summarizedThrough === "number" &&
-        Array.isArray(parsed.cachedSummary)
-      ) {
-        this.summarizedThrough = parsed.summarizedThrough;
-        this.cachedSummary = parsed.cachedSummary;
+      // Restore each field independently. A state file may carry only
+      // usage data (turn ended before any compaction) or only summary
+      // data (older writers), or both. We want to recover whatever's
+      // there so token-based thresholds survive process boundaries —
+      // critical for the per-turn-subprocess deployment shape where
+      // each turn is a fresh CompactingSession instance.
+      if (parsed.version === 1) {
+        if (
+          typeof parsed.summarizedThrough === "number" &&
+          Array.isArray(parsed.cachedSummary)
+        ) {
+          this.summarizedThrough = parsed.summarizedThrough;
+          this.cachedSummary = parsed.cachedSummary;
+        }
+        if (typeof parsed.lastUsed === "number") {
+          this.lastUsed = parsed.lastUsed;
+        }
+        if (typeof parsed.lastSize === "number") {
+          this.lastSize = parsed.lastSize;
+        }
       }
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -201,6 +216,8 @@ export class CompactingSession implements Session {
       version: 1,
       summarizedThrough: this.summarizedThrough,
       cachedSummary: this.cachedSummary,
+      lastUsed: this.lastUsed,
+      lastSize: this.lastSize,
     });
     await fs.writeFile(tmpPath, payload, "utf8");
     await fs.rename(tmpPath, statePath);
@@ -211,6 +228,17 @@ export class CompactingSession implements Session {
       // Track in memory; don't pollute the storage layer with metadata.
       this.lastUsed = update.used;
       this.lastSize = update.size;
+      // Persist usage so the next instance's `shouldCompact()` can
+      // evaluate tokenFraction / tokenThreshold before the first
+      // model call of the new turn. Without this, per-turn-subprocess
+      // deployments (a fresh CompactingSession per turn) silently fall
+      // through to the event-count threshold every turn — making
+      // tokenFraction/tokenThreshold effectively unreachable. Load
+      // existing state first so we don't clobber a cached summary.
+      if (this.persistDir) {
+        await this.maybeLoadState();
+        await this.saveState();
+      }
       return [];
     }
     // Pass everything else through unchanged. The layer(s) below us
@@ -279,9 +307,7 @@ export class CompactingSession implements Session {
     // summary cross `threshold`. Without subtracting `summarizedThrough`
     // we'd recompact every turn once a summary exists, since `latestBelow`
     // grows monotonically and never shrinks after compaction.
-    return (
-      this.latestBelow.length - this.summarizedThrough >= this.threshold
-    );
+    return this.latestBelow.length - this.summarizedThrough >= this.threshold;
   }
 
   /**

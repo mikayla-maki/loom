@@ -283,7 +283,6 @@ describe("CompactingSession", () => {
   });
 });
 
-
 describe("CompactingSession — tokenFraction", () => {
   function stubAgent(session: Session) {
     return {
@@ -339,7 +338,7 @@ describe("CompactingSession — tokenFraction", () => {
     const compactor = new CompactingSession({
       threshold: 10_000,
       tokenThreshold: 1_000_000, // very high; would never trip
-      tokenFraction: 0.25,        // low; will trip
+      tokenFraction: 0.25, // low; will trip
       keep: 2,
       onCompact: (info) => compactions.push(info),
     });
@@ -462,7 +461,11 @@ describe("CompactingSession — persistence", () => {
 
   it("ignores corrupt state.json and rebuilds from scratch", async () => {
     const persistDir = await freshTmpDir();
-    await fs.writeFile(path.join(persistDir, "state.json"), "{not json", "utf8");
+    await fs.writeFile(
+      path.join(persistDir, "state.json"),
+      "{not json",
+      "utf8",
+    );
 
     const memory = new InMemorySession();
     await memory.push?.(userMsg("hello"));
@@ -472,6 +475,58 @@ describe("CompactingSession — persistence", () => {
     // Should not throw; just returns the raw memory contents.
     const out = (await session.pull?.([])) ?? [];
     expect(out).toHaveLength(1);
+  });
+
+  it("persists lastUsed/lastSize so tokenFraction trips across instances", async () => {
+    // Regression: per-turn-subprocess deployments (e.g. `loom prompt`
+    // invoked once per turn) build a fresh CompactingSession every
+    // turn. Without persisting usage data, `shouldCompact()`'s
+    // tokenFraction/tokenThreshold branches see `lastUsed === null`
+    // and silently fall through to the event-count fallback.
+    const persistDir = await freshTmpDir();
+
+    // Turn 1: push some events plus a usage_update that exceeds the
+    // tokenFraction bar. No compaction runs (prepareTurn never fires
+    // here), but the usage data must hit disk before the instance is
+    // discarded.
+    {
+      const memory = new InMemorySession();
+      const compactor = new CompactingSession({
+        persistDir,
+        threshold: 10_000, // event-count fallback well out of reach
+        tokenFraction: 0.75,
+        keep: 2,
+      });
+      const session: Session = new ChainedSession([compactor, memory]);
+      for (let i = 0; i < 4; i++) await session.push?.(userMsg(`m${i}`));
+      await session.push?.({
+        sessionUpdate: "usage_update",
+        used: 180_000,
+        size: 200_000,
+      });
+    }
+
+    // Turn 2: fresh compactor, same persistDir, same underlying events
+    // replayed. After loading state, prepareTurn should see the prior
+    // usage data and trip tokenFraction.
+    {
+      const compactions: { before: number; after: number }[] = [];
+      const memory = new InMemorySession();
+      for (let i = 0; i < 4; i++) await memory.push?.(userMsg(`m${i}`));
+      const compactor = new CompactingSession({
+        persistDir,
+        threshold: 10_000,
+        tokenFraction: 0.75,
+        keep: 2,
+        onCompact: (info) => compactions.push(info),
+      });
+      const session: Session = new ChainedSession([compactor, memory]);
+      await session.pull?.([]); // triggers maybeLoadState
+      expect(compactor.tokensInContext).toBe(180_000);
+      expect(compactor.contextWindow).toBe(200_000);
+      await compactor.prepareTurn(stubAgent(session));
+      expect(compactions).toHaveLength(1);
+    }
   });
 });
 
