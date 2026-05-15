@@ -324,7 +324,7 @@ export interface CapabilityTree {
 export type AuditOptions = Record<string, never>;
 
 const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
-  bash: { subprocess: "*", paths: ["./"] },
+  bash: { commands: "*", paths: ["./"] },
   read_file: { paths: ["./"] },
   write_file: { paths: ["./"] },
   edit_file: { paths: ["./"] },

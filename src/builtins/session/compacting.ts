@@ -15,11 +15,29 @@
  * (cache active). The cache is built when the event-count or token
  * thresholds trip, either inside `prepareTurn` or via `compactNow()`.
  *
+ * Thresholding signals, in priority order:
+ *   1. `tokenFraction` × most-recent `usage_update.size` (model-agnostic
+ *      context-window percentage — preferred when usage data flows).
+ *   2. Absolute `tokenThreshold` against most-recent `usage_update.used`.
+ *   3. Event-count `threshold` against the number of *new* events
+ *      past `summarizedThrough` (so we don't recompact every turn once
+ *      a summary exists).
+ *
+ * Optional persistence: when `persistDir` is set, the cached summary +
+ * cutoff are saved to `<persistDir>/state.json` after each successful
+ * compaction and reloaded on the next instance's first pull. Lets the
+ * summary survive across loom invocations instead of being recomputed
+ * per turn. Loom's manifest factory wires this from
+ * `FactoryContext.storage` when the manifest sets `persist = true`.
+ *
  * Default compactor is a deterministic heuristic. Use `modelCompactor()`
  * for model-driven summarisation. Compaction never splits a tool_call
  * from its later tool_call_update: the cutoff slides back past any
  * orphan pair.
  */
+
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 import type {
   Agent,
@@ -54,12 +72,33 @@ export interface CompactingSessionOptions {
    * over `threshold` when usage data is available.
    */
   tokenThreshold?: number;
+  /**
+   * Fraction of the context window (most recent `usage_update.size`)
+   * to fill before compacting. e.g. `0.75` = compact when the last
+   * request used more than 75% of the model's context window. Takes
+   * priority over `tokenThreshold` when both `lastUsed` and `lastSize`
+   * are available. Model-agnostic — works for any harness that emits
+   * `usage_update` events with a `size` field.
+   */
+  tokenFraction?: number;
   /** Most recent `keep` events that survive verbatim. Default 10. */
   keep?: number;
   /** Replace the heuristic summarizer with a custom one. */
   compactor?: Compactor;
   /** Diagnostic hook fired after each successful compaction. */
   onCompact?: (info: { before: number; after: number }) => void;
+  /**
+   * Directory for persisting compaction state across instances. When
+   * set, the cached summary + cutoff are written to
+   * `<persistDir>/state.json` after each successful compaction and
+   * loaded lazily on first pull. When unset, all state is in-memory
+   * only and lost when the session instance is dropped.
+   *
+   * Loom's manifest factory wires this from `FactoryContext.storage`
+   * when the manifest sets `persist = true`; SDK consumers can pass
+   * any directory directly.
+   */
+  persistDir?: string;
 }
 
 /**
@@ -85,23 +124,86 @@ export class CompactingSession implements Session {
   private latestBelow: SessionUpdate[] = [];
   private readonly threshold: number;
   private readonly tokenThreshold: number | null;
+  private readonly tokenFraction: number | null;
   private readonly keep: number;
   private readonly compactor: Compactor;
   private readonly onCompact?: (info: {
     before: number;
     after: number;
   }) => void;
+  private readonly persistDir: string | null;
+  private stateLoaded = false;
 
   constructor(opts: CompactingSessionOptions = {}) {
     this.threshold = opts.threshold ?? 40;
     this.tokenThreshold = opts.tokenThreshold ?? null;
+    this.tokenFraction = opts.tokenFraction ?? null;
     this.keep = opts.keep ?? 10;
     this.compactor = opts.compactor ?? heuristicCompactor;
     if (opts.onCompact) this.onCompact = opts.onCompact;
+    this.persistDir = opts.persistDir ?? null;
     if (this.threshold <= this.keep + 2) {
       // Pathological config: no slice would be left to compact.
       this.threshold = this.keep + 4;
     }
+  }
+
+  /**
+   * Lazy load persisted state on first pull / prepareTurn. Idempotent.
+   * No-op when `persistDir` isn't set. Failures are logged and treated
+   * as "no prior state" — the compactor rebuilds from scratch.
+   */
+  private async maybeLoadState(): Promise<void> {
+    if (this.stateLoaded) return;
+    this.stateLoaded = true;
+    if (!this.persistDir) return;
+    const statePath = path.join(this.persistDir, "state.json");
+    try {
+      const raw = await fs.readFile(statePath, "utf8");
+      const parsed = JSON.parse(raw) as {
+        version?: number;
+        summarizedThrough?: number;
+        cachedSummary?: SessionUpdate[];
+      };
+      if (
+        parsed.version === 1 &&
+        typeof parsed.summarizedThrough === "number" &&
+        Array.isArray(parsed.cachedSummary)
+      ) {
+        this.summarizedThrough = parsed.summarizedThrough;
+        this.cachedSummary = parsed.cachedSummary;
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        // Corrupt or unreadable state: warn but proceed without it.
+        // The compactor will rebuild on next compaction.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `CompactingSession: failed to load state from ${statePath}: ${
+            (e as Error).message
+          }`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Atomically write current state to `<persistDir>/state.json`.
+   * No-op when `persistDir` isn't set. Creates the directory if
+   * needed. Write-then-rename so a crash mid-write doesn't corrupt.
+   */
+  private async saveState(): Promise<void> {
+    if (!this.persistDir) return;
+    await fs.mkdir(this.persistDir, { recursive: true });
+    const statePath = path.join(this.persistDir, "state.json");
+    const tmpPath = `${statePath}.tmp`;
+    const payload = JSON.stringify({
+      version: 1,
+      summarizedThrough: this.summarizedThrough,
+      cachedSummary: this.cachedSummary,
+    });
+    await fs.writeFile(tmpPath, payload, "utf8");
+    await fs.rename(tmpPath, statePath);
   }
 
   async push(update: SessionUpdate): Promise<SessionUpdate[]> {
@@ -117,6 +219,7 @@ export class CompactingSession implements Session {
   }
 
   async pull(below: SessionUpdate[]): Promise<SessionUpdate[]> {
+    await this.maybeLoadState();
     // Snapshot a fresh array so later layers can't mutate our view.
     this.latestBelow = below.slice();
     if (this.cachedSummary && this.summarizedThrough > 0) {
@@ -138,6 +241,7 @@ export class CompactingSession implements Session {
 
   /** Per-turn hook. Compacts if token- or event-threshold is met. */
   async prepareTurn(agent: Agent): Promise<void> {
+    await this.maybeLoadState();
     // Refresh our view of events below us before checking thresholds.
     // ChainedSession.pull cascades down to the storage layer and back
     // up through us, populating `latestBelow` along the way. Doing
@@ -160,10 +264,24 @@ export class CompactingSession implements Session {
   }
 
   private shouldCompact(): boolean {
+    if (
+      this.tokenFraction !== null &&
+      this.lastUsed !== null &&
+      this.lastSize !== null &&
+      this.lastSize > 0
+    ) {
+      return this.lastUsed >= this.lastSize * this.tokenFraction;
+    }
     if (this.tokenThreshold !== null && this.lastUsed !== null) {
       return this.lastUsed >= this.tokenThreshold;
     }
-    return this.latestBelow.length >= this.threshold;
+    // Event-count fallback: trigger only when NEW events past the last
+    // summary cross `threshold`. Without subtracting `summarizedThrough`
+    // we'd recompact every turn once a summary exists, since `latestBelow`
+    // grows monotonically and never shrinks after compaction.
+    return (
+      this.latestBelow.length - this.summarizedThrough >= this.threshold
+    );
   }
 
   /**
@@ -174,6 +292,7 @@ export class CompactingSession implements Session {
   async compactNow(
     harness: Harness | null = null,
   ): Promise<{ before: number; after: number } | null> {
+    await this.maybeLoadState();
     return this.runCompaction(harness, true);
   }
 
@@ -195,6 +314,7 @@ export class CompactingSession implements Session {
       const replacement = await Promise.resolve(this.compactor(slice, harness));
       this.cachedSummary = replacement;
       this.summarizedThrough = cutoff;
+      await this.saveState();
     } finally {
       this.compacting = false;
     }
@@ -429,18 +549,30 @@ export function compactingFileSession(
 export const compactingSessionFactory: SessionFactory = {
   name: "compacting",
   // CompactingSession reads events from inner layers via `pull` and
-  // emits summary events; it does NOT itself persist anything.
-  // Including it in a chain without an inner storage layer means
-  // events propagate through and vanish.
+  // emits summary events; it does NOT itself persist event streams.
+  // It MAY persist its own cached-summary state to `ctx.storage` when
+  // the manifest sets `persist = true`, but that's compactor-internal
+  // state, not the event log.
   passThrough: true,
-  create(
+  async create(
     config: Record<string, unknown>,
-    _ctx: FactoryContext,
+    ctx: FactoryContext,
     _secrets: Record<string, string>,
-  ): Session {
+  ): Promise<Session> {
     const opts: CompactingSessionOptions = {};
     if (typeof config.threshold === "number") opts.threshold = config.threshold;
+    if (typeof config.token_threshold === "number") {
+      opts.tokenThreshold = config.token_threshold;
+    }
+    if (typeof config.token_fraction === "number") {
+      opts.tokenFraction = config.token_fraction;
+    }
     if (typeof config.keep === "number") opts.keep = config.keep;
+    if (config.persist === true) {
+      const persistDir = path.join(ctx.storage, "compacting");
+      await fs.mkdir(persistDir, { recursive: true });
+      opts.persistDir = persistDir;
+    }
     return new CompactingSession(opts);
   },
 };

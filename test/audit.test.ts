@@ -63,7 +63,7 @@ describe("auditAgent", () => {
       systemPrompt: "x",
       tools: { bash: "builtin" },
       harness: { provider: "test" },
-      capabilities: { bash: { subprocess: "*", paths: ["./"] } },
+      capabilities: { bash: { commands: "*", paths: ["./"] } },
     };
     const tree = await auditAgent(spec);
     const bashEntry = tree.tools.find((t) => t.name === "bash");

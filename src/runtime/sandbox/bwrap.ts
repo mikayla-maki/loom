@@ -50,9 +50,12 @@
  *     network entirely. Per-host filtering isn't a bwrap thing
  *     (you'd need iptables/netns plumbing), so same restriction
  *     as sandbox-exec: only "*" or [] are valid.
- *   - subprocess: bwrap doesn't restrict exec inside the namespace
- *     once it's running. As with sandbox-exec, exec-allowlist is
- *     out of scope.
+ *   - commands: bwrap doesn't restrict exec inside the namespace
+ *     once it's running. Argv-mode narrowing happens entirely at
+ *     the bash tool's dispatch layer (schema enum + direct spawn),
+ *     so the bwrap profile treats `commands = "*"` and `commands =
+ *     […]` identically — paths/network/env are the only sandboxed
+ *     concerns here.
  */
 
 import * as fs from "node:fs/promises";
@@ -101,20 +104,28 @@ export function _resetBwrapCache(): void {
 /**
  * Validate that a grant uses only value shapes the Linux sandbox can
  * actually enforce. Mirrors `validateBashGrant` (darwin) — same
- * star-or-empty restrictions on subprocess and network, since neither
- * sandbox-exec nor bwrap supports those advanced cases.
+ * star-or-list restrictions on commands and same star-or-empty
+ * restriction on network. Argv-mode narrowing (`commands = […]`) is
+ * accepted on both platforms because the narrowing is structural at
+ * the tool layer, not an OS-level allowlist.
  *
  * `"*"` whole-tool grants are exempt (no sandbox, nothing to enforce).
  */
 export function validateBashGrantLinux(grant: CapabilitySet): void {
   if (grant === "*") return;
 
-  const sp = grant.subprocess;
-  if (sp !== undefined && sp !== "*") {
-    throw new Error(
-      `bash: capabilities.subprocess only supports "*" on Linux (bwrap ` +
-        `has no exec allowlist). Got ${JSON.stringify(sp)}.`,
-    );
+  const c = grant.commands;
+  if (c !== undefined && c !== "*") {
+    if (
+      !Array.isArray(c) ||
+      c.length === 0 ||
+      !c.every((x) => typeof x === "string" && x.length > 0)
+    ) {
+      throw new Error(
+        `bash: capabilities.commands must be "*" or a non-empty array of ` +
+          `command-name strings. Got ${JSON.stringify(c)}.`,
+      );
+    }
   }
 
   const p = grant.paths;

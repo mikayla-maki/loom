@@ -38,7 +38,7 @@ find       = "builtin"
 read_file  = { paths = ["./", "../other-files"] }
 find       = { paths = ["./", "../other-files"] }
 # Writing + editing files is restricted to the current directory
-bash       = { subprocess = "*", paths = ["./"] } # Sandboxed by default, no network access
+bash       = { commands = "*", paths = ["./"] } # Sandboxed by default, no network access
 write_file = { paths = ["./"] }
 edit_file  = { paths = ["./"] }
 ```
@@ -196,7 +196,7 @@ const manifest: AgentManifest = {
   ],
   tools: { bash: "builtin", read_file: "builtin" },
   capabilities: {
-    bash: { subprocess: "*", paths: ["./"] },
+    bash: { commands: "*", paths: ["./"] },
     read_file: { paths: ["./"] },
   },
 };
@@ -326,7 +326,7 @@ and those it may use if granted (`optional`). The manifest's
 
 ```toml
 [capabilities]
-bash      = { subprocess = "*", paths = ["./"], env = ["PATH", "HOME"] }
+bash      = { commands = "*", paths = ["./"], env = ["PATH", "HOME"] }
 read_file = { paths = ["./"] }
 edit_file = "*"                # whole-tool unrestricted
 fetch_url = "*"
@@ -345,7 +345,7 @@ fetch_url = "*"
 | Kind         | Used by | Semantics |
 |---|---|---|
 | `paths`      | `read_file`, `write_file`, `edit_file`, `find`, `bash` | `"*"` any FS; `["./"]` allowlist; absent → smart default |
-| `subprocess` | `bash` | `"*"` allow exec; absent → deny |
+| `commands`   | `bash` | `"*"` shell mode (any command via `bash -c`); `["cat", …]` argv mode (model picks from list, direct spawn, no shell); absent → boot fails (required) |
 | `network`    | `bash` | `"*"` allow; absent → deny |
 | `env`        | `bash` | Two-tier inheritance — see below |
 
@@ -600,7 +600,13 @@ and the OS-level confinement.
 | `cwd` | string | Working directory; must be inside an allowed path. |
 | `timeout_ms` | number | Default 30000. |
 
-- **Capability kinds:** requires `subprocess`; optional `paths`, `network`, `env`.
+- **Capability kinds:** requires `commands`; optional `paths`, `network`, `env`.
+  - `commands = "*"` → **shell mode**: input is a free-form `command` string,
+    dispatched via `/bin/bash -c "…"`. Today's behaviour.
+  - `commands = ["pwd", "cat"]` → **argv mode**: the input schema enumerates
+    the allowed commands and exposes an `args` array; dispatch is direct
+    `spawn(cmd, args, …)` with no shell. Useful for scoped sub-agents that
+    should only run a handful of programs.
 - **Sandbox profile** is derived from the grant — a structured
   grant engages the sandbox; `"*"` opts out (no confinement).
 
@@ -720,7 +726,7 @@ bash           = "builtin"
 
 [capabilities]
 spawn_subagent = "*"
-bash           = { subprocess = "*", paths = ["./"] }
+bash           = { commands = "*", paths = ["./"] }
 ```
 
 With that manifest, calling `spawn_subagent({ prompt: "..." })`

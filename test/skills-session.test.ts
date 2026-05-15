@@ -438,7 +438,7 @@ describe("Skills session via runAgent", () => {
       capabilities: {
         read_file: { paths: ["./"] },
         edit_file: { paths: ["./"] },
-        bash: { subprocess: "*", paths: ["./"] },
+        bash: { commands: "*", paths: ["./"] },
       },
       // skills is pass-through; pair with in-memory so the chain has
       // a storage layer (otherwise the runtime fails with the new
@@ -528,7 +528,7 @@ describe("auditAgent + skills session", () => {
       tools: { read_file: "builtin" },
       capabilities: {
         read_file: { paths: ["./"] },
-        bash: { subprocess: "*", paths: ["./"] },
+        bash: { commands: "*", paths: ["./"] },
       },
       session: { provider: "skills", root: TMP, default_tools: [] },
       harness: { provider: "test" },

@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import {
   CompactingSession,
@@ -277,5 +280,261 @@ describe("CompactingSession", () => {
     } finally {
       await agent.close();
     }
+  });
+});
+
+
+describe("CompactingSession — tokenFraction", () => {
+  function stubAgent(session: Session) {
+    return {
+      manifest: { name: "t", harness: { provider: "test" } },
+      harness: { run: async () => ({ stopReason: "end_turn" as const }) },
+      session,
+      systemPromptCore: "",
+    };
+  }
+
+  it("compacts when used/size crosses the fraction", async () => {
+    const compactions: { before: number; after: number }[] = [];
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({
+      threshold: 10_000, // event-count out of reach
+      tokenFraction: 0.5,
+      keep: 2,
+      onCompact: (info) => compactions.push(info),
+    });
+    const session: Session = new ChainedSession([compactor, memory]);
+
+    for (let i = 0; i < 6; i++) {
+      await session.push?.({
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: `m${i}` },
+      });
+    }
+    // Under the bar: 40% of 200k = 80k, used is 70k.
+    await session.push?.({
+      sessionUpdate: "usage_update",
+      used: 70_000,
+      size: 200_000,
+    });
+    await session.pull?.([]);
+    await compactor.prepareTurn(stubAgent(session));
+    expect(compactions).toHaveLength(0);
+
+    // Over the bar: 60% of 200k = 120k, used is 110k. Still under 50%? No,
+    // 110k/200k = 55%, which is > 0.5. Compaction trips.
+    await session.push?.({
+      sessionUpdate: "usage_update",
+      used: 110_000,
+      size: 200_000,
+    });
+    await session.pull?.([]);
+    await compactor.prepareTurn(stubAgent(session));
+    expect(compactions).toHaveLength(1);
+  });
+
+  it("tokenFraction takes priority over tokenThreshold when both set", async () => {
+    const compactions: { before: number; after: number }[] = [];
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({
+      threshold: 10_000,
+      tokenThreshold: 1_000_000, // very high; would never trip
+      tokenFraction: 0.25,        // low; will trip
+      keep: 2,
+      onCompact: (info) => compactions.push(info),
+    });
+    const session: Session = new ChainedSession([compactor, memory]);
+
+    for (let i = 0; i < 4; i++) {
+      await session.push?.({
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: `m${i}` },
+      });
+    }
+    // 30% of 200k = 60k, above the 0.25 bar.
+    await session.push?.({
+      sessionUpdate: "usage_update",
+      used: 60_000,
+      size: 200_000,
+    });
+    await session.pull?.([]);
+    await compactor.prepareTurn(stubAgent(session));
+    expect(compactions).toHaveLength(1);
+  });
+});
+
+describe("CompactingSession — persistence", () => {
+  function stubAgent(session: Session) {
+    return {
+      manifest: { name: "t", harness: { provider: "test" } },
+      harness: { run: async () => ({ stopReason: "end_turn" as const }) },
+      session,
+      systemPromptCore: "",
+    };
+  }
+
+  function userMsg(text: string): SessionUpdate {
+    return {
+      sessionUpdate: "user_message_chunk",
+      content: { type: "text", text },
+    };
+  }
+  function agentMsg(text: string): SessionUpdate {
+    return {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text },
+    };
+  }
+
+  async function freshTmpDir(): Promise<string> {
+    return fs.mkdtemp(path.join(os.tmpdir(), "loom-compact-test-"));
+  }
+
+  it("writes state.json after a compaction", async () => {
+    const persistDir = await freshTmpDir();
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({
+      threshold: 10,
+      keep: 4,
+      persistDir,
+    });
+    const session: Session = new ChainedSession([compactor, memory]);
+
+    for (let i = 0; i < 12; i++) {
+      await session.push?.(i % 2 === 0 ? userMsg(`u${i}`) : agentMsg(`a${i}`));
+    }
+    await session.pull?.([]);
+    await compactor.compactNow();
+
+    const statePath = path.join(persistDir, "state.json");
+    const raw = await fs.readFile(statePath, "utf8");
+    const parsed = JSON.parse(raw) as {
+      version: number;
+      summarizedThrough: number;
+      cachedSummary: SessionUpdate[];
+    };
+    expect(parsed.version).toBe(1);
+    expect(parsed.summarizedThrough).toBe(8); // 12 - keep(4)
+    expect(parsed.cachedSummary).toHaveLength(2); // heuristic emits user+agent
+  });
+
+  it("loads state.json on first pull of a fresh instance", async () => {
+    const persistDir = await freshTmpDir();
+    // Prime: write a state file directly.
+    const seeded = {
+      version: 1,
+      summarizedThrough: 3,
+      cachedSummary: [
+        userMsg("[summary] earlier discussion about Liouville volume"),
+        agentMsg("[summary recap] noted; carry forward"),
+      ],
+    };
+    await fs.writeFile(
+      path.join(persistDir, "state.json"),
+      JSON.stringify(seeded),
+      "utf8",
+    );
+
+    // Fresh memory with 5 events, fresh compactor pointed at the same dir.
+    const memory = new InMemorySession();
+    await memory.push?.(userMsg("e0"));
+    await memory.push?.(agentMsg("e1"));
+    await memory.push?.(userMsg("e2"));
+    await memory.push?.(agentMsg("e3"));
+    await memory.push?.(userMsg("e4"));
+    const compactor = new CompactingSession({ persistDir });
+    const session: Session = new ChainedSession([compactor, memory]);
+
+    const out = (await session.pull?.([])) ?? [];
+    // Expect: [2 summary events] + memory.slice(3) = 2 + 2 = 4 events
+    expect(out).toHaveLength(4);
+    const first = out[0];
+    if (
+      first &&
+      first.sessionUpdate === "user_message_chunk" &&
+      first.content.type === "text"
+    ) {
+      expect(first.content.text).toContain("Liouville");
+    } else {
+      throw new Error("expected loaded summary as first event");
+    }
+  });
+
+  it("ignores corrupt state.json and rebuilds from scratch", async () => {
+    const persistDir = await freshTmpDir();
+    await fs.writeFile(path.join(persistDir, "state.json"), "{not json", "utf8");
+
+    const memory = new InMemorySession();
+    await memory.push?.(userMsg("hello"));
+    const compactor = new CompactingSession({ persistDir });
+    const session: Session = new ChainedSession([compactor, memory]);
+
+    // Should not throw; just returns the raw memory contents.
+    const out = (await session.pull?.([])) ?? [];
+    expect(out).toHaveLength(1);
+  });
+});
+
+describe("CompactingSession — recompaction discipline", () => {
+  function stubAgent(session: Session) {
+    return {
+      manifest: { name: "t", harness: { provider: "test" } },
+      harness: { run: async () => ({ stopReason: "end_turn" as const }) },
+      session,
+      systemPromptCore: "",
+    };
+  }
+  function userMsg(text: string): SessionUpdate {
+    return {
+      sessionUpdate: "user_message_chunk",
+      content: { type: "text", text },
+    };
+  }
+
+  it("doesn't re-compact when growth past last summary is under threshold", async () => {
+    const compactions: { before: number; after: number }[] = [];
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({
+      threshold: 10,
+      keep: 4,
+      onCompact: (info) => compactions.push(info),
+    });
+    const session: Session = new ChainedSession([compactor, memory]);
+
+    // First compaction: 12 events, threshold 10, summarizedThrough -> 8.
+    for (let i = 0; i < 12; i++) await session.push?.(userMsg(`m${i}`));
+    await session.pull?.([]);
+    await compactor.prepareTurn(stubAgent(session));
+    expect(compactions).toHaveLength(1);
+
+    // Add a few more events. below.length = 16, growth past summary = 8.
+    // Still under threshold (10) — no recompaction.
+    for (let i = 12; i < 16; i++) await session.push?.(userMsg(`m${i}`));
+    await session.pull?.([]);
+    await compactor.prepareTurn(stubAgent(session));
+    expect(compactions).toHaveLength(1); // unchanged
+  });
+
+  it("does re-compact once growth past last summary crosses threshold", async () => {
+    const compactions: { before: number; after: number }[] = [];
+    const memory = new InMemorySession();
+    const compactor = new CompactingSession({
+      threshold: 10,
+      keep: 4,
+      onCompact: (info) => compactions.push(info),
+    });
+    const session: Session = new ChainedSession([compactor, memory]);
+
+    // First compaction at 12 events -> summarizedThrough = 8.
+    for (let i = 0; i < 12; i++) await session.push?.(userMsg(`m${i}`));
+    await session.pull?.([]);
+    await compactor.prepareTurn(stubAgent(session));
+    expect(compactions).toHaveLength(1);
+
+    // Push 12 more (totaling 24). Growth past summary = 24 - 8 = 16, over 10.
+    for (let i = 12; i < 24; i++) await session.push?.(userMsg(`m${i}`));
+    await session.pull?.([]);
+    await compactor.prepareTurn(stubAgent(session));
+    expect(compactions).toHaveLength(2);
   });
 });

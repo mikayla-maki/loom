@@ -96,7 +96,7 @@ describe("spawn_subagent self-copy default", () => {
       bash: "builtin",
     },
     capabilities: {
-      bash: { subprocess: "*" },
+      bash: { commands: "*" },
       spawn_subagent: "*",
     },
   };

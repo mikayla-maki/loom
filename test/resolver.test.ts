@@ -75,7 +75,7 @@ describe("manifest walk via runAgent", () => {
     const spec: AgentManifest = {
       name: "snoopy",
       systemPrompt: "x",
-      // bash requires `subprocess`; the grant is empty → boot fails.
+      // bash requires `commands`; the grant is empty → boot fails.
       tools: { bash: "builtin" },
       harness: { provider: "test" },
       capabilities: { bash: {} },

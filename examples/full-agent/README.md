@@ -129,7 +129,7 @@ the manifest.
 | `[harness]`   | Picking a built-in harness factory (`anthropic`) and tightening tokens / turn budget. |
 | `[session]`   | A **layered session**, outer-to-inner: bounded growth via `compacting`, persistent cross-session notes via the `notes` provider, raw event storage via `in-memory`. |
 | `[tools]`     | Three flavours side-by-side: **built-in tools** (`bash`, `read_file`, `write_file`, `edit_file`, `find`), names **contributed by the session itself** (`remember` — no explicit entry needed), and **harness-exposed server tools** (`web_search`, `web_fetch` via `provider = "anthropic"`). |
-| `[capabilities]` | The transitive ceiling: paths + subprocess allow-lists per tool, plus `remember = "*"` to permit the session-owned verb. Server tools need no local capability grant — they have no local execution surface. |
+| `[capabilities]` | The transitive ceiling: paths + commands allow-lists per tool, plus `remember = "*"` to permit the session-owned verb. Server tools need no local capability grant — they have no local execution surface. |
 
 The middle session layer is the interesting one — it loads notes
 from a markdown file into the system prompt AND owns the `remember`

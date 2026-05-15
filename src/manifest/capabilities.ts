@@ -212,7 +212,7 @@ export function assertSecretAllowlist(
 // ─── Argument-binding grants (MCP-style provider tools) ───────────────
 //
 // The historical capability model is "kinds the tool may exercise"
-// (paths, subprocess, network, …): one kind per capability concern,
+// (paths, commands, network, …): one kind per capability concern,
 // orthogonal to the tool's input schema. Built-in tools self-police
 // on those kinds at execute time.
 //

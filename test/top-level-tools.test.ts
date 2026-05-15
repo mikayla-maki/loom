@@ -67,8 +67,8 @@ describe("top-level [tools]", () => {
     const agent = await runAgent(
       buildAgent({
         tools: { bash: "builtin" },
-        // bash requires `subprocess`; grant it.
-        capabilities: { bash: { subprocess: "*" } },
+        // bash requires `commands`; grant it.
+        capabilities: { bash: { commands: "*" } },
       }),
       {},
     );
@@ -107,8 +107,8 @@ describe("top-level [tools]", () => {
     }
   });
 
-  it("explicit [tools] with bash but no `subprocess` grant fails boot", async () => {
-    // bash has `requires: ["subprocess"]`; without a grant, boot fails.
+  it("explicit [tools] with bash but no `commands` grant fails boot", async () => {
+    // bash has `requires: ["commands"]`; without a grant, boot fails.
     await expect(
       runAgent(
         buildAgent({
@@ -117,7 +117,7 @@ describe("top-level [tools]", () => {
         }),
         {},
       ),
-    ).rejects.toThrow(/missing required.*subprocess/);
+    ).rejects.toThrow(/missing required.*commands/);
   });
 
   it("audit: top-level tools carry a tools-table introducedBy label on the tree", async () => {

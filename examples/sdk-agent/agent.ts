@@ -150,7 +150,7 @@ const manifest: AgentManifest = {
   },
 
   capabilities: {
-    bash: { subprocess: "*", paths: ["./"] },
+    bash: { commands: "*", paths: ["./"] },
     read_file: { paths: ["./"] },
     write_file: { paths: ["./"] },
     edit_file: { paths: ["./"] },

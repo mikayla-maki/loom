@@ -1,23 +1,47 @@
 /**
- * `bash` — execute a shell command via `/bin/bash -c`.
+ * `bash` — run a command.
  *
  * Capability kinds:
- *   requires: ["subprocess"]
+ *   requires: ["commands"]
  *   optional: ["paths", "network", "env"]
  *
- * The grant determines what the bash subprocess can reach. The
- * description and (in a follow-up commit) the OS-level sandbox profile
- * are both derived from this grant — the same JSON drives the model's
- * mental model, the runtime self-policing, and (eventually) the
- * sandbox-exec rules. One source of truth.
+ * The grant determines BOTH what reach the child has AND what input
+ * shape the model sees:
  *
- * macOS sandbox engagement: when the grant is structured (anything
- * other than `"*"`), bash spawns under `/usr/bin/sandbox-exec` with
- * a generated SBPL profile derived from the grant. `"*"` opts out
- * (no sandbox). On Linux a sandbox engagement is a no-op for now (we
- * surface a warning at audit time); a `bwrap`-based path can slot
- * into the same shape later. The `env` filter applies regardless of
- * sandbox availability.
+ *   commands = "*"           → shell mode (today's behaviour).
+ *                              Schema: { command: string, … }
+ *                              Dispatch: `/bin/bash -c "<command>"`.
+ *   commands = ["cat", …]    → argv mode. Schema enumerates the
+ *                              allowed commands; dispatch is direct
+ *                              `spawn(cmd, args, …)` with no shell.
+ *                              Model literally cannot ask for any
+ *                              other binary — the constraint is
+ *                              structural, not policed.
+ *
+ * Why two modes:
+ *   - Shell mode is the right primitive for an unrestricted coding
+ *     agent that needs pipes, redirection, builtins, etc.
+ *   - Argv mode is the right primitive for narrowed sub-agents:
+ *     same tool family, but the model sees a small purpose-shaped
+ *     surface (e.g. `commands = ["pwd"]` exposes a tool that takes
+ *     only `args` and runs `pwd <args>`). No shell injection surface
+ *     and no platform-allowlist plumbing — Linux/macOS parity falls
+ *     out for free because we never ask the sandbox to enforce an
+ *     exec allowlist.
+ *
+ * The grant is the sole source of truth: it drives the description,
+ * the input schema, the dispatch path, and the OS-level profile.
+ *
+ * Sandbox engagement (orthogonal to the shell/argv split): when the
+ * grant is structured (anything other than `"*"`), bash spawns under
+ * `/usr/bin/sandbox-exec` (darwin) or `bwrap` (linux) with a profile
+ * derived from `paths`/`network`/`env`. `bash = "*"` opts out
+ * entirely (no sandbox, no narrowing, no schema change — today's
+ * escape hatch). The sandbox profile is the same in shell and argv
+ * mode: in both we want `process-exec*` allowed inside the sandbox so
+ * the chosen command can launch its own helpers (git → git-helpers,
+ * etc.). Argv mode's narrowing happens before the spawn, not at the
+ * exec boundary.
  *
  * Env semantics (asymmetric with paths/network on purpose — see below):
  *
@@ -69,7 +93,7 @@ import type {
   ToolDisplay,
   ToolResult,
 } from "../../types/interfaces.js";
-import type { CapabilitySet } from "../../types/manifest.js";
+import type { CapabilitySet, CapabilityValue } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import type { ClientBridge } from "../client-bridge.js";
@@ -135,12 +159,13 @@ export const SAFE_DEFAULT_ENV_NAMES = [
 ] as const;
 
 /**
- * Input schema. `ToolTable` validates against this with `ajv` before
- * dispatch, so `execute()` may trust the shape — `command` is a
- * non-empty string, `cwd` is a string when set, `timeout_ms` is a
- * positive number when set. No defensive `typeof` checks below.
+ * Shell-mode input schema. `ToolTable` validates against this with
+ * `ajv` before dispatch, so `execute()` may trust the shape —
+ * `command` is a non-empty string, `cwd` is a string when set,
+ * `timeout_ms` is a positive number when set. No defensive `typeof`
+ * checks below.
  */
-const SCHEMA: JSONSchema = {
+const SHELL_SCHEMA: JSONSchema = {
   type: "object",
   required: ["command"],
   additionalProperties: false,
@@ -159,22 +184,112 @@ const SCHEMA: JSONSchema = {
   },
 };
 
-interface BashInput {
+/**
+ * Build the argv-mode schema for a list of allowed commands.
+ *
+ *   commands = ["pwd"]          → { args?, cwd?, timeout_ms? }
+ *                                 (command implicit — only one to pick)
+ *   commands = ["pwd", "cat"]   → { command: enum, args?, cwd?,
+ *                                   timeout_ms? }
+ *
+ * `args` is always optional; programs that take no args (`pwd`) just
+ * ignore an empty array. Finer per-command arg control ("this one
+ * takes no args", "that one takes at most one positional") is real
+ * follow-up work and wants its own DSL; not v1.
+ */
+function argvSchema(commands: readonly string[]): JSONSchema {
+  const argsProp = {
+    type: "array",
+    items: { type: "string" },
+    description: "Arguments to pass on the command line.",
+  };
+  const cwdProp = {
+    type: "string",
+    description: "Optional working directory.",
+  };
+  const timeoutProp = {
+    type: "number",
+    exclusiveMinimum: 0,
+    description: "Optional timeout in milliseconds (default 30000).",
+  };
+  if (commands.length === 1) {
+    const [name] = commands;
+    return {
+      type: "object",
+      additionalProperties: false,
+      description: `Run \`${name}\` directly (no shell).`,
+      properties: {
+        args: argsProp,
+        cwd: cwdProp,
+        timeout_ms: timeoutProp,
+      },
+    };
+  }
+  return {
+    type: "object",
+    required: ["command"],
+    additionalProperties: false,
+    properties: {
+      command: {
+        type: "string",
+        enum: [...commands],
+        description: "Which command to run.",
+      },
+      args: argsProp,
+      cwd: cwdProp,
+      timeout_ms: timeoutProp,
+    },
+  };
+}
+
+interface ShellInput {
   command: string;
   cwd?: string;
   timeout_ms?: number;
 }
 
+interface ArgvInput {
+  /** Required iff `commands` had >1 entry; absent when there's only one option. */
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  timeout_ms?: number;
+}
+
+type DispatchMode = "shell" | "argv";
+
 export class BashTool implements Tool {
   public readonly name = "bash";
   public readonly description: string;
-  public readonly inputSchema = SCHEMA;
-  public readonly requires = ["subprocess"];
+  public readonly inputSchema: JSONSchema;
+  public readonly requires = ["commands"];
   public readonly optional = ["paths", "network", "env"];
   public readonly capabilities: CapabilitySet;
 
+  /** "shell" → bash -c; "argv" → direct spawn from a fixed command list. */
+  private readonly mode: DispatchMode;
+  /** Populated iff `mode === "argv"`; the allowed command names. */
+  private readonly allowedCommands: readonly string[] | null;
+
   constructor(_config: ToolConfig, capabilities: CapabilitySet | undefined) {
     this.capabilities = capabilities ?? {};
+
+    // Decide dispatch mode from the `commands` grant shape. `"*"` (or
+    // a `"*"` whole-tool grant) keeps today's shell behaviour; an
+    // explicit list switches to argv mode and narrows the schema to
+    // match. `commands` is the tool's required kind, so absence here
+    // would have failed the requires check before we got constructed.
+    const cmds = readCommandsGrant(this.capabilities);
+    if (Array.isArray(cmds)) {
+      this.mode = "argv";
+      this.allowedCommands = cmds;
+      this.inputSchema = argvSchema(cmds);
+    } else {
+      this.mode = "shell";
+      this.allowedCommands = null;
+      this.inputSchema = SHELL_SCHEMA;
+    }
+
     // Reject configurations the platform sandbox can't enforce — see
     // each validator for per-kind rationale. Doing this in the
     // constructor surfaces unsupported configs at boot rather than at
@@ -184,7 +299,11 @@ export class BashTool implements Tool {
     } else if (process.platform === "linux") {
       validateBashGrantLinux(this.capabilities);
     }
-    this.description = describeBash(this.capabilities);
+    this.description = describeBash(
+      this.capabilities,
+      this.mode,
+      this.allowedCommands,
+    );
   }
 
   async audit(): Promise<AuditFinding[]> {
@@ -195,7 +314,7 @@ export class BashTool implements Tool {
         message:
           'capabilities = "*" — bash will run unsandboxed (no OS-level enforcement of paths/network/env).',
         remediation:
-          'Replace with a structured grant like { subprocess = "*", paths = ["./"] } to engage the sandbox.',
+          'Replace with a structured grant like { commands = "*", paths = ["./"] } to engage the sandbox.',
       });
       return findings;
     }
@@ -243,13 +362,16 @@ export class BashTool implements Tool {
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
-    // Schema-validated upstream by `ToolTable`.
-    const {
-      command,
-      cwd = process.cwd(),
-      timeout_ms = 30_000,
-    } = input as BashInput;
-    const timeout = timeout_ms;
+    // Build the program-and-argv pair the rest of the function will
+    // spawn. Shell mode wraps the user's command in `bash -c`; argv
+    // mode picks a binary from the allowlist and uses the supplied
+    // arg array verbatim. From this point down the two modes share
+    // their plumbing (sandbox prefix, env, ACP terminal path, etc.).
+    const dispatch =
+      this.mode === "argv" && this.allowedCommands
+        ? buildArgvDispatch(input as ArgvInput, this.allowedCommands)
+        : buildShellDispatch(input as ShellInput);
+    const { childProgram, childArgs, cwd, timeout, displayLabel } = dispatch;
 
     const env = buildEnv(this.capabilities);
 
@@ -269,10 +391,10 @@ export class BashTool implements Tool {
     let args: string[];
     if (sandboxPrefix) {
       binary = sandboxPrefix.binary;
-      args = [...sandboxPrefix.prefixArgs, "/bin/bash", "-c", command];
+      args = [...sandboxPrefix.prefixArgs, childProgram, ...childArgs];
     } else {
-      binary = "/bin/bash";
-      args = ["-c", command];
+      binary = childProgram;
+      args = childArgs;
       // Strict mode: user wrote a structured grant on a platform we
       // know how to sandbox, but the sandbox binary is missing.
       // Refuse rather than silently bypass enforcement.
@@ -303,7 +425,7 @@ export class BashTool implements Tool {
         args,
         cwd,
         timeout,
-        command,
+        displayLabel,
         env,
         abortSignal: ctx.abortSignal,
       });
@@ -315,7 +437,7 @@ export class BashTool implements Tool {
     //    consumers (or future ACP clients without terminal support)
     //    get the nicer per-invocation title.
     const baseDisplay: ToolDisplay = {
-      title: describeCommand(command),
+      title: displayLabel,
       kind: "execute",
     };
     return await new Promise<ToolResult>((resolve) => {
@@ -401,12 +523,12 @@ async function runViaClientTerminal(
     args: string[];
     cwd: string;
     timeout: number;
-    command: string;
+    displayLabel: string;
     env: NodeJS.ProcessEnv;
     abortSignal: AbortSignal;
   },
 ): Promise<ToolResult> {
-  const { binary, args, cwd, timeout, command, env, abortSignal } = opts;
+  const { binary, args, cwd, timeout, displayLabel, env, abortSignal } = opts;
 
   // Non-null by caller's check, but TypeScript wants it spelled out.
   const createTerminal = client.createTerminal;
@@ -427,7 +549,7 @@ async function runViaClientTerminal(
     terminalId: handle.id,
   };
   const baseDisplay: ToolDisplay = {
-    title: describeCommand(command),
+    title: displayLabel,
     kind: "execute",
     content: [terminalContent],
   };
@@ -568,6 +690,92 @@ function describeCommand(cmd: string): string {
 }
 
 /**
+ * Extract the `commands` value from a grant in a typed way.
+ * Returns the canonical shapes the rest of the bash tool reasons
+ * about:
+ *   - `"*"`        whole-tool wildcard or `commands = "*"`         → shell mode
+ *   - `string[]`   a non-empty list of command names                → argv mode
+ *   - `undefined`  no `commands` field at all (boot will fail later  → treat as shell)
+ *                  via the requires check on this tool)
+ *
+ * Anything else (an object, a number, a single string that isn't
+ * `"*"`) is treated as `undefined` here; the platform validator runs
+ * after this and rejects unsupported shapes with a clearer error.
+ */
+function readCommandsGrant(
+  grant: CapabilitySet,
+): "*" | readonly string[] | undefined {
+  if (grant === "*") return "*";
+  const c: CapabilityValue | undefined = grant.commands;
+  if (c === "*") return "*";
+  if (Array.isArray(c)) {
+    const list = c.filter((x): x is string => typeof x === "string");
+    return list.length > 0 ? list : undefined;
+  }
+  return undefined;
+}
+
+interface DispatchPlan {
+  /** What to spawn (or what the sandbox prefix will wrap). */
+  childProgram: string;
+  /** Args for `childProgram`. */
+  childArgs: string[];
+  cwd: string;
+  timeout: number;
+  /** One-line label for tool-call display + ACP terminal title. */
+  displayLabel: string;
+}
+
+/** Shell mode: `bash -c "<command>"`, today's behaviour. */
+function buildShellDispatch(input: ShellInput): DispatchPlan {
+  const cwd = input.cwd ?? process.cwd();
+  const timeout = input.timeout_ms ?? 30_000;
+  return {
+    childProgram: "/bin/bash",
+    childArgs: ["-c", input.command],
+    cwd,
+    timeout,
+    displayLabel: describeCommand(input.command),
+  };
+}
+
+/**
+ * Argv mode: pick a command name from `allowed`, build argv = [cmd,
+ * ...args], spawn directly with no shell.
+ *
+ * The schema already constrains `command` to the allowlist (via
+ * `enum`) and to omission when the list has one entry, so by the
+ * time we get here the input is well-formed. We still defensively
+ * check membership: `ajv` validation can be skipped in some test
+ * paths, and the cost of one `Array.includes` is nothing.
+ */
+function buildArgvDispatch(
+  input: ArgvInput,
+  allowed: readonly string[],
+): DispatchPlan {
+  const cwd = input.cwd ?? process.cwd();
+  const timeout = input.timeout_ms ?? 30_000;
+  const args = input.args ?? [];
+  const picked = allowed.length === 1 ? allowed[0] : input.command;
+  if (!picked || !allowed.includes(picked)) {
+    // Throwing here surfaces as a tool error at the dispatch layer.
+    // Should be unreachable when ajv has validated the input.
+    throw new Error(
+      `bash: command "${picked ?? ""}" is not in the allowlist (${allowed.join(", ")}).`,
+    );
+  }
+  return {
+    childProgram: picked,
+    childArgs: args,
+    cwd,
+    timeout,
+    displayLabel: describeCommand(
+      args.length === 0 ? picked : `${picked} ${args.join(" ")}`,
+    ),
+  };
+}
+
+/**
  * Convert a `NodeJS.ProcessEnv` (our internal shape, with possibly
  * undefined values) into the ACP `EnvVariable[]` array the terminal
  * API expects. Undefined values are dropped silently.
@@ -580,11 +788,24 @@ function toEnvVariables(env: NodeJS.ProcessEnv): EnvVariable[] {
   return out;
 }
 
-function describeBash(grant: CapabilitySet): string {
+function describeBash(
+  grant: CapabilitySet,
+  mode: DispatchMode,
+  allowedCommands: readonly string[] | null,
+): string {
   if (grant === "*") {
     return "Run a bash command. Unrestricted environment (no sandbox engaged).";
   }
-  const lines = ["Run a bash command in a sandboxed environment."];
+  // Lede varies by mode — argv mode is a much narrower tool from the
+  // model's POV and the description should say so up front, before
+  // the fs/network/env detail.
+  const lede =
+    mode === "argv" && allowedCommands
+      ? allowedCommands.length === 1
+        ? `Run \`${allowedCommands[0]}\` directly (no shell) in a sandboxed environment.`
+        : `Run one of (${allowedCommands.join(", ")}) directly (no shell) in a sandboxed environment.`
+      : "Run a bash command in a sandboxed environment.";
+  const lines = [lede];
   // Filesystem
   const explicitPaths = paths(grant);
   const fs = resolvedPaths(grant);

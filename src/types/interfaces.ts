@@ -238,7 +238,7 @@ export interface Tool extends ToolDescriptor {
    * Capability kinds that MUST be granted for this tool to function.
    * Boot fails if any required kind is missing from the grant.
    *
-   *   bash:      requires = ["subprocess"]
+   *   bash:      requires = ["commands"]
    *   read_file: requires = ["paths"]
    */
   requires?: string[];

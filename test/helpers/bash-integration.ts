@@ -70,7 +70,7 @@ async function runBash(
 }
 
 const grantFor = (root: string): CapabilitySet => ({
-  subprocess: "*",
+  commands: "*",
   paths: [root],
 });
 
@@ -138,7 +138,7 @@ export function describeBashIntegration(backend: BashBackend): void {
       expect(r.content.trim()).toBe("from-bash");
     });
 
-    dit("subprocess pipeline (echo | wc) succeeds", async () => {
+    dit("shell pipeline (echo | wc) succeeds", async () => {
       const r = await runBash(
         grantFor(scratch),
         "echo hi there | wc -w",
@@ -269,7 +269,7 @@ export function describeBashIntegration(backend: BashBackend): void {
       // Both /etc/hosts (darwin) and /etc/hostname (linux) exist and
       // have non-empty contents. Try whichever the host has.
       const r = await runBash(
-        { subprocess: "*", paths: "*" },
+        { commands: "*", paths: "*" },
         "cat /etc/hosts 2>/dev/null | head -1 || cat /etc/hostname | head -1",
       );
       expect(r.isError).toBeFalsy();

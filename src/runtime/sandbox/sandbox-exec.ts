@@ -83,15 +83,26 @@ export function sandboxEngaged(grant: CapabilitySet): boolean {
 export function validateBashGrant(grant: CapabilitySet): void {
   if (grant === "*") return;
 
-  // subprocess: only "*" supported. An exec-allowlist would need
-  // distinct (allow process-exec (literal ...)) per binary, plus more
-  // careful PATH handling. Future work; reject for now.
-  const sp = grant.subprocess;
-  if (sp !== undefined && sp !== "*") {
-    throw new Error(
-      `bash: capabilities.subprocess only supports "*" on macOS (sandbox-exec ` +
-        `cannot enforce an exec allowlist). Got ${JSON.stringify(sp)}.`,
-    );
+  // commands: `"*"` (shell mode — today's behaviour) or a non-empty
+  // string[] (argv mode — narrow the schema to a fixed allowlist and
+  // skip the shell entirely). Argv mode does NOT require
+  // sandbox-exec to allowlist execs at the syscall level: we know
+  // which binary will run because we're constructing the argv
+  // ourselves. The OS sandbox just keeps `process-exec*` permissive
+  // inside the profile so the chosen program can launch its own
+  // helpers (git → git-helpers, etc.).
+  const c = grant.commands;
+  if (c !== undefined && c !== "*") {
+    if (
+      !Array.isArray(c) ||
+      c.length === 0 ||
+      !c.every((x) => typeof x === "string" && x.length > 0)
+    ) {
+      throw new Error(
+        `bash: capabilities.commands must be "*" or a non-empty array of ` +
+          `command-name strings. Got ${JSON.stringify(c)}.`,
+      );
+    }
   }
 
   // paths: "*" or string array.
@@ -136,8 +147,12 @@ export function validateBashGrant(grant: CapabilitySet): void {
  * Build an SBPL profile from a structured CapabilitySet.
  *
  * Kinds we translate:
- *   subprocess: star    → allow process-fork + process-exec
- *   subprocess: list    → rejected by validateBashGrant
+ *   commands: star      → allow process-fork + process-exec (shell mode)
+ *   commands: list      → allow process-fork + process-exec (argv mode —
+ *                         narrowing is structural at the schema layer,
+ *                         not enforced via the sandbox; we still want
+ *                         the chosen program to be able to exec its
+ *                         own helpers)
  *   paths: star         → allow file-read + file-write (entire FS)
  *   paths: list         → allow file-read and file-write per (subpath ...)
  *   network: star       → allow network
@@ -242,12 +257,14 @@ export async function buildBashProfile(grant: CapabilitySet): Promise<string> {
     );
   }
 
-  // subprocess
-  if (grant.subprocess === "*") {
+  // commands: any non-undefined value means we want exec allowed
+  // inside the sandbox — argv mode just chose which binary at
+  // dispatch time, the spawned program still needs to exec helpers.
+  // The bash tool's `requires = ["commands"]` means we should
+  // basically always have one here when reaching this code path.
+  if (grant.commands !== undefined) {
     lines.push("(allow process-exec*)");
   }
-  // (Allowlist subprocess support is future work — sandbox-exec can
-  //  match exec by literal path, but the UX needs more thought.)
 
   // paths — read+write for everything in the grant. SBPL `(subpath ...)`
   // matches against the kernel's canonical view of paths, so we have to

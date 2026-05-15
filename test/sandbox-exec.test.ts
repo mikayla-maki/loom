@@ -17,7 +17,8 @@ describe("sandboxEngaged", () => {
 
   it("returns true for any structured grant, even empty", () => {
     expect(sandboxEngaged({})).toBe(true);
-    expect(sandboxEngaged({ subprocess: "*" })).toBe(true);
+    expect(sandboxEngaged({ commands: "*" })).toBe(true);
+    expect(sandboxEngaged({ commands: ["pwd"] })).toBe(true);
   });
 });
 
@@ -39,8 +40,16 @@ describe("buildBashProfile", () => {
     expect(profile).toContain('(allow file-read* (subpath "/System"))');
   });
 
-  it("emits process-exec when subprocess is granted star", async () => {
-    const profile = await buildBashProfile({ subprocess: "*" });
+  it("emits process-exec when commands is granted star (shell mode)", async () => {
+    const profile = await buildBashProfile({ commands: "*" });
+    expect(profile).toContain("(allow process-exec*)");
+  });
+
+  it("emits process-exec when commands is a list (argv mode)", async () => {
+    // Argv mode's narrowing is structural at the schema layer; the
+    // sandbox still allows process-exec so the chosen program can
+    // run its own helpers (git → git-helpers, etc.).
+    const profile = await buildBashProfile({ commands: ["pwd", "cat"] });
     expect(profile).toContain("(allow process-exec*)");
   });
 
@@ -93,7 +102,7 @@ describe("buildBashProfile", () => {
   it("resolves `./` against the current process.cwd()", async () => {
     // The default grant uses `paths: ["./"]`; the profile must embed
     // the absolute, canonical cwd, not the literal string.
-    const profile = await buildBashProfile({ subprocess: "*", paths: ["./"] });
+    const profile = await buildBashProfile({ commands: "*", paths: ["./"] });
     expect(profile).toContain("(allow process-exec*)");
     const canonicalCwd = await fs.realpath(process.cwd());
     expect(profile).toContain(
@@ -123,11 +132,28 @@ describe("validateBashGrant", () => {
     expect(() => validateBashGrant({})).not.toThrow();
   });
 
-  it("accepts subprocess = '*' but rejects exec allowlists", () => {
-    expect(() => validateBashGrant({ subprocess: "*" })).not.toThrow();
-    expect(() => validateBashGrant({ subprocess: ["ls", "rg"] })).toThrow(
-      /exec allowlist/,
+  it("accepts commands = '*' (shell mode)", () => {
+    expect(() => validateBashGrant({ commands: "*" })).not.toThrow();
+  });
+
+  it("accepts commands = string[] (argv mode — schema-level narrowing)", () => {
+    // Argv mode is honoured on both platforms because the narrowing
+    // is structural at the bash tool's dispatch layer, not enforced
+    // via sandbox-exec's exec rules.
+    expect(() => validateBashGrant({ commands: ["ls", "rg"] })).not.toThrow();
+    expect(() => validateBashGrant({ commands: ["pwd"] })).not.toThrow();
+  });
+
+  it("rejects empty commands array (would expose a useless tool)", () => {
+    expect(() => validateBashGrant({ commands: [] })).toThrow(
+      /non-empty array/,
     );
+  });
+
+  it("rejects non-string entries in commands", () => {
+    expect(() =>
+      validateBashGrant({ commands: ["ls", 42] } as unknown as never),
+    ).toThrow(/non-empty array/);
   });
 
   it("accepts paths = '*' or string array; rejects other shapes", () => {

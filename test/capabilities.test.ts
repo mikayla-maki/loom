@@ -118,23 +118,23 @@ describe("assertRequires", () => {
 
   it("passes when every required kind is granted", () => {
     const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["subprocess"] })],
+      ["bash", makeTool({ name: "bash", requires: ["commands"] })],
     ]);
     expect(() =>
-      assertRequires(tools, { bash: { subprocess: "*" } }),
+      assertRequires(tools, { bash: { commands: "*" } }),
     ).not.toThrow();
   });
 
   it("`*` whole-tool grant satisfies every requires", () => {
     const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["subprocess", "net"] })],
+      ["bash", makeTool({ name: "bash", requires: ["commands", "net"] })],
     ]);
     expect(() => assertRequires(tools, { bash: "*" })).not.toThrow();
   });
 
   it("throws when a required kind is missing from the grant", () => {
     const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["subprocess"] })],
+      ["bash", makeTool({ name: "bash", requires: ["commands"] })],
     ]);
     expect(() => assertRequires(tools, {})).toThrow(CapabilityError);
     expect(() => assertRequires(tools, { bash: {} })).toThrow(CapabilityError);
@@ -167,7 +167,7 @@ describe("assertKnownKinds", () => {
 
   it("`*` whole-tool grants are exempt from kind-checking", () => {
     const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["subprocess"] })],
+      ["bash", makeTool({ name: "bash", requires: ["commands"] })],
     ]);
     // "*" doesn't list any kinds, so there's nothing to typo-check.
     expect(() => assertKnownKinds(tools, { bash: "*" })).not.toThrow();
@@ -184,14 +184,14 @@ describe("assertKnownKinds", () => {
         "bash",
         makeTool({
           name: "bash",
-          requires: ["subprocess"],
+          requires: ["commands"],
           optional: ["paths", "network"],
         }),
       ],
     ]);
     expect(() =>
       assertKnownKinds(tools, {
-        bash: { subprocess: "*", paths: ["./"], network: "*" },
+        bash: { commands: "*", paths: ["./"], network: "*" },
       }),
     ).not.toThrow();
   });
