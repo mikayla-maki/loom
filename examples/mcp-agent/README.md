@@ -66,7 +66,7 @@ chunk-by-chunk; here's the high-level map:
 |---|---|---|
 | `echo` | `text: string` | Direct passthrough. Proves the configured-factory `[providers]` form works at all. |
 | `read_document` | `doc_id, format?` | Exposed twice — once unrestricted, once renamed to `read_welcome_doc` with `doc_id` pre-bound (the model sees a one-arg tool). |
-| `query_table` | `table, limit?` | Exposed under two model-facing names (`query_users`, `query_orders`) via `mcp_tool` rename, each with `table` pre-bound to a different literal. |
+| `query_table` | `table, limit?` | Exposed under two model-facing names (`query_users`, `query_orders`) via the `tool` rename, each with `table` pre-bound to a different literal. |
 | `set_status` | `status: string` | Constrained to `enum: ["online", "away"]` via the array form of the capability grant. The MCP server's schema is permissive; Loom narrows it before the model ever sees it. |
 | `send_alert` | `channel, message` | Requires `MOCK_API_KEY` in the server's env. Supplied via `secrets = { MOCK_API_KEY = "MOCK_API_KEY" }` on the `[providers]` entry; Loom resolves the secret and injects it at spawn time. |
 | `dangerous_delete` | `path: string` | **Advertised but deliberately omitted** from `[tools]`. The model never sees it. `loom audit` lists it under "advertised but unexposed". |

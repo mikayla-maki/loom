@@ -690,8 +690,9 @@ function resolveToolEntry(
       //     `args` / `npm` / `env` / `secrets`.
       //   - The per-tool config (from `[tools.X]` minus `provider`)
       //     flows to `resolveTool(name, config, …)` only. For MCP
-      //     that's `mcp_tool` (rename target) and other routing
-      //     concerns the FACTORY's resolveTool reads.
+      //     that's `tool` (rename target — the provider-agnostic
+      //     spelling, formerly `mcp_tool`) and other routing concerns
+      //     the FACTORY's resolveTool reads.
       //
       // Dedup uses only the provider-level config, so multiple
       // `[tools.X]` entries through the same `[providers]` handle

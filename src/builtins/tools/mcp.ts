@@ -167,13 +167,18 @@ export class McpServerTools implements Tools {
     capabilities: CapabilitySet | undefined,
   ): Tool | null {
     void _agent;
-    // Optional `mcp_tool` rename: when set, the manifest key
-    // (`name`) is the model-facing name and `config.mcp_tool` names
-    // the underlying MCP tool to dispatch to. When omitted, the
+    // Optional `tool` rename: when set, the manifest key (`name`)
+    // is the model-facing name and `config.tool` names the
+    // underlying MCP tool to dispatch to. When omitted, the
     // manifest key IS the MCP tool name. This is what lets the user
     // expose the same MCP tool under multiple model-facing names
     // (Chunk 5's partial-application story).
-    const mcpName = readMcpToolName(config) ?? name;
+    //
+    // The `tool` field is provider-agnostic by design: when native
+    // rebinding (`{ tool = "bash" }`) lands, the same field name
+    // signals the same intent in a different provider. One concept,
+    // one spelling.
+    const mcpName = readBoundToolName(config) ?? name;
     const mcp = this.toolsCache.get(mcpName);
     if (!mcp) return null;
     return buildLoomTool({
@@ -446,17 +451,25 @@ function defaultSdkEnv(): Record<string, string> {
 }
 
 /**
- * Pull `mcp_tool` out of the per-tool config (set on `[tools.X]`).
- * Reserved keys on the config: `mcp_tool` (Chunk 3 rename) and
- * `secrets` (Chunk 6 per-instance secret map). The MCP factory is
- * the only consumer of these; the parser doesn't know about them.
+ * Pull the `tool` rename target out of a `[tools.X]` per-tool config.
+ *
+ * Reserved per-tool keys the MCP factory understands:
+ *   - `tool`    — model-facing binding name → underlying-tool name override
+ *                (Chunk 3 rename; replaces the old `mcp_tool` spelling).
+ *   - `secrets` — per-instance secret map (Chunk 6).
+ *
+ * The parser doesn't reserve these names — the factory is the only
+ * consumer — so a provider-defined config that happens to use a
+ * field named `tool` for something else would conflict. That's why
+ * `tool` is treated as the universal binding-target name across
+ * provider kinds; we want exactly one spelling for the concept.
  */
-function readMcpToolName(config: ToolConfig): string | undefined {
-  const v = (config as Record<string, unknown>)["mcp_tool"];
+function readBoundToolName(config: ToolConfig): string | undefined {
+  const v = (config as Record<string, unknown>)["tool"];
   if (v === undefined) return undefined;
   if (typeof v !== "string" || v.length === 0) {
     throw new ManifestError(
-      `mcp-server: 'mcp_tool' on a [tools.X] entry must be a non-empty string`,
+      `mcp-server: 'tool' on a [tools.X] entry must be a non-empty string`,
     );
   }
   return v;

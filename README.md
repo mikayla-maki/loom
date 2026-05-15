@@ -564,9 +564,9 @@ name (no on-disk package needed). The same instance can back many
 Any [Model Context Protocol](https://modelcontextprotocol.io) server
 — stdio transport, spawned + adapted. One `[providers]` entry per
 server instance; one `[tools.X]` entry per exposed tool. Tools can
-be renamed (`mcp_tool = "original_name"`), narrowed (capability
-grant binds args), and constrained by enum (array grant). See the
-full section below for the integration tour.
+be renamed (`tool = "original_name"`), narrowed (capability grant
+binds args), and constrained by enum (array grant). See the full
+section below for the integration tour.
 
 | Config key | Default | Notes |
 |---|---|---|
@@ -932,8 +932,8 @@ One `[providers]` handle = **one** MCP server process. Every
 `[tools.X]` entry pointing at the handle dispatches against the
 same `Tools` instance — the underlying MCP server is contacted
 once, and `resolveTool(name, per_tool_config, …)` routes each
-tool call. Per-tool config (`mcp_tool`, etc.) flows to
-`resolveTool` only; it never affects which server gets spawned.
+tool call. Per-tool config (`tool`, etc.) flows to `resolveTool`
+only; it never affects which server gets spawned.
 
 **Capability-based partial application.** The big win: each
 `[capabilities]` per-arg grant doubles as a pre-binding. A literal
@@ -943,7 +943,7 @@ at execute time:
 ```toml
 [tools.read_one_doc]
 provider = "fs_mcp"
-mcp_tool = "read_text_file"      # underlying MCP tool name
+tool = "read_text_file"          # underlying MCP tool name
 
 [capabilities]
 read_one_doc = { path = "/path/to/welcome.md" }
@@ -952,8 +952,8 @@ read_one_doc = { path = "/path/to/welcome.md" }
 The model sees `read_one_doc` as a **zero-argument** tool; Loom
 supplies `path` transparently on every call. Same MCP tool can be
 exposed under multiple model-facing names with different bindings
-(`mcp_tool` rename + per-tool grant). Array grants narrow an arg
-to an enum (`status = ["online", "away"]` → model can pick those
+(`tool` rename + per-tool grant). Array grants narrow an arg to
+an enum (`status = ["online", "away"]` → model can pick those
 two only); `"*"` keeps an arg open. **A per-arg map is a strict
 whitelist** — anything the MCP server advertises but the manifest
 doesn't name disappears from the model-visible schema. Use

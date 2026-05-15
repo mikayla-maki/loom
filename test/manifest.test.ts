@@ -254,6 +254,158 @@ layers = [
     });
   });
 
+  it("accepts mixed-type [session].layers arrays (TOML 1.1.0 compliance)", async () => {
+    // The `toml` package (BinaryMuse) follows TOML 1.1.0 which
+    // allows mixed-type arrays. @iarna/toml, which we use only for
+    // lockfile stringify, enforces the legacy homogeneous-array rule
+    // and rejected this shape. Pinning so we don't regress if
+    // someone swaps the parser back.
+    const p = await writeManifest(`[agent]
+name = "mixed"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = [
+  "compacting",
+  { provider = "identity", vault_path = "/vault" },
+  "dms",
+]
+`);
+    const m = await parseAgentManifest(p);
+    const layers = m.session as Array<{
+      provider: unknown;
+      [k: string]: unknown;
+    }>;
+    expect(layers).toHaveLength(3);
+    expect(layers[0]).toEqual({ provider: "compacting" });
+    expect(layers[1]).toEqual({
+      provider: "identity",
+      vault_path: "/vault",
+    });
+    expect(layers[2]).toEqual({ provider: "dms" });
+  });
+
+  it("parses [session.<name>] sibling tables as per-layer config", async () => {
+    // The idiomatic shape for layered sessions with per-layer config:
+    // keep `layers` a flat string array and attach config via TOML
+    // sub-tables keyed by layer name. Without this, users hit TOML's
+    // homogeneous-array restriction the moment one layer needs config
+    // and the rest don't.
+    const p = await writeManifest(`[agent]
+name = "siblings"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = ["compacting", "identity", "dms"]
+
+[session.identity]
+vault_path = "/some/vault"
+
+[session.compacting]
+keep = 50
+persist = true
+`);
+    const m = await parseAgentManifest(p);
+    const layers = m.session as Array<{
+      provider: unknown;
+      [k: string]: unknown;
+    }>;
+    expect(layers).toHaveLength(3);
+    expect(layers[0]).toEqual({
+      provider: "compacting",
+      keep: 50,
+      persist: true,
+    });
+    expect(layers[1]).toEqual({
+      provider: "identity",
+      vault_path: "/some/vault",
+    });
+    // No sibling for 'dms'; stays as the bare string-shorthand form.
+    expect(layers[2]).toEqual({ provider: "dms" });
+  });
+
+  it("rejects [session.<name>] when <name> isn't in layers", async () => {
+    // Catches typos (`identitiy` instead of `identity`) and stale
+    // config that's been left behind after a layer was removed.
+    const p = await writeManifest(`[agent]
+name = "typo"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = ["compacting", "in-memory"]
+
+[session.identitiy]
+vault_path = "/v"
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /no matching string entry/,
+    );
+  });
+
+  it("rejects [session.<name>] that conflicts with an inline-table layer of the same name", async () => {
+    // Splitting one layer's config between an inline table and a
+    // sibling table is a footgun. Pick one.
+    const p = await writeManifest(`[agent]
+name = "split"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = [
+  { provider = "identity", inline_key = "a" },
+]
+
+[session.identity]
+vault_path = "/v"
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /conflicts with an inline-table entry/,
+    );
+  });
+
+  it("rejects [session.<name>] that tries to override the provider field", async () => {
+    const p = await writeManifest(`[agent]
+name = "override"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = ["identity"]
+
+[session.identity]
+provider = "something_else"
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /\.provider is not allowed/,
+    );
+  });
+
+  it("rejects non-table scalar keys on [session] outside the layered meta fields", async () => {
+    // Catches `[session]` with a stray scalar like `timeout = 30` that
+    // the user mistakenly thought meant something. Sub-tables only.
+    const p = await writeManifest(`[agent]
+name = "stray"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[session]
+layers = ["in-memory"]
+timeout = 30
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /not a recognised meta key/,
+    );
+  });
+
   it("singleton [session] (provider only) still parses as a single SessionSpec", async () => {
     const p = await writeManifest(`[agent]
 name = "single"

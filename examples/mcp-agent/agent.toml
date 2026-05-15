@@ -34,23 +34,23 @@ stream = true
 [session]
 layers = ["compacting", "in-memory"]
 
-# ── Tools ─────────────────────────────────────────────────────────────────
+# ── Tools ─────────────────────────────────────────────────────────────────────
 # Static enumeration: every tool the model can call MUST appear here.
-# `mcp_tool = "X"` renames the MCP tool to the manifest key so the same
-# server-side tool can be exposed under multiple narrowed names. The
-# actual narrowing / pre-binding lives in [capabilities] below — see
-# the comments there for what each model-facing tool ends up looking
-# like to the LLM.
+# `tool = "X"` renames the provider's tool to the manifest key so the
+# same server-side tool can be exposed under multiple narrowed names.
+# The actual narrowing / pre-binding lives in [capabilities] below —
+# see the comments there for what each model-facing tool ends up
+# looking like to the LLM.
 #
 # `dangerous_delete` is advertised by the server but DELIBERATELY
 # absent here — `loom audit` flags it as "advertised but unexposed".
 [tools]
 echo             = { provider = "mock_server" }
-read_document    = { provider = "mock_server" }                              # full schema
-read_welcome_doc = { provider = "mock_server", mcp_tool = "read_document" }  # → narrowed
-query_users      = { provider = "mock_server", mcp_tool = "query_table" }    # → narrowed
-query_orders     = { provider = "mock_server", mcp_tool = "query_table" }    # → narrowed
-set_status       = { provider = "mock_server" }                              # → enum-constrained
+read_document    = { provider = "mock_server" }                          # full schema
+read_welcome_doc = { provider = "mock_server", tool = "read_document" }  # → narrowed
+query_users      = { provider = "mock_server", tool = "query_table" }    # → narrowed
+query_orders     = { provider = "mock_server", tool = "query_table" }    # → narrowed
+set_status       = { provider = "mock_server" }                          # → enum-constrained
 send_alert       = { provider = "mock_server" }
 
 # ── Capabilities ──────────────────────────────────────────────────────────

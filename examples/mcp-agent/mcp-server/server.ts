@@ -20,7 +20,7 @@
  *   - `read_document(doc_id, format?)`
  *       Multi-arg tool. Used in the manifest twice: once as
  *       `read_document` (full schema, model picks doc_id and
- *       format) and once as `read_welcome_doc` via `mcp_tool` rename
+ *       format) and once as `read_welcome_doc` via the `tool` rename
  *       with `doc_id` pre-bound via `[capabilities]`. The renamed
  *       form is the load-bearing demo for Chunk 5 (capability-based
  *       partial application: the model sees a one-arg tool whose
@@ -31,7 +31,7 @@
  *       names — `query_users` and `query_orders` — each with `table`
  *       pre-bound to a different literal. Reinforces the "same MCP
  *       tool, multiple narrowed surfaces" story and demonstrates
- *       Chunk 3's `mcp_tool` rename in a realistic shape.
+ *       Chunk 3's `tool` rename in a realistic shape.
  *
  *   - `set_status(status)`
  *       `status` is a free string here at the protocol level. The

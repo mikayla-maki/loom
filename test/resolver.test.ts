@@ -254,7 +254,7 @@ describe("manifest walk via runAgent", () => {
       },
       tools: {
         a: { provider: "fs_mcp" },
-        b: { provider: "fs_mcp", mcp_tool: "something_else" },
+        b: { provider: "fs_mcp", tool: "something_else" },
         c: { provider: "fs_mcp", note: "per-tool-only" },
       },
     };

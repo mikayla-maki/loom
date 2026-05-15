@@ -10,7 +10,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import TOML from "@iarna/toml";
+import * as TOML from "toml";
 
 import { ManifestError } from "../errors.js";
 import { substituteEnv } from "./env-substitution.js";
@@ -313,6 +313,26 @@ function parseHarnessSpec(
  *     dotted-key array-of-tables `[[session.layers]]` produces the
  *     same shape and is interchangeable.
  *
+ *     **Per-layer config via sibling tables.** TOML 1.1.0 (which
+ *     Loom uses) allows mixed-type arrays, so inline
+ *     `layers = ["a", { … }, "c"]` parses fine. But it reads badly
+ *     for non-trivial config — the idiomatic Loom shape for layered
+ *     sessions with per-layer config is to keep `layers` as a flat
+ *     string array and attach config via sibling sub-tables keyed
+ *     by the layer name:
+ *
+ *         [session]
+ *         layers = ["compacting", "identity", "dms"]
+ *
+ *         [session.identity]
+ *         vault_path = "/some/path"
+ *
+ *     Each sibling table's keys are merged into the matching string
+ *     layer's config (as if the user had written `{ provider =
+ *     "identity", vault_path = "…" }` inline). Unknown sibling
+ *     names (no matching string entry) and sibling tables that try
+ *     to override `provider` are rejected.
+ *
  * `provider` and `layers` are mutually exclusive; neither one is an
  * error. The old top-level `[[session]]` form is rejected with a
  * pointer at `[session].layers`.
@@ -350,9 +370,117 @@ function parseSessionField(
   }
 
   if (hasLayers) {
-    return parseSessionLayers(obj.layers, where);
+    const specs = parseSessionLayers(obj.layers, where);
+    applySessionSiblingConfigs(specs, obj, where);
+    return specs;
   }
   return parseSessionSpec(obj, where);
+}
+
+/**
+ * Walk every non-meta key on the `[session]` table and, for each
+ * one that's a TOML sub-table (`[session.<name>]`), merge its keys
+ * into the corresponding layer's config. Mutates `specs` in place.
+ *
+ * Rules:
+ *   - Sibling key must be a TOML table (sub-table syntax). Scalars
+ *     or arrays at non-meta keys are unknown and rejected so
+ *     reviewers don't silently lose config they thought they set.
+ *   - Sibling name must match a string-shaped entry in `layers`.
+ *     If the name corresponds to an inline-table layer (which
+ *     already carries its own config), we reject — splitting one
+ *     layer's config across two places is a footgun.
+ *   - Sibling tables may not redefine `provider`. The layer's
+ *     provider is determined by its entry in `layers`; allowing it
+ *     here would let the sibling silently re-route the binding.
+ *   - When the same layer name appears multiple times in `layers`
+ *     (rare but legal), the sibling config applies to all of them.
+ *     The user can disambiguate with inline tables if they need
+ *     different configs for repeated layers.
+ */
+function applySessionSiblingConfigs(
+  specs: SessionSpec[],
+  parent: Record<string, unknown>,
+  where: string,
+): void {
+  // Build two indices: which positions hold a string entry of a
+  // given name, and which names are already claimed by an inline
+  // table. The second is just for clearer error messages.
+  const rawLayers = parent.layers as unknown[];
+  const stringIndicesByName = new Map<string, number[]>();
+  const inlineTableNames = new Set<string>();
+  for (let i = 0; i < rawLayers.length; i++) {
+    const v = rawLayers[i];
+    if (typeof v === "string") {
+      const arr = stringIndicesByName.get(v) ?? [];
+      arr.push(i);
+      stringIndicesByName.set(v, arr);
+    } else if (
+      v !== null &&
+      typeof v === "object" &&
+      !Array.isArray(v) &&
+      typeof (v as { provider?: unknown }).provider === "string"
+    ) {
+      inlineTableNames.add((v as { provider: string }).provider);
+    }
+  }
+
+  for (const [key, value] of Object.entries(parent)) {
+    if (key === "provider" || key === "layers") continue;
+
+    // Non-table values at non-meta keys are unknown. Reject so the
+    // user doesn't think their config landed somewhere.
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new ManifestError(
+        `agent.toml at ${where}: [session].${key} is not a recognised meta key ` +
+          `('provider'/'layers') and not a sub-table. Per-layer config siblings ` +
+          `must be TOML tables — e.g.\n\n` +
+          `  [session.${key}]\n  key = "value"\n\n` +
+          `to provide config for a layer named '${key}' listed in [session].layers.`,
+      );
+    }
+
+    const positions = stringIndicesByName.get(key);
+    if (!positions) {
+      if (inlineTableNames.has(key)) {
+        throw new ManifestError(
+          `agent.toml at ${where}: [session.${key}] conflicts with an inline-table ` +
+            `entry for '${key}' in [session].layers. Pick one: keep the inline ` +
+            `form, or convert the layers entry to the string shorthand ` +
+            `("${key}") and move all of its config to [session.${key}].`,
+        );
+      }
+      throw new ManifestError(
+        `agent.toml at ${where}: [session.${key}] has no matching string entry ` +
+          `in [session].layers. Add '${key}' to layers (e.g. layers = […, "${key}", …]) ` +
+          `to apply this config, or remove the sibling table.`,
+      );
+    }
+
+    const siblingConfig = value as Record<string, unknown>;
+    if ("provider" in siblingConfig) {
+      throw new ManifestError(
+        `agent.toml at ${where}: [session.${key}].provider is not allowed. The ` +
+          `layer's provider is determined by its entry in [session].layers (here: ` +
+          `'${key}'); the sibling table only carries config.`,
+      );
+    }
+
+    for (const i of positions) {
+      // specs[i] was produced from the string "<key>", so currently
+      // it's `{ provider: key }`. Merge the sibling table's keys in,
+      // pinning `provider` explicitly so the type checker sees that
+      // the SessionSpec shape is preserved (siblingConfig.provider
+      // is rejected upstream; this is belt-and-suspenders).
+      const existing = specs[i];
+      if (!existing) continue; // unreachable: positions[] came from rawLayers
+      specs[i] = {
+        ...siblingConfig,
+        ...existing,
+        provider: existing.provider,
+      };
+    }
+  }
 }
 
 function parseSessionLayers(v: unknown, where: string): SessionSpec[] {

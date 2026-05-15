@@ -415,7 +415,7 @@ export interface AuditHealth {
    * Tools named in `[tools]` that no provider claimed at audit time.
    * Typically follows a provider load/init failure but can also
    * happen when a provider doesn't recognise the requested name
-   * (typo in `mcp_tool`, etc.).
+   * (typo in the `tool` rename target, etc.).
    */
   unresolvedTools: number;
   /**
@@ -1198,11 +1198,12 @@ async function auditAgentInner(
     const exposed = new Set<string>();
     for (const binding of resolved.tools) {
       if (binding.providerInstanceId !== instanceId) continue;
-      // The dispatched MCP-tool name is either `config.mcp_tool` or
-      // the model-facing name. Reflect both for safety.
+      // The dispatched MCP-tool name is either `config.tool`
+      // (the provider-agnostic rename field) or the model-facing
+      // binding name. Reflect both for safety.
       const dispatched =
-        typeof binding.toolConfig.mcp_tool === "string"
-          ? (binding.toolConfig.mcp_tool as string)
+        typeof binding.toolConfig.tool === "string"
+          ? (binding.toolConfig.tool as string)
           : binding.toolName;
       exposed.add(dispatched);
     }

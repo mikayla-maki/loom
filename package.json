@@ -1,6 +1,6 @@
 {
   "name": "@mcmaki/loom",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Loom — A manifest-driven agent meta-harness",
   "type": "module",
   "main": "dist/index.js",
@@ -63,6 +63,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "ajv": "^8.17.1",
     "openai": "^6.37.0",
+    "toml": "^4.1.1",
     "yaml": "^2.8.4"
   },
   "devDependencies": {

@@ -250,7 +250,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("supports the `mcp_tool` rename so one MCP tool can be exposed under multiple model-facing names", async () => {
+  it("supports the `tool` rename so one MCP tool can be exposed under multiple model-facing names", async () => {
     const tools = mcpServerToolsFactory.create(
       { command: process.execPath, args: [ECHO_SERVER] },
       ctx(),
@@ -264,7 +264,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       // `say` is the model-facing name; the underlying MCP tool is
       // still `echo`.
       const say = defined(
-        tools.resolveTool("say", { mcp_tool: "echo" }, {} as never, undefined),
+        tools.resolveTool("say", { tool: "echo" }, {} as never, undefined),
         "resolveTool('say') returned null",
       );
       expect(say.name).toBe("say");
@@ -314,7 +314,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("end-to-end: same MCP tool exposed under multiple model-facing names via mcp_tool rename", async () => {
+  it("end-to-end: same MCP tool exposed under multiple model-facing names via the `tool` rename", async () => {
     const spec: AgentManifest = {
       name: "mcp-rename-e2e",
       systemPrompt: "x",
@@ -328,8 +328,8 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       },
       tools: {
         echo: { provider: "echo_mcp" },
-        say: { provider: "echo_mcp", mcp_tool: "echo" },
-        shout: { provider: "echo_mcp", mcp_tool: "echo" },
+        say: { provider: "echo_mcp", tool: "echo" },
+        shout: { provider: "echo_mcp", tool: "echo" },
       },
       capabilities: {
         echo: "*",
@@ -441,7 +441,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       },
       tools: {
         // model-facing name `add_to_10`; underlying tool is still `add`.
-        add_to_10: { provider: "echo_mcp", mcp_tool: "add" },
+        add_to_10: { provider: "echo_mcp", tool: "add" },
       },
       capabilities: {
         add_to_10: { a: 10, b: "*" },
@@ -484,7 +484,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
         },
       },
       tools: {
-        bound_echo: { provider: "echo_mcp", mcp_tool: "echo" },
+        bound_echo: { provider: "echo_mcp", tool: "echo" },
       },
       capabilities: {
         bound_echo: { text: "locked-value" },
@@ -591,11 +591,11 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       },
       tools: {
         echo: { provider: "echo_mcp" },
-        say: { provider: "echo_mcp", mcp_tool: "echo" },
-        shout: { provider: "echo_mcp", mcp_tool: "echo" },
+        say: { provider: "echo_mcp", tool: "echo" },
+        shout: { provider: "echo_mcp", tool: "echo" },
         add: { provider: "echo_mcp" },
-        add_to_10: { provider: "echo_mcp", mcp_tool: "add" },
-        whisper: { provider: "echo_mcp", mcp_tool: "echo", note: "extra" },
+        add_to_10: { provider: "echo_mcp", tool: "add" },
+        whisper: { provider: "echo_mcp", tool: "echo", note: "extra" },
       },
       capabilities: {
         echo: "*",
@@ -680,7 +680,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("rejects a non-string `mcp_tool` config value", async () => {
+  it("rejects a non-string `tool` config value", async () => {
     const tools = mcpServerToolsFactory.create(
       { command: process.execPath, args: [ECHO_SERVER] },
       ctx(),
@@ -694,11 +694,11 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       expect(() =>
         tools.resolveTool(
           "foo",
-          { mcp_tool: 42 as unknown as string },
+          { tool: 42 as unknown as string },
           {} as never,
           undefined,
         ),
-      ).toThrow(/'mcp_tool'.*must be a non-empty string/);
+      ).toThrow(/'tool'.*must be a non-empty string/);
     } finally {
       await tools.close();
     }

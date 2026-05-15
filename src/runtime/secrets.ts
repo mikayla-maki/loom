@@ -21,7 +21,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import * as TOML from "@iarna/toml";
+import * as TOML from "toml";
 
 import { SecretError } from "../errors.js";
 

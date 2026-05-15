@@ -21,7 +21,7 @@ integration described in
 |---|---|---|
 | `echo` | `text: string` | Direct passthrough — `[providers]` configured-factory form works at all (Chunk 1). |
 | `read_document` | `doc_id: string, format?: "text"\|"json"` | Used twice: full passthrough AND under a renamed name (`read_welcome_doc`) with `doc_id` pre-bound via `[capabilities]`. Load-bearing demo for capability-based partial application (Chunk 5). |
-| `query_table` | `table: string, limit?: number` | Exposed under two model-facing names (`query_users`, `query_orders`) via the `mcp_tool` rename, each with `table` pre-bound to a different literal (Chunks 3 + 5). |
+| `query_table` | `table: string, limit?: number` | Exposed under two model-facing names (`query_users`, `query_orders`) via the `tool` rename, each with `table` pre-bound to a different literal (Chunks 3 + 5). |
 | `set_status` | `status: string` | The MCP server's schema is permissive; the manifest narrows it to `enum: ["online", "away"]` via an array capability grant (Chunk 5). |
 | `send_alert` | `channel: string, message: string` | Requires `MOCK_API_KEY` in the process env. The manifest supplies it via `secrets = { MOCK_API_KEY = "MOCK_API_KEY" }` on the `[tools.send_alert]` entry (Chunk 6). |
 | `dangerous_delete` | `path: string` | Advertised but deliberately **not** listed in the manifest's `[tools]`. The model never sees it. Demonstrates the static-enumeration policy (Chunk 3 / `loom mcp inspect` rationale). |

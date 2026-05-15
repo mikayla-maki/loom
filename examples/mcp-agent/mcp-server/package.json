@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./server.js",
   "bin": "./server.js",
-  "description": "Example MCP server used by Loom's `examples/agent-with-mcp.toml`. Exposes six tools that exercise each new feature of the MCP meta-provider integration (configured-factory [providers], `mcp_tool` rename, capability-based partial application, enum-via-array grants, secrets in env, and static enumeration).",
+  "description": "Example MCP server used by Loom's `examples/agent-with-mcp.toml`. Exposes six tools that exercise each new feature of the MCP meta-provider integration (configured-factory [providers], `tool` rename, capability-based partial application, enum-via-array grants, secrets in env, and static enumeration).",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch",

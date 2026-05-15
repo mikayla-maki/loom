@@ -23,7 +23,14 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 
-import TOML from "@iarna/toml";
+// Split TOML responsibilities: the spec-compliant `toml` package
+// (BinaryMuse) for PARSING — mixed-type arrays + dotted/quoted
+// inline-table keys per TOML 1.1.0 — and `@iarna/toml` for STRINGIFY,
+// since `toml` is parse-only. The lockfile we write is simple enough
+// that @iarna's output is fine; we only need the modern parser on
+// the read side, where users hand-write manifests.
+import * as TOML from "toml";
+import TOMLWriter from "@iarna/toml";
 
 import { LoomError } from "../errors.js";
 import { parseAgentManifest } from "../manifest/parser.js";
@@ -318,7 +325,9 @@ async function writeLockfile(
     })),
   };
   // @iarna/toml stringifies arrays-of-tables as `[[source]]` blocks.
-  const text = TOML.stringify(lock as unknown as TOML.JsonMap);
+  // Lockfile is internal so the output side doesn't need TOML 1.1.0
+  // niceties — @iarna is fine here.
+  const text = TOMLWriter.stringify(lock as unknown as TOMLWriter.JsonMap);
   await fs.writeFile(
     path.join(manifestDir, ".loom", "lock.toml"),
     text,

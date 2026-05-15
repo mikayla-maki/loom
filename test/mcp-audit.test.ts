@@ -65,7 +65,7 @@ describe("audit: MCP-backed providers", () => {
         },
       },
       tools: {
-        add_to_10: { provider: "echo_mcp", mcp_tool: "add" },
+        add_to_10: { provider: "echo_mcp", tool: "add" },
       },
       capabilities: {
         add_to_10: { a: 10, b: "*" },
@@ -129,7 +129,7 @@ describe("audit: MCP-backed providers", () => {
     // the audit comes back clean.
     const prev = process.env.MOCK_API_KEY;
     process.env.MOCK_API_KEY = "test-value";
-    let tree;
+    let tree: Awaited<ReturnType<typeof auditAgent>>;
     try {
       const spec: AgentManifest = {
         name: "audit-mcp-secrets",
@@ -177,7 +177,7 @@ describe("audit: MCP-backed providers", () => {
         },
       },
       tools: {
-        add_to_10: { provider: "echo_mcp", mcp_tool: "add" },
+        add_to_10: { provider: "echo_mcp", tool: "add" },
       },
       capabilities: { add_to_10: { a: 10, b: "*" } },
     };
