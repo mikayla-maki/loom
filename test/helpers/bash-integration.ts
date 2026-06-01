@@ -84,10 +84,10 @@ export function describeBashIntegration(backend: BashBackend): void {
     supported = await backend.isSupported();
   });
 
-  /** `it` variant that no-ops when the backend isn't available. */
+  /** `it` variant that reports SKIPPED when the backend isn't available. */
   const dit = (name: string, fn: () => void | Promise<void>): void => {
-    it(name, async () => {
-      if (!supported) return;
+    it(name, async (ctx) => {
+      if (!supported) ctx.skip();
       await fn();
     });
   };

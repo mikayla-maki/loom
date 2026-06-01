@@ -1,0 +1,31 @@
+[agent]
+name = "example-agent"
+system_prompt = "You are a helpful assistant." # Customize for your needs
+
+[harness]
+provider = "anthropic" # This harness will inform Loom it needs an ANTHROPIC_API_KEY
+model    = "claude-sonnet-4-5"
+
+# Define what context management features you need
+[session]
+layers = ["skills", "compacting", "in-memory"]
+
+ # The four FS / shell tools auto-load when `[tools]` is absent;
+ # `find` is built-in but opt-in. 
+[tools]
+bash       = "builtin"
+read_file  = "builtin"
+write_file = "builtin"
+edit_file  = "builtin"
+find       = "builtin"
+
+# Use capabilities to define a flexible security model that fits your needs
+[capabilities]
+# Read files in this directory and another
+read_file  = { paths = ["./", "../other-files"] }
+find       = { paths = ["./", "../other-files"] }
+# Writing + editing files is restricted to the current directory
+bash       = { commands = "*", paths = ["./"] } # Sandboxed by default, no network access
+write_file = { paths = ["./"] }
+edit_file  = { paths = ["./"] }
+

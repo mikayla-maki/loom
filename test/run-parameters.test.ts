@@ -1,16 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
 import { TestHarness } from "../src/builtins/harness/test.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { Harness } from "../src/types/interfaces.js";
-
-/**
- * `RunParameters` flow: callers pass per-turn knobs to `prompt()`; loom
- * forwards them to `harness.run()`. The harness owns interpretation —
- * the Anthropic harness translates `effort` → `output_config.effort`
- * and `thinking` → top-level `thinking`. Other harnesses can ignore.
- */
 
 describe("RunParameters", () => {
   it("loom forwards params to the harness on each turn", async () => {
@@ -27,12 +20,8 @@ describe("RunParameters", () => {
       expect(test.lastParams).toEqual({ effort: "high" });
 
       await agent.prompt("b", { effort: "low", maxOutputTokens: 256 });
-      expect(test.lastParams).toEqual({
-        effort: "low",
-        maxOutputTokens: 256,
-      });
+      expect(test.lastParams).toEqual({ effort: "low", maxOutputTokens: 256 });
 
-      // No params → undefined arg.
       await agent.prompt("c");
       expect(test.lastParams).toBeUndefined();
     } finally {
@@ -80,7 +69,6 @@ describe("RunParameters", () => {
         { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
       );
       try {
-        // 1. effort alone → output_config.effort
         await agent.prompt("a", { effort: "high" });
         expect(captured).toMatchObject({
           model: "claude-sonnet-4-5",
@@ -88,24 +76,20 @@ describe("RunParameters", () => {
         });
         expect(captured).not.toHaveProperty("thinking");
 
-        // 2. thinking alone → top-level thinking
         const thinking = { type: "enabled", budget_tokens: 4096 };
         await agent.prompt("b", { thinking });
         expect(captured).toMatchObject({ thinking });
         expect(captured).not.toHaveProperty("output_config");
 
-        // 3. Both → both appear; thinking takes semantic precedence.
         await agent.prompt("c", { effort: "max", thinking });
         expect(captured).toMatchObject({
           output_config: { effort: "max" },
           thinking,
         });
 
-        // 4. Per-call model override.
         await agent.prompt("d", { model: "claude-haiku-4-5" });
         expect(captured).toMatchObject({ model: "claude-haiku-4-5" });
 
-        // 5. maxOutputTokens override.
         await agent.prompt("e", { maxOutputTokens: 1024 });
         expect(captured).toMatchObject({ max_tokens: 1024 });
       } finally {

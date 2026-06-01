@@ -1,12 +1,3 @@
-/**
- * Tests for the runtime audit step in runAgent().
- *
- * The static manifest checks (assertRequires, assertKnownKinds, etc.)
- * have their own coverage; this file exercises the per-tool
- * `Tool.audit()` step that runs at boot, throws on `error` findings,
- * and forwards `ok`/`warning` findings to the configured callback.
- */
-
 import { describe, expect, it } from "vitest";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { CapabilityError } from "../src/errors.js";
@@ -53,23 +44,7 @@ function makeTool(opts: {
 }
 
 describe("runAgent runtime audit", () => {
-  it("throws CapabilityError when a tool's audit reports an error", async () => {
-    const tool = makeTool({
-      name: "broken",
-      audit: () => [
-        {
-          severity: "error",
-          message: "the binary I need isn't installed",
-          remediation: "install it",
-        },
-      ],
-    });
-    await expect(
-      runAgent(manifestWith(tool), { providers: [provider(tool)] }),
-    ).rejects.toThrow(CapabilityError);
-  });
-
-  it("error message mentions the tool name and the finding", async () => {
+  it("throws CapabilityError naming the tool and finding when audit reports an error", async () => {
     const tool = makeTool({
       name: "broken",
       audit: () => [
@@ -86,6 +61,7 @@ describe("runAgent runtime audit", () => {
     } catch (e) {
       caught = e;
     }
+    expect(caught).toBeInstanceOf(CapabilityError);
     const msg = String(caught);
     expect(msg).toContain("broken");
     expect(msg).toContain("missing dep XYZ");
@@ -126,7 +102,7 @@ describe("runAgent runtime audit", () => {
     expect(String(caught)).toContain("B is broken");
   });
 
-  it("forwards `warning` findings to onAuditFinding instead of throwing", async () => {
+  it("forwards non-error findings to onAuditFinding instead of throwing", async () => {
     const tool = makeTool({
       name: "noisy",
       audit: () => [
@@ -151,11 +127,7 @@ describe("runAgent runtime audit", () => {
     }
   });
 
-  it("boot succeeds when there's nothing to throw on (no audit + non-error findings without a callback)", async () => {
-    // Two no-throw cases in one: a tool without audit() at all, and
-    // a tool whose audit() returns only ok/warning findings with no
-    // onAuditFinding callback to surface them. Both must complete
-    // boot cleanly.
+  it("boots cleanly with no audit() and with non-error findings but no callback", async () => {
     const plain = makeTool({ name: "plain" });
     const a1 = await runAgent(manifestWith(plain), {
       providers: [provider(plain)],
@@ -175,7 +147,7 @@ describe("runAgent runtime audit", () => {
     await a2.close();
   });
 
-  it("an audit() that throws is treated as a single error finding", async () => {
+  it("treats an audit() that throws as a single error finding", async () => {
     const tool = makeTool({
       name: "throws",
       audit: () => {

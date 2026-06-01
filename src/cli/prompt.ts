@@ -1,28 +1,3 @@
-/**
- * `loom prompt` — one-shot prompt execution + format-specific
- * renderers.
- *
- * Three modes, selected with `--format`:
- *
- *   text   (default) Final agent message → stdout. Pipe-friendly.
- *                    The CLI quietly augments [agent].system_prompt
- *                    with a note that only the final message is
- *                    surfaced. Tool calls, thoughts, and intermediate
- *                    commentary are dropped; non-text content blocks
- *                    in the final message land on stderr as
- *                    `[image: ...]` placeholders.
- *   trace            Coalesced labelled trace for debug. Tool calls,
- *                    agent text, and the stop reason are rendered one
- *                    line per logical unit (not per chunk).
- *   jsonl            One `SessionUpdate` per line, raw ACP shape.
- *
- * Exit codes track the turn's stop reason:
- *   end_turn  → 0
- *   max_turns → 1
- *   cancelled → 130   (SIGINT convention)
- *   error     → 1     (with message to stderr)
- */
-
 import { runAgent, type OnMissingSecret } from "../sdk/run-agent.js";
 import type { RunningAgent } from "../sdk/running-agent.js";
 import type {
@@ -37,27 +12,12 @@ import type { PermissionHandler } from "../types/permissions.js";
 
 export type PromptFormat = "text" | "trace" | "jsonl";
 
-/**
- * Hardcoded preamble appended to [agent].system_prompt when running
- * `loom prompt --format=text`. Tells the model that only its final
- * message — the text after its last tool call — reaches the user.
- *
- * Kept short and verbatim; no template engine, no customisation hook.
- */
 export const TEXT_MODE_PROMPT_AUGMENTATION =
   "You are being invoked in text-output mode. Only " +
   "your final message — the text after your last tool call, before " +
   "the turn ends — is shown to the user. Any text before tool calls " +
   "is invisible. Be concise; put the answer in your last message.";
 
-/**
- * Map a `StopReason` to a Unix-conventional process exit code.
- *
- * `end_turn` is a clean completion → 0. `cancelled` follows the
- * SIGINT convention → 130. The various "the agent didn't finish"
- * reasons (`max_tokens`, `max_turn_requests`, `refusal`) and Loom's
- * internal `error` sentinel all map to 1.
- */
 export function exitCodeForStopReason(reason: StopReason): number {
   switch (reason) {
     case "end_turn":
@@ -74,23 +34,6 @@ export function exitCodeForStopReason(reason: StopReason): number {
   }
 }
 
-/**
- * Append the text-mode preamble to whatever the manifest already
- * declares for `[agent].system_prompt`. Pure: returns a new manifest
- * with the systemPrompt rewritten as a literal string. The on-disk
- * file is never modified.
- *
- * If the existing entry is a `{ path }` form, we leave it alone and
- * **prepend** the augmentation in a wrapper string — but since
- * `runAgent` reads the file lazily, the cleanest path is to resolve
- * the file ourselves. To keep this code path lightweight we instead
- * convert path-form prompts to literal form only after `runAgent`
- * has loaded them. See `applyTextModeAugmentation`'s callers.
- *
- * For the in-memory `AgentManifest` shape the CLI uses, the field is
- * already a string in nearly all cases (parsed by the TOML parser).
- * We handle both forms safely below.
- */
 export function applyTextModeAugmentation(
   manifest: AgentManifest,
 ): AgentManifest {
@@ -104,19 +47,11 @@ export function applyTextModeAugmentation(
       : TEXT_MODE_PROMPT_AUGMENTATION;
     return { ...manifest, systemPrompt: joined };
   }
-  // `{ path }` form: leave the path alone, but tack the augmentation
-  // onto the *resolved* prompt instead. Callers convert via
-  // `augmentResolvedSystemPrompt` after the agent boots.
   return manifest;
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Renderers
-// ──────────────────────────────────────────────────────────────────
-
 export interface PromptRenderer {
   render(update: SessionUpdate): void;
-  /** Called once after the update stream ends. */
   finish(): void;
 }
 
@@ -130,13 +65,6 @@ const defaultStreams = (): RendererStreams => ({
   stderr: process.stderr,
 });
 
-/**
- * Text renderer — buffers `agent_message_chunk` content; any
- * tool call (or update) clears the buffer (because the agent's
- * final answer comes *after* its last tool result). On `stop`,
- * the buffered text reaches stdout and any non-text blocks are
- * surfaced to stderr as `[image: ...]` placeholders.
- */
 export class TextPromptRenderer implements PromptRenderer {
   private buffer: ContentBlock[] = [];
   private flushed = false;
@@ -153,16 +81,12 @@ export class TextPromptRenderer implements PromptRenderer {
         break;
       case "tool_call":
       case "tool_call_update":
-        // A tool result invalidates any agent text that came before
-        // it — the final answer is whatever follows the *last* tool
-        // call, not what precedes it.
+        // Final answer is whatever follows the last tool call, so drop earlier text.
         this.buffer = [];
         break;
       case "stop":
         this.flush();
         break;
-      // user_message_chunk, agent_thought_chunk, plan, usage_update,
-      // available_commands_update, current_mode_update… all silent.
       default:
         break;
     }
@@ -194,17 +118,6 @@ export class TextPromptRenderer implements PromptRenderer {
   }
 }
 
-/**
- * Trace renderer — labelled view, but **coalesced**. Agent and user
- * message chunks are buffered until a non-chunk boundary (tool call,
- * stop, etc.) or the stream ends, at which point they emit a single
- * `[agent] ...` / `[user] ...` line per logical message.
- *
- * Tool calls render the title + brief JSON input; their updates
- * render a status glyph + truncated output. The final stop reason
- * lands as `[stop] <reason>`, and any observed `usage_update` is
- * summarised to stderr after the turn.
- */
 export class TracePromptRenderer implements PromptRenderer {
   private readonly streams: RendererStreams;
   private agentBuf: ContentBlock[] = [];
@@ -265,8 +178,6 @@ export class TracePromptRenderer implements PromptRenderer {
         this.streams.stdout.write(`[stop] ${update.stopReason}\n`);
         break;
       default:
-        // Other SDK updates (available_commands_update,
-        // current_mode_update, …) aren't useful in a one-shot trace.
         break;
     }
   }
@@ -308,11 +219,6 @@ export class TracePromptRenderer implements PromptRenderer {
   }
 }
 
-/**
- * JSONL renderer — emit each `SessionUpdate` verbatim as a JSON
- * line. The consumer decides what to do with it. No special
- * handling, no augmentation, no exit-code surprises.
- */
 export class JsonlPromptRenderer implements PromptRenderer {
   private readonly streams: RendererStreams;
 
@@ -324,14 +230,8 @@ export class JsonlPromptRenderer implements PromptRenderer {
     this.streams.stdout.write(JSON.stringify(update) + "\n");
   }
 
-  finish(): void {
-    // Nothing to flush.
-  }
+  finish(): void {}
 }
-
-// ──────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────
 
 function renderInlineBlocks(blocks: ContentBlock[]): string {
   const parts: string[] = [];
@@ -368,7 +268,6 @@ function describeNonTextBlock(block: ContentBlock): string {
 
 function approxBase64Size(data: string | undefined): number {
   if (!data) return 0;
-  // Base64: 4 chars → 3 bytes. Approximate, ignoring padding.
   return Math.floor((data.length * 3) / 4);
 }
 
@@ -419,22 +318,11 @@ export function makeRenderer(
   }
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Command entry point — used by `loom prompt` and by tests.
-// ──────────────────────────────────────────────────────────────────
-
 export interface RunPromptOptions {
   manifest: string | AgentManifest;
   text: string;
   format: PromptFormat;
-  /**
-   * When true, emits one `{"preamble": {...}}` JSON line on stdout
-   * before the turn's events. Requires `format === "jsonl"` — the
-   * CLI rejects the combination otherwise. Use this to capture a
-   * full audit record for the turn (system prompt + history events
-   * + tool list as the model will see them) in the same invocation
-   * that drives the prompt.
-   */
+  /** Emits one `{"preamble": {...}}` JSON line before the turn; requires `format === "jsonl"`. */
   emitPreamble?: boolean;
   permissionHandler?: PermissionHandler;
   onMissingSecret?: OnMissingSecret;
@@ -442,17 +330,9 @@ export interface RunPromptOptions {
     finding: AuditFinding & { tool: string },
   ) => void | Promise<void>;
   streams?: RendererStreams;
-  /** Hook for tests — observe the booted agent before the prompt runs. */
   onAgentReady?: (agent: RunningAgent) => void;
 }
 
-/**
- * Boot the agent, run one turn, render the stream according to
- * `format`, and return the resulting Unix exit code.
- *
- * Caller is responsible for parsing flags and reading stdin (this
- * function takes the resolved `text` as a string).
- */
 export async function runPromptCommand(
   opts: RunPromptOptions,
 ): Promise<number> {
@@ -460,12 +340,9 @@ export async function runPromptCommand(
 
   let manifest = opts.manifest;
   if (opts.format === "text") {
-    // Augment in-memory only. The TOML file on disk is untouched.
     if (typeof manifest !== "string") {
       manifest = applyTextModeAugmentation(manifest);
     } else {
-      // Path form: parse, augment, then hand the augmented manifest
-      // to runAgent (which accepts either form).
       const { parseAgentManifest } = await import("../manifest/parser.js");
       const parsed = await parseAgentManifest(manifest);
       manifest = applyTextModeAugmentation(parsed);
@@ -495,11 +372,6 @@ export async function runPromptCommand(
       opts.emitPreamble
         ? {
             onPreamble: (preamble) => {
-              // Single JSON line, distinguishable from SessionUpdates
-              // (which always carry a `sessionUpdate` field) by the
-              // top-level `preamble` key. Always emit on stdout — the
-              // CLI already constrained this to `--format jsonl`, so
-              // it composes naturally with the rest of the stream.
               streams.stdout.write(JSON.stringify({ preamble }) + "\n");
             },
           }

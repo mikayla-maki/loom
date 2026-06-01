@@ -18,12 +18,6 @@ import type { AgentManifest } from "../src/types/manifest.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
-/**
- * Narrow a `ResolvedSessionLayer` (which may be either a
- * `SessionBinding` or a pre-built instance) to a `SessionBinding`,
- * failing the test if the layer turned out to be pre-built. Keeps
- * the assertions below readable.
- */
 function asSessionBinding(
   layer: ResolvedSessionLayer | undefined,
 ): SessionBinding {
@@ -34,9 +28,7 @@ function asSessionBinding(
 }
 
 describe("manifest walk via runAgent", () => {
-  it("resolves the sample agent end-to-end", async () => {
-    // The fixture stays file-based on purpose: exercises on-disk
-    // system_prompt resolution and v2 [capabilities] grants.
+  it("resolves the file-based sample agent end-to-end", async () => {
     const agent = await runAgent(
       path.join(FIXTURES, "sample-agent/agent.toml"),
       {},
@@ -49,7 +41,6 @@ describe("manifest walk via runAgent", () => {
         "read_file",
         "write_file",
       ]);
-      // The agent surfaces the granted caps from [capabilities].
       expect(agent.capabilities.read_file).toEqual({ paths: ["./"] });
     } finally {
       await agent.close();
@@ -75,7 +66,6 @@ describe("manifest walk via runAgent", () => {
     const spec: AgentManifest = {
       name: "snoopy",
       systemPrompt: "x",
-      // bash requires `commands`; the grant is empty → boot fails.
       tools: { bash: "builtin" },
       harness: { provider: "test" },
       capabilities: { bash: {} },
@@ -147,14 +137,7 @@ describe("manifest walk via runAgent", () => {
     expect(sp).toBe("Be concise. Use only tools provided.");
   });
 
-  // ─── [providers] configured-factory form plumbing (MCP, Chunk 1) ───
-  //
-  // These tests exercise the resolver IR for the new configured-
-  // factory shape. The factory itself doesn't exist yet (Chunk 2
-  // wires up `mcp-server`); a fake `test-meta` name is enough to
-  // prove the resolver carries everything through correctly.
-
-  it("resolves a [tools.X] entry through a configured-factory [providers] handle", () => {
+  it("resolves [tools.X] entries through a configured-factory [providers] handle", () => {
     const spec: AgentManifest = {
       name: "cf-tool",
       systemPrompt: "x",
@@ -169,9 +152,6 @@ describe("manifest walk via runAgent", () => {
     };
     const r = resolveManifest(spec);
 
-    // Two tool bindings, both pointing at the same provider instance
-    // (the configured-factory entry is shared by dedup on
-    // (factoryName, mergedConfig)).
     expect(r.tools).toHaveLength(2);
     const t0 = defined(r.tools[0]);
     const t1 = defined(r.tools[1]);
@@ -179,7 +159,6 @@ describe("manifest walk via runAgent", () => {
     expect(t1.toolName).toBe("list_directory");
     expect(t0.providerInstanceId).toBe(t1.providerInstanceId);
 
-    // The instance is factory-backed with no source.
     const instance = defined(
       r.providers.find((p) => p.id === t0.providerInstanceId),
       "provider instance not found",
@@ -188,10 +167,7 @@ describe("manifest walk via runAgent", () => {
     expect(instance.source).toBeUndefined();
     expect(instance.factoryName).toBe("test-meta");
     expect(instance.providerHandle).toBe("fs_mcp");
-    // Per-handle config carried through verbatim (no tool config to
-    // merge in this case).
     expect(instance.config).toEqual({ npm: "@example/mcp-fs" });
-    // Origin reflects the configured-factory shape.
     expect(instance.origin).toEqual({
       kind: "handle-factory",
       providerHandle: "fs_mcp",
@@ -199,12 +175,7 @@ describe("manifest walk via runAgent", () => {
     });
   });
 
-  it("provider-level and per-tool config are kept SEPARATE (no merge)", () => {
-    // Per-tool config (`[tools.X]` minus `provider`) flows to
-    // `resolveTool(name, config, ...)`. Provider-level config (the
-    // `[providers]` table) flows to `Tools.create()` and is the
-    // sole dedup key. Multiple tools through one handle therefore
-    // share ONE instance regardless of their per-tool shapes.
+  it("keeps provider-level and per-tool config separate, deduping to one instance", () => {
     const spec: AgentManifest = {
       name: "cf-split",
       systemPrompt: "x",
@@ -225,26 +196,21 @@ describe("manifest walk via runAgent", () => {
     const t0 = defined(r.tools[0]);
     const t1 = defined(r.tools[1]);
 
-    // Both tools share ONE provider instance (one MCP connection).
     expect(t0.providerInstanceId).toBe(t1.providerInstanceId);
     const instance = defined(
       r.providers.find((p) => p.id === t0.providerInstanceId),
       "provider instance not found",
     );
-    // Instance config = [providers] config only. No per-tool keys.
     expect(instance.config).toEqual({
       npm: "@example/mcp-fs",
       shared: "from-provider",
     });
 
-    // ToolBinding.toolConfig keeps the tool's own config, which is
-    // what the factory's `resolveTool(name, config, ...)` receives.
     expect(t0.toolConfig).toEqual({ flavour: "vanilla" });
     expect(t1.toolConfig).toEqual({ shared: "from-tool" });
   });
 
   it("dedupes tools pointing at the same configured-factory handle, even with different per-tool config", () => {
-    // Three different per-tool shapes; one instance.
     const spec: AgentManifest = {
       name: "cf-dedup",
       systemPrompt: "x",
@@ -263,10 +229,7 @@ describe("manifest walk via runAgent", () => {
     expect(ids.size).toBe(1);
   });
 
-  it("resolves [harness] through a configured-factory [providers] handle", () => {
-    // A configured-factory entry can be used to alias a built-in
-    // harness factory with pre-bound config. The resolver flattens
-    // that into the HarnessBinding.
+  it("resolves [harness] through a configured-factory [providers] handle, with call-site config winning", () => {
     const spec: AgentManifest = {
       name: "cf-harness",
       systemPrompt: "x",
@@ -281,9 +244,7 @@ describe("manifest walk via runAgent", () => {
     const r = resolveManifest(spec);
     expect(r.harness?.factoryName).toBe("test");
     expect(r.harness?.providerHandle).toBe("configured");
-    // No source: factory-backed.
     expect(r.harness?.source).toBeUndefined();
-    // Merged config: provider-level + call-site (call-site wins).
     expect(r.harness?.config).toEqual({
       locked_config_key: "locked_value",
       call_site_key: "call_site_value",
@@ -316,18 +277,14 @@ describe("manifest walk via runAgent", () => {
       "configured provider instance not found",
     );
 
-    // Source-form binding: `source` set, `factoryName` undefined.
     expect(loaded.source).toEqual({ path: "./loaded-provider" });
     expect(loaded.factoryName).toBeUndefined();
 
-    // Configured-factory binding: `factoryName` set, `source` undefined.
     expect(configured.factoryName).toBe("test-meta");
     expect(configured.source).toBeUndefined();
   });
 
   it("resolves [agent].system_prompt as a file when path-like", async () => {
-    // Path-like system_prompt is a file-on-disk feature; the inline
-    // path stays a literal string. This test must remain file-based.
     await withTmpDir("loom-sp-path-", async (dir) => {
       const agentDir = path.join(dir, "agent");
       await fs.mkdir(agentDir, { recursive: true });

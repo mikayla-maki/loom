@@ -6,47 +6,29 @@ import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
 
-/**
- * The Anthropic harness consumes SSE via the official `@anthropic-ai/sdk`
- * `MessageStream`. We stub `global.fetch` to return a body built from a
- * hand-crafted event sequence — fully shaped so the SDK's stricter
- * parser accepts every event — and verify that:
- *   - text deltas surface as `agent_message_chunk` updates during streaming
- *   - tool_use input arrives as a complete JSON object after content_block_stop
- *   - stop_reason from `message_delta` is honoured (turn ends with end_turn)
- *   - the non-streaming path produces the same shape (text + usage)
- *
- * NOTE: the SDK requires `message_start.message` to carry the full
- * `Message` envelope (id, type:"message", role, content:[], model,
- * stop_reason:null, stop_sequence:null, usage). Stripped-down fixtures
- * trip the SDK's content-block assembler. The helpers below produce
- * conforming events.
- */
-
-interface Stream {
-  body: ReadableStream<Uint8Array>;
-}
-
-function eventStream(events: Array<Record<string, unknown>>): Stream {
+function eventStream(
+  events: Array<Record<string, unknown>>,
+): ReadableStream<Uint8Array> {
   const enc = new TextEncoder();
-  const chunks: Uint8Array[] = events.map((e) =>
+  const chunks = events.map((e) =>
     enc.encode(`event: ${String(e.type)}\ndata: ${JSON.stringify(e)}\n\n`),
   );
-  return {
-    body: new ReadableStream<Uint8Array>({
-      start(ctrl) {
-        for (const c of chunks) ctrl.enqueue(c);
-        ctrl.close();
-      },
-    }),
-  };
+  return new ReadableStream<Uint8Array>({
+    start(ctrl) {
+      for (const c of chunks) ctrl.enqueue(c);
+      ctrl.close();
+    },
+  });
 }
 
-/**
- * Build a `message_start` event with all fields the SDK expects on the
- * embedded `Message`. Callers override what they care about (id, model,
- * usage).
- */
+function streamResponse(events: Array<Record<string, unknown>>): Response {
+  return new Response(eventStream(events), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
+// The SDK's content-block assembler requires the full Message envelope here.
 function messageStart(opts: {
   id?: string;
   model?: string;
@@ -77,7 +59,6 @@ function messageStart(opts: {
   };
 }
 
-/** A finished non-streaming `Message` body. */
 function messageBody(opts: {
   id?: string;
   model?: string;
@@ -110,7 +91,6 @@ function messageBody(opts: {
 const realFetch = global.fetch;
 let capturedRequest: { url: string; body: unknown } | null = null;
 
-/** `models.retrieve` stub — SDK shape (`max_input_tokens`, not `context_window`). */
 function modelInfoResponse(modelId: string): Response {
   return new Response(
     JSON.stringify({
@@ -126,22 +106,19 @@ function modelInfoResponse(modelId: string): Response {
   );
 }
 
+function modelIdFromUrl(url: string): string {
+  return url.split("/v1/models/")[1] ?? "unknown";
+}
+
 function stubFetch(events: Array<Record<string, unknown>>): void {
   global.fetch = (async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
-    if (u.includes("/v1/models/")) {
-      const modelId = u.split("/v1/models/")[1] ?? "unknown";
-      return modelInfoResponse(modelId);
-    }
+    if (u.includes("/v1/models/")) return modelInfoResponse(modelIdFromUrl(u));
     capturedRequest = {
       url: u,
       body: init?.body ? JSON.parse(String(init.body)) : null,
     };
-    const s = eventStream(events);
-    return new Response(s.body, {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    });
+    return streamResponse(events);
   }) as typeof fetch;
 }
 
@@ -153,7 +130,7 @@ describe("AnthropicHarness streaming", () => {
     global.fetch = realFetch;
   });
 
-  it("surfaces text deltas as they arrive", async () => {
+  it("surfaces text deltas as separate chunks and emits usage", async () => {
     stubFetch([
       messageStart({ inputTokens: 25, outputTokens: 1 }),
       {
@@ -185,9 +162,7 @@ describe("AnthropicHarness streaming", () => {
         name: "stream-test",
         tools: {},
         harness: { provider: "anthropic", model: "x" },
-        // The default chain (compacting+memory) swallows usage_update
-        // events; pin to a plain memory session so the test can
-        // inspect them in pull() output.
+        // Plain memory session keeps usage_update events visible in pull().
         session: new InMemorySession(),
       },
       { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
@@ -195,26 +170,28 @@ describe("AnthropicHarness streaming", () => {
     try {
       const result = await agent.prompt("hi");
       expect(result.stopReason).toBe("end_turn");
-      // Per-turn cumulative usage rides back on the prompt() result.
       expect(result.usage).toMatchObject({ inputTokens: 25, outputTokens: 14 });
+      expect(capturedRequest?.body).toMatchObject({ stream: true });
+      // Automatic prompt caching: a top-level ephemeral breakpoint must be
+      // sent or every turn re-bills the full prompt.
+      expect(capturedRequest?.body).toMatchObject({
+        cache_control: { type: "ephemeral" },
+      });
+
       const events = (await agent.session.pull?.([])) ?? [];
       const chunks = events.filter(
         (e): e is SessionUpdate & { sessionUpdate: "agent_message_chunk" } =>
           e.sessionUpdate === "agent_message_chunk",
       );
-      // Two deltas should land as two separate chunks (not one combined).
-      expect(chunks).toHaveLength(2);
       const texts = chunks.map((c) =>
         c.content.type === "text" ? c.content.text : "",
       );
       expect(texts).toEqual(["Hello", ", world"]);
-      expect(capturedRequest?.body).toMatchObject({ stream: true });
-      // A usage_update SessionUpdate should have been emitted with the
-      // post-response context size and the model's window from /v1/models/x.
+
       const usage = events.find((e) => e.sessionUpdate === "usage_update");
       expect(usage).toBeDefined();
       if (usage && usage.sessionUpdate === "usage_update") {
-        expect(usage.used).toBe(25 + 14); // input + output
+        expect(usage.used).toBe(25 + 14);
         expect(usage.size).toBe(200000);
       }
     } finally {
@@ -223,15 +200,10 @@ describe("AnthropicHarness streaming", () => {
   });
 
   it("buffers tool_use input across input_json_delta events", async () => {
-    // The harness will loop; the stub serves the streamed tool_use
-    // turn first, then a streamed text-only turn that ends with end_turn.
     let calls = 0;
     global.fetch = (async (url: string | URL) => {
       const u = String(url);
-      if (u.includes("/v1/models/")) {
-        const modelId = u.split("/v1/models/")[1] ?? "unknown";
-        return modelInfoResponse(modelId);
-      }
+      if (u.includes("/v1/models/")) return modelInfoResponse(modelIdFromUrl(u));
       calls++;
       const events: Array<Record<string, unknown>> =
         calls === 1
@@ -285,11 +257,7 @@ describe("AnthropicHarness streaming", () => {
               },
               { type: "message_stop" },
             ];
-      const s = eventStream(events);
-      return new Response(s.body, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      });
+      return streamResponse(events);
     }) as typeof fetch;
 
     const agent = await runAgent(
@@ -323,10 +291,7 @@ describe("AnthropicHarness streaming", () => {
   it("falls back to non-streaming when stream=false", async () => {
     global.fetch = (async (url: string | URL, init?: RequestInit) => {
       const u = String(url);
-      if (u.includes("/v1/models/")) {
-        const modelId = u.split("/v1/models/")[1] ?? "unknown";
-        return modelInfoResponse(modelId);
-      }
+      if (u.includes("/v1/models/")) return modelInfoResponse(modelIdFromUrl(u));
       capturedRequest = {
         url: u,
         body: init?.body ? JSON.parse(String(init.body)) : null,
@@ -349,20 +314,15 @@ describe("AnthropicHarness streaming", () => {
         name: "nostream",
         tools: {},
         harness: { provider: "anthropic", model: "x", stream: false },
-        // See comment above re: usage_update visibility.
         session: new InMemorySession(),
       },
       { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
     );
     try {
       const result = await agent.prompt("hi");
-      // Body should NOT have stream: true.
       expect(capturedRequest?.body).not.toMatchObject({ stream: true });
-      // Usage flows through the non-streaming path too.
-      expect(result.usage).toMatchObject({
-        inputTokens: 100,
-        outputTokens: 5,
-      });
+      expect(result.usage).toMatchObject({ inputTokens: 100, outputTokens: 5 });
+
       const events = (await agent.session.pull?.([])) ?? [];
       const text = events.find(
         (e) => e.sessionUpdate === "agent_message_chunk",
@@ -375,6 +335,7 @@ describe("AnthropicHarness streaming", () => {
       } else {
         throw new Error("expected agent text");
       }
+
       const usage = events.find((e) => e.sessionUpdate === "usage_update");
       expect(usage).toBeDefined();
       if (usage && usage.sessionUpdate === "usage_update") {

@@ -1,25 +1,3 @@
-/**
- * Manifest resolver — turns the parsed v5 manifest into a normalised
- * form the runtime can instantiate against.
- *
- * Three jobs:
- *   1. **Shape classification.** A `Reference` is a string (bare handle
- *      or SourceSpec fast-path) or a SourceSpec table; classify it.
- *   2. **Handle lookup.** Bare-handle references resolve against
- *      `[providers]` first, then the slot's built-in registry
- *      (§1.2 of manifest-v5.md). One rule, parameterised by slot.
- *   3. **Anonymous-instance dedup.** Multiple references that resolve
- *      to the same `(resolved source, config)` share one runtime
- *      `Tools` instance (§1.5 of manifest-v5.md).
- *
- * The output is a `ResolvedManifest` — a flat list of provider
- * instances to materialise plus bindings (tools → instance, harness →
- * factory, session → factory). The runtime consumes that without ever
- * touching the on-disk shape again.
- *
- * Also still home to `resolveSystemPrompt` (unchanged).
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -39,14 +17,6 @@ import type {
   ToolEntryTable,
 } from "../types/manifest.js";
 
-// ─── System prompt (unchanged) ─────────────────────────────────────────────
-
-/**
- * Read `[agent].system_prompt` and return its text. The string form is
- * disambiguated by prefix (`./`, `../`, `/`, `~/` → path; otherwise
- * literal); the structured form `{ path }` is unambiguous and accepted
- * even when the literal would be path-shaped.
- */
 export async function resolveSystemPrompt(
   manifest: AgentManifest,
   baseDir: string,
@@ -84,13 +54,6 @@ function looksLikePromptPath(s: string): boolean {
   );
 }
 
-// ─── Reference shape classification ───────────────────────────────────────
-
-/**
- * A bare handle is a string with no `/`, no `@`, no `./` or `../`
- * prefix — i.e., a local identifier resolving to a `[providers]`
- * table entry or a built-in registry name.
- */
 export function isBareHandle(s: string): boolean {
   return (
     !s.startsWith("./") &&
@@ -100,15 +63,6 @@ export function isBareHandle(s: string): boolean {
   );
 }
 
-/**
- * Reify a `Reference` as a `SourceSpec` when its shape is SourceSpec-like.
- * Returns null for bare handles. Strings with leading `./` / `../` /
- * `~/` / `/` become `{ path }`; other strings containing `/`
- * (e.g. `@org/pkg`) become `{ npm }`; tables are passed through.
- *
- * The `~/` prefix is classified as a path so `provider = "~/loom-providers/foo"`
- * works. The loader expands the `~` to the user's home dir at load time.
- */
 export function referenceToSourceSpec(ref: Reference): SourceSpec | null {
   if (typeof ref === "string") {
     if (
@@ -128,26 +82,17 @@ export function referenceToSourceSpec(ref: Reference): SourceSpec | null {
   return ref;
 }
 
-/** Reify a `Reference` as a bare handle, or null if it's a SourceSpec. */
 export function referenceToHandle(ref: Reference): string | null {
   if (typeof ref === "string" && isBareHandle(ref)) return ref;
   return null;
 }
 
-// ─── Canonical keys (for dedup + lock.toml) ───────────────────────────────
-
-/** Stable structural key for a `SourceSpec`, used for dedup + `lock.toml`. */
 export function sourceSpecKey(s: SourceSpec): string {
   if ("npm" in s) return `npm:${s.npm}@${s.version ?? "*"}`;
   if ("path" in s) return `path:${s.path}${s.subpath ? "#" + s.subpath : ""}`;
   return `unknown:${JSON.stringify(s)}`;
 }
 
-/**
- * Stable, content-addressed key for a config object. Used to dedup
- * anonymous provider instances that have the same (source, config).
- * Canonicalises by sorting keys; only meaningful for JSON-shaped values.
- */
 export function configKey(config: Record<string, unknown>): string {
   return canonicalJsonStringify(config);
 }
@@ -173,82 +118,37 @@ function canonicalJsonStringify(v: unknown): string {
   );
 }
 
-// ─── Resolved manifest IR ─────────────────────────────────────────────────
-
-/**
- * Provenance — where in the manifest a provider instance came from.
- * Used for diagnostics and audit output.
- *
- * v5 doesn't distinguish "named" vs. "anonymous via handle" any more
- * — both resolve through `[providers]`, and dedup carries shared
- * instances implicitly via `(source, config)`. The origin variants
- * mostly inform error messages now.
- */
 export type ProviderOrigin =
   | { kind: "native" }
-  | { kind: "handle-anonymous"; providerHandle: string } // resolved via [providers].<handle> (SourceSpec form)
+  | { kind: "handle-anonymous"; providerHandle: string }
   | {
       kind: "handle-factory";
       providerHandle: string;
       factoryName: string;
-    } // resolved via [providers].<handle> (configured-factory form)
-  | { kind: "inline-anonymous"; toolName?: string }; // resolved via inline SourceSpec
+    }
+  | { kind: "inline-anonymous"; toolName?: string };
 
-/**
- * A `Tools` instance the runtime will materialise. The `id` is
- * stable across references that dedupe to the same instance.
- *
- * Two `kind === "provider"` shapes coexist:
- *
- *   - **Source-backed.** `source` is set; the provider loader
- *     materialises code-on-disk. This is the historical shape.
- *   - **Factory-backed.** `factoryName` is set, `source` is undefined;
- *     the runtime looks up a Tools factory by name (e.g. `"mcp-server"`)
- *     in the built-in registry and calls its `create()` directly.
- *     Used by the configured-factory `[providers]` form.
- */
 export interface ProviderInstance {
-  /** Stable id used in tool bindings. `"native"` for the built-in. */
   id: string;
-  /** `"native"` (the singleton) or `"provider"` (instantiated per-entry). */
   kind: "native" | "provider";
-  /** Source-backed providers: SourceSpec the provider loads from. */
   source?: SourceSpec;
-  /** Factory-backed providers: name of the Tools factory to instantiate. */
   factoryName?: string;
-  /** For `"provider"`: per-instance config passed to the `Tools` create(). */
   config: Record<string, unknown>;
-  /** For `"provider"`: handle the user wrote (when via `[providers]`). */
   providerHandle?: string;
-  /** Provenance for diagnostics. */
   origin: ProviderOrigin;
 }
 
-/** One bound tool: model-facing name → provider instance + per-tool config. */
 export interface ToolBinding {
   toolName: string;
   providerInstanceId: string;
-  /**
-   * Per-tool config (everything in `[tools.X]` other than `provider`).
-   * For anonymous-instance bindings, this same map *also* flows to the
-   * provider as its instance config — the provider does the split
-   * between provider-level and per-tool keys per its registered schema.
-   * Sharing follows from `(source, config)` dedup.
-   */
   toolConfig: Record<string, unknown>;
-  /** Source line for diagnostics (`"[tools.bash]"`). */
   origin: string;
 }
 
-/** Resolved harness selection. Singleton per agent. */
 export interface HarnessBinding {
-  /** Bare-handle factory name when builtin or `[providers]`-handled. */
   factoryName: string;
-  /** SourceSpec to load (if a provider-backed harness); undefined for builtin. */
   source?: SourceSpec;
-  /** Optional `[providers]` handle (when the user wrote one). */
   providerHandle?: string;
-  /** Factory config (everything in `[harness]` other than `provider`). */
   config: Record<string, unknown>;
 }
 
@@ -259,21 +159,11 @@ export interface SessionBinding {
   config: Record<string, unknown>;
 }
 
-/**
- * A pre-built `Session` instance slotted into a chain position. The
- * resolver records it verbatim; the runtime threads it through
- * instantiation without consulting any factory.
- */
 export interface PreBuiltSessionLayer {
   preBuilt: true;
   instance: Session;
 }
 
-/**
- * One resolved entry in a layered session. Either a factory binding
- * to be instantiated, or a pre-built `Session` instance to be used
- * as-is. Discriminate with `"preBuilt" in layer`.
- */
 export type ResolvedSessionLayer = SessionBinding | PreBuiltSessionLayer;
 
 export function isPreBuiltSessionLayer(
@@ -283,86 +173,30 @@ export function isPreBuiltSessionLayer(
 }
 
 export interface ResolvedManifest {
-  /** All distinct provider instances to materialise. */
   providers: ProviderInstance[];
-  /** Bound tools. Order matches the manifest's `[tools]` insertion order. */
   tools: ToolBinding[];
-  /**
-   * Resolved harness factory binding. Undefined when `manifest.harness`
-   * is a pre-built `Harness` instance (the runtime uses it directly).
-   */
   harness?: HarnessBinding;
-  /**
-   * Resolved session chain. Each entry is a link in the composition
-   * pipeline (outer-to-inner order); a length-1 array is the trivial
-   * singleton case (matches a `[session]` table on disk). Entries may
-   * be `SessionBinding`s (factory references the runtime instantiates)
-   * or `PreBuiltSessionLayer`s (a Session instance passed through
-   * untouched). Undefined when the manifest omits the session section
-   * *or* when `manifest.session` is itself a single pre-built `Session`
-   * instance (in which case the runtime uses it directly without ever
-   * building a chain).
-   */
   session?: ResolvedSessionLayer[];
-  /**
-   * All distinct SourceSpecs the manifest references, keyed by
-   * {@link sourceSpecKey}. Used by `loom install` and audit.
-   * Providers declared in `[providers]` map their local handle to
-   * their spec; anonymous references appear under a synthetic key.
-   */
   sources: Map<string, ResolvedSource>;
 }
 
 export interface ResolvedSource {
-  /** Canonical key (see {@link sourceSpecKey}). */
   key: string;
   spec: SourceSpec;
-  /** Local handle from `[providers]`, when declared; else undefined. */
   handle?: string;
-  /** Where this source was found in the manifest (for diagnostics). */
   origins: string[];
 }
 
-// ─── The main resolution entry point ──────────────────────────────────────
-
 export interface ResolveOptions {
-  /**
-   * Built-in tool names the native provider claims. Used to disambiguate
-   * bare-handle tool `provider` values that match a builtin tool.
-   * Defaults to the set known to the native provider at the call site.
-   */
   builtinToolNames?: Set<string>;
-  /**
-   * The agent's harness factory name (e.g. `"anthropic"`). When the
-   * manifest is in spec form (`[harness] provider = "<name>"`), this
-   * lets the resolver route `[tools.<name>] provider = "<harness>"`
-   * bindings to a synthetic `(harness)` Tools instance whose
-   * `resolveTool` is the harness's `Harness.resolveTool`. Used for
-   * provider-native server tools like Anthropic's `web_search`.
-   *
-   * Undefined when the manifest carries a pre-built `Harness`
-   * instance — in that case `provider = "..."` references to the
-   * harness aren't supported via the manifest; SDK consumers wire
-   * those tools directly.
-   */
   harnessFactoryName?: string;
 }
 
-/**
- * Resolve a parsed manifest into the runtime IR. Pure: no I/O.
- *
- * Throws `ResolutionError` for handle-collision / unresolved-handle
- * problems; throws `ManifestError` for shape errors that should
- * really have been caught at parse time but weren't.
- */
 export function resolveManifest(
   manifest: AgentManifest,
   options: ResolveOptions = {},
 ): ResolvedManifest {
   const builtinToolNames = options.builtinToolNames ?? new Set<string>();
-  // The harness factory name only applies when the manifest is in
-  // spec form. Pre-built Harness instances don't get a routing name
-  // — SDK consumers wire harness-exposed tools directly.
   const harnessFactoryName =
     options.harnessFactoryName ??
     ("provider" in manifest.harness
@@ -372,21 +206,11 @@ export function resolveManifest(
   const providers: ProviderInstance[] = [];
   const tools: ToolBinding[] = [];
 
-  // Index `[providers]` entries — local handle → (SourceSpec | factory).
   const providerIndex = resolveProvidersTable(manifest.providers, sources);
 
-  // Cache for instance dedup. Key prefix discriminates source-backed
-  // vs. factory-backed (built-in factory by name) instances; native
-  // is a single slot with id "native".
-  const instanceCache = new Map<string, string>(); // key → instance id
+  const instanceCache = new Map<string, string>();
   let nextInstanceCounter = 1;
 
-  /**
-   * Bind one provider instance from one of three shapes:
-   *   - `{ kind: "native" }`           → the singleton native provider
-   *   - `{ kind: "source", source }`   → source-backed (loader instantiates)
-   *   - `{ kind: "factory", factoryName }` → factory-backed (registry lookup)
-   */
   function getOrCreateInstance(
     binding:
       | { kind: "native" }
@@ -437,18 +261,12 @@ export function resolveManifest(
         ...(providerHandle ? { providerHandle } : {}),
         origin,
       });
-      // Factory-backed instances aren't reflected in the `sources`
-      // index — they have no SourceSpec. `loom install` / audit treat
-      // them as built-in resolution targets.
     }
     return id;
   }
 
-  // ─── Tools ──────────────────────────────────────────────────────────────────────
   const toolsTable = manifest.tools;
   if (toolsTable === undefined) {
-    // Default builtin set — see AgentManifest.tools docs. The runtime
-    // composes this; we just emit bindings to the native provider.
     for (const name of DEFAULT_BUILTIN_TOOLS) {
       const instanceId = getOrCreateInstance(
         { kind: "native" },
@@ -476,27 +294,11 @@ export function resolveManifest(
     }
   }
 
-  // ─── Harness ───────────────────────────────────────────────────────────────
-  // Pre-built `Harness` instances skip resolution — the runtime
-  // uses them directly. Same goes for sessions.
   const harness =
     "provider" in manifest.harness
       ? resolveHarnessSpec(manifest.harness, providerIndex, sources)
       : undefined;
 
-  // ─── Session ─────────────────────────────────────
-  // ─── Session ─────────────────────────────────────
-  // Four input shapes:
-  //   * undefined → default chain applied later by the runtime
-  //   * single pre-built `Session` instance → bypass resolution
-  //     entirely (`session` stays undefined; runtime uses the
-  //     instance directly)
-  //   * `SessionSpec` (singleton) → length-1 binding array
-  //   * `SessionLayerEntry[]` (chain) → one resolved layer per entry,
-  //     in order. Entries may be strings (desugared to
-  //     `{ provider: str }`), `SessionSpec`s (resolved normally), or
-  //     pre-built `Session` instances (passed through as
-  //     `PreBuiltSessionLayer`).
   let session: ResolvedSessionLayer[] | undefined;
   if (manifest.session !== undefined) {
     if (Array.isArray(manifest.session)) {
@@ -511,8 +313,6 @@ export function resolveManifest(
         resolveSessionSpec(manifest.session, providerIndex, sources, undefined),
       ];
     }
-    // else: single pre-built `Session` instance — leave `session`
-    // undefined and let the runtime use the instance directly.
   }
 
   return {
@@ -524,37 +324,13 @@ export function resolveManifest(
   };
 }
 
-// Tools auto-loaded when `[tools]` is absent. `find` is a built-in
-// too, but opt-in only — list `find = "builtin"` in `[tools]` to
-// pull it in. Same with `spawn_subagent`.
 const DEFAULT_BUILTIN_TOOLS = ["bash", "read_file", "write_file", "edit_file"];
 
-// ─── Internal: [providers] ─────────────────────────────────────────────────
-
-/**
- * `[providers]` entries split into two parallel maps by shape:
- *
- *   - `sources`: handle → SourceSpec       (loader-backed)
- *   - `factories`: handle → factory ref     (configured-factory form)
- *
- * Downstream resolution (`resolveToolEntry`, `resolveFactoryReference`)
- * consults both: a bare handle in `[tools.X].provider` /
- * `[harness].provider` / `[session].provider` matches a `[providers]`
- * entry of either shape. The two maps share a handle namespace, so a
- * handle never appears in both at once.
- */
 interface ProviderIndex {
   sources: Map<string, SourceSpec>;
   factories: Map<string, ConfiguredFactoryRef>;
 }
 
-/**
- * A configured-factory `[providers]` entry, normalised. The
- * `factoryName` is the bare-handle factory name (e.g. `"mcp-server"`);
- * source-loaded factories aren't supported in v1 (the parser accepts
- * any `Reference` but the resolver rejects non-handle forms here with
- * a clear error — see `resolveProvidersTable`).
- */
 interface ConfiguredFactoryRef {
   factoryName: string;
   config: Record<string, unknown>;
@@ -571,7 +347,6 @@ function resolveProvidersTable(
   if (!providersTable) return out;
   for (const [handle, entry] of Object.entries(providersTable)) {
     if (isProviderEntryTable(entry)) {
-      // Configured-factory form: `{ provider = "<factory>", ...config }`.
       const { provider: factoryRef, ...config } = entry;
       const factoryName = referenceToHandle(factoryRef);
       if (!factoryName) {
@@ -582,14 +357,11 @@ function resolveProvidersTable(
             `${JSON.stringify(factoryRef)}.`,
         );
       }
-      // No collision with sources is possible — same map iteration.
       out.factories.set(handle, { factoryName, config });
       continue;
     }
-    // SourceSpec form.
     const spec = referenceToSourceSpec(entry);
     if (!spec) {
-      // Parser should have caught this — but defensive.
       throw new ManifestError(
         `[providers].${handle}: expected a SourceSpec or configured-factory ` +
           `table; got ${JSON.stringify(entry)}`,
@@ -607,8 +379,6 @@ function isProviderEntryTable(e: ProviderEntry): e is ProviderEntryTable {
   );
 }
 
-// ─── Internal: [tools.<name>] ─────────────────────────────────────────────
-
 function resolveToolEntry(
   name: string,
   entry: ToolEntry,
@@ -625,9 +395,6 @@ function resolveToolEntry(
     providerHandle?: string,
   ) => string,
 ): ToolBinding {
-  // Normalise the on-disk shape to { provider, config }. The parser
-  // rejects table entries that omit `provider`; this throw is
-  // defensive for SDK-direct callers who bypass parser typing.
   let providerRef: Reference;
   let toolConfig: Record<string, unknown>;
   const originLabel = `[tools.${name}]`;
@@ -646,8 +413,6 @@ function resolveToolEntry(
     toolConfig = rest;
   }
 
-  // Case 1: bare handle → [providers] (source or factory form), then
-  // built-in registry.
   const handle = referenceToHandle(providerRef);
   if (handle) {
     if (handle === "builtin") {
@@ -667,8 +432,6 @@ function resolveToolEntry(
     const isBuiltin = builtinToolNames.has(handle);
     const isHarnessName =
       harnessFactoryName !== undefined && handle === harnessFactoryName;
-    // Collision detection: a handle that matches multiple resolution
-    // targets is a fatal manifest error.
     const matches = [
       providerSpec || factoryRef ? `[providers].${handle}` : null,
       isBuiltin ? `built-in tool '${handle}'` : null,
@@ -681,24 +444,6 @@ function resolveToolEntry(
       );
     }
     if (factoryRef) {
-      // Configured-factory `[providers]` entry. There's a clean
-      // separation here that we honour:
-      //
-      //   - The provider-level config (from `[providers].<handle>`)
-      //     is what the factory's `create()` sees — i.e. how the
-      //     provider connects / spawns. For MCP that's `command` /
-      //     `args` / `npm` / `env` / `secrets`.
-      //   - The per-tool config (from `[tools.X]` minus `provider`)
-      //     flows to `resolveTool(name, config, …)` only. For MCP
-      //     that's `tool` (rename target — the provider-agnostic
-      //     spelling, formerly `mcp_tool`) and other routing concerns
-      //     the FACTORY's resolveTool reads.
-      //
-      // Dedup uses only the provider-level config, so multiple
-      // `[tools.X]` entries through the same `[providers]` handle
-      // ALWAYS share one instance regardless of their per-tool
-      // shapes — they're literally the same `server.resolveTool(...)`
-      // call dispatched against the same Tools instance.
       return {
         toolName: name,
         providerInstanceId: getOrCreateInstance(
@@ -716,9 +461,6 @@ function resolveToolEntry(
       };
     }
     if (providerSpec) {
-      // Handle-anonymous: the tool's config flows to the Tools instance
-      // as its per-instance config. Dedup by (source, config) shares
-      // instances across multiple tools pointing at the same handle.
       return {
         toolName: name,
         providerInstanceId: getOrCreateInstance(
@@ -732,9 +474,6 @@ function resolveToolEntry(
       };
     }
     if (isBuiltin) {
-      // Bare-name builtin tool with `provider = "<builtin-name>"` —
-      // unusual but legal. The native provider keys by tool name, so
-      // this only works when name === handle.
       if (name !== handle) {
         throw new ResolutionError(
           `${originLabel}.provider = "${handle}": built-in tool names ` +
@@ -755,16 +494,6 @@ function resolveToolEntry(
       };
     }
     if (isHarnessName) {
-      // Route through the synthetic `(harness)` Tools instance the
-      // runtime materialises from `Harness.resolveTool`. The harness
-      // owns dispatch for these (server-side / provider-native tools);
-      // the per-tool config flows verbatim into `resolveTool` so the
-      // harness can translate `max_uses` / `allowed_domains` / etc.
-      // into the API's native server-tool shape.
-      //
-      // No `ProviderInstance` is allocated for `(harness)` — it's a
-      // runtime synthetic, just like `(session)`. Boot wires the
-      // Tools adapter when materialising tool instances.
       return {
         toolName: name,
         providerInstanceId: "(harness)",
@@ -782,8 +511,6 @@ function resolveToolEntry(
     );
   }
 
-  // Case 2: inline SourceSpec → anonymous instance, tool config flows
-  // to the Tools instance.
   const spec = referenceToSourceSpec(providerRef);
   if (!spec) {
     throw new ManifestError(
@@ -805,16 +532,11 @@ function resolveToolEntry(
   };
 }
 
-// ─── Internal: [harness] / [session] ──────────────────────────────────────
-
 function resolveHarnessSpec(
   spec: AgentManifest["harness"],
   providerIndex: ProviderIndex,
   sources: Map<string, ResolvedSource>,
 ): HarnessBinding {
-  // The runtime accepts a pre-built `Harness` instance too; in that
-  // case we shouldn't be in resolveHarnessSpec at all — the runtime
-  // handles it directly. The presence of `provider` disambiguates.
   if (!("provider" in spec)) {
     throw new ManifestError(
       `[harness]: a pre-built Harness instance was passed to resolveManifest; ` +
@@ -831,15 +553,6 @@ function resolveHarnessSpec(
   );
 }
 
-/**
- * Resolve one entry in a layered-session array into a
- * `ResolvedSessionLayer`. Mirrors what the TOML parser does for
- * `[session].layers` entries (strings desugar to `{ provider: str }`,
- * inline tables pass through), and adds the pre-built-instance case
- * that has no TOML equivalent: any value that's an object without a
- * `provider` key is treated as a `Session` instance and recorded as
- * a `PreBuiltSessionLayer`.
- */
 function resolveSessionLayerEntry(
   entry: SessionLayerEntry,
   providerIndex: ProviderIndex,
@@ -863,10 +576,6 @@ function resolveSessionLayerEntry(
     );
   }
   if (entry && typeof entry === "object") {
-    // Anything else with no `provider` field — treat it as a
-    // pre-built `Session` instance. We don't structurally check
-    // here; if it doesn't actually implement Session, the runtime
-    // will surface that at the first push/pull call.
     return { preBuilt: true, instance: entry as Session };
   }
   throw new ManifestError(
@@ -916,15 +625,8 @@ function resolveFactoryReference(
 } {
   const handle = referenceToHandle(ref);
   if (handle) {
-    // Bare handle: either a [providers] entry (source or configured-
-    // factory form), or a built-in registry name (factory by literal
-    // name). Built-in registry membership is checked by the runtime;
-    // we just normalise the binding here.
     const factoryRef = providerIndex.factories.get(handle);
     if (factoryRef) {
-      // Configured-factory entry: the handle aliases another factory.
-      // Provider-level config merges with call-site config; call-site
-      // wins on collision (same precedence as the tool path).
       return {
         factoryName: factoryRef.factoryName,
         providerHandle: handle,
@@ -943,8 +645,6 @@ function resolveFactoryReference(
     }
     return { factoryName: handle, config };
   }
-  // Inline SourceSpec — anonymous. The factory name defaults to the
-  // package name; the runtime knows the convention.
   const spec = referenceToSourceSpec(ref);
   if (!spec) {
     throw new ManifestError(
@@ -965,16 +665,6 @@ function defaultFactoryNameForSource(s: SourceSpec): string {
   return "unknown";
 }
 
-/**
- * Derive the factory name `manifest.harness` will resolve to, used
- * by the resolver to route `[tools.<name>] provider = "<harness>"`
- * bindings. Mirrors what {@link resolveFactoryReference} would
- * produce for the harness spec; we extract just the name without
- * doing the full binding resolution (which we don't have the
- * provider index for at the call site this is invoked from).
- *
- * Returns undefined when the spec is a pre-built `Harness` instance.
- */
 function deriveHarnessFactoryName(
   spec: AgentManifest["harness"],
 ): string | undefined {
@@ -986,8 +676,6 @@ function deriveHarnessFactoryName(
   if (!src) return undefined;
   return defaultFactoryNameForSource(src);
 }
-
-// ─── SourceSpec index helpers ─────────────────────────────────────────────
 
 function addSource(
   sources: Map<string, ResolvedSource>,

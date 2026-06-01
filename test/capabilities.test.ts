@@ -13,10 +13,6 @@ import { CapabilityError, SecretError } from "../src/errors.js";
 import type { Tool } from "../src/types/interfaces.js";
 import type { CapabilitySet } from "../src/types/manifest.js";
 
-/**
- * Synthetic Tool builder. We only care about the v2 fields:
- *   `requires`, `optional`, `capabilities`, `secrets`.
- */
 function makeTool(opts: {
   name: string;
   requires?: string[];
@@ -40,11 +36,13 @@ function makeTool(opts: {
   };
 }
 
+function toolMap(...tools: Tool[]): Map<string, Tool> {
+  return new Map(tools.map((t) => [t.name, t]));
+}
+
 describe("grant lookup helpers", () => {
   it("grantFor returns the manifest entry or undefined", () => {
-    expect(grantFor({ a: { paths: ["/x"] } }, "a")).toEqual({
-      paths: ["/x"],
-    });
+    expect(grantFor({ a: { paths: ["/x"] } }, "a")).toEqual({ paths: ["/x"] });
     expect(grantFor({ a: { paths: ["/x"] } }, "missing")).toBeUndefined();
     expect(grantFor(undefined, "a")).toBeUndefined();
   });
@@ -91,10 +89,7 @@ describe("defaultContains (audit subset)", () => {
 
   it("recurses into nested objects with array fields", () => {
     expect(
-      defaultContains(
-        { paths: ["./", "./a"], tags: ["x"] },
-        { paths: ["./a"] },
-      ),
+      defaultContains({ paths: ["./", "./a"], tags: ["x"] }, { paths: ["./a"] }),
     ).toBe(true);
     expect(
       defaultContains({ paths: ["./a"] }, { paths: ["./a", "/etc"] }),
@@ -109,42 +104,31 @@ describe("defaultContains (audit subset)", () => {
 });
 
 describe("assertRequires", () => {
-  it("passes when a tool has no `requires`", () => {
-    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
-    // No grant → still passes; nothing required.
-    expect(() => assertRequires(tools, undefined)).not.toThrow();
-    expect(() => assertRequires(tools, {})).not.toThrow();
-  });
+  it("passes when requirements are absent or satisfied", () => {
+    const echo = toolMap(makeTool({ name: "echo" }));
+    expect(() => assertRequires(echo, undefined)).not.toThrow();
+    expect(() => assertRequires(echo, {})).not.toThrow();
 
-  it("passes when every required kind is granted", () => {
-    const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["commands"] })],
-    ]);
+    const bash = toolMap(
+      makeTool({ name: "bash", requires: ["commands", "net"] }),
+    );
     expect(() =>
-      assertRequires(tools, { bash: { commands: "*" } }),
+      assertRequires(bash, { bash: { commands: "*", net: "*" } }),
     ).not.toThrow();
-  });
-
-  it("`*` whole-tool grant satisfies every requires", () => {
-    const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["commands", "net"] })],
-    ]);
-    expect(() => assertRequires(tools, { bash: "*" })).not.toThrow();
+    expect(() => assertRequires(bash, { bash: "*" })).not.toThrow();
   });
 
   it("throws when a required kind is missing from the grant", () => {
-    const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["commands"] })],
-    ]);
+    const tools = toolMap(makeTool({ name: "bash", requires: ["commands"] }));
     expect(() => assertRequires(tools, {})).toThrow(CapabilityError);
     expect(() => assertRequires(tools, { bash: {} })).toThrow(CapabilityError);
   });
 
   it("aggregates multiple violations across tools into one error", () => {
-    const tools = new Map<string, Tool>([
-      ["a", makeTool({ name: "a", requires: ["x"] })],
-      ["b", makeTool({ name: "b", requires: ["y", "z"] })],
-    ]);
+    const tools = toolMap(
+      makeTool({ name: "a", requires: ["x"] }),
+      makeTool({ name: "b", requires: ["y", "z"] }),
+    );
     let caught: unknown;
     try {
       assertRequires(tools, { a: {}, b: { y: "*" } });
@@ -160,52 +144,31 @@ describe("assertRequires", () => {
 });
 
 describe("assertKnownKinds", () => {
-  it("absent capabilities passes trivially", () => {
-    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
-    expect(() => assertKnownKinds(tools, undefined)).not.toThrow();
-  });
+  it("passes for absent caps, star grants, empty grants, and declared kinds", () => {
+    const echo = toolMap(makeTool({ name: "echo" }));
+    expect(() => assertKnownKinds(echo, undefined)).not.toThrow();
+    expect(() => assertKnownKinds(echo, { echo: {} })).not.toThrow();
 
-  it("`*` whole-tool grants are exempt from kind-checking", () => {
-    const tools = new Map<string, Tool>([
-      ["bash", makeTool({ name: "bash", requires: ["commands"] })],
-    ]);
-    // "*" doesn't list any kinds, so there's nothing to typo-check.
-    expect(() => assertKnownKinds(tools, { bash: "*" })).not.toThrow();
-  });
-
-  it("empty grant `{}` passes (no keys to check)", () => {
-    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
-    expect(() => assertKnownKinds(tools, { echo: {} })).not.toThrow();
-  });
-
-  it("passes when every granted kind is declared (in requires or optional)", () => {
-    const tools = new Map<string, Tool>([
-      [
-        "bash",
-        makeTool({
-          name: "bash",
-          requires: ["commands"],
-          optional: ["paths", "network"],
-        }),
-      ],
-    ]);
+    const bash = toolMap(
+      makeTool({
+        name: "bash",
+        requires: ["commands"],
+        optional: ["paths", "network"],
+      }),
+    );
+    expect(() => assertKnownKinds(bash, { bash: "*" })).not.toThrow();
     expect(() =>
-      assertKnownKinds(tools, {
+      assertKnownKinds(bash, {
         bash: { commands: "*", paths: ["./"], network: "*" },
       }),
     ).not.toThrow();
   });
 
-  it("throws when a granted kind isn't in requires or optional (typo)", () => {
-    const tools = new Map<string, Tool>([
-      ["read_file", makeTool({ name: "read_file", optional: ["paths"] })],
-    ]);
-    // `pahts` (typo) would silently do nothing under v1; v2 catches it.
+  it("throws on an undeclared granted kind and suggests the intended name", () => {
+    const tools = toolMap(makeTool({ name: "read_file", optional: ["paths"] }));
     let caught: unknown;
     try {
-      assertKnownKinds(tools, {
-        read_file: { pahts: ["./"] },
-      });
+      assertKnownKinds(tools, { read_file: { pahts: ["./"] } });
     } catch (e) {
       caught = e;
     }
@@ -216,26 +179,20 @@ describe("assertKnownKinds", () => {
   });
 
   it("throws when a tool with no declared kinds receives a structured grant", () => {
-    // The footgun the user pointed at: `echo` doesn't read caps, but
-    // the user grants `{ paths: ["./"] }` thinking it constrains the
-    // tool. The check rejects this so the user notices.
-    const tools = new Map<string, Tool>([["echo", makeTool({ name: "echo" })]]);
+    const tools = toolMap(makeTool({ name: "echo" }));
     expect(() => assertKnownKinds(tools, { echo: { paths: ["./"] } })).toThrow(
       CapabilityError,
     );
   });
 
   it("aggregates violations across multiple tools", () => {
-    const tools = new Map<string, Tool>([
-      ["a", makeTool({ name: "a", optional: ["x"] })],
-      ["b", makeTool({ name: "b", optional: ["y"] })],
-    ]);
+    const tools = toolMap(
+      makeTool({ name: "a", optional: ["x"] }),
+      makeTool({ name: "b", optional: ["y"] }),
+    );
     let caught: unknown;
     try {
-      assertKnownKinds(tools, {
-        a: { z: "*" },
-        b: { wat: "*" },
-      });
+      assertKnownKinds(tools, { a: { z: "*" }, b: { wat: "*" } });
     } catch (e) {
       caught = e;
     }
@@ -246,65 +203,42 @@ describe("assertKnownKinds", () => {
 });
 
 describe("assertSecretAllowlist", () => {
-  it("absent allowlist passes any secret needs", () => {
-    const tools = new Map<string, Tool>([
-      [
-        "s3",
-        makeTool({
-          name: "s3",
-          secrets: { required: ["AWS_ACCESS_KEY_ID"] },
-        }),
-      ],
-    ]);
+  it("absent allowlist or `*` passes any secret needs", () => {
+    const tools = toolMap(
+      makeTool({ name: "s3", secrets: { required: ["AWS_ACCESS_KEY_ID"] } }),
+    );
     expect(() => assertSecretAllowlist(tools, undefined)).not.toThrow();
     expect(() => assertSecretAllowlist(tools, "*")).not.toThrow();
   });
 
-  it("allowlist passes when every needed name is in it", () => {
-    const tools = new Map<string, Tool>([
-      [
-        "s3",
-        makeTool({
-          name: "s3",
-          secrets: {
-            required: ["AWS_ACCESS_KEY_ID"],
-            optional: ["AWS_REGION"],
-          },
-        }),
-      ],
-    ]);
+  it("passes when every needed secret is in the allowlist", () => {
+    const tools = toolMap(
+      makeTool({
+        name: "s3",
+        secrets: { required: ["AWS_ACCESS_KEY_ID"], optional: ["AWS_REGION"] },
+      }),
+    );
     expect(() =>
       assertSecretAllowlist(tools, ["AWS_ACCESS_KEY_ID", "AWS_REGION"]),
     ).not.toThrow();
   });
 
-  it("throws when a tool wants a secret outside the allowlist", () => {
-    const tools = new Map<string, Tool>([
-      [
-        "s3",
-        makeTool({
-          name: "s3",
-          secrets: {
-            required: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
-          },
-        }),
-      ],
-    ]);
+  it("throws when a needed secret is outside the allowlist", () => {
+    const tools = toolMap(
+      makeTool({
+        name: "s3",
+        secrets: { required: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] },
+      }),
+    );
     expect(() => assertSecretAllowlist(tools, ["AWS_ACCESS_KEY_ID"])).toThrow(
       SecretError,
     );
   });
 
   it("empty allowlist denies any tool that wants a secret", () => {
-    const tools = new Map<string, Tool>([
-      [
-        "fetch",
-        makeTool({
-          name: "fetch",
-          secrets: { optional: ["BEARER_TOKEN"] },
-        }),
-      ],
-    ]);
+    const tools = toolMap(
+      makeTool({ name: "fetch", secrets: { optional: ["BEARER_TOKEN"] } }),
+    );
     expect(() => assertSecretAllowlist(tools, [])).toThrow(SecretError);
   });
 });

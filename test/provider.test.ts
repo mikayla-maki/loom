@@ -9,10 +9,25 @@ import type {
 } from "../src/types/interfaces.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 
+type CapturingProvider = Tools & { capturedCapabilities?: unknown };
+
+function providerFor(...tools: Tool[]): CapturingProvider {
+  const provider: CapturingProvider = {
+    resolveTool(name, _config, _agent, capabilities) {
+      const tool = tools.find((t) => t.name === name);
+      if (!tool) return null;
+      provider.capturedCapabilities = capabilities;
+      return tool;
+    },
+    close: () => {},
+  };
+  return provider;
+}
+
 describe("Tools extension — dynamic tool resolution", () => {
-  it("a programmatic provider supplies a tool the model uses", async () => {
+  it("serves provider tools by name and forwards input/output", async () => {
     let receivedInput: unknown = null;
-    const stubTool: Tool = {
+    const shout: Tool = {
       name: "stub.shout",
       description: "Shout text from the provider's in-memory tool.",
       inputSchema: {
@@ -22,73 +37,10 @@ describe("Tools extension — dynamic tool resolution", () => {
       },
       async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
         receivedInput = input;
-        const text = String((input as { text: string }).text);
-        return { content: text.toUpperCase() + "!" };
+        return { content: String((input as { text: string }).text).toUpperCase() + "!" };
       },
     };
-
-    const provider: Tools = {
-      resolveTool(name) {
-        if (name === "stub.shout") return stubTool;
-        return null;
-      },
-      close: () => {},
-    };
-
-    // Inline parent agent. The provider claims `stub.shout` from
-    // [tools]; the harness can call it by name.
-    const spec: AgentManifest = {
-      name: "provider-agent",
-      systemPrompt: "x",
-      tools: { "stub.shout": "builtin" },
-      harness: {
-        provider: "test",
-        script: [
-          [
-            { call: { tool: "stub.shout", input: { text: "hi" } } },
-            { stop: "end_turn" },
-          ],
-        ],
-      },
-    };
-
-    const agent = await runAgent(spec, {
-      providers: [provider],
-    });
-    try {
-      await agent.prompt("go");
-      const events = (await agent.session.pull?.([])) ?? [];
-      const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
-      expect(tu).toBeTruthy();
-      if (tu && tu.sessionUpdate === "tool_call_update") {
-        expect(tu.status).toBe("completed");
-        const text =
-          tu.content?.[0]?.type === "content" &&
-          tu.content[0].content.type === "text"
-            ? tu.content[0].content.text
-            : "";
-        expect(text).toBe("HI!");
-      }
-      expect(receivedInput).toEqual({ text: "hi" });
-    } finally {
-      await agent.close();
-    }
-  });
-
-  it("a provider serves multiple tools by name", async () => {
-    const fsSearch: Tool = {
-      name: "fs.search",
-      description: "Search files (synthetic).",
-      inputSchema: {
-        type: "object",
-        required: ["q"],
-        properties: { q: { type: "string" } },
-      },
-      async execute(input) {
-        return { content: `searched: ${(input as { q: string }).q}` };
-      },
-    };
-    const fsRead: Tool = {
+    const read: Tool = {
       name: "fs.read",
       description: "Read a file (synthetic).",
       inputSchema: {
@@ -101,24 +53,15 @@ describe("Tools extension — dynamic tool resolution", () => {
       },
     };
 
-    const provider: Tools = {
-      resolveTool(name) {
-        if (name === "fs.search") return fsSearch;
-        if (name === "fs.read") return fsRead;
-        return null;
-      },
-      close: () => {},
-    };
-
     const spec: AgentManifest = {
-      name: "skill-provider-agent",
+      name: "provider-agent",
       systemPrompt: "x",
-      tools: { "fs.search": "builtin", "fs.read": "builtin" },
+      tools: { "stub.shout": "builtin", "fs.read": "builtin" },
       harness: {
         provider: "test",
         script: [
           [
-            { call: { tool: "fs.search", input: { q: "needle" } } },
+            { call: { tool: "stub.shout", input: { text: "hi" } } },
             { call: { tool: "fs.read", input: { path: "/etc/hosts" } } },
             { stop: "end_turn" },
           ],
@@ -126,33 +69,29 @@ describe("Tools extension — dynamic tool resolution", () => {
       },
     };
 
-    const agent = await runAgent(spec, {
-      providers: [provider],
-    });
+    const agent = await runAgent(spec, { providers: [providerFor(shout, read)] });
     try {
       await agent.prompt("go");
       const events = (await agent.session.pull?.([])) ?? [];
-      const updates = events.filter(
-        (e) => e.sessionUpdate === "tool_call_update",
-      );
+      const updates = events.filter((e) => e.sessionUpdate === "tool_call_update");
       expect(updates).toHaveLength(2);
 
       const texts = updates.map((u) =>
         u.sessionUpdate === "tool_call_update" &&
+        u.status === "completed" &&
         u.content?.[0]?.type === "content" &&
         u.content[0].content.type === "text"
           ? u.content[0].content.text
           : "",
       );
-      expect(texts).toEqual(["searched: needle", "read: /etc/hosts"]);
+      expect(texts).toEqual(["HI!", "read: /etc/hosts"]);
+      expect(receivedInput).toEqual({ text: "hi" });
     } finally {
       await agent.close();
     }
   });
 
-  it("provider-supplied tool with unmet `requires` fails boot", async () => {
-    // Tool declares it needs the `network` kind; the manifest's
-    // [capabilities] grant doesn't include it → boot fails.
+  it("fails boot when a provider tool's `requires` is not granted", async () => {
     const netTool: Tool = {
       name: "danger.net",
       description: "x",
@@ -162,32 +101,19 @@ describe("Tools extension — dynamic tool resolution", () => {
         return { content: "noop" };
       },
     };
-    const provider: Tools = {
-      resolveTool(name) {
-        if (name === "danger.net") return netTool;
-        return null;
-      },
-      close: () => {},
-    };
-
     const spec: AgentManifest = {
       name: "n",
       systemPrompt: "x",
       tools: { "danger.net": "builtin" },
       harness: { provider: "test" },
-      capabilities: { "danger.net": {} }, // empty grant, network missing
+      capabilities: { "danger.net": {} },
     };
     await expect(
-      runAgent(spec, {
-        providers: [provider],
-      }),
+      runAgent(spec, { providers: [providerFor(netTool)] }),
     ).rejects.toThrow(/missing required.*network/);
   });
 
-  it("provider-supplied tool gets its grant via the 4th resolveTool arg", async () => {
-    // The provider should receive the manifest's grant and forward it
-    // to the tool, which stores it on `this.capabilities` for self-policing.
-    let receivedCapabilities: unknown = null;
+  it("passes the manifest grant to resolveTool's capabilities argument", async () => {
     const tool: Tool = {
       name: "observed",
       description: "x",
@@ -197,16 +123,7 @@ describe("Tools extension — dynamic tool resolution", () => {
         return { content: "" };
       },
     };
-    const provider: Tools = {
-      resolveTool(name, _config, _agent, capabilities) {
-        if (name === "observed") {
-          receivedCapabilities = capabilities;
-          return tool;
-        }
-        return null;
-      },
-      close: () => {},
-    };
+    const provider = providerFor(tool);
     const spec: AgentManifest = {
       name: "n",
       systemPrompt: "x",
@@ -216,7 +133,7 @@ describe("Tools extension — dynamic tool resolution", () => {
     };
     const agent = await runAgent(spec, { providers: [provider] });
     try {
-      expect(receivedCapabilities).toEqual({ foo: ["a", "b"] });
+      expect(provider.capturedCapabilities).toEqual({ foo: ["a", "b"] });
     } finally {
       await agent.close();
     }

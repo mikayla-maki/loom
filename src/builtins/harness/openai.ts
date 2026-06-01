@@ -1,47 +1,3 @@
-/**
- * OpenAI harness — Responses API via the official `openai` SDK.
- *
- * Config:
- *   model: string                   (default `gpt-5.1`)
- *   apiKey: string                  (optional; otherwise OPENAI_API_KEY)
- *   apiBase: string                 (optional; default api.openai.com/v1)
- *   maxOutputTokens: number         (optional; soft cap on output + reasoning)
- *   maxTurnRequests: number         (default 16; soft cap on model calls per turn)
- *   stream: boolean                 (default true; emit text + reasoning deltas live)
- *
- * Translation — ACP `SessionUpdate` → Responses API input items:
- *   - `user_message_chunk`   → `EasyInputMessage(role=user)` with mixed text + image content
- *   - `agent_message_chunk`  → `EasyInputMessage(role=assistant)` text
- *   - `agent_thought_chunk`  → dropped (reasoning items are one-way, like Anthropic's thinking)
- *   - `tool_call`            → `ResponseFunctionToolCall` (call_id + name + arguments)
- *   - `tool_call_update`     → `FunctionCallOutput` (call_id + stringified output)
- *
- * Image support flows via ACP's `{ type: "image", mimeType, data }`
- * `ContentBlock`. The harness packs it into a Responses API
- * `input_image` content with a `data:` URL.
- *
- * Reasoning ("thinking"):
- *   - `params.effort` maps to `reasoning.effort` (Responses API
- *     vocabulary: `none | minimal | low | medium | high | xhigh`).
- *     Loom's `"max"` is mapped to `"xhigh"` (the highest level Responses
- *     supports). `"low" | "medium" | "high" | "xhigh"` pass through.
- *   - `params.thinking` is forwarded verbatim as the `reasoning`
- *     param, so callers wanting to set `summary` or other fields can
- *     do so directly.
- *
- * Loop:
- *   The harness re-requests the model while the response contains
- *   `function_call` output items; once it returns text-only output,
- *   the turn ends with `end_turn`. `maxTurnRequests` is a soft cap on
- *   per-turn API requests.
- *
- * Streaming:
- *   With `stream: true` the SDK's `ResponseStream` helper is consumed
- *   via its `response.output_text.delta` and
- *   `response.reasoning_text.delta` events, which emit deltas as they
- *   arrive. The final `Response` is taken from `finalResponse()`.
- */
-
 import OpenAI, { APIUserAbortError } from "openai";
 import type {
   EasyInputMessage,
@@ -85,8 +41,6 @@ interface OpenAIConfig {
 
 export class OpenAIHarness implements Harness {
   private readonly client: OpenAI;
-
-  /** Cumulative usage across the current turn. Reset at each `run()` start. */
   private turnUsage: TurnUsage | null = null;
 
   constructor(
@@ -100,12 +54,6 @@ export class OpenAIHarness implements Harness {
     this.client = new OpenAI({ apiKey, baseURL: apiBase });
   }
 
-  /**
-   * Implements the optional `Harness.withModel` API — returns a
-   * sibling harness with the same credentials/transport but a
-   * different model id. Used by parent-derived harness factories
-   * (e.g. `small-model-of-parent`).
-   */
   withModel(modelId: string): OpenAIHarness {
     return new OpenAIHarness(
       modelId,
@@ -117,12 +65,6 @@ export class OpenAIHarness implements Harness {
     );
   }
 
-  /**
-   * Implements the optional `Harness.smallModel` API — returns the
-   * id of a smaller/faster sibling of the currently-configured
-   * model. Pattern-matches the known `mini` families; falls back to
-   * `gpt-4o-mini` for unrecognised model ids.
-   */
   smallModel(): string {
     const m = this.model;
     if (m.includes("mini")) return m;
@@ -133,26 +75,13 @@ export class OpenAIHarness implements Harness {
     return "gpt-4o-mini";
   }
 
-  /**
-   * Implements `Harness.currentModel` — the model id this harness
-   * is currently configured to route to.
-   */
   currentModel(): string {
     return this.model;
   }
 
-  /** Lazy cache of `client.models.list()`; see Anthropic harness. */
   private modelsListCache: HarnessModel[] | null = null;
   private modelsListInflight: Promise<HarnessModel[]> | null = null;
 
-  /**
-   * Implements `Harness.models` — returns the list of models the
-   * OpenAI API advertises for this account. The OpenAI list is
-   * deeply heterogeneous (chat, embeddings, audio, image, fine-tunes,
-   * etc.); we filter to ids that look like text-generation models
-   * (`gpt-*`, `o*`, `chatgpt-*`) since those are the only ones a
-   * Responses-API-driven harness can swap to.
-   */
   async models(): Promise<HarnessModel[]> {
     if (this.modelsListCache !== null) return this.modelsListCache;
     if (this.modelsListInflight) return this.modelsListInflight;
@@ -163,8 +92,6 @@ export class OpenAIHarness implements Harness {
           if (!isResponsesApiModel(m.id)) continue;
           out.push({ id: m.id });
         }
-        // Sort newest-first by id heuristic; the API doesn't return
-        // a stable sort order across calls.
         out.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
         this.modelsListCache = out;
         return out;
@@ -178,10 +105,6 @@ export class OpenAIHarness implements Harness {
     return this.modelsListInflight;
   }
 
-  /**
-   * Native summarisation. Responses API with no tools and a single
-   * combined prompt; cheaper than `summariseViaRun`.
-   */
   async summarise(args: SummariseArgs): Promise<string> {
     const input = this.eventsToInputItems(args.events);
     input.push({
@@ -260,10 +183,6 @@ export class OpenAIHarness implements Harness {
           });
           return this.finishTurn("cancelled");
         }
-        // Don't pollute the session log with the error text — it isn't
-        // an assistant utterance. Stop with `error`; the runtime's
-        // consumer (ACP server, CLI REPL, SDK caller) renders
-        // `result.error.message` however it likes.
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
         return this.finishTurn("error", {
           message: `[openai] ${(e as Error).message}`,
@@ -275,7 +194,6 @@ export class OpenAIHarness implements Harness {
         await this.emitUsageUpdate(runtime, response.usage);
       }
 
-      // Walk the output items: collect function calls for dispatch.
       const toolCalls: ResponseFunctionToolCall[] = [];
       for (const item of response.output) {
         if (item.type === "function_call") {
@@ -296,10 +214,6 @@ export class OpenAIHarness implements Harness {
         }
       }
 
-      // Map Responses API stop conditions to ACP `StopReason`. The
-      // Responses API uses `incomplete_details.reason` when the response
-      // didn't finish naturally; the `status` field carries the broad
-      // outcome.
       if (
         response.status === "incomplete" &&
         response.incomplete_details?.reason === "max_output_tokens"
@@ -311,7 +225,6 @@ export class OpenAIHarness implements Harness {
         return this.finishTurn("max_tokens");
       }
       if (response.status === "incomplete") {
-        // Other incomplete reasons (content_filter, etc.) — surface as error.
         const reason = response.incomplete_details?.reason ?? "unknown";
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
         return this.finishTurn("error", {
@@ -347,8 +260,6 @@ export class OpenAIHarness implements Harness {
           const status: ToolCallStatus = result.isError
             ? "failed"
             : "completed";
-          // Split-channel emit (see `Runtime.emitToolResult` and
-          // anthropic.ts for the rationale).
           await runtime.emitToolResult({
             toolCallId: tc.call_id,
             status,
@@ -357,12 +268,9 @@ export class OpenAIHarness implements Harness {
           });
         }),
       );
-      // Next iteration: input items include the function_call and
-      // function_call_output records for these calls.
     }
   }
 
-  /** Non-streaming path: one `responses.create()` call. */
   private async runNonStreaming(
     body: ResponseCreateParamsBase,
     runtime: Runtime,
@@ -371,7 +279,6 @@ export class OpenAIHarness implements Harness {
       { ...body, stream: false },
       { signal: runtime.abortSignal },
     );
-    // Surface text + reasoning content blocks (no live streaming).
     for (const item of response.output) {
       if (item.type === "message" && item.role === "assistant") {
         for (const part of item.content) {
@@ -412,11 +319,6 @@ export class OpenAIHarness implements Harness {
     return response;
   }
 
-  /**
-   * Streaming path: forward text + reasoning text deltas live via the
-   * SDK's `ResponseStream` helper. Final `Response` from
-   * `finalResponse()` is returned to the common post-response code.
-   */
   private async runStreaming(
     body: ResponseCreateParamsBase,
     runtime: Runtime,
@@ -459,10 +361,6 @@ export class OpenAIHarness implements Harness {
     return final;
   }
 
-  /**
-   * Wrap a stop reason with the turn's accumulated usage (if any) and
-   * the optional error message (when `stopReason === "error"`).
-   */
   private finishTurn(
     stopReason: StopReason,
     error?: { message: string },
@@ -473,7 +371,6 @@ export class OpenAIHarness implements Harness {
     return result;
   }
 
-  /** Fold a per-request usage payload into the turn's cumulative tally. */
   private accumulateUsage(u: ResponseUsage): void {
     const cur: TurnUsage = this.turnUsage ?? {
       inputTokens: 0,
@@ -499,14 +396,6 @@ export class OpenAIHarness implements Harness {
     this.turnUsage = cur;
   }
 
-  /**
-   * Emit a `usage_update`. `used` = this request's input + output; the
-   * Responses API doesn't surface a context window from its standard
-   * usage payload, so `size` is left at 0 (clients render "used"
-   * alone). A model-info lookup is possible via `client.models.retrieve`
-   * but the field isn't standardised; we defer that until OpenAI
-   * exposes it consistently.
-   */
   private async emitUsageUpdate(
     runtime: Runtime,
     u: ResponseUsage,
@@ -519,44 +408,23 @@ export class OpenAIHarness implements Harness {
     });
   }
 
-  /**
-   * Translate the session event log into Responses API input items.
-   * Consecutive user/assistant text chunks coalesce into one message
-   * (matching natural turn boundaries). Image content packs into an
-   * `input_image` content part with a base64 `data:` URL.
-   *
-   * Function calls and their results round-trip as discrete input
-   * items (`function_call` + `function_call_output`) so the model can
-   * correlate them across turns.
-   */
   private eventsToInputItems(events: SessionUpdate[]): ResponseInputItem[] {
     const items: ResponseInputItem[] = [];
 
-    /**
-     * If the last item is a user/assistant message, return its content
-     * list (creating array form if it's currently a plain string).
-     * Otherwise null — the caller pushes a fresh message.
-     */
+    const isMessageItem = (
+      item: ResponseInputItem,
+    ): item is EasyInputMessage =>
+      !("type" in item) ||
+      item.type === "message" ||
+      item.type === undefined;
+
     const lastMessageContent = (
       role: "user" | "assistant",
     ): ResponseInputMessageContentList | null => {
       const last = items[items.length - 1];
-      if (
-        last &&
-        !(
-          "type" in last &&
-          last.type !== "message" &&
-          last.type !== undefined
-        ) &&
-        "role" in last &&
-        last.role === role &&
-        (!("type" in last) ||
-          last.type === "message" ||
-          last.type === undefined)
-      ) {
+      if (last && isMessageItem(last) && "role" in last && last.role === role) {
         const easy = last as EasyInputMessage;
         if (Array.isArray(easy.content)) return easy.content;
-        // String shorthand — promote to array form.
         const promoted: ResponseInputMessageContentList = easy.content
           ? [{ type: "input_text", text: easy.content }]
           : [];
@@ -577,8 +445,6 @@ export class OpenAIHarness implements Harness {
     const pushAssistantText = (text: string): void => {
       const existing = lastMessageContent("assistant");
       if (existing) {
-        // Assistant input messages use `input_text` for content parts
-        // (echoing the conversation back to the model).
         existing.push({ type: "input_text", text });
       } else {
         items.push({
@@ -602,12 +468,8 @@ export class OpenAIHarness implements Harness {
           break;
         }
         case "agent_thought_chunk":
-          // Reasoning is one-way; don't echo it back.
           break;
         case "tool_call": {
-          // Emit a function_call output item so the model sees its
-          // own prior tool invocation when correlating against
-          // function_call_output below.
           const call: ResponseFunctionToolCall = {
             type: "function_call",
             call_id: e.toolCallId,
@@ -643,25 +505,7 @@ export class OpenAIHarness implements Harness {
   }
 }
 
-/**
- * Build the `reasoning` body field from RunParameters. Returns
- * undefined when no reasoning config is requested (skips the field
- * entirely so non-reasoning models don't reject the request).
- *
- * `params.thinking` (when set) wins, since callers passing it expect
- * to control the full `Reasoning` shape (effort + summary). When only
- * `params.effort` is set, we map it to `reasoning.effort`. Loom's
- * `"max"` is an Anthropic-only level; on OpenAI it maps to `"xhigh"`.
- */
-/**
- * Heuristic filter for OpenAI's `models.list()`: keep only ids that
- * a Responses-API-driven harness can actually swap to. The list
- * returns embeddings, audio, image, moderation, fine-tunes, etc.;
- * we don't want any of those in a `model` config selector.
- */
 function isResponsesApiModel(id: string): boolean {
-  // Text-generation families. Conservative — if a new family ships
-  // we'd rather omit it from the picker than confuse the user.
   if (id.startsWith("gpt-")) return true;
   if (id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4")) {
     return true;
@@ -683,13 +527,11 @@ function buildReasoning(
 }
 
 function mapEffort(e: RunParameters["effort"]): ReasoningEffort {
-  // Responses API supports: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
-  // Loom's RunParameters: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  // Loom's "max" has no Responses equivalent; "xhigh" is the highest level.
   if (e === "max") return "xhigh";
   return e as ReasoningEffort;
 }
 
-/** Translate an ACP ContentBlock to a Responses API input content part. */
 function acpToOpenAIContent(
   block: ACPContentBlock,
 ): ResponseInputContent | null {
@@ -697,9 +539,6 @@ function acpToOpenAIContent(
     return block.text ? { type: "input_text", text: block.text } : null;
   }
   if (block.type === "image") {
-    // Responses API accepts either a `file_id` (uploaded via /files)
-    // or an `image_url` that may be a fully-qualified URL OR a base64
-    // data URL. ACP carries the bytes, so we use the data URL form.
     return {
       type: "input_image",
       detail: "auto",
@@ -707,7 +546,6 @@ function acpToOpenAIContent(
     };
   }
   if (block.type === "resource") {
-    // Resource blocks aren't a thing on OpenAI; degrade to text.
     const res = block.resource;
     const text =
       "text" in res && typeof res.text === "string"
@@ -718,7 +556,6 @@ function acpToOpenAIContent(
   return null;
 }
 
-/** Fallback text extractor for `summarise()` when `output_text` isn't populated. */
 function extractTextFromOutput(items: ResponseOutputItem[]): string {
   const parts: string[] = [];
   for (const item of items) {
@@ -734,9 +571,6 @@ function extractTextFromOutput(items: ResponseOutputItem[]): string {
 export const openaiHarnessFactory: HarnessFactory = {
   name: "openai",
   secrets: { required: ["OPENAI_API_KEY"] },
-  // OpenAI Responses API accepts inline image content and embedded
-  // resources. Audio isn't supported in this path. Reported at
-  // `initialize` time without instantiating the harness.
   acpCapabilities() {
     return { promptCapabilities: { image: true, embeddedContext: true } };
   },

@@ -1,11 +1,3 @@
-/**
- * Parent-derived session factories. Sub-agent only (enforced by
- * `requiresParent: true`).
- *
- *   `fork-of-parent`: snapshot parent's events into a new `InMemorySession`
- *   at fork time; subsequent appends on either side don't bleed.
- */
-
 import { InMemorySession } from "./memory.js";
 import { ResolutionError } from "../../errors.js";
 import type {

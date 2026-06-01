@@ -1,34 +1,9 @@
-/**
- * `loom install` — materialise the manifest's npm and path dependencies
- * so `loom run` can resolve them at boot. See `internal-docs/manifest-v3.md`
- * §3 for the full design.
- *
- * Layout (per manifest dir):
- *
- *   <manifest-dir>/
- *   ├── agent.toml
- *   ├── .loom/
- *   │   ├── package.json          (generated; npm deps from manifest)
- *   │   ├── node_modules/         (npm install output)
- *   │   └── lock.toml             (canonical lockfile; safe to commit)
- *
- * `lock.toml` records each source the manifest references and what was
- * on disk after the install. `loom run` consumes the manifest directly
- * — the lockfile is currently informational, surfaced via `loom audit`.
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 
-// Split TOML responsibilities: the spec-compliant `toml` package
-// (BinaryMuse) for PARSING — mixed-type arrays + dotted/quoted
-// inline-table keys per TOML 1.1.0 — and `@iarna/toml` for STRINGIFY,
-// since `toml` is parse-only. The lockfile we write is simple enough
-// that @iarna's output is fine; we only need the modern parser on
-// the read side, where users hand-write manifests.
 import * as TOML from "toml";
 import TOMLWriter from "@iarna/toml";
 
@@ -41,36 +16,20 @@ import type { AgentManifest, SourceSpec } from "../types/manifest.js";
 const exec = promisify(execFile);
 
 export interface InstallOptions {
-  /**
-   * If true, exit with an error when `lock.toml` is missing or stale.
-   * Used by CI / reproducible builds: refuses to discover new versions.
-   */
   frozen?: boolean;
-  /**
-   * Skip the actual `npm install` step. Used by tests that pre-populate
-   * `.loom/node_modules` themselves (no network needed) but still want
-   * the lockfile written.
-   */
   skipNpmInstall?: boolean;
-  /**
-   * Where to log progress. Defaults to stderr; pass a no-op writer to
-   * silence (e.g. when running install programmatically).
-   */
   log?: (line: string) => void;
 }
 
 export interface InstallResult {
   manifestPath: string;
   loomDir: string;
-  /** Per-source resolved location (relative to manifestDir). */
   sources: InstallSourceRecord[];
-  /** True if `npm install` was actually run. */
   ranNpmInstall: boolean;
 }
 
 export interface InstallSourceRecord {
   spec: string;
-  /** Resolved version (npm) or absolute path on disk. */
   resolved?: string;
   location: string;
 }
@@ -85,13 +44,9 @@ export async function installManifest(
   const manifestDir = path.dirname(absManifest);
   const loomDir = path.join(manifestDir, ".loom");
 
-  // ─── 1. Harvest sources from the manifest ──────────────────────
-  // ─── 1. Harvest sources from the manifest ──────────────
   const sources = harvestSources(manifest);
   if (sources.size === 0) {
     log("loom install: no non-builtin sources in the manifest; nothing to do");
-    // Still write the empty lockfile + .gitignore so `--frozen` has
-    // something to verify against and the directory is git-friendly.
     await fs.mkdir(loomDir, { recursive: true });
     await writeLockfile(manifestDir, manifest, []);
     await writeGitignore(loomDir);
@@ -103,7 +58,6 @@ export async function installManifest(
     };
   }
 
-  // ─── 2. Frozen mode: refuse if lockfile is stale ───────────────
   if (options.frozen) {
     const existing = await readLockfile(manifestDir).catch(() => null);
     if (!existing) {
@@ -121,7 +75,6 @@ export async function installManifest(
     }
   }
 
-  // ─── 3. Split into npm vs path; validate path sources eagerly ───
   const npmSources: Array<{
     key: string;
     source: { npm: string; version?: string };
@@ -148,7 +101,6 @@ export async function installManifest(
     }
   }
 
-  // ─── 4. Write .loom/package.json + run npm install ──────────────
   await fs.mkdir(loomDir, { recursive: true });
   let ranNpmInstall = false;
   if (npmSources.length > 0 && !options.skipNpmInstall) {
@@ -181,8 +133,6 @@ export async function installManifest(
     }
     ranNpmInstall = true;
   } else if (npmSources.length > 0 && options.skipNpmInstall) {
-    // Still write the package.json so the install step is reproducible
-    // by hand even when the tool is skipping the npm command itself.
     const pkgJson = generateLoomPackageJson(manifest.name, npmSources);
     await fs.writeFile(
       path.join(loomDir, "package.json"),
@@ -191,7 +141,6 @@ export async function installManifest(
     );
   }
 
-  // ─── 5. Build install records (read versions from node_modules) ─
   const records: InstallSourceRecord[] = [];
   for (const { key, source } of npmSources) {
     const pkgDir = path.join(loomDir, "node_modules", source.npm);
@@ -202,8 +151,7 @@ export async function installManifest(
       ) as { version?: string };
       resolved = pj.version;
     } catch {
-      // npm install was skipped or the package isn't on disk yet;
-      // the lockfile still records what the manifest asked for.
+      // npm install skipped or package not yet on disk
     }
     records.push({
       spec: sourceSpecToKey(source),
@@ -222,7 +170,6 @@ export async function installManifest(
     });
   }
 
-  // ─── 6. Write .loom/lock.toml + .gitignore ─────────────────────
   await writeLockfile(manifestDir, manifest, records);
   await writeGitignore(loomDir);
 
@@ -235,17 +182,6 @@ export async function installManifest(
   };
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Source harvesting.
-// ──────────────────────────────────────────────────────────────────────
-
-/**
- * Run the manifest through the resolver and collect every distinct
- * SourceSpec it references — declared `[providers]` handles plus
- * inline references from `[tools]`, `[harness].provider`,
- * `[session].provider`. The resolver dedupes by canonical key, so
- * the install step and the runtime see the same set.
- */
 function harvestSources(manifest: AgentManifest): Map<string, SourceSpec> {
   const builtinToolNames = new Set(nativeBuiltinNames());
   const resolved = resolveManifest(manifest, { builtinToolNames });
@@ -260,22 +196,12 @@ function sourceSpecToKey(s: SourceSpec): string {
   return sourceSpecKey(s);
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Generated files.
-// ──────────────────────────────────────────────────────────────────────
-
 function generateLoomPackageJson(
   agentName: string,
   npmSources: Array<{ source: { npm: string; version?: string } }>,
 ): Record<string, unknown> {
   const dependencies: Record<string, string> = {};
   for (const { source } of npmSources) {
-    // If two manifest entries pin the same package to different
-    // versions, the harvest map already deduped them by source key
-    // (`npm:<name>@<ver>`), so each entry here has a unique key.
-    // npm itself will only install one version per name, though, so
-    // a mismatch would surface there. We keep the last-wins behaviour
-    // (consistent with TOML overwrite semantics).
     dependencies[source.npm] = source.version ?? "*";
   }
   return {
@@ -324,9 +250,6 @@ async function writeLockfile(
       location: r.location,
     })),
   };
-  // @iarna/toml stringifies arrays-of-tables as `[[source]]` blocks.
-  // Lockfile is internal so the output side doesn't need TOML 1.1.0
-  // niceties — @iarna is fine here.
   const text = TOMLWriter.stringify(lock as unknown as TOMLWriter.JsonMap);
   await fs.writeFile(
     path.join(manifestDir, ".loom", "lock.toml"),
@@ -365,9 +288,9 @@ async function writeGitignore(loomDir: string): Promise<void> {
   const p = path.join(loomDir, ".gitignore");
   try {
     await fs.access(p);
-    return; // already exists; leave the user's tweaks alone
+    return;
   } catch {
-    // not present; generate the default
+    // fall through and generate the default
   }
   const text =
     "# Generated by `loom install`. lock.toml is the only file in\n" +

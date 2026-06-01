@@ -1,16 +1,3 @@
-/**
- * Tests for the `web_search` builtin (Brave LLM Context API).
- *
- * Covers:
- *   - happy path: fetch is called with the right shape; results render
- *     as markdown
- *   - input.freshness / input.count override the configured defaults
- *   - missing API key returns an isError result, doesn't hit the API
- *   - non-2xx response is surfaced as an error
- *   - registered in the native provider under the name "web_search"
- *   - end-to-end: runAgent → tool call → rendered content
- */
-
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 
 import { WebSearchTool } from "../src/runtime/builtins/web_search.js";
@@ -25,8 +12,6 @@ import type {
   ToolContext,
   ToolResult,
 } from "../src/types/interfaces.js";
-
-// ─── fetch stubbing helpers ──────────────────────────────────────────────
 
 type FetchCall = { url: string; init: RequestInit };
 
@@ -61,8 +46,6 @@ function stubFetch(): FetchStub {
   };
 }
 
-// Minimal ToolContext stub. The web_search tool only reads
-// `ctx.secrets` and `ctx.abortSignal`; everything else can be dummies.
 function buildCtx(secrets: Record<string, string>): ToolContext {
   return {
     secrets,
@@ -74,7 +57,6 @@ function buildCtx(secrets: Record<string, string>): ToolContext {
   };
 }
 
-// A minimal sample Brave response we can vary across tests.
 const SAMPLE_RESPONSE = {
   grounding: {
     generic: [
@@ -105,8 +87,6 @@ const SAMPLE_RESPONSE = {
   },
 };
 
-// ─── Direct-construction tests ───────────────────────────────────────────
-
 describe("web_search tool (direct)", () => {
   let stub: FetchStub;
   beforeEach(() => {
@@ -116,7 +96,7 @@ describe("web_search tool (direct)", () => {
     stub.restore();
   });
 
-  it("declares the BRAVE_SEARCH_API_KEY secret by default", () => {
+  it("declares secret, name, and description by default", () => {
     const tool = new WebSearchTool({}, undefined);
     expect(tool.secrets?.required).toEqual(["BRAVE_SEARCH_API_KEY"]);
     expect(tool.name).toBe("web_search");
@@ -124,35 +104,27 @@ describe("web_search tool (direct)", () => {
     expect(tool.description).toMatch(/BRAVE_SEARCH_API_KEY/);
   });
 
-  it("calls the Brave endpoint with the right shape", async () => {
+  it("calls the Brave endpoint with the right shape and renders markdown", async () => {
     stub.respond(SAMPLE_RESPONSE);
     const tool = new WebSearchTool({}, undefined);
-    const result = await tool.execute(
+    const result = (await tool.execute(
       { query: "mount everest height" },
       buildCtx({ BRAVE_SEARCH_API_KEY: "sk-test" }),
-    );
+    )) as ToolResult;
 
     expect(result.isError).toBeUndefined();
     expect(stub.calls).toHaveLength(1);
-    const call = stub.calls[0]!;
-    const { url, init } = call;
+    const { url, init } = stub.calls[0]!;
     expect(url).toBe("https://api.search.brave.com/res/v1/llm/context");
     expect(init.method).toBe("POST");
     const headers = init.headers as Record<string, string>;
     expect(headers["X-Subscription-Token"]).toBe("sk-test");
     expect(headers["Content-Type"]).toBe("application/json");
-    const body = JSON.parse(String(init.body));
-    expect(body).toEqual({ q: "mount everest height" });
-  });
+    expect(JSON.parse(String(init.body))).toEqual({
+      q: "mount everest height",
+    });
 
-  it("renders results as markdown the model can read", async () => {
-    stub.respond(SAMPLE_RESPONSE);
-    const tool = new WebSearchTool({}, undefined);
-    const result = (await tool.execute(
-      { query: "examples" },
-      buildCtx({ BRAVE_SEARCH_API_KEY: "k" }),
-    )) as ToolResult;
-    expect(result.content).toMatch(/^# Search results for "examples"/);
+    expect(result.content).toMatch(/^# Search results for "mount everest/);
     expect(result.content).toContain("## Example Page");
     expect(result.content).toContain("example.com");
     expect(result.content).toContain("380 days ago");
@@ -175,9 +147,9 @@ describe("web_search tool (direct)", () => {
     expect(result.content).toMatch(/No results for/);
   });
 
-  it("passes config-level defaults to the API body", async () => {
+  it("sends config defaults, lets input override them, and honors custom endpoint/secret", async () => {
     stub.respond(SAMPLE_RESPONSE);
-    const tool = new WebSearchTool(
+    const configured = new WebSearchTool(
       {
         count: 5,
         freshness: "pm",
@@ -187,12 +159,11 @@ describe("web_search tool (direct)", () => {
       },
       undefined,
     );
-    await tool.execute(
+    await configured.execute(
       { query: "react hooks" },
       buildCtx({ BRAVE_SEARCH_API_KEY: "k" }),
     );
-    const body = JSON.parse(String(stub.calls[0]?.init.body));
-    expect(body).toEqual({
+    expect(JSON.parse(String(stub.calls[0]?.init.body))).toEqual({
       q: "react hooks",
       count: 5,
       freshness: "pm",
@@ -200,31 +171,24 @@ describe("web_search tool (direct)", () => {
       context_threshold_mode: "strict",
       maximum_number_of_tokens: 4096,
     });
-  });
 
-  it("input.freshness and input.count override config defaults", async () => {
-    stub.respond(SAMPLE_RESPONSE);
-    const tool = new WebSearchTool({ count: 5, freshness: "pm" }, undefined);
-    await tool.execute(
+    await configured.execute(
       { query: "fresh news", freshness: "pd", count: 10 },
       buildCtx({ BRAVE_SEARCH_API_KEY: "k" }),
     );
-    const body = JSON.parse(String(stub.calls[0]?.init.body));
-    expect(body.freshness).toBe("pd");
-    expect(body.count).toBe(10);
-  });
+    const overridden = JSON.parse(String(stub.calls[1]?.init.body));
+    expect(overridden.freshness).toBe("pd");
+    expect(overridden.count).toBe(10);
 
-  it("respects a custom endpoint and secret_name", async () => {
-    stub.respond(SAMPLE_RESPONSE);
-    const tool = new WebSearchTool(
+    const custom = new WebSearchTool(
       { endpoint: "https://example.test/search", secret_name: "MY_KEY" },
       undefined,
     );
-    expect(tool.secrets?.required).toEqual(["MY_KEY"]);
-    await tool.execute({ query: "x" }, buildCtx({ MY_KEY: "tok" }));
-    expect(stub.calls[0]?.url).toBe("https://example.test/search");
-    const headers = stub.calls[0]?.init.headers as Record<string, string>;
-    expect(headers["X-Subscription-Token"]).toBe("tok");
+    expect(custom.secrets?.required).toEqual(["MY_KEY"]);
+    await custom.execute({ query: "x" }, buildCtx({ MY_KEY: "tok" }));
+    expect(stub.calls[2]?.url).toBe("https://example.test/search");
+    const customHeaders = stub.calls[2]?.init.headers as Record<string, string>;
+    expect(customHeaders["X-Subscription-Token"]).toBe("tok");
   });
 
   it("returns an error (without calling fetch) when the secret is absent", async () => {
@@ -303,14 +267,9 @@ describe("web_search tool (direct)", () => {
   });
 });
 
-// ─── Native registration ─────────────────────────────────────────────────
-
 describe("web_search native registration", () => {
-  it("is listed among the native builtin names", () => {
+  it("is listed and resolves to a WebSearchTool instance", async () => {
     expect(nativeBuiltinNames()).toContain("web_search");
-  });
-
-  it("native provider resolves web_search to a WebSearchTool instance", async () => {
     const native = buildNativeTools();
     const tool = await native.resolveTool(
       "web_search",
@@ -322,8 +281,6 @@ describe("web_search native registration", () => {
     expect(tool?.name).toBe("web_search");
   });
 });
-
-// ─── End-to-end through runAgent ────────────────────────────────────────
 
 describe("web_search end-to-end via runAgent", () => {
   let stub: FetchStub;

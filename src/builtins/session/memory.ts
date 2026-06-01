@@ -1,16 +1,3 @@
-/**
- * `in-memory` session — the canonical leaf storage layer.
- *
- * Events live in a process-local array; nothing is persisted. The
- * session has no config — every instance is a fresh, empty log. When
- * the process exits, the conversation is gone. Use a `file`-backed
- * session below the compacting layer if you want durability.
- *
- * Named "in-memory" rather than "memory" to disambiguate from the
- * broader concept of "the agent's memory" (which is the whole
- * session chain, not just the storage layer).
- */
-
 import type {
   FactoryContext,
   Session,

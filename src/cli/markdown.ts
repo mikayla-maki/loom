@@ -1,21 +1,3 @@
-/**
- * Tiny terminal markdown renderer.
- *
- * Handles the subset that's worth rendering inline:
- *   - # / ## / ### headings        (bold + colored)
- *   - **bold** / __bold__          (ANSI bold)
- *   - *italic* / _italic_          (ANSI italic — many terms render dim)
- *   - `inline code`                (ANSI inverse for legibility)
- *   - ``` fenced blocks            (indent + dim)
- *   - - / * bullets                (replaced with •)
- *   - 1. ordered lists             (left as-is)
- *   - > blockquotes                (vertical bar prefix)
- *
- * Streamed input is fine: render() is pure (string in, string out). For
- * incremental output we render line-by-line; partial fences pass through
- * with a best-effort indent.
- */
-
 const ANSI = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
@@ -31,11 +13,9 @@ const ANSI = {
 };
 
 export interface RenderOptions {
-  /** Disable ANSI styling (e.g. when stdout isn't a TTY). */
   plain?: boolean;
 }
 
-/** Render a complete markdown string into a styled terminal string. */
 export function renderMarkdown(src: string, opts: RenderOptions = {}): string {
   const lines = src.split("\n");
   const out: string[] = [];
@@ -43,7 +23,6 @@ export function renderMarkdown(src: string, opts: RenderOptions = {}): string {
   for (const raw of lines) {
     if (/^```/.test(raw)) {
       inFence = !inFence;
-      // Drop the fence delimiter from the rendered output.
       continue;
     }
     if (inFence) {
@@ -57,10 +36,8 @@ export function renderMarkdown(src: string, opts: RenderOptions = {}): string {
   return out.join("\n");
 }
 
-/** Render a single line. Used for incremental output. */
 export function renderLine(line: string, opts: RenderOptions = {}): string {
   if (opts.plain) return stripMd(line);
-  // Headings
   let m = /^(#{1,6})\s+(.*)$/.exec(line);
   if (m) {
     const level = m[1]!.length;
@@ -69,17 +46,14 @@ export function renderLine(line: string, opts: RenderOptions = {}): string {
       level === 1 ? ANSI.magenta : level === 2 ? ANSI.cyan : ANSI.yellow;
     return `${color}${ANSI.bold}${text}${ANSI.reset}`;
   }
-  // Blockquote
   m = /^>\s?(.*)$/.exec(line);
   if (m) {
     return `${ANSI.gray}│${ANSI.reset} ${inlineMd(m[1]!, opts)}`;
   }
-  // Bullet list
   m = /^(\s*)[-*]\s+(.*)$/.exec(line);
   if (m) {
     return `${m[1]!}${ANSI.cyan}•${ANSI.reset} ${inlineMd(m[2]!, opts)}`;
   }
-  // Numbered list — leave the prefix, render the body
   m = /^(\s*\d+\.\s+)(.*)$/.exec(line);
   if (m) {
     return `${m[1]!}${inlineMd(m[2]!, opts)}`;
@@ -89,12 +63,9 @@ export function renderLine(line: string, opts: RenderOptions = {}): string {
 
 function inlineMd(s: string, opts: RenderOptions): string {
   if (opts.plain) return stripMd(s);
-  // Inline code: `…`
   s = s.replace(/`([^`\n]+)`/g, `${ANSI.inverse}$1${ANSI.reset}`);
-  // Bold: **…** or __…__
   s = s.replace(/\*\*([^*\n]+)\*\*/g, `${ANSI.bold}$1${ANSI.reset}`);
   s = s.replace(/__([^_\n]+)__/g, `${ANSI.bold}$1${ANSI.reset}`);
-  // Italic: *…* or _…_  (avoid matching ** or __)
   s = s.replace(
     /(^|[^*])\*([^*\n]+)\*(?!\*)/g,
     `$1${ANSI.italic}$2${ANSI.reset}`,
@@ -113,5 +84,4 @@ function stripMd(s: string): string {
     .replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1$2");
 }
 
-/** ANSI helper used by callers for non-markdown chrome (banners, etc.). */
 export const ansi = ANSI;

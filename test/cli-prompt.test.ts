@@ -1,10 +1,3 @@
-/**
- * `loom prompt` CLI surface — renderer behaviour, exit-code mapping,
- * and the text-mode system-prompt augmentation. Drives the same
- * entry point the CLI uses (`runPromptCommand`) with in-memory
- * manifests and captured streams; no subprocess.
- */
-
 import { describe, expect, it } from "vitest";
 import { Writable } from "node:stream";
 
@@ -20,10 +13,6 @@ import {
 import type { AgentManifest } from "../src/types/manifest.js";
 import type { Harness, Runtime } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
-
-// ──────────────────────────────────────────────────────────────────
-// Stream capture helpers
-// ──────────────────────────────────────────────────────────────────
 
 interface Capture {
   stdout: () => string;
@@ -53,15 +42,10 @@ function captureStreams(): Capture {
   };
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Inline harness helpers
-// ──────────────────────────────────────────────────────────────────
-
-/** A Harness that records the systemPromptCore it sees and runs a callback. */
 function makeRecordingHarness(
   inner: (rt: Runtime) => Promise<SessionUpdate[]>,
 ): Harness & { systemPromptCore: string | null } {
-  const h = {
+  return {
     systemPromptCore: null as string | null,
     async run(rt: Runtime) {
       this.systemPromptCore = rt.systemPromptCore();
@@ -75,28 +59,10 @@ function makeRecordingHarness(
       return { stopReason: "end_turn" as const };
     },
   };
-  return h;
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Renderer unit tests — synthetic update streams
-// ──────────────────────────────────────────────────────────────────
-
 describe("TextPromptRenderer", () => {
-  it("emits the final agent message on stop, with a trailing newline", () => {
-    const cap = captureStreams();
-    const r = new TextPromptRenderer(cap.streams);
-    r.render({
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "4" },
-    });
-    r.render({ sessionUpdate: "stop", stopReason: "end_turn" });
-    r.finish();
-    expect(cap.stdout()).toBe("4\n");
-    expect(cap.stderr()).toBe("");
-  });
-
-  it("coalesces multiple agent chunks into one stdout write", () => {
+  it("renders only the final agent message, coalesced, with a trailing newline", () => {
     const cap = captureStreams();
     const r = new TextPromptRenderer(cap.streams);
     r.render({
@@ -114,9 +80,10 @@ describe("TextPromptRenderer", () => {
     r.render({ sessionUpdate: "stop", stopReason: "end_turn" });
     r.finish();
     expect(cap.stdout()).toBe("Hello world.\n");
+    expect(cap.stderr()).toBe("");
   });
 
-  it("drops text that comes before a tool call (only post-last-tool text is final)", () => {
+  it("keeps only text after the last tool call", () => {
     const cap = captureStreams();
     const r = new TextPromptRenderer(cap.streams);
     r.render({
@@ -147,7 +114,7 @@ describe("TextPromptRenderer", () => {
     expect(cap.stdout()).toBe("Result: 42.\n");
   });
 
-  it("suppresses thoughts, plans, usage, user echoes", () => {
+  it("suppresses thoughts, plans, usage, and user echoes", () => {
     const cap = captureStreams();
     const r = new TextPromptRenderer(cap.streams);
     r.render({
@@ -169,7 +136,7 @@ describe("TextPromptRenderer", () => {
     expect(cap.stderr()).toBe("");
   });
 
-  it("routes non-text content blocks in the final message to stderr as placeholders", () => {
+  it("routes non-text content blocks to stderr as placeholders", () => {
     const cap = captureStreams();
     const r = new TextPromptRenderer(cap.streams);
     r.render({
@@ -180,7 +147,6 @@ describe("TextPromptRenderer", () => {
       sessionUpdate: "agent_message_chunk",
       content: {
         type: "image",
-        // ~12.3 KB of base64 (16400 chars → 12.3 KB).
         data: "x".repeat(16400),
         mimeType: "image/png",
       },
@@ -191,7 +157,7 @@ describe("TextPromptRenderer", () => {
     expect(cap.stderr()).toMatch(/^\[image: image\/png, [\d.]+ KB\]\n$/);
   });
 
-  it("emits nothing if the agent produced no text and no stop arrived", () => {
+  it("emits nothing when the agent produced no text and no stop arrived", () => {
     const cap = captureStreams();
     const r = new TextPromptRenderer(cap.streams);
     r.finish();
@@ -222,7 +188,6 @@ describe("TracePromptRenderer", () => {
     expect(out).toContain("[user] check disk\n");
     expect(out).toContain("[agent] You have 32GB free.\n");
     expect(out).toContain("[stop] end_turn\n");
-    // exactly one [agent] line, not three:
     expect(out.match(/\[agent\]/g)?.length).toBe(1);
   });
 
@@ -252,21 +217,19 @@ describe("TracePromptRenderer", () => {
     expect(out).toContain("[stop] end_turn");
   });
 
-  it("emits a stderr usage summary if usage_update was seen", () => {
-    const cap = captureStreams();
-    const r = new TracePromptRenderer(cap.streams);
-    r.render({ sessionUpdate: "usage_update", used: 1234, size: 8192 });
-    r.render({ sessionUpdate: "stop", stopReason: "end_turn" });
-    r.finish();
-    expect(cap.stderr()).toBe("[usage] 1234 / 8192 tokens\n");
-  });
+  it("emits a stderr usage summary only when usage_update was seen", () => {
+    const withUsage = captureStreams();
+    const r1 = new TracePromptRenderer(withUsage.streams);
+    r1.render({ sessionUpdate: "usage_update", used: 1234, size: 8192 });
+    r1.render({ sessionUpdate: "stop", stopReason: "end_turn" });
+    r1.finish();
+    expect(withUsage.stderr()).toBe("[usage] 1234 / 8192 tokens\n");
 
-  it("omits the usage line when no usage_update arrived", () => {
-    const cap = captureStreams();
-    const r = new TracePromptRenderer(cap.streams);
-    r.render({ sessionUpdate: "stop", stopReason: "end_turn" });
-    r.finish();
-    expect(cap.stderr()).toBe("");
+    const withoutUsage = captureStreams();
+    const r2 = new TracePromptRenderer(withoutUsage.streams);
+    r2.render({ sessionUpdate: "stop", stopReason: "end_turn" });
+    r2.finish();
+    expect(withoutUsage.stderr()).toBe("");
   });
 });
 
@@ -289,10 +252,7 @@ describe("JsonlPromptRenderer", () => {
     r.finish();
     const lines = cap.stdout().trimEnd().split("\n");
     expect(lines.length).toBe(3);
-    for (const l of lines) {
-      // Each line is valid JSON (jq-compatible shape).
-      expect(() => JSON.parse(l)).not.toThrow();
-    }
+    for (const l of lines) expect(() => JSON.parse(l)).not.toThrow();
     expect(JSON.parse(lines[0]!)).toEqual(updates[0]);
     expect(JSON.parse(lines[2]!)).toEqual({
       sessionUpdate: "stop",
@@ -300,10 +260,6 @@ describe("JsonlPromptRenderer", () => {
     });
   });
 });
-
-// ──────────────────────────────────────────────────────────────────
-// Exit-code mapping
-// ──────────────────────────────────────────────────────────────────
 
 describe("exitCodeForStopReason", () => {
   it("maps known stop reasons to Unix conventions", () => {
@@ -315,10 +271,6 @@ describe("exitCodeForStopReason", () => {
     expect(exitCodeForStopReason("error")).toBe(1);
   });
 });
-
-// ──────────────────────────────────────────────────────────────────
-// System-prompt augmentation
-// ──────────────────────────────────────────────────────────────────
 
 describe("applyTextModeAugmentation", () => {
   it("appends the augmentation to an existing literal system prompt", () => {
@@ -341,16 +293,7 @@ describe("applyTextModeAugmentation", () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────
-// End-to-end: runPromptCommand with an inline harness
-// ─────────────────────────────────────────────────────────────────
-
 describe("runPromptCommand (end-to-end)", () => {
-  /**
-   * Drives `runPromptCommand` with a recording harness that replays
-   * `updates`. Returns the captured streams, the recorded
-   * `systemPromptCore`, and the exit code.
-   */
   async function runScenario(opts: {
     updates: SessionUpdate[];
     format: "text" | "trace" | "jsonl";
@@ -385,7 +328,7 @@ describe("runPromptCommand (end-to-end)", () => {
     };
   }
 
-  it("text mode: no-tool turn → stdout = answer + \\n, exit 0", async () => {
+  it("text mode: no-tool turn renders the answer, exit 0, and augments the system prompt", async () => {
     const r = await runScenario({
       updates: [
         {
@@ -401,15 +344,11 @@ describe("runPromptCommand (end-to-end)", () => {
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("4\n");
     expect(r.stderr).toBe("");
+    expect(r.systemPromptCore).toContain("You answer math.");
+    expect(r.systemPromptCore).toContain(TEXT_MODE_PROMPT_AUGMENTATION);
   });
 
-  it("text mode: multi-segment turn with a tool → only the final answer reaches stdout", async () => {
-    // Emit the same SessionUpdate sequence a real tool dispatch
-    // produces, without actually wiring a tool registration —
-    // we're testing the renderer's coalescing behaviour, not the
-    // tool table. Uses an inline harness (not runScenario) because
-    // we need a custom `run()` rather than `makeRecordingHarness`'s
-    // replay shape.
+  it("text mode: with a tool dispatch, only the final answer reaches stdout", async () => {
     const cap = captureStreams();
     const harness: Harness = {
       async run(rt: Runtime) {
@@ -455,7 +394,7 @@ describe("runPromptCommand (end-to-end)", () => {
     expect(cap.stderr()).toBe("");
   });
 
-  it("text mode: final message with image → stderr placeholder", async () => {
+  it("text mode: a final-message image becomes a stderr placeholder", async () => {
     const r = await runScenario({
       updates: [
         {
@@ -476,25 +415,7 @@ describe("runPromptCommand (end-to-end)", () => {
     expect(r.stderr).toMatch(/\[image: image\/png/);
   });
 
-  it("text mode: system prompt augmentation reaches the harness", async () => {
-    const r = await runScenario({
-      updates: [
-        {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "ok" },
-        },
-        { sessionUpdate: "stop", stopReason: "end_turn" },
-      ],
-      format: "text",
-      systemPrompt: "You are helpful.",
-    });
-    expect(r.code).toBe(0);
-    expect(r.systemPromptCore).not.toBeNull();
-    expect(r.systemPromptCore).toContain("You are helpful.");
-    expect(r.systemPromptCore).toContain(TEXT_MODE_PROMPT_AUGMENTATION);
-  });
-
-  it("trace mode: does NOT augment the system prompt", async () => {
+  it("trace mode: leaves the system prompt unaugmented and traces every event", async () => {
     const r = await runScenario({
       updates: [
         {
@@ -508,13 +429,12 @@ describe("runPromptCommand (end-to-end)", () => {
     });
     expect(r.code).toBe(0);
     expect(r.systemPromptCore).toBe("You are helpful.");
-    // The user echo and agent message both appear, plus stop:
     expect(r.stdout).toContain("[user] hi");
     expect(r.stdout).toContain("[agent] ok");
     expect(r.stdout).toContain("[stop] end_turn");
   });
 
-  it("jsonl mode: each event on its own line; no augmentation", async () => {
+  it("jsonl mode: leaves the system prompt unaugmented and emits one event per line", async () => {
     const r = await runScenario({
       updates: [
         {
@@ -530,7 +450,6 @@ describe("runPromptCommand (end-to-end)", () => {
     expect(r.systemPromptCore).toBe("You are helpful.");
     const lines = r.stdout.trimEnd().split("\n");
     for (const l of lines) expect(() => JSON.parse(l)).not.toThrow();
-    // sanity: includes user, agent, stop
     const kinds = lines.map((l) => JSON.parse(l).sessionUpdate);
     expect(kinds).toContain("user_message_chunk");
     expect(kinds).toContain("agent_message_chunk");

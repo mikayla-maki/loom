@@ -1,13 +1,3 @@
-/**
- * Parser for `agent.toml` (manifest v5). Validates shape and classifies
- * every `Reference` value (bare handle vs. SourceSpec string fast-path
- * vs. SourceSpec table) by *shape*. Does NOT touch the filesystem to
- * resolve sources or look up handles — that happens in the resolver
- * at boot time.
- *
- * See `internal-docs/manifest-v5.md` §1 for the grammar.
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as TOML from "toml";
@@ -30,16 +20,11 @@ import type {
   ToolEntry,
 } from "../types/manifest.js";
 
-// ─── Top-level entry point ─────────────────────────────────────────────────
-
 export async function parseAgentManifest(
   manifestPath: string,
 ): Promise<AgentManifest> {
   const abs = path.resolve(manifestPath);
   const rawToml = await readToml(abs, "agent.toml");
-  // Apply `${VAR}` / `${VAR:-default}` substitution before structural
-  // validation so every downstream consumer sees ready-to-use values.
-  // See `env-substitution.ts` for the syntax and the rationale.
   const raw = substituteEnv(rawToml, { context: abs }) as Record<
     string,
     unknown
@@ -97,18 +82,6 @@ export async function parseAgentManifest(
   };
 }
 
-// ─── Agent-section helpers (system prompt + secrets + storage + metadata) ─
-
-/**
- * Parse `[agent.metadata]`. Must be a TOML table (object); the
- * runtime stores it verbatim and forwards it to plugins as opaque
- * JSON. We don't recursively validate values — anything TOML
- * accepts is fair game.
- *
- * Returns `undefined` when the manifest omits the table, so
- * `manifest.metadata` only appears on the parsed shape when the
- * user actually declared it.
- */
 function parseMetadata(
   v: unknown,
   where: string,
@@ -124,12 +97,6 @@ function parseMetadata(
   return v as Record<string, unknown>;
 }
 
-/**
- * Parse `[agent].storage_id`. Must be a non-empty string with no
- * path separators — same character class as a directory name. The
- * storage layer further sanitizes punctuation; the parser only
- * enforces the structural invariants the user might typo.
- */
 function parseStorageId(v: unknown, where: string): string | undefined {
   if (v === undefined) return undefined;
   if (typeof v !== "string" || v.length === 0) {
@@ -180,8 +147,6 @@ function parseSecretAllowlist(
   );
 }
 
-// ─── [providers] ──────────────────────────────────────────────────────────
-
 function parseProviders(v: unknown, where: string): Providers {
   const obj = ensureObject(v, "[providers]", where);
   const out: Providers = {};
@@ -197,19 +162,6 @@ function parseProviderEntry(
   label: string,
   where: string,
 ): ProviderEntry {
-  // Two accepted on-disk shapes (see `ProviderEntry` JSDoc):
-  //
-  //   1. SourceSpec form — string fast-path or a `{ npm }` / `{ path }`
-  //      table. Code-on-disk; loaded by the provider loader.
-  //   2. Configured-factory form — a table with a `provider` field.
-  //      Same shape as [harness] / [session] / [tools.X]; the
-  //      `provider` field names a Tools factory (built-in or, in
-  //      future, source-loaded) and the rest of the table is
-  //      per-handle config.
-  //
-  // Discriminator: a table carrying a `provider` field IS the
-  // configured-factory form; any other table shape is parsed as a
-  // SourceSpec table.
   if (v && typeof v === "object" && !Array.isArray(v)) {
     const obj = v as Record<string, unknown>;
     if (obj.provider !== undefined) {
@@ -218,12 +170,8 @@ function parseProviderEntry(
       void _p;
       return { provider, ...config };
     }
-    // SourceSpec table (no `provider` field).
     return parseSourceSpecTable(obj, label, where);
   }
-  // Otherwise the value must be a SourceSpec-shaped string. Bare
-  // handles aren't accepted at this layer — they would point at
-  // themselves.
   const ref = parseReference(v, label, where);
   if (typeof ref === "string" && !isSourceSpecShapedString(ref)) {
     throw new ManifestError(
@@ -236,8 +184,6 @@ function parseProviderEntry(
   return ref;
 }
 
-// ─── [tools] ───────────────────────────────────────────────────────────────
-
 function parseToolTable(v: unknown, where: string): Record<string, ToolEntry> {
   const obj = ensureObject(v, "[tools]", where);
   const out: Record<string, ToolEntry> = {};
@@ -248,7 +194,6 @@ function parseToolTable(v: unknown, where: string): Record<string, ToolEntry> {
 }
 
 function parseToolEntry(v: unknown, label: string, where: string): ToolEntry {
-  // String shorthand: equivalent to `{ provider = "<string>" }`.
   if (typeof v === "string") {
     if (v.length === 0) {
       throw new ManifestError(
@@ -278,8 +223,6 @@ function parseToolEntry(v: unknown, label: string, where: string): ToolEntry {
   );
 }
 
-// ─── [harness] / [session] ────────────────────────────────────────────────
-
 function parseHarnessSpec(
   raw: Record<string, unknown>,
   where: string,
@@ -297,46 +240,6 @@ function parseHarnessSpec(
   return { provider, ...config };
 }
 
-/**
- * Parse the `session` field. A manifest has exactly one session;
- * that session is either a single layer (singleton) or a layered
- * composition. Both forms live under one `[session]` block:
- *
- *   - **Singleton.** `[session]` carries a `provider` key. The rest
- *     of the block is its config. This is the trivial one-layer
- *     session.
- *
- *   - **Composition.** `[session]` carries a `layers` key. The value
- *     is an array of layer specs, outer-to-inner. Each entry is
- *     either a string (sugar for `{ provider = "<string>" }`) or an
- *     inline table with its own `provider` + config. TOML's
- *     dotted-key array-of-tables `[[session.layers]]` produces the
- *     same shape and is interchangeable.
- *
- *     **Per-layer config via sibling tables.** TOML 1.1.0 (which
- *     Loom uses) allows mixed-type arrays, so inline
- *     `layers = ["a", { … }, "c"]` parses fine. But it reads badly
- *     for non-trivial config — the idiomatic Loom shape for layered
- *     sessions with per-layer config is to keep `layers` as a flat
- *     string array and attach config via sibling sub-tables keyed
- *     by the layer name:
- *
- *         [session]
- *         layers = ["compacting", "identity", "dms"]
- *
- *         [session.identity]
- *         vault_path = "/some/path"
- *
- *     Each sibling table's keys are merged into the matching string
- *     layer's config (as if the user had written `{ provider =
- *     "identity", vault_path = "…" }` inline). Unknown sibling
- *     names (no matching string entry) and sibling tables that try
- *     to override `provider` are rejected.
- *
- * `provider` and `layers` are mutually exclusive; neither one is an
- * error. The old top-level `[[session]]` form is rejected with a
- * pointer at `[session].layers`.
- */
 function parseSessionField(
   v: unknown,
   where: string,
@@ -377,35 +280,11 @@ function parseSessionField(
   return parseSessionSpec(obj, where);
 }
 
-/**
- * Walk every non-meta key on the `[session]` table and, for each
- * one that's a TOML sub-table (`[session.<name>]`), merge its keys
- * into the corresponding layer's config. Mutates `specs` in place.
- *
- * Rules:
- *   - Sibling key must be a TOML table (sub-table syntax). Scalars
- *     or arrays at non-meta keys are unknown and rejected so
- *     reviewers don't silently lose config they thought they set.
- *   - Sibling name must match a string-shaped entry in `layers`.
- *     If the name corresponds to an inline-table layer (which
- *     already carries its own config), we reject — splitting one
- *     layer's config across two places is a footgun.
- *   - Sibling tables may not redefine `provider`. The layer's
- *     provider is determined by its entry in `layers`; allowing it
- *     here would let the sibling silently re-route the binding.
- *   - When the same layer name appears multiple times in `layers`
- *     (rare but legal), the sibling config applies to all of them.
- *     The user can disambiguate with inline tables if they need
- *     different configs for repeated layers.
- */
 function applySessionSiblingConfigs(
   specs: SessionSpec[],
   parent: Record<string, unknown>,
   where: string,
 ): void {
-  // Build two indices: which positions hold a string entry of a
-  // given name, and which names are already claimed by an inline
-  // table. The second is just for clearer error messages.
   const rawLayers = parent.layers as unknown[];
   const stringIndicesByName = new Map<string, number[]>();
   const inlineTableNames = new Set<string>();
@@ -428,8 +307,6 @@ function applySessionSiblingConfigs(
   for (const [key, value] of Object.entries(parent)) {
     if (key === "provider" || key === "layers") continue;
 
-    // Non-table values at non-meta keys are unknown. Reject so the
-    // user doesn't think their config landed somewhere.
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
       throw new ManifestError(
         `agent.toml at ${where}: [session].${key} is not a recognised meta key ` +
@@ -467,13 +344,8 @@ function applySessionSiblingConfigs(
     }
 
     for (const i of positions) {
-      // specs[i] was produced from the string "<key>", so currently
-      // it's `{ provider: key }`. Merge the sibling table's keys in,
-      // pinning `provider` explicitly so the type checker sees that
-      // the SessionSpec shape is preserved (siblingConfig.provider
-      // is rejected upstream; this is belt-and-suspenders).
       const existing = specs[i];
-      if (!existing) continue; // unreachable: positions[] came from rawLayers
+      if (!existing) continue;
       specs[i] = {
         ...siblingConfig,
         ...existing,
@@ -504,7 +376,6 @@ function parseLayerEntry(
   index: number,
   where: string,
 ): SessionSpec {
-  // String shorthand: equivalent to `{ provider = "<string>" }`.
   if (typeof v === "string") {
     if (v.length === 0) {
       throw new ManifestError(
@@ -545,18 +416,6 @@ function parseSessionSpec(
   return { provider, ...config };
 }
 
-// ─── References (shape-first classification) ──────────────────────────────
-
-/**
- * Parse a `Reference` value. Accepts:
- *
- *   - string (validated by {@link validateReferenceString})
- *   - SourceSpec table (`{ npm = ... }` / `{ path = ... }`)
- *
- * Resolution against the appropriate tables (`[providers]`, built-in
- * registries) happens later in the resolver — the parser only
- * classifies by shape.
- */
 function parseReference(v: unknown, label: string, where: string): Reference {
   if (typeof v === "string") {
     if (v.length === 0) {
@@ -576,22 +435,12 @@ function parseReference(v: unknown, label: string, where: string): Reference {
   );
 }
 
-/**
- * Validate a reference string. Accepted shapes:
- *
- *   - `"./..."`, `"../..."` — local path (SourceSpec fast-path)
- *   - `"name/sub"`, `"@scope/pkg"` — npm spec (SourceSpec fast-path)
- *   - bare identifier — handle for [providers] / built-in
- *
- * Absolute paths (`"/foo"`) are rejected with a pointer to the table
- * form.
- */
 function validateReferenceString(
   s: string,
   label: string,
   where: string,
 ): void {
-  if (s.startsWith("./") || s.startsWith("../")) return; // path
+  if (s.startsWith("./") || s.startsWith("../")) return;
   if (s.startsWith("/")) {
     throw new ManifestError(
       `agent.toml at ${where}: ${label} "${s}" is an absolute path. ` +
@@ -599,7 +448,6 @@ function validateReferenceString(
     );
   }
   if (s.includes("/")) {
-    // npm-shaped
     if (!/^[@a-zA-Z0-9_\-./]+$/.test(s)) {
       throw new ManifestError(
         `agent.toml at ${where}: ${label} "${s}" doesn't look like a valid ` +
@@ -608,7 +456,6 @@ function validateReferenceString(
     }
     return;
   }
-  // Bare handle.
   if (s.includes("@")) {
     throw new ManifestError(
       `agent.toml at ${where}: ${label} "${s}" contains '@' without a slash. ` +
@@ -623,7 +470,6 @@ function validateReferenceString(
   }
 }
 
-/** Validate a `[providers].<handle>` key. */
 function validateHandle(s: string, label: string, where: string): void {
   if (!/^[a-zA-Z_][a-zA-Z0-9_\-.]*$/.test(s)) {
     throw new ManifestError(
@@ -633,17 +479,9 @@ function validateHandle(s: string, label: string, where: string): void {
   }
 }
 
-/**
- * Classify a reference string as a SourceSpec-shaped fast-path
- * (vs. a bare handle). Used by parsers that need to enforce
- * SourceSpec-only (e.g., `[providers]` values can't be bare handles —
- * that would be a self-reference).
- */
 function isSourceSpecShapedString(s: string): boolean {
   return s.startsWith("./") || s.startsWith("../") || s.includes("/");
 }
-
-// ─── SourceSpec table parsing ─────────────────────────────────────────────
 
 function parseSourceSpecTable(
   obj: Record<string, unknown>,
@@ -662,8 +500,6 @@ function parseSourceSpecTable(
       `agent.toml at ${where}: ${label} has multiple source kinds (${present.join(", ")}); pick one`,
     );
   }
-  // We just checked `present.length === 0` and `present.length > 1`,
-  // so exactly one entry remains here.
   const [kind] = present as [(typeof sourceKeys)[number]];
   if (kind === "npm") {
     if (typeof obj.npm !== "string" || !obj.npm) {
@@ -683,7 +519,6 @@ function parseSourceSpecTable(
     rejectStrayKeys(obj, ["npm", "version"], label, where);
     return out;
   }
-  // path
   if (typeof obj.path !== "string" || !obj.path) {
     throw new ManifestError(
       `agent.toml at ${where}: ${label}.path must be a non-empty string`,
@@ -717,8 +552,6 @@ function rejectStrayKeys(
     }
   }
 }
-
-// ─── TOML I/O and ensureObject ────────────────────────────────────────────
 
 async function readToml(
   abs: string,
@@ -761,8 +594,6 @@ function ensureObject(
   return v as Record<string, unknown>;
 }
 
-// ─── [capabilities] ───────────────────────────────────────────────────────
-
 function parseCapabilities(v: unknown, where: string): Capabilities {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     throw new ManifestError(
@@ -803,9 +634,6 @@ function parseCapabilityValue(
   label: string,
 ): CapabilityValue {
   if (v === "*") return "*";
-  // Literal-binding shapes (used by argument-binding tool grants, see
-  // `applyArgGrant`). Built-in kinds that don't recognise the literal
-  // shape will leave the value untouched at audit time.
   if (typeof v === "string") return v;
   if (typeof v === "number") return v;
   if (typeof v === "boolean") return v;

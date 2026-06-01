@@ -9,20 +9,8 @@ import type {
 } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 
-/**
- * The Session can contribute a section to the assembled system prompt.
- * Loom calls `systemPromptSection(agent)` per turn, after
- * `prepareTurn`, passing a fresh `Agent` ref — nothing is bound at
- * boot.
- */
-
-/**
- * Minimal storage session used by these tests. The `push`/`pull`
- * shape is the real Session contract; we only care here about the
- * `systemPromptSection` hook the caller injects.
- */
 function makeSession(
-  sectionOrThrow: string | ((agent: Agent) => string | Promise<string>),
+  section: string | ((agent: Agent) => string | Promise<string>),
 ): Session {
   const events: SessionUpdate[] = [];
   return {
@@ -34,14 +22,11 @@ function makeSession(
       return events.slice();
     },
     systemPromptSection(agent) {
-      return typeof sectionOrThrow === "function"
-        ? sectionOrThrow(agent)
-        : sectionOrThrow;
+      return typeof section === "function" ? section(agent) : section;
     },
   };
 }
 
-/** Trivial harness that records the assembled system prompt and ends the turn. */
 function recordingHarness(): {
   harness: Harness;
   captured: () => string | null;
@@ -58,11 +43,12 @@ function recordingHarness(): {
 }
 
 describe("Session.systemPromptSection", () => {
-  it("contributes a section that lands in the assembled system prompt", async () => {
+  it("lands in the assembled prompt and is called per turn with a fresh Agent ref", async () => {
     const seenAgents: Agent[] = [];
+    let calls = 0;
     const session = makeSession((agent) => {
       seenAgents.push(agent);
-      return "Recently retrieved memories: user prefers terse replies.";
+      return `Recently retrieved memories: user prefers terse replies. turn ${++calls}`;
     });
     const { harness, captured } = recordingHarness();
 
@@ -73,42 +59,19 @@ describe("Session.systemPromptSection", () => {
       session,
     });
     try {
-      await agent.prompt("anything");
-      expect(seenAgents).toHaveLength(1);
-      expect(seenAgents[0]?.harness).toBe(harness);
-      expect(seenAgents[0]?.session).toBe(session);
-      expect(seenAgents[0]?.manifest.name).toBe("section-test");
-      expect(captured()).not.toBeNull();
+      await agent.prompt("a");
       expect(captured()!).toContain("# Session");
       expect(captured()!).toContain("user prefers terse replies");
-    } finally {
-      await agent.close();
-    }
-  });
 
-  it("is called per turn with a fresh Agent ref", async () => {
-    let calls = 0;
-    const session = makeSession(() => `turn ${++calls}`);
-    const harness: Harness = {
-      async run(rt: Runtime) {
-        // Read once so the section is realised.
-        rt.systemPrompt();
-        await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return { stopReason: "end_turn" as const };
-      },
-    };
-
-    const agent = await runAgent({
-      name: "per-turn",
-      tools: {},
-      harness,
-      session,
-    });
-    try {
-      await agent.prompt("a");
       await agent.prompt("b");
       await agent.prompt("c");
       expect(calls).toBe(3);
+      expect(seenAgents).toHaveLength(3);
+      for (const seen of seenAgents) {
+        expect(seen.harness).toBe(harness);
+        expect(seen.session).toBe(session);
+        expect(seen.manifest.name).toBe("section-test");
+      }
     } finally {
       await agent.close();
     }
@@ -119,9 +82,7 @@ describe("Session.systemPromptSection", () => {
     const harness: Harness = {
       async run(rt: Runtime) {
         ran = true;
-        const sp = rt.systemPrompt();
-        // Section should be empty (the throw was caught and dropped).
-        expect(sp).not.toContain("# Session");
+        expect(rt.systemPrompt()).not.toContain("# Session");
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
         return { stopReason: "end_turn" as const };
       },

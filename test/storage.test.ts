@@ -1,7 +1,3 @@
-/**
- * Per-host data home + per-agent storage tests.
- */
-
 import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -44,11 +40,7 @@ describe("resolveLoomDataHome", () => {
       { USERPROFILE: "C:/Users/alice" },
       path.join("C:/Users/alice", "AppData", "Roaming", "Loom"),
     ],
-    [
-      "freebsd" as NodeJS.Platform,
-      { HOME: "/home/alice" },
-      "/home/alice/.loom",
-    ],
+    ["freebsd" as NodeJS.Platform, { HOME: "/home/alice" }, "/home/alice/.loom"],
   ])("platform=%s env=%j → %s", (platform, env, expected) => {
     expect(resolveLoomDataHome(env, platform)).toBe(expected);
   });
@@ -69,6 +61,10 @@ function manifest(overrides: Partial<AgentManifest> = {}): AgentManifest {
   };
 }
 
+async function readMeta(storagePath: string) {
+  return JSON.parse(await fs.readFile(path.join(storagePath, ".loom-agent"), "utf8"));
+}
+
 describe("resolveAgentStorage", () => {
   const tmp = useTmpDir("loom-storage-");
 
@@ -81,45 +77,35 @@ describe("resolveAgentStorage", () => {
     expect(r.path).toBe(path.join(dataHome, "agents", "scribe"));
     expect(r.source).toBe("name");
     expect(r.warnings).toEqual([]);
-    // The directory exists.
-    const stat = await fs.stat(r.path);
-    expect(stat.isDirectory()).toBe(true);
-    // Metadata is present and well-formed.
-    const meta = JSON.parse(
-      await fs.readFile(path.join(r.path, ".loom-agent"), "utf8"),
-    );
+    expect((await fs.stat(r.path)).isDirectory()).toBe(true);
+
+    const meta = await readMeta(r.path);
     expect(meta.agentName).toBe("scribe");
     expect(meta.storageId).toBe("scribe");
     expect(meta.createdByManifest).toBe("/abs/path/agent.toml");
     expect(meta.knownManifests).toEqual(["/abs/path/agent.toml"]);
-  });
 
-  it("re-opens with the same manifest path silently (no warnings)", async () => {
-    const m = manifest({
-      name: "scribe",
-      manifestPath: "/abs/path/agent.toml",
-    });
-    await resolveAgentStorage(m, { LOOM_DATA_HOME: tmp() });
-    const r2 = await resolveAgentStorage(m, { LOOM_DATA_HOME: tmp() });
-    expect(r2.warnings).toEqual([]);
+    const reopened = await resolveAgentStorage(
+      manifest({ name: "scribe", manifestPath: "/abs/path/agent.toml" }),
+      { LOOM_DATA_HOME: dataHome },
+    );
+    expect(reopened.warnings).toEqual([]);
   });
 
   it("warns when a different manifest path opens an existing storage, and records both in knownManifests", async () => {
+    const dataHome = tmp();
     await resolveAgentStorage(
       manifest({ name: "scribe", manifestPath: "/path/one.toml" }),
-      { LOOM_DATA_HOME: tmp() },
+      { LOOM_DATA_HOME: dataHome },
     );
     const r2 = await resolveAgentStorage(
       manifest({ name: "scribe", manifestPath: "/path/two.toml" }),
-      { LOOM_DATA_HOME: tmp() },
+      { LOOM_DATA_HOME: dataHome },
     );
     expect(r2.warnings).toHaveLength(1);
     expect(r2.warnings[0]).toMatch(/previously opened by \/path\/one\.toml/);
     expect(r2.warnings[0]).toMatch(/now opened by \/path\/two\.toml/);
-    const meta = JSON.parse(
-      await fs.readFile(path.join(r2.path, ".loom-agent"), "utf8"),
-    );
-    expect(meta.knownManifests.sort()).toEqual([
+    expect((await readMeta(r2.path)).knownManifests.sort()).toEqual([
       "/path/one.toml",
       "/path/two.toml",
     ]);
@@ -138,7 +124,6 @@ describe("resolveAgentStorage", () => {
     const r = await resolveAgentStorage(manifest({ name: "my agent v2.0" }), {
       LOOM_DATA_HOME: tmp(),
     });
-    // Spaces sanitised to `_`; dots preserved.
     expect(path.basename(r.path)).toBe("my_agent_v2.0");
 
     await expect(
@@ -153,9 +138,7 @@ describe("resolveAgentStorage", () => {
       LOOM_DATA_HOME: tmp(),
     });
     expect(r.warnings).toEqual([]);
-    const meta = JSON.parse(
-      await fs.readFile(path.join(r.path, ".loom-agent"), "utf8"),
-    );
+    const meta = await readMeta(r.path);
     expect(meta.createdByManifest).toBeNull();
     expect(meta.knownManifests).toEqual([]);
   });

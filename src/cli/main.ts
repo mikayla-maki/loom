@@ -1,16 +1,4 @@
 #!/usr/bin/env node
-/**
- * Loom CLI — `loom <subcommand>`.
- *
- * Subcommands:
- *   run <agent.toml>           Drive the agent in a REPL loop.
- *   prompt <agent.toml> [text] One-shot: prompt with `text` (or stdin) and exit.
- *   audit <agent.toml>         Print the static capability tree.
- *   acp serve <agent.toml>     Speak ACP over stdio (peer can drive turns).
- *
- * The CLI is intentionally minimal — the surface area is the SDK.
- */
-
 import { runAgent, LOOM_VERSION } from "../sdk/run-agent.js";
 import { runPromptCommand, type PromptFormat } from "./prompt.js";
 import {
@@ -25,11 +13,6 @@ import { ansi } from "./markdown.js";
 import { wantsColor } from "./term.js";
 import type { AuditFinding } from "../types/interfaces.js";
 
-/**
- * Runtime audit findings from `Tool.audit()` get printed to stderr
- * with severity-colored icons. Errors don't reach this hook — they
- * throw at boot — so we only see ok / warning here.
- */
 function stderrAuditPrinter() {
   const color = wantsColor();
   const dim = color ? "\x1b[2m" : "";
@@ -42,7 +25,6 @@ function stderrAuditPrinter() {
         process.stderr.write(`  ${dim}→ ${f.remediation}${reset}\n`);
       }
     }
-    // ok findings are silent at the CLI; visible via `loom audit`.
   };
 }
 
@@ -164,11 +146,6 @@ async function cmdPrompt(args: string[]): Promise<number> {
     return 2;
   }
   const format = rawFormat as PromptFormat;
-  // `--emit-preamble` only makes sense alongside `--format jsonl` —
-  // the preamble's a structured snapshot, and jsonl is the format
-  // that already speaks structured-line-per-event. We refuse to mix
-  // it with text / trace rather than silently produce something
-  // unparseable.
   const emitPreamble = opts.flags["emit-preamble"] === true;
   if (emitPreamble && format !== "jsonl") {
     console.error(
@@ -202,8 +179,6 @@ async function cmdAudit(args: string[]): Promise<number> {
     console.error("usage: loom audit <agent.toml> [--json]");
     return 2;
   }
-  // Colours track COLORTERM — callers unset it to get plain output
-  // when piping.
   const color = wantsColor();
   try {
     const tree = await auditAgent(manifestPath);
@@ -214,11 +189,6 @@ async function cmdAudit(args: string[]): Promise<number> {
     }
     return 0;
   } catch (e) {
-    // AuditError carries the partial tree + a structured health
-    // summary. Print the tree so the user can see what DID resolve,
-    // then the structured error message, then exit non-zero. There
-    // is no "lenient" path that returns success with hidden
-    // problems — either the manifest is fully resolved or it isn't.
     if (e instanceof AuditError) {
       if (opts.flags.json) {
         process.stdout.write(
@@ -253,9 +223,6 @@ async function cmdAcp(args: string[]): Promise<number> {
     return 2;
   }
   const { serveOverStdio } = await import("../acp/server.js");
-  // serveOverStdio waits for `initialize`, then constructs the agent
-  // with the negotiated client capabilities. The CLI just supplies
-  // the manifest path and lets the server own the lifecycle.
   await serveOverStdio(manifestPath, {
     onMissingSecret: ttyMissingSecretHandler(),
   });
@@ -267,12 +234,6 @@ async function cmdProviders(args: string[]): Promise<number> {
   const { listInstalledProviders, locateProviderPackage } =
     await import("../providers/loader.js");
   if (sub === "list") {
-    // Two sections — built-in harness factories (with their
-    // server-tool catalogs), then on-disk npm provider packages.
-    // The built-ins section is the discoverability path for
-    // harness-exposed server tools like Anthropic's `web_search` /
-    // `web_fetch`; `loom audit` deliberately doesn't list them per
-    // manifest, pointing users here instead.
     await listBuiltinHarnesses();
     const items = await listInstalledProviders({});
     process.stdout.write("\ninstalled provider packages:\n");
@@ -311,21 +272,6 @@ async function cmdProviders(args: string[]): Promise<number> {
   return 2;
 }
 
-/**
- * Print the built-in harness factories registered in the harness
- * registry, plus each one's `availableTools()` catalog (when it
- * implements the optional method). This is where reviewers find
- * out which harness-exposed server tools exist (e.g. Anthropic's
- * `web_search` / `web_fetch`); the per-agent audit deliberately
- * doesn't repeat the catalog on every run.
- *
- * Harness construction needs secrets in principle, but the
- * `availableTools()` catalog is a static / config-only declaration
- * for the built-in factories we ship — so we synthesise stub
- * values for any required-secret slot, the same way `loom audit`
- * does. A construction failure (or a harness without the optional
- * method) is silently treated as "no catalog".
- */
 async function listBuiltinHarnesses(): Promise<void> {
   const { listHarnesses, getHarnessFactory } =
     await import("../builtins/index.js");
@@ -350,17 +296,12 @@ async function listBuiltinHarnesses(): Promise<void> {
         stubSecrets[s] = "providers-list-stub";
       }
       const harness = await Promise.resolve(
-        factory.create(
-          /*config*/ {},
-          factoryCtx,
-          stubSecrets,
-          /*parent*/ undefined,
-        ),
+        factory.create({}, factoryCtx, stubSecrets, undefined),
       );
       const catalog = (await Promise.resolve(harness.availableTools?.())) ?? [];
       exposed = catalog.map((r) => r.name).sort();
     } catch {
-      /* construction failed (e.g. requiresParent) — leave empty */
+      // construction failure (e.g. requiresParent) means no catalog
     }
     if (exposed.length > 0) {
       process.stdout.write(`  ${name}\n`);
@@ -371,10 +312,6 @@ async function listBuiltinHarnesses(): Promise<void> {
   }
 }
 
-/**
- * `loom mcp <subcmd>` — MCP-related authoring aids. Only `inspect`
- * today.
- */
 async function cmdMcp(args: string[]): Promise<number> {
   const sub = args[0];
   if (sub !== "inspect") {
@@ -422,10 +359,6 @@ async function cmdMcp(args: string[]): Promise<number> {
   }
 }
 
-/**
- * `loom install` — install the manifest's declared deps (npm + path
- * sources). Delegates to `cli/install.ts`.
- */
 async function cmdInstall(args: string[]): Promise<number> {
   const opts = parseFlags(args);
   const manifestPath = opts._[0] ?? "agent.toml";

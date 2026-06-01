@@ -1,16 +1,3 @@
-/**
- * Tty-driven PermissionHandler for the CLI.
- *
- * Prints the permission request (and its available options) to
- * stderr, prompts on stdin, and returns the corresponding ACP
- * `RequestPermissionResponse`. Options are 1-indexed in the UI to
- * keep the prompt friendly; the optionId selected is the SDK's
- * canonical `optionId` string.
- *
- * If stdin is not a TTY (piped, tests) the handler returns a
- * "cancelled" outcome — same secure default as no handler at all.
- */
-
 import * as readline from "node:readline";
 
 import type {

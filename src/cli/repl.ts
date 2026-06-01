@@ -1,23 +1,3 @@
-/**
- * Interactive REPL for `loom run`.
- *
- * Knows nothing about which harness or session powers the agent.
- * Takes a `RunningAgent`, runs a turn-based chat against it, and
- * extends the surface with a small slash-command API for inspection.
- *
- * Design points:
- *   - Streaming markdown renderer for agent output (tokens reach the
- *     terminal as soon as delimiters are recognised, no buffer-til-newline)
- *   - Tool calls are *paired* with their results: the call line and
- *     result line render together when the result lands, so parallel
- *     tool calls don't look like two stacks of unrelated messages
- *   - Slash commands have tab completion via readline's completer hook
- *   - Compact argument rendering (read_file("foo.ts") rather than
- *     {"path":"foo.ts"})
- *   - Operator-console oriented: built-in commands focus on inspection
- *     (/audit, /events, /tools) rather than productivity features
- */
-
 import * as readline from "node:readline";
 import { stdin, stdout, stderr, exit } from "node:process";
 
@@ -32,47 +12,23 @@ import { ansi } from "./markdown.js";
 import { StreamingMarkdownRenderer } from "./streaming-markdown.js";
 import { wantsColor } from "./term.js";
 
-// ────────────────────────────────────────────────────────────────────────────
-// Public API
-// ────────────────────────────────────────────────────────────────────────────
-
 export interface SlashCommand {
-  /** Command name without the leading slash. */
   name: string;
-  /** Short description shown by `/help`. */
   description: string;
-  /**
-   * Invoked when the user types `/<name> [rest]`. `rest` is everything
-   * after the command name (may be empty). Output goes to stdout.
-   */
   handler(rest: string): void | Promise<void>;
 }
 
-/** Number of trailing session events replayed at REPL startup. */
 const HISTORY_REPLAY_LINES = 10;
 
 export interface ReplOptions {
   agent: RunningAgent;
-  /** Override ANSI styling. Defaults to `COLORTERM`-driven detection. */
   plain?: boolean;
-  /** Per-turn run parameters applied to every prompt. */
   runParameters?: RunParameters;
-  /**
-   * Override for the prompt path. Default: `(text) => agent.prompt(text, runParameters)`.
-   * Useful for clients that want to record prompts, switch models per
-   * input, or otherwise pre/post-process.
-   */
   onPrompt?: (text: string) => Promise<TurnResult>;
-  /** Banner printed at startup. */
   banner?: string;
-  /** Custom slash commands. Built-ins are /quit /exit /help /audit /events /tools. */
   commands?: SlashCommand[];
 }
 
-/**
- * Drive the REPL until the user quits (`/quit`, `/exit`, Ctrl-D, or
- * Ctrl-C at idle). The agent is NOT closed here — caller owns lifecycle.
- */
 export async function runRepl(opts: ReplOptions): Promise<void> {
   const plain = opts.plain ?? !wantsColor();
   const s = ansiStyle(plain);
@@ -83,8 +39,6 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
 
   const printer = startPrinter(agent, plain);
 
-  // Resume hint: replay the last few session events on startup so the
-  // user sees recent context after a reconnect.
   {
     const all = (await agent.session.pull?.([])) ?? [];
     const tail = all.slice(-HISTORY_REPLAY_LINES);
@@ -97,7 +51,6 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
     }
   }
 
-  // Built-in commands.
   const builtins: SlashCommand[] = [
     {
       name: "quit",
@@ -176,7 +129,6 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
   for (const c of builtins) commandTable.set(c.name, c);
   for (const c of opts.commands ?? []) commandTable.set(c.name, c);
 
-  // Tab-completion for slash commands.
   const completer = (line: string): [string[], string] => {
     if (!line.startsWith("/")) return [[], line];
     const partial = line.slice(1).toLowerCase();
@@ -196,7 +148,6 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
   let inFlight = false;
   let cancelling = false;
 
-  // Ctrl-C: at idle exit; mid-turn cancel; second Ctrl-C force-quit.
   rl.on("SIGINT", () => {
     if (!inFlight) {
       stdout.write("\n");
@@ -212,7 +163,6 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
     void agent.cancel();
   });
 
-  // Esc cancels mid-turn (silent at idle).
   if (stdin.isTTY) {
     readline.emitKeypressEvents(stdin);
     stdin.on("keypress", (_str, key) => {
@@ -255,16 +205,12 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
       continue;
     }
 
-    // Normal turn.
     try {
       inFlight = true;
       const result = opts.onPrompt
         ? await opts.onPrompt(text)
         : await agent.prompt(text, opts.runParameters);
       if (result.stopReason === "error") {
-        // Harness signalled a fatal turn error out-of-band; surface it
-        // here rather than letting the user wonder why "(stopped: error)"
-        // appeared with no context.
         const msg = result.error?.message ?? "agent error";
         stderr.write(`${s.red}error:${s.reset} ${msg}\n`);
       } else if (result.stopReason !== "end_turn") {
@@ -283,13 +229,8 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
   printer.stop();
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Printer — subscribes to agent updates, renders incrementally.
-// ────────────────────────────────────────────────────────────────────────────
-
 interface Printer {
   stop(): void;
-  /** Latest usage observed via `usage_update`, or null. */
   getUsage(): { used: number; size: number } | null;
   replay(updates: Iterable<SessionUpdate>): void;
 }
@@ -306,11 +247,6 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
   let lastUsage: { used: number; size: number } | null = null;
   const stopFlag = { current: false };
 
-  // Tool-call pairing: we buffer the call until its final result update
-  // arrives, then render call + result as one paired block. For
-  // parallel tool calls this means each (call, result) renders together
-  // in completion order rather than calls-then-results. Pending call
-  // info is keyed by toolCallId.
   const pendingCalls = new Map<string, PendingCall>();
 
   const finishMessage = (): void => {
@@ -347,7 +283,6 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
       }
       case "tool_call": {
         finishMessage();
-        // Buffer; render only when the result lands.
         pendingCalls.set(u.toolCallId, {
           title: u.title,
           input: u.rawInput,
@@ -357,15 +292,11 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
       case "tool_call_update": {
         const status = u.status ?? "?";
         if (status !== "completed" && status !== "failed") {
-          break; // skip non-final transitions
+          break;
         }
         const call = pendingCalls.get(u.toolCallId);
         pendingCalls.delete(u.toolCallId);
 
-        // Render the paired block. If the call is missing (e.g. the
-        // matching tool_call event never arrived because of a replay
-        // window), still render the result alone with the title from
-        // the update, so we don't drop information.
         const title = call?.title ?? u.title ?? "tool";
         const argsStr = call ? renderArgs(call.input) : "";
         const callLine = `${s.cyan}⏺${s.reset} ${s.bold}${title}${s.reset}${
@@ -418,7 +349,7 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
           u.sessionUpdate === "tool_call_update" &&
           !seenCallIds.has(u.toolCallId)
         ) {
-          continue; // orphan result, drop
+          continue;
         }
         handleUpdate(u);
       }
@@ -427,16 +358,6 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
   };
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────────────
-
-/**
- * Render tool input compactly. Single-property objects show just the
- * value (e.g. `read_file("foo.ts")`); multi-property show key=value
- * pairs (e.g. `bash("ls", cwd="/proj")`). Strings are quoted; long
- * strings get truncated.
- */
 function renderArgs(input: unknown): string {
   if (input === undefined || input === null) return "";
   if (typeof input !== "object") return formatScalar(input);

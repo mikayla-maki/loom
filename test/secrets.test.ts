@@ -10,32 +10,18 @@ import type {
   Runtime,
   Tool,
 } from "../src/types/interfaces.js";
-import type { StopReason } from "../src/types/acp.js";
 import { registerHarness } from "../src/builtins/index.js";
 
-/**
- * The secrets pipeline contract:
- *   1. Factories declare what they need; runtime resolves the closure
- *      from a SecretsStore chain (caller-supplied → env → file).
- *   2. A required miss fails the boot with a message naming who asked.
- *   3. Each component receives ONLY the secrets it declared at create
- *      time. Tools see their per-tool subset at every execute() call.
- *   4. Factory implementations do NOT read `process.env`.
- */
-
-// A captured-secrets harness factory used by these tests. Records what
-// the runtime hands it at create() so we can assert the slice.
 const capturedByHarness = new Map<string, Record<string, string>>();
 const captureFactory: HarnessFactory = {
   name: "capture",
   secrets: { required: ["CAPTURE_REQUIRED"], optional: ["CAPTURE_OPTIONAL"] },
   create(
     _config: Record<string, unknown>,
-    _ctx: FactoryContext,
+    ctx: FactoryContext,
     secrets: Record<string, string>,
   ): Harness {
-    const id = String(_ctx.agentName);
-    capturedByHarness.set(id, { ...secrets });
+    capturedByHarness.set(String(ctx.agentName), { ...secrets });
     return {
       async run(rt: Runtime) {
         await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
@@ -46,98 +32,64 @@ const captureFactory: HarnessFactory = {
 };
 registerHarness(captureFactory);
 
+async function runCapture(
+  name: string,
+  options: Parameters<typeof runAgent>[1],
+): Promise<Record<string, string> | undefined> {
+  capturedByHarness.clear();
+  const agent = await runAgent(
+    { name, tools: {}, harness: { provider: "capture" } },
+    options,
+  );
+  try {
+    return capturedByHarness.get(name);
+  } finally {
+    await agent.close();
+  }
+}
+
 describe("secrets pipeline", () => {
-  it("a factory receives only its declared secrets, never the full bag", async () => {
-    capturedByHarness.clear();
-    const agent = await runAgent(
-      {
-        name: "factory-slice",
-        tools: {},
-        harness: { provider: "capture" },
-      },
-      {
-        secrets: new StaticSecretsStore({
-          CAPTURE_REQUIRED: "rv",
-          CAPTURE_OPTIONAL: "ov",
-          UNRELATED: "should-not-appear",
-        }),
-      },
-    );
-    try {
-      const got = capturedByHarness.get("factory-slice");
-      expect(got).toEqual({
+  it("a factory receives only its declared secrets, present-or-absent per its allowlist", async () => {
+    const full = await runCapture("factory-slice", {
+      secrets: new StaticSecretsStore({
         CAPTURE_REQUIRED: "rv",
         CAPTURE_OPTIONAL: "ov",
-      });
-      expect(got).not.toHaveProperty("UNRELATED");
-    } finally {
-      await agent.close();
-    }
+        UNRELATED: "should-not-appear",
+      }),
+    });
+    expect(full).toEqual({ CAPTURE_REQUIRED: "rv", CAPTURE_OPTIONAL: "ov" });
+
+    const optionalMissing = await runCapture("optional-missing", {
+      secrets: new StaticSecretsStore({ CAPTURE_REQUIRED: "rv" }),
+    });
+    expect(optionalMissing).toEqual({ CAPTURE_REQUIRED: "rv" });
   });
 
   it("missing required secret throws SecretError naming the requester", async () => {
     await expect(
       runAgent(
-        {
-          name: "missing-required",
-          tools: {},
-          harness: { provider: "capture" },
-        },
-        { secrets: new StaticSecretsStore({}) }, // no CAPTURE_REQUIRED
+        { name: "missing-required", tools: {}, harness: { provider: "capture" } },
+        { secrets: new StaticSecretsStore({}) },
       ),
     ).rejects.toThrow(/CAPTURE_REQUIRED.*harness:capture/s);
   });
 
-  it("optional secret missing is silently absent (not in the slice)", async () => {
-    capturedByHarness.clear();
-    const agent = await runAgent(
-      {
-        name: "optional-missing",
-        tools: {},
-        harness: { provider: "capture" },
-      },
-      {
-        secrets: new StaticSecretsStore({ CAPTURE_REQUIRED: "rv" }),
-      },
-    );
-    try {
-      const got = capturedByHarness.get("optional-missing");
-      expect(got).toEqual({ CAPTURE_REQUIRED: "rv" });
-      expect(got).not.toHaveProperty("CAPTURE_OPTIONAL");
-    } finally {
-      await agent.close();
-    }
-  });
-
   it("a tool only sees its own declared secrets at execute time", async () => {
-    // Two synthetic tools supplied by an in-process Tools. Each
-    // declares a different `secrets` allowlist; their `execute()` reads
-    // ctx.secrets and emits the slice as JSON content. The runtime
-    // filters bag → per-tool slice; this test asserts that filter.
-    const toolA: Tool = {
-      name: "tool_a",
-      description: "a",
+    const probe = (name: string, declared: string[]): Tool => ({
+      name,
+      description: name,
       inputSchema: { type: "object" },
-      secrets: { required: ["A_TOKEN", "SHARED"] },
+      secrets: { required: declared },
       async execute(_input, ctx) {
-        const want = ["A_TOKEN", "B_TOKEN", "SHARED"];
         const out: Record<string, string | null> = {};
-        for (const k of want) out[k] = ctx.secrets[k] ?? null;
+        for (const k of ["A_TOKEN", "B_TOKEN", "SHARED"]) {
+          out[k] = ctx.secrets[k] ?? null;
+        }
         return { content: JSON.stringify(out) };
       },
-    };
-    const toolB: Tool = {
-      name: "tool_b",
-      description: "b",
-      inputSchema: { type: "object" },
-      secrets: { required: ["B_TOKEN", "SHARED"] },
-      async execute(_input, ctx) {
-        const want = ["A_TOKEN", "B_TOKEN", "SHARED"];
-        const out: Record<string, string | null> = {};
-        for (const k of want) out[k] = ctx.secrets[k] ?? null;
-        return { content: JSON.stringify(out) };
-      },
-    };
+    });
+    const toolA = probe("tool_a", ["A_TOKEN", "SHARED"]);
+    const toolB = probe("tool_b", ["B_TOKEN", "SHARED"]);
     const provider: Tools = {
       resolveTool(name) {
         if (name === "tool_a") return toolA;
@@ -186,20 +138,14 @@ describe("secrets pipeline", () => {
             : "";
         return JSON.parse(text) as Record<string, string | null>;
       };
-      const a = parse(0);
-      const b = parse(1);
-      // tool_a sees A_TOKEN + SHARED, NOT B_TOKEN.
-      expect(a).toEqual({ A_TOKEN: "AAA", B_TOKEN: null, SHARED: "SSS" });
-      // tool_b sees B_TOKEN + SHARED, NOT A_TOKEN.
-      expect(b).toEqual({ A_TOKEN: null, B_TOKEN: "BBB", SHARED: "SSS" });
+      expect(parse(0)).toEqual({ A_TOKEN: "AAA", B_TOKEN: null, SHARED: "SSS" });
+      expect(parse(1)).toEqual({ A_TOKEN: null, B_TOKEN: "BBB", SHARED: "SSS" });
     } finally {
       await agent.close();
     }
   });
 
   it("a Harness instance passed directly does NOT trigger secret resolution", async () => {
-    // Custom Harness instance bypasses the factory layer entirely. The
-    // runtime should not attempt to look up factory secrets for it.
     let ran = false;
     const inst: Harness = {
       async run(rt) {
@@ -210,10 +156,7 @@ describe("secrets pipeline", () => {
     };
     const agent = await runAgent(
       { name: "harness-instance", tools: {}, harness: inst },
-      {
-        // Empty store: the test verifies no secrets are demanded.
-        secrets: new StaticSecretsStore({}),
-      },
+      { secrets: new StaticSecretsStore({}) },
     );
     try {
       await agent.prompt("hi");
@@ -223,58 +166,35 @@ describe("secrets pipeline", () => {
     }
   });
 
-  it("onMissingSecret hook supplies a missing required secret", async () => {
-    capturedByHarness.clear();
-    const seen: Array<{
-      name: string;
-      requestedBy: string;
-      required: boolean;
-    }> = [];
-    const agent = await runAgent(
-      {
-        name: "hook-required",
-        tools: {},
-        harness: { provider: "capture" },
+  it("onMissingSecret supplies a missing required secret and sees every miss", async () => {
+    const seen: Array<{ name: string; requestedBy: string; required: boolean }> =
+      [];
+    const got = await runCapture("hook-required", {
+      secrets: new StaticSecretsStore({}),
+      onMissingSecret: async (req) => {
+        seen.push({
+          name: req.name,
+          requestedBy: req.requestedBy,
+          required: req.required,
+        });
+        return req.name === "CAPTURE_REQUIRED" ? "hooked" : null;
       },
-      {
-        secrets: new StaticSecretsStore({}), // chain has nothing
-        onMissingSecret: async (req) => {
-          seen.push({
-            name: req.name,
-            requestedBy: req.requestedBy,
-            required: req.required,
-          });
-          if (req.name === "CAPTURE_REQUIRED") return "hooked";
-          return null; // optional miss → skip
-        },
-      },
-    );
-    try {
-      const got = capturedByHarness.get("hook-required");
-      expect(got).toEqual({ CAPTURE_REQUIRED: "hooked" });
-      // Both required and optional missed; hook saw both.
-      expect(seen.map((s) => s.name).sort()).toEqual([
-        "CAPTURE_OPTIONAL",
-        "CAPTURE_REQUIRED",
-      ]);
-      const req = seen.find((s) => s.name === "CAPTURE_REQUIRED");
-      expect(req?.required).toBe(true);
-      expect(req?.requestedBy).toBe("harness:capture");
-      const opt = seen.find((s) => s.name === "CAPTURE_OPTIONAL");
-      expect(opt?.required).toBe(false);
-    } finally {
-      await agent.close();
-    }
+    });
+    expect(got).toEqual({ CAPTURE_REQUIRED: "hooked" });
+    expect(seen.map((s) => s.name).sort()).toEqual([
+      "CAPTURE_OPTIONAL",
+      "CAPTURE_REQUIRED",
+    ]);
+    const required = seen.find((s) => s.name === "CAPTURE_REQUIRED");
+    expect(required?.required).toBe(true);
+    expect(required?.requestedBy).toBe("harness:capture");
+    expect(seen.find((s) => s.name === "CAPTURE_OPTIONAL")?.required).toBe(false);
   });
 
   it("onMissingSecret returning null still throws SecretError for required", async () => {
     await expect(
       runAgent(
-        {
-          name: "hook-null",
-          tools: {},
-          harness: { provider: "capture" },
-        },
+        { name: "hook-null", tools: {}, harness: { provider: "capture" } },
         {
           secrets: new StaticSecretsStore({}),
           onMissingSecret: async () => null,
@@ -284,51 +204,26 @@ describe("secrets pipeline", () => {
   });
 
   it("onMissingSecret is bypassed when the chain already has a value", async () => {
-    capturedByHarness.clear();
     let calls = 0;
-    const agent = await runAgent(
-      {
-        name: "hook-bypass",
-        tools: {},
-        harness: { provider: "capture" },
-      },
-      {
-        secrets: new StaticSecretsStore({
-          CAPTURE_REQUIRED: "from-chain",
-          CAPTURE_OPTIONAL: "opt-chain",
-        }),
-        onMissingSecret: async () => {
-          calls += 1;
-          return "should-not-be-used";
-        },
-      },
-    );
-    try {
-      expect(calls).toBe(0);
-      expect(capturedByHarness.get("hook-bypass")).toEqual({
+    const got = await runCapture("hook-bypass", {
+      secrets: new StaticSecretsStore({
         CAPTURE_REQUIRED: "from-chain",
         CAPTURE_OPTIONAL: "opt-chain",
-      });
-    } finally {
-      await agent.close();
-    }
+      }),
+      onMissingSecret: async () => {
+        calls += 1;
+        return "should-not-be-used";
+      },
+    });
+    expect(calls).toBe(0);
+    expect(got).toEqual({
+      CAPTURE_REQUIRED: "from-chain",
+      CAPTURE_OPTIONAL: "opt-chain",
+    });
   });
 
   it("phase-1 secret collection uses the package-name fallback (regression: 0.1.4 bug)", async () => {
-    // Bug: `collectPhase1SecretNeeds` was looking up factories by
-    // their *binding* name only, skipping the package-name fallback
-    // that instantiation uses. A path-provider harness registered
-    // under its package's primary name but referenced by a different
-    // `[providers]` handle would have its secret declarations
-    // silently dropped — boot then failed with "<SECRET> not
-    // provided" because the bundle never asked for them.
-    //
-    // We register a harness under the basename of a synthetic path
-    // source and reference it via a different handle in the
-    // manifest. The captured secrets must include the declared
-    // required secret, which is only true if the fallback engages.
-    const { collectPhase1SecretNeeds } =
-      await import("../src/sdk/run-agent.js");
+    const { collectPhase1SecretNeeds } = await import("../src/sdk/run-agent.js");
     const { registerHarness: regH } = await import("../src/builtins/index.js");
     regH({
       name: "phase1-fallback-pkg",
@@ -338,9 +233,8 @@ describe("secrets pipeline", () => {
       },
     });
 
-    // Synthetic ResolvedManifest: handle 'companion', source basename
-    // 'phase1-fallback-pkg'. With the fix, the fallback resolves the
-    // factory and surfaces its declared secret.
+    // Harness referenced via a 'companion' handle but registered under the
+    // source basename: declarations surface only if the fallback engages.
     const needs = collectPhase1SecretNeeds(
       {
         providers: [],
@@ -354,7 +248,6 @@ describe("secrets pipeline", () => {
       },
       new Map(),
     );
-    const names = needs.map((n) => n.name);
-    expect(names).toContain("PHASE1_FALLBACK_SECRET");
+    expect(needs.map((n) => n.name)).toContain("PHASE1_FALLBACK_SECRET");
   });
 });

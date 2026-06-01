@@ -10,13 +10,6 @@ import type {
 } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 
-/**
- * Verifies that `runAgent` accepts pre-built `Harness` / `Session` /
- * `Tools` *instances* directly in the manifest, not just the
- * `{ provider: "name", ...config }` reference form. This is the path the
- * SDK consumer takes when building a custom CLI/TUI on top of Loom.
- */
-
 describe("manifest accepts instances directly", () => {
   it("a Harness instance bypasses the registry lookup", async () => {
     let runs = 0;
@@ -32,11 +25,7 @@ describe("manifest accepts instances directly", () => {
       },
     };
 
-    const agent = await runAgent({
-      name: "inst-harness",
-      tools: {},
-      harness, // ← raw instance, not { provider: "test" }
-    });
+    const agent = await runAgent({ name: "inst-harness", tools: {}, harness });
     try {
       const result = await agent.prompt("anything");
       expect(result.stopReason).toBe("end_turn");
@@ -72,7 +61,7 @@ describe("manifest accepts instances directly", () => {
       name: "inst-session",
       tools: {},
       harness: { provider: "test", echo: true },
-      session, // ← raw instance
+      session,
     });
     try {
       await agent.prompt("ping");
@@ -82,7 +71,6 @@ describe("manifest accepts instances directly", () => {
       expect(log.some((e) => e.sessionUpdate === "agent_message_chunk")).toBe(
         true,
       );
-      // The Session instance is the same object the runtime drove.
       expect(agent.session).toBe(session);
     } finally {
       await agent.close();
@@ -90,15 +78,10 @@ describe("manifest accepts instances directly", () => {
   });
 
   it("a session array mixes pre-built instances with named layers", async () => {
-    // Heterogeneous session: a hand-built Session instance in the
-    // outer position, a string-shorthand layer in the inner. The
-    // runtime should resolve the string (`"in-memory"`) via the
-    // built-in registry and wrap both in a ChainedSession.
     const captured: SessionUpdate[] = [];
     const outer: Session = {
       async push(u) {
         captured.push(u);
-        // Pass through to the inner layer unchanged.
         return [u];
       },
       async pull(below) {
@@ -110,23 +93,16 @@ describe("manifest accepts instances directly", () => {
       name: "inst-session-mix",
       tools: {},
       harness: { provider: "test", echo: true },
-      // Heterogeneous: instance + string. The runtime resolves
-      // `"in-memory"` via the built-in session registry and chains
-      // both layers outer-to-inner.
       session: [outer, "in-memory"],
     });
     try {
       await agent.prompt("hello");
-      // The outer (pre-built) layer saw events flow through it.
       expect(
         captured.some((e) => e.sessionUpdate === "user_message_chunk"),
       ).toBe(true);
       expect(
         captured.some((e) => e.sessionUpdate === "agent_message_chunk"),
       ).toBe(true);
-      // Pulling from the chain returns events the inner storage
-      // retained, replayed back up through the outer (which is a
-      // passthrough).
       const events = (await agent.session.pull?.([])) ?? [];
       expect(events.some((e) => e.sessionUpdate === "user_message_chunk")).toBe(
         true,
@@ -159,8 +135,6 @@ describe("manifest accepts instances directly", () => {
     const agent = await runAgent(
       {
         name: "inst-provider",
-        // Reference the provider-supplied tool by name in [tools] so it's
-        // in the resolution list.
         tools: { stub: "builtin" },
         harness: {
           provider: "test",
@@ -169,7 +143,7 @@ describe("manifest accepts instances directly", () => {
           ],
         },
       },
-      { providers: [provider] }, // ← raw Tools instance, programmatic injection
+      { providers: [provider] },
     );
     try {
       await agent.prompt("go");
@@ -187,7 +161,6 @@ describe("manifest accepts instances directly", () => {
       }
     } finally {
       await agent.close();
-      // close() on the agent fans out to providers that expose it.
       expect(closed).toBe(true);
     }
   });

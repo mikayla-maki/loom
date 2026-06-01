@@ -1,24 +1,3 @@
-/**
- * Tests for harness-exposed server tools.
- *
- * Covers:
- *   - `AnthropicHarness.availableTools()` returns the catalog.
- *   - Resolver routes `[tools.web_search] provider = "anthropic"` to
- *     the synthetic `(harness)` instance.
- *   - End-to-end: a manifest opting in via `provider = "anthropic"`
- *     boots successfully; the API request body carries the native
- *     `web_search_20250305` server-tool shape (not a regular `tool`).
- *   - Server-tool config (max_uses / allowed_domains) flows from
- *     `[tools.web_search]` into the API tool descriptor.
- *   - `server_tool_use` + `web_search_tool_result` blocks in a
- *     response surface as `tool_call` + `tool_call_update` events
- *     without dispatching through ToolTable.
- *   - The Brave-based `web_search` (provider="builtin") still works
- *     alongside the harness route \u2014 the two are mutually
- *     exclusive per manifest.
- *   - Audit surfaces `availableTools` on the harness summary.
- */
-
 import { describe, expect, it, afterEach } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
@@ -28,8 +7,9 @@ import { anthropicHarnessFactory } from "../src/builtins/harness/anthropic.js";
 import { InMemorySession } from "../src/builtins/session/memory.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import { nativeBuiltinNames } from "../src/builtins/tools/native.js";
-import type { Harness, SessionFactory } from "../src/types/interfaces.js";
+import type { Harness } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 
 const realFetch = global.fetch;
 
@@ -37,7 +17,73 @@ afterEach(() => {
   global.fetch = realFetch;
 });
 
-// ─── Harness-direct tests ────────────────────────────────────────────────
+const modelInfoResponse = () =>
+  new Response(
+    JSON.stringify({
+      id: "claude-sonnet-4-5-latest",
+      type: "model",
+      display_name: "Sonnet",
+      created_at: "2024-01-01T00:00:00Z",
+      max_input_tokens: 200000,
+      max_tokens: 8192,
+      capabilities: null,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+
+const usage = (input: number, output: number, serverToolUse: unknown = null) => ({
+  input_tokens: input,
+  output_tokens: output,
+  cache_creation_input_tokens: null,
+  cache_read_input_tokens: null,
+  server_tool_use: serverToolUse,
+  service_tier: "standard",
+  cache_creation: null,
+  inference_geo: null,
+});
+
+const jsonResponse = (body: unknown) =>
+  new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+
+function resolveByName(body: unknown, name: string): Record<string, unknown> | undefined {
+  const tools = (body as { tools?: unknown[] } | null)?.tools ?? [];
+  return tools.find(
+    (t): t is Record<string, unknown> =>
+      typeof t === "object" && t !== null && (t as { name?: string }).name === name,
+  );
+}
+
+type ToolCall = SessionUpdate & { sessionUpdate: "tool_call" };
+type ToolCallUpdate = SessionUpdate & { sessionUpdate: "tool_call_update" };
+
+function pull(agent: { session: { pull?: (below: SessionUpdate[]) => Promise<SessionUpdate[]> } }) {
+  return agent.session.pull?.([]) ?? Promise.resolve<SessionUpdate[]>([]);
+}
+
+const toolCalls = (events: SessionUpdate[]): ToolCall[] =>
+  events.filter((e): e is ToolCall => e.sessionUpdate === "tool_call");
+
+const toolCallUpdates = (events: SessionUpdate[]): ToolCallUpdate[] =>
+  events.filter((e): e is ToolCallUpdate => e.sessionUpdate === "tool_call_update");
+
+function updateText(update: ToolCallUpdate | undefined): string {
+  const first = update?.content?.[0];
+  return first?.type === "content" && first.content.type === "text" ? first.content.text : "";
+}
+
+const anthropicHarness = (overrides?: Record<string, unknown>) => ({
+  provider: "anthropic" as const,
+  model: "claude-sonnet-4-5-latest",
+  stream: false,
+  ...overrides,
+});
+
+const anthropicSecrets = () => ({
+  secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }),
+});
 
 describe("AnthropicHarness server-tool catalog", () => {
   function makeHarness(): Harness {
@@ -58,121 +104,61 @@ describe("AnthropicHarness server-tool catalog", () => {
     ) as Harness;
   }
 
-  it("availableTools() exposes web_search and web_fetch", async () => {
+  function resolve(h: Harness, name: string) {
+    return Promise.resolve(
+      h.resolveTool?.(
+        name,
+        { max_uses: 3 },
+        { manifest: {} as never, harness: h, session: {}, systemPromptCore: "" },
+        undefined,
+      ),
+    );
+  }
+
+  it("exposes web_search and web_fetch and resolves them to server-side stubs", async () => {
     const h = makeHarness();
-    const catalog = await Promise.resolve(h.availableTools?.());
-    expect(catalog).toBeDefined();
-    const names = (catalog ?? []).map((r) => r.name);
+
+    const catalog = (await Promise.resolve(h.availableTools?.())) ?? [];
+    const names = catalog.map((r) => r.name);
     expect(names).toContain("web_search");
     expect(names).toContain("web_fetch");
-  });
 
-  it("resolveTool('web_search') returns a stub Tool", async () => {
-    const h = makeHarness();
-    const tool = await Promise.resolve(
-      h.resolveTool?.(
-        "web_search",
-        { max_uses: 3 },
-        // The stub doesn't read `agent` or capabilities; pass minimal.
-        {
-          manifest: {} as never,
-          harness: h,
-          session: {},
-          systemPromptCore: "",
-        },
-        undefined,
-      ),
-    );
-    expect(tool).not.toBeNull();
-    expect(tool?.name).toBe("web_search");
-    expect(tool?.description).toMatch(/server-side/);
-  });
+    const webSearch = await resolve(h, "web_search");
+    expect(webSearch?.name).toBe("web_search");
+    expect(webSearch?.description).toMatch(/server-side/);
 
-  it("resolveTool returns null for unknown names", async () => {
-    const h = makeHarness();
-    const tool = await Promise.resolve(
-      h.resolveTool?.(
-        "bash",
-        {},
-        {
-          manifest: {} as never,
-          harness: h,
-          session: {},
-          systemPromptCore: "",
-        },
-        undefined,
-      ),
-    );
-    expect(tool).toBeNull();
+    expect(await resolve(h, "bash")).toBeNull();
   });
 });
 
-// ─── Resolver routing ────────────────────────────────────────────────────
+describe('resolver: provider = "anthropic" routing', () => {
+  const resolve = (manifest: AgentManifest) =>
+    resolveManifest(manifest, { builtinToolNames: new Set(nativeBuiltinNames()) });
 
-describe('resolver: provider = "anthropic" routes to (harness)', () => {
-  it("emits a (harness) binding when the tool name is opted in", () => {
-    const resolved = resolveManifest(
-      {
-        name: "r",
-        harness: { provider: "anthropic" },
-        tools: {
-          web_search: { provider: "anthropic", max_uses: 5 },
-        },
-      },
-      { builtinToolNames: new Set(nativeBuiltinNames()) },
-    );
+  it("routes opted-in web_search to the (harness) binding with its config", () => {
+    const resolved = resolve({
+      name: "r",
+      harness: { provider: "anthropic" },
+      tools: { web_search: { provider: "anthropic", max_uses: 5 } },
+    });
     const binding = resolved.tools.find((b) => b.toolName === "web_search");
-    expect(binding).toBeDefined();
     expect(binding?.providerInstanceId).toBe("(harness)");
     expect(binding?.toolConfig).toEqual({ max_uses: 5 });
   });
 
-  it('`provider = "anthropic"` on a non-anthropic harness fails resolution', () => {
-    expect(() =>
-      resolveManifest(
-        {
-          name: "r",
-          harness: { provider: "openai" },
-          tools: { web_search: { provider: "anthropic" } },
-        },
-        { builtinToolNames: new Set(nativeBuiltinNames()) },
-      ),
-    ).toThrow(/no matching \[providers\] entry or built-in/);
-  });
-
-  it('the Brave web_search (provider = "builtin") still resolves', () => {
-    const resolved = resolveManifest(
-      {
-        name: "r",
-        harness: { provider: "anthropic" },
-        tools: { web_search: "builtin" },
-      },
-      { builtinToolNames: new Set(nativeBuiltinNames()) },
-    );
-    const binding = resolved.tools.find((b) => b.toolName === "web_search");
-    expect(binding?.providerInstanceId).toBe("native");
-  });
-});
-
-// ─── web_fetch routing ──────────────────────────────────────────────────
-
-describe("resolver + harness: web_fetch", () => {
-  it('routes provider = "anthropic" for web_fetch to (harness)', () => {
-    const resolved = resolveManifest(
-      {
-        name: "r",
-        harness: { provider: "anthropic" },
-        tools: {
-          web_fetch: {
-            provider: "anthropic",
-            max_uses: 2,
-            max_content_tokens: 8000,
-            allowed_domains: ["example.com"],
-          },
+  it("routes opted-in web_fetch to (harness) preserving config", () => {
+    const resolved = resolve({
+      name: "r",
+      harness: { provider: "anthropic" },
+      tools: {
+        web_fetch: {
+          provider: "anthropic",
+          max_uses: 2,
+          max_content_tokens: 8000,
+          allowed_domains: ["example.com"],
         },
       },
-      { builtinToolNames: new Set(nativeBuiltinNames()) },
-    );
+    });
     const binding = resolved.tools.find((b) => b.toolName === "web_fetch");
     expect(binding?.providerInstanceId).toBe("(harness)");
     expect(binding?.toolConfig).toEqual({
@@ -181,43 +167,35 @@ describe("resolver + harness: web_fetch", () => {
       allowed_domains: ["example.com"],
     });
   });
+
+  it('fails resolution when provider = "anthropic" on a non-anthropic harness', () => {
+    expect(() =>
+      resolve({
+        name: "r",
+        harness: { provider: "openai" },
+        tools: { web_search: { provider: "anthropic" } },
+      }),
+    ).toThrow(/no matching \[providers\] entry or built-in/);
+  });
+
+  it("still resolves the Brave web_search via provider = builtin", () => {
+    const resolved = resolve({
+      name: "r",
+      harness: { provider: "anthropic" },
+      tools: { web_search: "builtin" },
+    });
+    const binding = resolved.tools.find((b) => b.toolName === "web_search");
+    expect(binding?.providerInstanceId).toBe("native");
+  });
 });
 
-// ─── End-to-end via runAgent ────────────────────────────────────
-
-/**
- * Minimal in-memory session factory used by these tests so we can read
- * back `tool_call_update` content without the compacting layer
- * dropping them.
- */
-const inMemSessionFactory: SessionFactory = {
-  name: "in-memory",
-  create: () => new InMemorySession(),
-};
-
 describe("anthropic web_search end-to-end", () => {
-  function stubAnthropicWithServerToolResponse(): { body: unknown | null } {
+  function stubServerToolResponse(): { body: unknown | null } {
     const captured: { body: unknown | null } = { body: null };
     global.fetch = (async (url: string | URL, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/v1/models/")) {
-        return new Response(
-          JSON.stringify({
-            id: "claude-sonnet-4-5-latest",
-            type: "model",
-            display_name: "Sonnet",
-            created_at: "2024-01-01T00:00:00Z",
-            max_input_tokens: 200000,
-            max_tokens: 8192,
-            capabilities: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
+      if (String(url).includes("/v1/models/")) return modelInfoResponse();
       captured.body = init?.body ? JSON.parse(String(init.body)) : null;
-      // A non-streaming Message body containing a server_tool_use
-      // + web_search_tool_result + a final text block.
-      const body = {
+      return jsonResponse({
         id: "msg_1",
         type: "message",
         role: "assistant",
@@ -237,83 +215,44 @@ describe("anthropic web_search end-to-end", () => {
             content: [
               {
                 type: "web_search_result",
-                title: "Loom \u2014 README",
+                title: "Loom — README",
                 url: "https://example.com/loom",
                 encrypted_content: "<opaque>",
                 page_age: "3 days ago",
               },
             ],
           },
-          {
-            type: "text",
-            text: "I found a README about Loom.",
-            citations: null,
-          },
+          { type: "text", text: "I found a README about Loom.", citations: null },
         ],
         stop_reason: "end_turn",
         stop_sequence: null,
-        usage: {
-          input_tokens: 100,
-          output_tokens: 20,
-          cache_creation_input_tokens: null,
-          cache_read_input_tokens: null,
-          server_tool_use: { web_search_requests: 1 },
-          service_tier: "standard",
-          cache_creation: null,
-          inference_geo: null,
-        },
-      };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" },
+        usage: usage(100, 20, { web_search_requests: 1 }),
       });
     }) as typeof fetch;
     return captured;
   }
 
   it("translates [tools] config + [capabilities] grants into web_search_20250305 on the wire", async () => {
-    const captured = stubAnthropicWithServerToolResponse();
+    const captured = stubServerToolResponse();
     const agent = await runAgent(
       {
         name: "ws-e2e",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: new InMemorySession(),
-        tools: {
-          web_search: { provider: "anthropic", max_uses: 3 },
-        },
-        capabilities: {
-          web_search: { allowed_domains: ["docs.python.org"] },
-        },
+        tools: { web_search: { provider: "anthropic", max_uses: 3 } },
+        capabilities: { web_search: { allowed_domains: ["docs.python.org"] } },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("search please");
-      const body = captured.body as { tools?: unknown[] } | null;
-      expect(body).toBeTruthy();
-      expect(body?.tools).toBeDefined();
-      const webSearch = (body?.tools ?? []).find(
-        (t: unknown) =>
-          typeof t === "object" &&
-          t !== null &&
-          (t as { name?: string }).name === "web_search",
-      );
-      // Config (max_uses) lands on the API descriptor:
+      const webSearch = resolveByName(captured.body, "web_search");
       expect(webSearch).toMatchObject({
         type: "web_search_20250305",
         name: "web_search",
         max_uses: 3,
-      });
-      // Capability (allowed_domains) lands on the API descriptor:
-      expect(webSearch).toMatchObject({
         allowed_domains: ["docs.python.org"],
       });
-      // Regular `Tool` shape (name + description + input_schema)
-      // shouldn't leak in for harness-exposed tools.
       expect(webSearch).not.toHaveProperty("input_schema");
       expect(webSearch).not.toHaveProperty("description");
     } finally {
@@ -321,81 +260,54 @@ describe("anthropic web_search end-to-end", () => {
     }
   });
 
+  // An empty allowed_domains would mean "search no domains", so an ungranted
+  // capability must omit the field entirely rather than send [].
   it("omits allowed_domains on the wire when the capability isn't granted", async () => {
-    // No `[capabilities]` block at all — the tool runs unrestricted
-    // (Anthropic's default of "any domain"). The API descriptor must
-    // NOT include an empty `allowed_domains: []` (that would mean
-    // "search no domains"), only omit the field.
-    const captured = stubAnthropicWithServerToolResponse();
+    const captured = stubServerToolResponse();
     const agent = await runAgent(
       {
         name: "ws-no-cap",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: new InMemorySession(),
-        tools: { web_search: "anthropic" }, // string shorthand
+        tools: { web_search: "anthropic" },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("search");
-      const body = captured.body as { tools?: unknown[] } | null;
-      const webSearch = (body?.tools ?? []).find(
-        (t: unknown) =>
-          typeof t === "object" &&
-          t !== null &&
-          (t as { name?: string }).name === "web_search",
-      ) as { allowed_domains?: unknown } | undefined;
-      expect(webSearch?.allowed_domains).toBeUndefined();
+      expect(resolveByName(captured.body, "web_search")?.allowed_domains).toBeUndefined();
     } finally {
       await agent.close();
     }
   });
 
   it("surfaces server_tool_use + web_search_tool_result as tool_call events", async () => {
-    stubAnthropicWithServerToolResponse();
+    stubServerToolResponse();
     const agent = await runAgent(
       {
         name: "ws-events",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: new InMemorySession(),
         tools: { web_search: { provider: "anthropic" } },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       const result = await agent.prompt("search please");
       expect(result.stopReason).toBe("end_turn");
-      const events = (await agent.session.pull?.([])) ?? [];
-      const calls = events.filter(
-        (e): e is SessionUpdate & { sessionUpdate: "tool_call" } =>
-          e.sessionUpdate === "tool_call",
-      );
-      const updates = events.filter(
-        (e): e is SessionUpdate & { sessionUpdate: "tool_call_update" } =>
-          e.sessionUpdate === "tool_call_update",
-      );
-      // One server tool call surfaced as tool_call with title=web_search.
+      const events = await pull(agent);
+      const calls = toolCalls(events);
+      const updates = toolCallUpdates(events);
+
       expect(calls).toHaveLength(1);
       expect(calls[0]?.title).toBe("web_search");
       expect(calls[0]?.toolCallId).toBe("srvr_1");
-      // Paired update with completion status + rendered text.
+
       expect(updates).toHaveLength(1);
       expect(updates[0]?.toolCallId).toBe("srvr_1");
       expect(updates[0]?.status).toBe("completed");
-      const text =
-        updates[0]?.content?.[0]?.type === "content" &&
-        updates[0]?.content[0]?.content.type === "text"
-          ? updates[0]?.content[0]?.content.text
-          : "";
-      expect(text).toContain("Loom \u2014 README");
+      const text = updateText(updates[0]);
+      expect(text).toContain("Loom — README");
       expect(text).toContain("https://example.com/loom");
     } finally {
       await agent.close();
@@ -403,29 +315,13 @@ describe("anthropic web_search end-to-end", () => {
   });
 });
 
-// ─── web_fetch end-to-end ──────────────────────────────────────────────
-
 describe("anthropic web_fetch end-to-end", () => {
-  function stubAnthropicWithFetchResponse(): { body: unknown | null } {
+  function stubFetchResponse(): { body: unknown | null } {
     const captured: { body: unknown | null } = { body: null };
     global.fetch = (async (url: string | URL, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/v1/models/")) {
-        return new Response(
-          JSON.stringify({
-            id: "claude-sonnet-4-5-latest",
-            type: "model",
-            display_name: "Sonnet",
-            created_at: "2024-01-01T00:00:00Z",
-            max_input_tokens: 200000,
-            max_tokens: 8192,
-            capabilities: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
+      if (String(url).includes("/v1/models/")) return modelInfoResponse();
       captured.body = init?.body ? JSON.parse(String(init.body)) : null;
-      const body = {
+      return jsonResponse({
         id: "msg_1",
         type: "message",
         role: "assistant",
@@ -462,68 +358,33 @@ describe("anthropic web_fetch end-to-end", () => {
         ],
         stop_reason: "end_turn",
         stop_sequence: null,
-        usage: {
-          input_tokens: 80,
-          output_tokens: 15,
-          cache_creation_input_tokens: null,
-          cache_read_input_tokens: null,
-          server_tool_use: null,
-          service_tier: "standard",
-          cache_creation: null,
-          inference_geo: null,
-        },
-      };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" },
+        usage: usage(80, 15),
       });
     }) as typeof fetch;
     return captured;
   }
 
   it("emits web_fetch_20250910 with config (max_uses, max_content_tokens) + capability (allowed_domains)", async () => {
-    const captured = stubAnthropicWithFetchResponse();
+    const captured = stubFetchResponse();
     const agent = await runAgent(
       {
         name: "wf-e2e",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: new InMemorySession(),
         tools: {
-          web_fetch: {
-            provider: "anthropic",
-            max_uses: 2,
-            max_content_tokens: 8000,
-          },
+          web_fetch: { provider: "anthropic", max_uses: 2, max_content_tokens: 8000 },
         },
-        capabilities: {
-          web_fetch: { allowed_domains: ["example.com"] },
-        },
+        capabilities: { web_fetch: { allowed_domains: ["example.com"] } },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("fetch please");
-      const body = captured.body as { tools?: unknown[] } | null;
-      const fetchTool = (body?.tools ?? []).find(
-        (t: unknown) =>
-          typeof t === "object" &&
-          t !== null &&
-          (t as { name?: string }).name === "web_fetch",
-      );
-      // Config knobs land on the API descriptor:
-      expect(fetchTool).toMatchObject({
+      expect(resolveByName(captured.body, "web_fetch")).toMatchObject({
         type: "web_fetch_20250910",
         name: "web_fetch",
         max_uses: 2,
         max_content_tokens: 8000,
-      });
-      // The capability grant flows through `[capabilities]`, not
-      // `[tools]`, and lands on the API descriptor's allow-list:
-      expect(fetchTool).toMatchObject({
         allowed_domains: ["example.com"],
       });
     } finally {
@@ -531,74 +392,47 @@ describe("anthropic web_fetch end-to-end", () => {
     }
   });
 
-  it("does not pass allowed_domains from [tools] config (it must come from [capabilities])", async () => {
-    // Putting `allowed_domains` in `[tools]` config is silently
-    // ignored — it's not a config knob, it's a capability. The user
-    // should move it to `[capabilities]`; the resolver doesn't error
-    // because `assertKnownKinds` only checks the capability side.
-    const captured = stubAnthropicWithFetchResponse();
+  // allowed_domains is a capability, not a [tools] config knob, so placing it
+  // under [tools] is silently dropped rather than reaching the wire.
+  it("does not pass allowed_domains from [tools] config", async () => {
+    const captured = stubFetchResponse();
     const agent = await runAgent(
       {
         name: "wf-misplaced",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: new InMemorySession(),
         tools: {
-          web_fetch: {
-            provider: "anthropic",
-            allowed_domains: ["misplaced.example.com"],
-          },
+          web_fetch: { provider: "anthropic", allowed_domains: ["misplaced.example.com"] },
         },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("fetch");
-      const body = captured.body as { tools?: unknown[] } | null;
-      const fetchTool = (body?.tools ?? []).find(
-        (t: unknown) =>
-          typeof t === "object" &&
-          t !== null &&
-          (t as { name?: string }).name === "web_fetch",
-      ) as { allowed_domains?: unknown } | undefined;
-      expect(fetchTool?.allowed_domains).toBeUndefined();
+      expect(resolveByName(captured.body, "web_fetch")?.allowed_domains).toBeUndefined();
     } finally {
       await agent.close();
     }
   });
 
   it("renders web_fetch_tool_result text into the tool_call_update content", async () => {
-    stubAnthropicWithFetchResponse();
+    stubFetchResponse();
     const agent = await runAgent(
       {
         name: "wf-events",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: new InMemorySession(),
         tools: { web_fetch: { provider: "anthropic" } },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("fetch");
-      const events = (await agent.session.pull?.([])) ?? [];
-      const update = events.find(
-        (e): e is SessionUpdate & { sessionUpdate: "tool_call_update" } =>
-          e.sessionUpdate === "tool_call_update",
-      );
+      const events = await pull(agent);
+      const update = toolCallUpdates(events)[0];
       expect(update?.toolCallId).toBe("srvr_2");
       expect(update?.status).toBe("completed");
-      const text =
-        update?.content?.[0]?.type === "content" &&
-        update?.content[0]?.content.type === "text"
-          ? update?.content[0]?.content.text
-          : "";
+      const text = updateText(update);
       expect(text).toContain("Example Page");
       expect(text).toContain("https://example.com/page");
       expect(text).toContain("The full extracted page text.");
@@ -608,29 +442,15 @@ describe("anthropic web_fetch end-to-end", () => {
   });
 });
 
-// ─── In-session replay (encrypted content survives across turns) ─────────────
-
-// ─── Streaming order ────────────────────────────────────────────────────
-
 describe("anthropic server-tool event order during streaming", () => {
-  it("surfaces server_tool_use + result blocks BETWEEN surrounding text deltas", async () => {
-    // Regression test for the v0.1.x bug where streamed responses
-    // emitted all text deltas live but deferred the tool_call /
-    // tool_call_update emissions until `finalMessage()` resolved —
-    // so the tool call appeared AFTER the model's full text in the
-    // session log, instead of in the middle of it where Anthropic
-    // actually produced it.
-    //
-    // The stub serves an SSE stream with content blocks in this
-    // order: text → server_tool_use → web_search_tool_result → text.
-    // We expect the session events to land in the same chronological
-    // order: agent_message_chunk → tool_call → tool_call_update →
-    // agent_message_chunk.
+  // Regression: streamed responses once deferred tool_call / tool_call_update
+  // emission until finalMessage() resolved, so tool events landed after the
+  // model's full text instead of interleaved where Anthropic produced them.
+  it("surfaces server_tool_use + result blocks between surrounding text deltas", async () => {
     const enc = new TextEncoder();
     const sseFrame = (e: Record<string, unknown>): Uint8Array =>
       enc.encode(`event: ${String(e.type)}\ndata: ${JSON.stringify(e)}\n\n`);
     const eventSequence: Record<string, unknown>[] = [
-      // Header
       {
         type: "message_start",
         message: {
@@ -641,31 +461,16 @@ describe("anthropic server-tool event order during streaming", () => {
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: {
-            input_tokens: 10,
-            output_tokens: 0,
-            cache_creation_input_tokens: null,
-            cache_read_input_tokens: null,
-            server_tool_use: null,
-            service_tier: "standard",
-            cache_creation: null,
-            inference_geo: null,
-          },
+          usage: usage(10, 0),
         },
       },
-      // Block 0: opening text
-      {
-        type: "content_block_start",
-        index: 0,
-        content_block: { type: "text", text: "" },
-      },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
       {
         type: "content_block_delta",
         index: 0,
         delta: { type: "text_delta", text: "Let me search." },
       },
       { type: "content_block_stop", index: 0 },
-      // Block 1: server_tool_use
       {
         type: "content_block_start",
         index: 1,
@@ -683,7 +488,6 @@ describe("anthropic server-tool event order during streaming", () => {
         delta: { type: "input_json_delta", partial_json: "" },
       },
       { type: "content_block_stop", index: 1 },
-      // Block 2: web_search_tool_result
       {
         type: "content_block_start",
         index: 2,
@@ -702,12 +506,7 @@ describe("anthropic server-tool event order during streaming", () => {
         },
       },
       { type: "content_block_stop", index: 2 },
-      // Block 3: closing text
-      {
-        type: "content_block_start",
-        index: 3,
-        content_block: { type: "text", text: "" },
-      },
+      { type: "content_block_start", index: 3, content_block: { type: "text", text: "" } },
       {
         type: "content_block_delta",
         index: 3,
@@ -722,21 +521,7 @@ describe("anthropic server-tool event order during streaming", () => {
       { type: "message_stop" },
     ];
     global.fetch = (async (url: string | URL) => {
-      const u = String(url);
-      if (u.includes("/v1/models/")) {
-        return new Response(
-          JSON.stringify({
-            id: "claude-sonnet-4-5-latest",
-            type: "model",
-            display_name: "Sonnet",
-            created_at: "2024-01-01T00:00:00Z",
-            max_input_tokens: 200000,
-            max_tokens: 8192,
-            capabilities: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
+      if (String(url).includes("/v1/models/")) return modelInfoResponse();
       const body = new ReadableStream<Uint8Array>({
         start(ctrl) {
           for (const e of eventSequence) ctrl.enqueue(sseFrame(e));
@@ -752,36 +537,26 @@ describe("anthropic server-tool event order during streaming", () => {
     const agent = await runAgent(
       {
         name: "streaming-order",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: true,
-        },
+        harness: anthropicHarness({ stream: true }),
         session: new InMemorySession(),
         tools: { web_search: "anthropic" },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("search please");
-      const events = (await agent.session.pull?.([])) ?? [];
-      // Filter out usage_update / stop events and look only at the
-      // four content kinds we care about ordering between.
+      const events = await pull(agent);
       const sequenceKinds = events
         .map((e) => e.sessionUpdate)
         .filter(
           (k) =>
-            k === "agent_message_chunk" ||
-            k === "tool_call" ||
-            k === "tool_call_update",
+            k === "agent_message_chunk" || k === "tool_call" || k === "tool_call_update",
         );
       expect(sequenceKinds).toEqual([
-        // user_message_chunk would have been before these, but we
-        // filtered to agent-side kinds only.
-        "agent_message_chunk", // "Let me search."
-        "tool_call", // server_tool_use(web_search)
-        "tool_call_update", // web_search_tool_result
-        "agent_message_chunk", // "Found the README."
+        "agent_message_chunk",
+        "tool_call",
+        "tool_call_update",
+        "agent_message_chunk",
       ]);
     } finally {
       await agent.close();
@@ -791,32 +566,13 @@ describe("anthropic server-tool event order during streaming", () => {
 
 describe("anthropic server-tool replay within a session", () => {
   it("re-sends server_tool_use + web_search_tool_result on a second turn", async () => {
-    // Two consecutive prompts. The first turn's response contains a
-    // server_tool_use + web_search_tool_result + text; the second
-    // turn's response is text-only. We capture both request bodies
-    // and assert the second one includes the full server-tool pair
-    // (with encrypted_content intact) in the assistant history.
     const captured: { bodies: unknown[] } = { bodies: [] };
     let turn = 0;
     global.fetch = (async (url: string | URL, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/v1/models/")) {
-        return new Response(
-          JSON.stringify({
-            id: "claude-sonnet-4-5-latest",
-            type: "model",
-            display_name: "Sonnet",
-            created_at: "2024-01-01T00:00:00Z",
-            max_input_tokens: 200000,
-            max_tokens: 8192,
-            capabilities: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
+      if (String(url).includes("/v1/models/")) return modelInfoResponse();
       captured.bodies.push(init?.body ? JSON.parse(String(init.body)) : null);
       turn += 1;
-      const body =
+      return jsonResponse(
         turn === 1
           ? {
               id: "msg_1",
@@ -845,24 +601,11 @@ describe("anthropic server-tool replay within a session", () => {
                     },
                   ],
                 },
-                {
-                  type: "text",
-                  text: "I found a README about Loom.",
-                  citations: null,
-                },
+                { type: "text", text: "I found a README about Loom.", citations: null },
               ],
               stop_reason: "end_turn",
               stop_sequence: null,
-              usage: {
-                input_tokens: 100,
-                output_tokens: 20,
-                cache_creation_input_tokens: null,
-                cache_read_input_tokens: null,
-                server_tool_use: { web_search_requests: 1 },
-                service_tier: "standard",
-                cache_creation: null,
-                inference_geo: null,
-              },
+              usage: usage(100, 20, { web_search_requests: 1 }),
             }
           : {
               id: "msg_2",
@@ -870,61 +613,33 @@ describe("anthropic server-tool replay within a session", () => {
               role: "assistant",
               model: "claude-sonnet-4-5-latest",
               content: [
-                {
-                  type: "text",
-                  text: "Building on the search above…",
-                  citations: null,
-                },
+                { type: "text", text: "Building on the search above…", citations: null },
               ],
               stop_reason: "end_turn",
               stop_sequence: null,
-              usage: {
-                input_tokens: 150,
-                output_tokens: 8,
-                cache_creation_input_tokens: null,
-                cache_read_input_tokens: null,
-                server_tool_use: null,
-                service_tier: "standard",
-                cache_creation: null,
-                inference_geo: null,
-              },
-            };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+              usage: usage(150, 8),
+            },
+      );
     }) as typeof fetch;
 
     const agent = await runAgent(
       {
         name: "replay",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: new InMemorySession(),
         tools: { web_search: { provider: "anthropic" } },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("search please");
       await agent.prompt("now tell me more");
       expect(captured.bodies).toHaveLength(2);
       const second = captured.bodies[1] as { messages?: unknown[] };
-      expect(second?.messages).toBeDefined();
-      // The assistant message reconstructed from the first turn must
-      // contain BOTH the server_tool_use AND web_search_tool_result
-      // blocks — inline, in the assistant message (not split off into
-      // a synthesised user tool_result).
       const assistant = (second.messages ?? []).find(
         (m): m is { role: string; content: unknown[] } =>
-          typeof m === "object" &&
-          m !== null &&
-          (m as { role?: string }).role === "assistant",
+          typeof m === "object" && m !== null && (m as { role?: string }).role === "assistant",
       );
-      expect(assistant).toBeDefined();
       const content = (assistant?.content ?? []) as Array<{
         type: string;
         id?: string;
@@ -932,24 +647,17 @@ describe("anthropic server-tool replay within a session", () => {
         tool_use_id?: string;
         content?: unknown;
       }>;
-      const serverUse = content.find((c) => c.type === "server_tool_use");
-      const serverResult = content.find(
-        (c) => c.type === "web_search_tool_result",
-      );
-      expect(serverUse).toMatchObject({
+      expect(content.find((c) => c.type === "server_tool_use")).toMatchObject({
         type: "server_tool_use",
         id: "srvr_1",
         name: "web_search",
       });
+      const serverResult = content.find((c) => c.type === "web_search_tool_result");
       expect(serverResult).toMatchObject({
         type: "web_search_tool_result",
         tool_use_id: "srvr_1",
       });
-      // The critical assertion: encrypted_content survived the
-      // round-trip via session-stored rawOutput.
-      const results = (serverResult?.content ?? []) as Array<{
-        encrypted_content?: string;
-      }>;
+      const results = (serverResult?.content ?? []) as Array<{ encrypted_content?: string }>;
       expect(results[0]?.encrypted_content).toBe("ENC-XYZ-123");
     } finally {
       await agent.close();
@@ -957,32 +665,13 @@ describe("anthropic server-tool replay within a session", () => {
   });
 
   it("falls back to an `unavailable` placeholder when rawOutput is missing", async () => {
-    // Same two-prompt setup, but a transformer session strips
-    // rawOutput from tool_call_update events before the second turn.
-    // The harness should still emit a server_tool_use + result pair
-    // (not drop the call), with the result block being the
-    // `error_code: "unavailable"` variant.
     const captured: { bodies: unknown[] } = { bodies: [] };
     let turn = 0;
     global.fetch = (async (url: string | URL, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/v1/models/")) {
-        return new Response(
-          JSON.stringify({
-            id: "claude-sonnet-4-5-latest",
-            type: "model",
-            display_name: "Sonnet",
-            created_at: "2024-01-01T00:00:00Z",
-            max_input_tokens: 200000,
-            max_tokens: 8192,
-            capabilities: null,
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
+      if (String(url).includes("/v1/models/")) return modelInfoResponse();
       captured.bodies.push(init?.body ? JSON.parse(String(init.body)) : null);
       turn += 1;
-      const body =
+      return jsonResponse(
         turn === 1
           ? {
               id: "msg_1",
@@ -1014,16 +703,7 @@ describe("anthropic server-tool replay within a session", () => {
               ],
               stop_reason: "end_turn",
               stop_sequence: null,
-              usage: {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_creation_input_tokens: null,
-                cache_read_input_tokens: null,
-                server_tool_use: { web_search_requests: 1 },
-                service_tier: "standard",
-                cache_creation: null,
-                inference_geo: null,
-              },
+              usage: usage(10, 5, { web_search_requests: 1 }),
             }
           : {
               id: "msg_2",
@@ -1033,25 +713,11 @@ describe("anthropic server-tool replay within a session", () => {
               content: [{ type: "text", text: "ok", citations: null }],
               stop_reason: "end_turn",
               stop_sequence: null,
-              usage: {
-                input_tokens: 10,
-                output_tokens: 1,
-                cache_creation_input_tokens: null,
-                cache_read_input_tokens: null,
-                server_tool_use: null,
-                service_tier: "standard",
-                cache_creation: null,
-                inference_geo: null,
-              },
-            };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+              usage: usage(10, 1),
+            },
+      );
     }) as typeof fetch;
 
-    // Session that strips rawOutput from tool_call_update events to
-    // simulate compaction / cross-process resume.
     const stripping = new InMemorySession();
     const origPush = stripping.push?.bind(stripping);
     stripping.push = async (event) => {
@@ -1066,15 +732,11 @@ describe("anthropic server-tool replay within a session", () => {
     const agent = await runAgent(
       {
         name: "unavailable",
-        harness: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5-latest",
-          stream: false,
-        },
+        harness: anthropicHarness(),
         session: stripping,
         tools: { web_search: { provider: "anthropic" } },
       },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
+      anthropicSecrets(),
     );
     try {
       await agent.prompt("search");
@@ -1082,16 +744,13 @@ describe("anthropic server-tool replay within a session", () => {
       const second = captured.bodies[1] as { messages?: unknown[] };
       const assistant = (second.messages ?? []).find(
         (m): m is { role: string; content: unknown[] } =>
-          typeof m === "object" &&
-          m !== null &&
-          (m as { role?: string }).role === "assistant",
+          typeof m === "object" && m !== null && (m as { role?: string }).role === "assistant",
       );
       const content = (assistant?.content ?? []) as Array<{
         type: string;
         content?: { type?: string; error_code?: string };
       }>;
-      const result = content.find((c) => c.type === "web_search_tool_result");
-      expect(result?.content).toMatchObject({
+      expect(content.find((c) => c.type === "web_search_tool_result")?.content).toMatchObject({
         type: "web_search_tool_result_error",
         error_code: "unavailable",
       });
@@ -1101,8 +760,6 @@ describe("anthropic server-tool replay within a session", () => {
   });
 });
 
-// ─── Audit surfaces availableTools ──────────────────────────────────
-
 describe("audit: harness availableTools surfaces in summary", () => {
   it("lists the catalog on the harness summary", async () => {
     const tree = await auditAgent({
@@ -1110,13 +767,7 @@ describe("audit: harness availableTools surfaces in summary", () => {
       harness: { provider: "anthropic" },
       tools: { web_search: { provider: "anthropic" } },
     });
-    expect(tree.harness.availableTools).toBeDefined();
     expect(tree.harness.availableTools).toContain("web_search");
     expect(tree.harness.availableTools).toContain("web_fetch");
   });
 });
-
-// `inMemSessionFactory` kept around in case future tests want it; we
-// currently use `new InMemorySession()` directly via the pre-built
-// session-instance manifest shape.
-void inMemSessionFactory;

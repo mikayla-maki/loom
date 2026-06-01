@@ -1,11 +1,3 @@
-/**
- * `loom mcp inspect` tests (Chunk 4).
- *
- * Exercises the authoring-aid CLI: provider-spec resolution from
- * paths / npm names / manifest handles, plus the TOML snippet
- * shape. Spawns the test fixture's echo server end-to-end.
- */
-
 import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
@@ -23,6 +15,22 @@ const ECHO_SERVER = path.join(FIXTURES, "mcp/echo-server.mjs");
 
 describe("loom mcp inspect — provider-spec resolution", () => {
   const tmp = useTmpDir("loom-inspect-");
+
+  async function writeManifest(providersEntry: string): Promise<string> {
+    const p = path.join(tmp(), "agent.toml");
+    await fs.writeFile(
+      p,
+      `[agent]
+name = "x"
+[harness]
+provider = "test"
+[providers]
+${providersEntry}
+`,
+      "utf8",
+    );
+    return p;
+  }
 
   it("treats `./foo` and `/abs/foo.js` as path shorthand", async () => {
     const r1 = await resolveProviderSpec("./bin/server.mjs");
@@ -53,17 +61,8 @@ describe("loom mcp inspect — provider-spec resolution", () => {
   });
 
   it("resolves bare handles against the manifest's [providers] table", async () => {
-    const p = path.join(tmp(), "agent.toml");
-    await fs.writeFile(
-      p,
-      `[agent]
-name = "x"
-[harness]
-provider = "test"
-[providers]
-my_handle = { provider = "mcp-server", command = "node", args = ["./server.mjs"] }
-`,
-      "utf8",
+    const p = await writeManifest(
+      `my_handle = { provider = "mcp-server", command = "node", args = ["./server.mjs"] }`,
     );
     const r = await resolveProviderSpec("my_handle", { manifestPath: p });
     expect(r.config).toEqual({
@@ -74,9 +73,6 @@ my_handle = { provider = "mcp-server", command = "node", args = ["./server.mjs"]
     expect(r.manifestDir).toBe(path.dirname(path.resolve(p)));
   });
 
-  // Variants of "bare handle rejected because the [providers] entry
-  // isn't a usable mcp-server entry". Each row writes a single
-  // [providers] entry and asserts the diagnostic.
   it.each([
     {
       label: "non-mcp-server factory",
@@ -93,18 +89,7 @@ my_handle = { provider = "mcp-server", command = "node", args = ["./server.mjs"]
   ])(
     "rejects bare handles pointing at $label",
     async ({ entry, handle, message }) => {
-      const p = path.join(tmp(), "agent.toml");
-      await fs.writeFile(
-        p,
-        `[agent]
-name = "x"
-[harness]
-provider = "test"
-[providers]
-${entry}
-`,
-        "utf8",
-      );
+      const p = await writeManifest(entry);
       await expect(
         resolveProviderSpec(handle, { manifestPath: p }),
       ).rejects.toThrow(message);
@@ -113,19 +98,13 @@ ${entry}
 });
 
 describe("loom mcp inspect — handle suggestion", () => {
-  it("strips scope + common prefixes + extensions", () => {
+  it("strips scope, prefixes, and extensions, then escapes the rest", () => {
     expect(suggestHandle("@modelcontextprotocol/server-filesystem")).toBe(
       "filesystem",
     );
     expect(suggestHandle("mcp-server-linear")).toBe("linear");
-    // We strip prefixes + extension; suffixes (and embedded hyphens)
-    // become underscores so the result is TOML-handle-safe.
     expect(suggestHandle("./bin/echo-server.mjs")).toBe("echo_server");
-    // `mcp-` prefix gets stripped → "server".
     expect(suggestHandle("@linear/mcp-server")).toBe("server");
-  });
-
-  it("escapes invalid characters and falls back to a default name", () => {
     expect(suggestHandle("./a path with spaces.mjs")).toMatch(/^[a-zA-Z_]/);
     expect(suggestHandle("123-numeric")).toMatch(/^mcp_/);
   });
@@ -140,19 +119,12 @@ describe("loom mcp inspect — end-to-end against the echo fixture", () => {
     expect(r.serverVersion).toBe("0.0.1");
     expect(r.tools.map((t) => t.name).sort()).toEqual(["add", "echo"]);
 
-    // TOML snippet sanity checks: must have a [providers] entry, one
-    // [tools.X] per discovered tool, and a [capabilities] block with
-    // commented-out hints.
     expect(r.toml).toMatch(/^# Tools advertised by /m);
     expect(r.toml).toMatch(/\[providers\]/);
     expect(r.toml).toMatch(/provider = "mcp-server"/);
     expect(r.toml).toMatch(/\[tools\.echo\]/);
     expect(r.toml).toMatch(/\[tools\.add\]/);
     expect(r.toml).toMatch(/\[capabilities\]/);
-    // Capability hints are commented-out lines containing each tool name.
-    expect(r.toml).toMatch(/^# echo = /m);
-    expect(r.toml).toMatch(/^# add = /m);
-    // Hint reflects the schema's properties (text for echo, a+b for add).
     expect(r.toml).toMatch(/^# echo = \{ text = "\*" \}$/m);
     expect(r.toml).toMatch(/^# add = \{ a = "\*", b = "\*" \}$/m);
   });
@@ -162,7 +134,6 @@ describe("loom mcp inspect — end-to-end against the echo fixture", () => {
       suggestedHandle: "echo_mcp",
     });
     const p = path.join(tmp(), "agent.toml");
-    // Wrap the snippet with the minimum manifest scaffolding.
     const manifest = `[agent]
 name = "rt"
 [harness]
@@ -171,11 +142,9 @@ ${r.toml}`;
     await fs.writeFile(p, manifest, "utf8");
     const { parseAgentManifest } = await import("../src/manifest/parser.js");
     const m = await parseAgentManifest(p);
-    // The provider entry parses as the configured-factory form.
     expect(m.providers?.echo_mcp).toMatchObject({
       provider: "mcp-server",
     });
-    // Both tools appear with the right handle.
     expect(m.tools?.echo).toEqual({ provider: "echo_mcp" });
     expect(m.tools?.add).toEqual({ provider: "echo_mcp" });
   });

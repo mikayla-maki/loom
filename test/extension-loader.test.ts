@@ -12,23 +12,18 @@ import { parseAgentManifest } from "../src/manifest/parser.js";
 import { LoomError } from "../src/errors.js";
 import { useTmpDir } from "./helpers/tmp.js";
 
-/**
- * Build a directory tree that looks like a node_modules folder, containing
- * a single Loom provider package. The package's `loom.provider` field
- * points at an entry that registers a Tools instance supplying a
- * synthetic tool.
- */
 async function buildExtensionFixture(opts: {
   rootDir: string;
   packageName: string;
   scope?: string;
 }): Promise<{ packageDir: string; nodeModulesDir: string }> {
   const nm = path.join(opts.rootDir, "node_modules");
-  const dirName = opts.packageName;
   const packageDir = opts.scope
-    ? path.join(nm, opts.scope, dirName)
-    : path.join(nm, dirName);
-  const fullName = opts.scope ? `${opts.scope}/${dirName}` : dirName;
+    ? path.join(nm, opts.scope, opts.packageName)
+    : path.join(nm, opts.packageName);
+  const fullName = opts.scope
+    ? `${opts.scope}/${opts.packageName}`
+    : opts.packageName;
   await fs.mkdir(packageDir, { recursive: true });
   await fs.writeFile(
     path.join(packageDir, "package.json"),
@@ -45,10 +40,6 @@ async function buildExtensionFixture(opts: {
       2,
     ),
   );
-  // Entry: ESM module exporting register(). Registers a Tools
-  // contribution via api.registerTools(); its Tools.resolveTool()
-  // returns a synthetic 'fixture.echo' tool by name. v5: per-tool
-  // config (`greeting`) flows into `Tools.resolveTool(name, config, …)`.
   await fs.writeFile(
     path.join(packageDir, "index.js"),
     `export function register(api) {
@@ -68,7 +59,7 @@ async function buildExtensionFixture(opts: {
             },
           };
         },
-        async close() { /* noop */ },
+        async close() {},
       };
     },
   });
@@ -78,71 +69,58 @@ async function buildExtensionFixture(opts: {
   return { packageDir, nodeModulesDir: nm };
 }
 
+async function writeNonProviderPackage(
+  rootDir: string,
+  name: string,
+): Promise<void> {
+  const dir = path.join(rootDir, "node_modules", name);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name, version: "1.0.0", main: "./index.js" }),
+  );
+  await fs.writeFile(path.join(dir, "index.js"), "export const x = 1;");
+}
+
 describe("provider package loader", () => {
   const tmp = useTmpDir("loom-ext-");
 
-  it("locates and imports a package with loom.provider metadata", async () => {
+  it("locates plain, scoped, and rejects non-provider or missing packages", async () => {
     const root = tmp();
+    await buildExtensionFixture({ rootDir: root, packageName: "fixture-loom-ext" });
     await buildExtensionFixture({
       rootDir: root,
-      packageName: "fixture-loom-ext",
+      packageName: "fixture",
+      scope: "@my-org",
     });
+    await writeNonProviderPackage(root, "boring-pkg");
+
     const info = await locateProviderPackage("fixture-loom-ext", {
       agentManifestDir: root,
     });
     expect(info.name).toBe("fixture-loom-ext");
     expect(info.entryPath).toMatch(/index\.js$/);
     expect(info.version).toBe("0.1.0");
-  });
 
-  it("throws a clear error for missing packages", async () => {
+    const scoped = await locateProviderPackage("@my-org/fixture", {
+      agentManifestDir: root,
+    });
+    expect(scoped.name).toBe("@my-org/fixture");
+
     await expect(
-      locateProviderPackage("does-not-exist-loom-ext", {
-        agentManifestDir: tmp(),
-      }),
+      locateProviderPackage("does-not-exist-loom-ext", { agentManifestDir: root }),
+    ).rejects.toThrow(/Cannot find Loom provider/);
+    await expect(
+      locateProviderPackage("boring-pkg", { agentManifestDir: root }),
     ).rejects.toThrow(/Cannot find Loom provider/);
   });
 
-  it("rejects packages without a loom.provider field (treats as 'not a provider')", async () => {
-    const nm = path.join(tmp(), "node_modules", "boring-pkg");
-    await fs.mkdir(nm, { recursive: true });
-    await fs.writeFile(
-      path.join(nm, "package.json"),
-      JSON.stringify({
-        name: "boring-pkg",
-        version: "1.0.0",
-        main: "./index.js",
-      }),
-    );
-    await fs.writeFile(path.join(nm, "index.js"), "export const x = 1;");
-    await expect(
-      locateProviderPackage("boring-pkg", { agentManifestDir: tmp() }),
-    ).rejects.toThrow(/Cannot find Loom provider/);
-  });
-
-  it("supports scoped package names (@scope/name)", async () => {
-    await buildExtensionFixture({
-      rootDir: tmp(),
-      packageName: "fixture",
-      scope: "@my-org",
-    });
-    const info = await locateProviderPackage("@my-org/fixture", {
-      agentManifestDir: tmp(),
-    });
-    expect(info.name).toBe("@my-org/fixture");
-  });
-
-  it("listInstalledProviders enumerates packages with loom.provider metadata", async () => {
+  it("listInstalledProviders enumerates only packages with loom.provider metadata", async () => {
     const root = tmp();
     await buildExtensionFixture({ rootDir: root, packageName: "fixture-a" });
     await buildExtensionFixture({ rootDir: root, packageName: "fixture-b" });
-    // A non-provider package alongside.
-    const boring = path.join(root, "node_modules", "boring");
-    await fs.mkdir(boring, { recursive: true });
-    await fs.writeFile(
-      path.join(boring, "package.json"),
-      JSON.stringify({ name: "boring", version: "1.0.0" }),
-    );
+    await writeNonProviderPackage(root, "boring");
+
     const items = await listInstalledProviders(
       { agentManifestDir: root },
       { searchPaths: [path.join(root, "node_modules")] },
@@ -153,7 +131,7 @@ describe("provider package loader", () => {
     expect(names).not.toContain("boring");
   });
 
-  it("loadProviderByName executes register() and surfaces contributed Tools registrations", async () => {
+  it("loadProviderByName runs register() and surfaces Tools contributions", async () => {
     await buildExtensionFixture({
       rootDir: tmp(),
       packageName: "register-side-effect-ext",
@@ -167,10 +145,9 @@ describe("provider package loader", () => {
         providerName: "register-side-effect-ext",
       },
     );
-    // The fixture's register() calls api.registerTools() with a
-    // contribution whose name matches the package.
-    const names = toolsContributions.map((f) => f.name);
-    expect(names).toContain("register-side-effect-ext");
+    expect(toolsContributions.map((f) => f.name)).toContain(
+      "register-side-effect-ext",
+    );
   });
 
   it("rejects packages whose entry doesn't export register()", async () => {
@@ -185,10 +162,7 @@ describe("provider package loader", () => {
         loom: { provider: "./index.js" },
       }),
     );
-    await fs.writeFile(
-      path.join(pkgDir, "index.js"),
-      `export const noop = true;`,
-    );
+    await fs.writeFile(path.join(pkgDir, "index.js"), `export const noop = true;`);
     await expect(
       loadProviderByName("no-register", {
         agentManifestDir: tmp(),
@@ -206,17 +180,8 @@ describe("agent.toml v5 source resolution end-to-end", () => {
   it("a tool with a path source loads the package and resolves through its Tools instance", async () => {
     const agentDir = path.join(tmp(), "agent");
     await fs.mkdir(agentDir, { recursive: true });
-    await buildExtensionFixture({
-      rootDir: agentDir,
-      packageName: "ext-pkg-e2e",
-    });
+    await buildExtensionFixture({ rootDir: agentDir, packageName: "ext-pkg-e2e" });
 
-    // v5: the tool entry's `provider` field is an inline SourceSpec
-    // pointing at the provider package on disk. Loom loads it, runs
-    // `register()`, and routes 'fixture.echo' through the Tools
-    // instance that package added via `registerTools()`. The
-    // `greeting` field is per-tool config (the test fixture reads
-    // it inside `resolveTool`).
     await fs.writeFile(
       path.join(agentDir, "agent.toml"),
       `[agent]
@@ -232,12 +197,7 @@ greeting = "yo"
 `,
     );
 
-    // Parse the manifest and mutate the harness to inject the test
-    // script. Easier than expressing the script as TOML, and the
-    // manifest is what runAgent ultimately consumes either way.
-    const manifest = await parseAgentManifest(
-      path.join(agentDir, "agent.toml"),
-    );
+    const manifest = await parseAgentManifest(path.join(agentDir, "agent.toml"));
     if ("provider" in manifest.harness) {
       manifest.harness.script = [
         [

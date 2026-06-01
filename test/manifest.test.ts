@@ -8,10 +8,11 @@ import { useTmpDir } from "./helpers/tmp.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
+type Layers = Array<{ provider: unknown; [k: string]: unknown }>;
+
 describe("agent.toml parser", () => {
   const tmp = useTmpDir("loom-manifest-");
 
-  /** Writes `agent.toml` with `body` and returns its absolute path. */
   async function writeManifest(body: string): Promise<string> {
     const p = path.join(tmp(), "agent.toml");
     await fs.writeFile(p, body, "utf8");
@@ -26,17 +27,11 @@ describe("agent.toml parser", () => {
     if ("provider" in m.harness) expect(m.harness.provider).toBe("test");
     if (m.session && "provider" in m.session)
       expect(m.session.provider).toBe("file");
-    // [agent].secrets allowlist parsed.
     expect(m.secrets).toEqual(["sample_user_name"]);
-    // Per-tool capability grants. The fixture uses per-kind maps for
-    // each FS tool; the `"*"` whole-tool form is exercised elsewhere.
     expect(m.capabilities?.read_file).toEqual({ paths: ["./"] });
     expect(m.capabilities?.write_file).toEqual({ paths: ["./"] });
     expect(m.capabilities?.edit_file).toEqual({ paths: ["./"] });
     expect(m.capabilities?.find).toEqual({ paths: ["./"] });
-    // v5: tool entries are tables (with a required `provider` field)
-    // or the string shorthand. The sample agent uses the string form
-    // `"builtin"` for its native tools.
     expect(m.tools).toEqual({
       read_file: "builtin",
       write_file: "builtin",
@@ -46,17 +41,11 @@ describe("agent.toml parser", () => {
   });
 
   it("rejects manifests missing required sections", async () => {
-    // [session] and [capabilities] are now optional, so a manifest can omit
-    // them. Missing required sections that should still throw: [agent]
-    // (or [agent].name), and [harness].provider.
     const p = await writeManifest('[agent]\nname = "x"\n[harness]\n');
     await expect(parseAgentManifest(p)).rejects.toThrow(ManifestError);
   });
 
-  it("parses an explicit [tools] table with string shorthand (v3)", async () => {
-    // v3: string shorthand still works — it's a bare provider ref.
-    // `"builtin"` resolves to the native provider; `"./local-tool"`
-    // resolves to a local-path source.
+  it("parses [tools] string shorthand as bare provider refs", async () => {
     const p = await writeManifest(`[agent]
 name = "with-tools"
 system_prompt = "x"
@@ -127,11 +116,10 @@ provider = { npm = "@my-org/harness", greeting = "hi" }
     await expect(parseAgentManifest(p)).rejects.toThrow(/is not a known key/);
   });
 
-  it("distinguishes absent [tools] from empty [tools] (defaults vs. opt-out)", async () => {
-    // 1) absent [tools] section
-    const a = path.join(tmp(), "absent.toml");
+  it("distinguishes absent [tools] (defaults) from empty [tools] (opt-out)", async () => {
+    const absent = path.join(tmp(), "absent.toml");
     await fs.writeFile(
-      a,
+      absent,
       `[agent]
 name = "absent"
 system_prompt = "x"
@@ -140,13 +128,11 @@ provider = "test"
 `,
       "utf8",
     );
-    const ma = await parseAgentManifest(a);
-    expect(ma.tools).toBeUndefined();
+    expect((await parseAgentManifest(absent)).tools).toBeUndefined();
 
-    // 2) explicit empty [tools] section
-    const b = path.join(tmp(), "empty.toml");
+    const empty = path.join(tmp(), "empty.toml");
     await fs.writeFile(
-      b,
+      empty,
       `[agent]
 name = "empty"
 system_prompt = "x"
@@ -156,27 +142,34 @@ provider = "test"
 `,
       "utf8",
     );
-    const mb = await parseAgentManifest(b);
-    expect(mb.tools).toEqual({});
+    expect((await parseAgentManifest(empty)).tools).toEqual({});
   });
 
-  it("system_prompt accepts an inline string (no path prefix)", async () => {
-    const p = await writeManifest(`[agent]
+  it("parses system_prompt as a literal string (inline or path-like)", async () => {
+    const inline = await parseAgentManifest(
+      await writeManifest(`[agent]
 name = "x"
 system_prompt = "You are a friendly demo agent."
-[tools]
-
 [harness]
 provider = "test"
-[session]
-provider = "in-memory"
-`);
-    const m = await parseAgentManifest(p);
-    expect(m.systemPrompt).toBe("You are a friendly demo agent.");
+`),
+    );
+    expect(inline.systemPrompt).toBe("You are a friendly demo agent.");
+
+    const pathLike = await parseAgentManifest(
+      await writeManifest(`[agent]
+name = "x"
+system_prompt = "./prompt.md"
+[harness]
+provider = "test"
+`),
+    );
+    expect(pathLike.systemPrompt).toBe("./prompt.md");
   });
 
-  it("parses [[session.layers]] (dotted-key array-of-tables) into a layered session", async () => {
-    const p = await writeManifest(`[agent]
+  describe("[session] layers", () => {
+    it("parses [[session.layers]] array-of-tables", async () => {
+      const p = await writeManifest(`[agent]
 name = "layered"
 system_prompt = "x"
 [harness]
@@ -189,44 +182,34 @@ threshold = 60
 [[session.layers]]
 provider = "in-memory"
 `);
-    const m = await parseAgentManifest(p);
-    expect(Array.isArray(m.session)).toBe(true);
-    const layers = m.session as Array<{
-      provider: unknown;
-      [k: string]: unknown;
-    }>;
-    expect(layers).toHaveLength(2);
-    expect(layers[0]).toMatchObject({
-      provider: "compacting",
-      threshold: 60,
+      const m = await parseAgentManifest(p);
+      expect(Array.isArray(m.session)).toBe(true);
+      const layers = m.session as Layers;
+      expect(layers).toHaveLength(2);
+      expect(layers[0]).toMatchObject({ provider: "compacting", threshold: 60 });
+      expect(layers[1]).toMatchObject({ provider: "in-memory" });
     });
-    expect(layers[1]).toMatchObject({ provider: "in-memory" });
-  });
 
-  it("parses inline [session].layers with all-string shorthand", async () => {
-    const p = await writeManifest(`[agent]
-name = "inline-layered"
+    it("parses inline layers in string, table, and mixed forms", async () => {
+      const strings = (await parseAgentManifest(
+        await writeManifest(`[agent]
+name = "inline-strings"
 system_prompt = "x"
 [harness]
 provider = "test"
 
 [session]
 layers = ["skills", "compacting", "in-memory"]
-`);
-    const m = await parseAgentManifest(p);
-    const layers = m.session as Array<{
-      provider: unknown;
-      [k: string]: unknown;
-    }>;
-    expect(layers).toHaveLength(3);
-    // String shorthand expands to `{ provider: "<string>" }`.
-    expect(layers[0]).toEqual({ provider: "skills" });
-    expect(layers[1]).toEqual({ provider: "compacting" });
-    expect(layers[2]).toEqual({ provider: "in-memory" });
-  });
+`),
+      )).session as Layers;
+      expect(strings).toEqual([
+        { provider: "skills" },
+        { provider: "compacting" },
+        { provider: "in-memory" },
+      ]);
 
-  it("parses inline [session].layers with all-table form (config per layer)", async () => {
-    const p = await writeManifest(`[agent]
+      const tables = (await parseAgentManifest(
+        await writeManifest(`[agent]
 name = "inline-tables"
 system_prompt = "x"
 [harness]
@@ -237,30 +220,15 @@ layers = [
   { provider = "compacting", threshold = 60 },
   { provider = "file", path = "./s.jsonl" },
 ]
-`);
-    const m = await parseAgentManifest(p);
-    const layers = m.session as Array<{
-      provider: unknown;
-      [k: string]: unknown;
-    }>;
-    expect(layers).toHaveLength(2);
-    expect(layers[0]).toMatchObject({
-      provider: "compacting",
-      threshold: 60,
-    });
-    expect(layers[1]).toMatchObject({
-      provider: "file",
-      path: "./s.jsonl",
-    });
-  });
+`),
+      )).session as Layers;
+      expect(tables).toEqual([
+        { provider: "compacting", threshold: 60 },
+        { provider: "file", path: "./s.jsonl" },
+      ]);
 
-  it("accepts mixed-type [session].layers arrays (TOML 1.1.0 compliance)", async () => {
-    // The `toml` package (BinaryMuse) follows TOML 1.1.0 which
-    // allows mixed-type arrays. @iarna/toml, which we use only for
-    // lockfile stringify, enforces the legacy homogeneous-array rule
-    // and rejected this shape. Pinning so we don't regress if
-    // someone swaps the parser back.
-    const p = await writeManifest(`[agent]
+      const mixed = (await parseAgentManifest(
+        await writeManifest(`[agent]
 name = "mixed"
 system_prompt = "x"
 [harness]
@@ -272,28 +240,17 @@ layers = [
   { provider = "identity", vault_path = "/vault" },
   "dms",
 ]
-`);
-    const m = await parseAgentManifest(p);
-    const layers = m.session as Array<{
-      provider: unknown;
-      [k: string]: unknown;
-    }>;
-    expect(layers).toHaveLength(3);
-    expect(layers[0]).toEqual({ provider: "compacting" });
-    expect(layers[1]).toEqual({
-      provider: "identity",
-      vault_path: "/vault",
+`),
+      )).session as Layers;
+      expect(mixed).toEqual([
+        { provider: "compacting" },
+        { provider: "identity", vault_path: "/vault" },
+        { provider: "dms" },
+      ]);
     });
-    expect(layers[2]).toEqual({ provider: "dms" });
-  });
 
-  it("parses [session.<name>] sibling tables as per-layer config", async () => {
-    // The idiomatic shape for layered sessions with per-layer config:
-    // keep `layers` a flat string array and attach config via TOML
-    // sub-tables keyed by layer name. Without this, users hit TOML's
-    // homogeneous-array restriction the moment one layer needs config
-    // and the rest don't.
-    const p = await writeManifest(`[agent]
+    it("merges [session.<name>] sibling tables into matching string layers", async () => {
+      const p = await writeManifest(`[agent]
 name = "siblings"
 system_prompt = "x"
 [harness]
@@ -309,29 +266,16 @@ vault_path = "/some/vault"
 keep = 50
 persist = true
 `);
-    const m = await parseAgentManifest(p);
-    const layers = m.session as Array<{
-      provider: unknown;
-      [k: string]: unknown;
-    }>;
-    expect(layers).toHaveLength(3);
-    expect(layers[0]).toEqual({
-      provider: "compacting",
-      keep: 50,
-      persist: true,
+      const layers = (await parseAgentManifest(p)).session as Layers;
+      expect(layers).toEqual([
+        { provider: "compacting", keep: 50, persist: true },
+        { provider: "identity", vault_path: "/some/vault" },
+        { provider: "dms" },
+      ]);
     });
-    expect(layers[1]).toEqual({
-      provider: "identity",
-      vault_path: "/some/vault",
-    });
-    // No sibling for 'dms'; stays as the bare string-shorthand form.
-    expect(layers[2]).toEqual({ provider: "dms" });
-  });
 
-  it("rejects [session.<name>] when <name> isn't in layers", async () => {
-    // Catches typos (`identitiy` instead of `identity`) and stale
-    // config that's been left behind after a layer was removed.
-    const p = await writeManifest(`[agent]
+    it("rejects [session.<name>] with no matching string layer", async () => {
+      const p = await writeManifest(`[agent]
 name = "typo"
 system_prompt = "x"
 [harness]
@@ -343,15 +287,13 @@ layers = ["compacting", "in-memory"]
 [session.identitiy]
 vault_path = "/v"
 `);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /no matching string entry/,
-    );
-  });
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /no matching string entry/,
+      );
+    });
 
-  it("rejects [session.<name>] that conflicts with an inline-table layer of the same name", async () => {
-    // Splitting one layer's config between an inline table and a
-    // sibling table is a footgun. Pick one.
-    const p = await writeManifest(`[agent]
+    it("rejects [session.<name>] conflicting with an inline-table layer", async () => {
+      const p = await writeManifest(`[agent]
 name = "split"
 system_prompt = "x"
 [harness]
@@ -365,13 +307,13 @@ layers = [
 [session.identity]
 vault_path = "/v"
 `);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /conflicts with an inline-table entry/,
-    );
-  });
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /conflicts with an inline-table entry/,
+      );
+    });
 
-  it("rejects [session.<name>] that tries to override the provider field", async () => {
-    const p = await writeManifest(`[agent]
+    it("rejects [session.<name>] that overrides the provider field", async () => {
+      const p = await writeManifest(`[agent]
 name = "override"
 system_prompt = "x"
 [harness]
@@ -383,15 +325,13 @@ layers = ["identity"]
 [session.identity]
 provider = "something_else"
 `);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /\.provider is not allowed/,
-    );
-  });
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /\.provider is not allowed/,
+      );
+    });
 
-  it("rejects non-table scalar keys on [session] outside the layered meta fields", async () => {
-    // Catches `[session]` with a stray scalar like `timeout = 30` that
-    // the user mistakenly thought meant something. Sub-tables only.
-    const p = await writeManifest(`[agent]
+    it("rejects stray scalar keys on [session] outside meta fields", async () => {
+      const p = await writeManifest(`[agent]
 name = "stray"
 system_prompt = "x"
 [harness]
@@ -401,12 +341,45 @@ provider = "test"
 layers = ["in-memory"]
 timeout = 30
 `);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /not a recognised meta key/,
-    );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /not a recognised meta key/,
+      );
+    });
+
+    it("rejects empty [session].layers", async () => {
+      const p = await writeManifest(`[agent]
+name = "empty"
+system_prompt = "x"
+[harness]
+provider = "test"
+[session]
+layers = []
+`);
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /\[session\]\.layers is empty/,
+      );
+    });
+
+    it("rejects the old top-level [[session]] form", async () => {
+      const p = await writeManifest(`[agent]
+name = "old-chain"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[[session]]
+provider = "compacting"
+
+[[session]]
+provider = "in-memory"
+`);
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /\[session\] with a 'layers' array/,
+      );
+    });
   });
 
-  it("singleton [session] (provider only) still parses as a single SessionSpec", async () => {
+  it("parses a singleton [session] (provider only) as a single SessionSpec", async () => {
     const p = await writeManifest(`[agent]
 name = "single"
 system_prompt = "x"
@@ -417,27 +390,12 @@ provider = "test"
 provider = "in-memory"
 `);
     const m = await parseAgentManifest(p);
-    // Singleton stays as a plain table (not an array).
     expect(Array.isArray(m.session)).toBe(false);
     if (m.session && "provider" in m.session) {
       expect(m.session.provider).toBe("in-memory");
     } else {
       throw new Error("expected SessionSpec");
     }
-  });
-
-  it("rejects empty [session].layers", async () => {
-    const p = await writeManifest(`[agent]
-name = "empty"
-system_prompt = "x"
-[harness]
-provider = "test"
-[session]
-layers = []
-`);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /\[session\]\.layers is empty/,
-    );
   });
 
   it("rejects [session] with both 'provider' and 'layers'", async () => {
@@ -468,120 +426,73 @@ provider = "test"
     );
   });
 
-  it("rejects the old top-level [[session]] form with a pointer at [session].layers", async () => {
-    const p = await writeManifest(`[agent]
-name = "old-chain"
-system_prompt = "x"
-[harness]
-provider = "test"
-
-[[session]]
-provider = "compacting"
-
-[[session]]
-provider = "in-memory"
-`);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /\[session\] with a 'layers' array/,
-    );
-  });
-
-  it("system_prompt accepts a path-like string", async () => {
-    const p = await writeManifest(`[agent]
-name = "x"
-system_prompt = "./prompt.md"
-[tools]
-
-[harness]
-provider = "test"
-[session]
-provider = "in-memory"
-`);
-    const m = await parseAgentManifest(p);
-    expect(m.systemPrompt).toBe("./prompt.md");
-  });
-
-  // ─── [providers] configured-factory form (MCP integration, Chunk 1) ───
-  //
-  // The configured-factory form lets a [providers] entry name a Tools
-  // factory (built-in or, in future, source-loaded) plus per-handle
-  // config. Same shape as [harness] / [session] / [tools.X]:
-  // `{ provider = "<factory>", ...config }`. The big use case is MCP
-  // servers via the built-in `mcp-server` factory, but the shape is
-  // factory-agnostic — these parser tests use a fake `test-meta`
-  // factory name to exercise the plumbing without depending on
-  // anything that hasn't been built yet.
-
-  it("parses [providers] entries in the configured-factory form", async () => {
-    const p = await writeManifest(`[agent]
-name = "prov-cf"
-system_prompt = "x"
-[harness]
-provider = "test"
-
-[providers]
-fs_mcp = { provider = "test-meta", npm = "@example/mcp-fs" }
-linear  = { provider = "test-meta", command = "npx", args = ["@linear/mcp"] }
-`);
-    const m = await parseAgentManifest(p);
-    expect(m.providers).toEqual({
-      fs_mcp: {
-        provider: "test-meta",
-        npm: "@example/mcp-fs",
-      },
-      linear: {
-        provider: "test-meta",
-        command: "npx",
-        args: ["@linear/mcp"],
-      },
-    });
-  });
-
-  it("still parses [providers] entries in the SourceSpec form alongside configured-factory", async () => {
-    const p = await writeManifest(`[agent]
+  describe("[providers]", () => {
+    it("parses configured-factory and SourceSpec forms together", async () => {
+      const p = await writeManifest(`[agent]
 name = "prov-mixed"
 system_prompt = "x"
 [harness]
 provider = "test"
 
 [providers]
-local     = { path = "./my-tools" }
+fs_mcp = { provider = "test-meta", npm = "@example/mcp-fs" }
+linear = { provider = "test-meta", command = "npx", args = ["@linear/mcp"] }
+local = { path = "./my-tools" }
 npm_thing = "@scope/pkg"
-mcp_thing = { provider = "test-meta", npm = "@example/mcp" }
 `);
-    const m = await parseAgentManifest(p);
-    expect(m.providers).toEqual({
-      local: { path: "./my-tools" },
-      npm_thing: "@scope/pkg",
-      mcp_thing: { provider: "test-meta", npm: "@example/mcp" },
+      const m = await parseAgentManifest(p);
+      expect(m.providers).toEqual({
+        fs_mcp: { provider: "test-meta", npm: "@example/mcp-fs" },
+        linear: { provider: "test-meta", command: "npx", args: ["@linear/mcp"] },
+        local: { path: "./my-tools" },
+        npm_thing: "@scope/pkg",
+      });
+    });
+
+    it("rejects bare-handle strings as entries", async () => {
+      const p = await writeManifest(`[agent]
+name = "prov-bare"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[providers]
+oops = "some_handle"
+`);
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /Bare handles aren't allowed at this layer/,
+      );
     });
   });
 
-  it("parses [agent].storage_id override", async () => {
-    const p = await writeManifest(`[agent]
+  describe("[agent].storage_id", () => {
+    it("parses an override", async () => {
+      const p = await writeManifest(`[agent]
 name = "x"
 storage_id = "pinned-id"
 [harness]
 provider = "test"
 `);
-    const m = await parseAgentManifest(p);
-    expect(m.storageId).toBe("pinned-id");
-  });
+      expect((await parseAgentManifest(p)).storageId).toBe("pinned-id");
+    });
 
-  it("rejects [agent].storage_id containing path separators", async () => {
-    const p = await writeManifest(`[agent]
+    it("rejects path separators", async () => {
+      const p = await writeManifest(`[agent]
 name = "x"
 storage_id = "../escape"
 [harness]
 provider = "test"
 `);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /storage_id.*path separator/,
-    );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /storage_id.*path separator/,
+      );
+    });
   });
 
-  it("parses [agent.metadata] as opaque passthrough", async () => {
-    const p = await writeManifest(`[agent]
+  describe("[agent.metadata]", () => {
+    it("parses tables as opaque passthrough and omits when absent", async () => {
+      const withMeta = await parseAgentManifest(
+        await writeManifest(`[agent]
 name = "meta"
 
 [agent.metadata]
@@ -592,155 +503,135 @@ rollout = { region = "us-east-1", percent = 25 }
 
 [harness]
 provider = "test"
-`);
-    const m = await parseAgentManifest(p);
-    expect(m.metadata).toBeDefined();
-    expect(m.metadata).toEqual({
-      team: "platform-eng",
-      release_channel: "canary",
-      owners: ["alice", "bob"],
-      rollout: { region: "us-east-1", percent: 25 },
-    });
-  });
+`),
+      );
+      expect(withMeta.metadata).toEqual({
+        team: "platform-eng",
+        release_channel: "canary",
+        owners: ["alice", "bob"],
+        rollout: { region: "us-east-1", percent: 25 },
+      });
 
-  it("omits manifest.metadata when [agent.metadata] is absent", async () => {
-    const p = await writeManifest(`[agent]
+      const noMeta = await parseAgentManifest(
+        await writeManifest(`[agent]
 name = "no-meta"
 [harness]
 provider = "test"
-`);
-    const m = await parseAgentManifest(p);
-    expect(m.metadata).toBeUndefined();
-  });
+`),
+      );
+      expect(noMeta.metadata).toBeUndefined();
+    });
 
-  it("rejects scalar values for [agent].metadata", async () => {
-    const p = await writeManifest(`[agent]
+    it("rejects scalar values", async () => {
+      const p = await writeManifest(`[agent]
 name = "bad-meta"
 metadata = "not-a-table"
 [harness]
 provider = "test"
 `);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /\[agent\.metadata\] must be a table/,
-    );
+      await expect(parseAgentManifest(p)).rejects.toThrow(
+        /\[agent\.metadata\] must be a table/,
+      );
+    });
   });
 
-  // ─── env-var substitution ─────────────────────────────────────────
-  //
-  // `${VAR}` and `${VAR:-default}` are substituted at parse time so
-  // every downstream consumer (resolver, audit, runtime) sees ready-
-  // to-use values. The parser surfaces a clean `ManifestError` when
-  // a required reference is unset.
+  describe("env-var substitution", () => {
+    async function withEnv(
+      vars: Record<string, string | undefined>,
+      fn: () => Promise<void>,
+    ): Promise<void> {
+      const prev: Record<string, string | undefined> = {};
+      for (const [k, v] of Object.entries(vars)) {
+        prev[k] = process.env[k];
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      try {
+        await fn();
+      } finally {
+        for (const [k, v] of Object.entries(prev)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    }
 
-  it("substitutes ${VAR} references from process.env in string values", async () => {
-    process.env.LOOM_TEST_VAULT_PATH = "/tmp/glass-vault";
-    try {
-      const p = await writeManifest(`[agent]
+    it("substitutes ${VAR} in string values, arrays, and nested tables", async () => {
+      await withEnv(
+        { LOOM_TEST_VAULT_PATH: "/tmp/glass-vault", LOOM_TEST_PATH: "/tmp/loom-test" },
+        async () => {
+          const m = await parseAgentManifest(
+            await writeManifest(`[agent]
 name = "env-sub"
 system_prompt = "vault: \${LOOM_TEST_VAULT_PATH}"
 [harness]
 provider = "test"
-`);
-      const m = await parseAgentManifest(p);
-      expect(m.systemPrompt).toBe("vault: /tmp/glass-vault");
-    } finally {
-      delete process.env.LOOM_TEST_VAULT_PATH;
-    }
-  });
-
-  it("substitutes ${VAR} inside arrays and nested tables", async () => {
-    process.env.LOOM_TEST_PATH = "/tmp/loom-test";
-    try {
-      const p = await writeManifest(`[agent]
-name = "env-deep"
-[harness]
-provider = "test"
 [capabilities]
 read_file = { paths = ["\${LOOM_TEST_PATH}", "./local"] }
-`);
-      const m = await parseAgentManifest(p);
-      expect(m.capabilities?.read_file).toEqual({
-        paths: ["/tmp/loom-test", "./local"],
-      });
-    } finally {
-      delete process.env.LOOM_TEST_PATH;
-    }
-  });
+`),
+          );
+          expect(m.systemPrompt).toBe("vault: /tmp/glass-vault");
+          expect(m.capabilities?.read_file).toEqual({
+            paths: ["/tmp/loom-test", "./local"],
+          });
+        },
+      );
+    });
 
-  it("honours ${VAR:-default} when the env var is unset", async () => {
-    delete process.env.LOOM_TEST_UNSET;
-    const p = await writeManifest(`[agent]
-name = "env-default"
-system_prompt = "\${LOOM_TEST_UNSET:-fallback text}"
-[harness]
-provider = "test"
-`);
-    const m = await parseAgentManifest(p);
-    expect(m.systemPrompt).toBe("fallback text");
-  });
-
-  it("prefers the env value when ${VAR:-default} resolves", async () => {
-    process.env.LOOM_TEST_SET = "real";
-    try {
-      const p = await writeManifest(`[agent]
+    it("resolves ${VAR:-default} to the env value or the fallback", async () => {
+      await withEnv(
+        { LOOM_TEST_SET: "real", LOOM_TEST_UNSET: undefined },
+        async () => {
+          const set = await parseAgentManifest(
+            await writeManifest(`[agent]
 name = "env-set"
 system_prompt = "\${LOOM_TEST_SET:-fallback}"
 [harness]
 provider = "test"
-`);
-      const m = await parseAgentManifest(p);
-      expect(m.systemPrompt).toBe("real");
-    } finally {
-      delete process.env.LOOM_TEST_SET;
-    }
-  });
+`),
+          );
+          expect(set.systemPrompt).toBe("real");
 
-  it("throws ManifestError when a required ${VAR} is unset", async () => {
-    delete process.env.LOOM_TEST_MISSING;
-    const p = await writeManifest(`[agent]
+          const unset = await parseAgentManifest(
+            await writeManifest(`[agent]
+name = "env-default"
+system_prompt = "\${LOOM_TEST_UNSET:-fallback text}"
+[harness]
+provider = "test"
+`),
+          );
+          expect(unset.systemPrompt).toBe("fallback text");
+        },
+      );
+    });
+
+    it("throws ManifestError when a required ${VAR} is unset", async () => {
+      await withEnv({ LOOM_TEST_MISSING: undefined }, async () => {
+        const p = await writeManifest(`[agent]
 name = "env-missing"
 system_prompt = "\${LOOM_TEST_MISSING}"
 [harness]
 provider = "test"
 `);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /undefined env var 'LOOM_TEST_MISSING'/,
-    );
-  });
+        await expect(parseAgentManifest(p)).rejects.toThrow(
+          /undefined env var 'LOOM_TEST_MISSING'/,
+        );
+      });
+    });
 
-  it("leaves keys unsubstituted (only values)", async () => {
-    // A literal `${...}`-shaped key shouldn't trigger substitution.
-    // If a user genuinely needs dynamic keys they construct the
-    // manifest programmatically.
-    process.env.LOOM_TEST_KEY = "oops";
-    try {
-      const p = await writeManifest(`[agent]
+    it("substitutes values only, leaving ${VAR}-shaped keys literal", async () => {
+      await withEnv({ LOOM_TEST_KEY: "oops" }, async () => {
+        const m = await parseAgentManifest(
+          await writeManifest(`[agent]
 name = "env-keys"
 [harness]
 provider = "test"
 [agent.metadata]
 "\${LOOM_TEST_KEY}" = "value"
-`);
-      const m = await parseAgentManifest(p);
-      // The key stays literal `${LOOM_TEST_KEY}` — NOT substituted.
-      expect(Object.keys(m.metadata ?? {})).toContain("${LOOM_TEST_KEY}");
-    } finally {
-      delete process.env.LOOM_TEST_KEY;
-    }
-  });
-
-  it("still rejects bare-handle strings as [providers] entries", async () => {
-    const p = await writeManifest(`[agent]
-name = "prov-bare"
-system_prompt = "x"
-[harness]
-provider = "test"
-
-[providers]
-oops = "some_handle"
-`);
-    await expect(parseAgentManifest(p)).rejects.toThrow(
-      /Bare handles aren't allowed at this layer/,
-    );
+`),
+        );
+        expect(Object.keys(m.metadata ?? {})).toContain("${LOOM_TEST_KEY}");
+      });
+    });
   });
 });

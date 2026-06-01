@@ -1,31 +1,3 @@
-/**
- * `loom mcp inspect <provider-spec>` — dump the tools an MCP server
- * advertises as a TOML snippet ready to paste into a manifest.
- *
- * This is an **authoring aid**, not a runtime feature. Loom's
- * static-enumeration policy means every tool the model can call must
- * appear by name in `[tools]`. `inspect` exists so users don't have
- * to type 20 stub entries by hand for a 20-tool server: it spawns
- * the server, calls `tools/list`, kills the server, prints TOML the
- * user pastes and prunes.
- *
- * Usage:
- *
- *     loom mcp inspect <provider-spec> [--manifest <agent.toml>] [--json]
- *
- * Provider spec shapes:
- *
- *   - `@scope/pkg` — npm package shorthand (→ `{ npm = "..." }`)
- *   - `./path/to/server.js` — path shorthand (→ `command = "node"`,
- *                              `args = ["./path/to/server.js"]`)
- *   - `<handle>` — bare handle from `[providers]` in `--manifest`
- *
- * Output (default): a TOML snippet with one `[tools.X]` per
- * advertised tool plus a commented-out `[capabilities]` block
- * suggesting plausible pre-bindings. `--json` emits the raw
- * tools/list result for machine consumers.
- */
-
 import * as path from "node:path";
 
 import { LoomError } from "../errors.js";
@@ -39,39 +11,23 @@ import { transientStorage } from "../runtime/storage.js";
 import type { FactoryContext, InitArgs } from "../types/interfaces.js";
 
 export interface McpInspectOptions {
-  /**
-   * Path to a manifest, used to resolve bare-handle provider specs
-   * against the manifest's `[providers]` table. Required when the
-   * provider spec is a bare handle.
-   */
   manifestPath?: string;
-  /** Print JSON instead of TOML. */
   json?: boolean;
-  /** Handle suggested in the TOML snippet's `[providers]` entry. */
   suggestedHandle?: string;
 }
 
 export interface McpInspectResult {
-  /** Server's name from the `initialize` handshake. */
   serverName: string;
-  /** Server version. */
   serverVersion: string;
-  /** Discovered tools, in server-returned order. */
   tools: Array<{
     name: string;
     description?: string;
     inputSchema?: unknown;
   }>;
-  /** The TOML snippet (always produced; CLI may print this or JSON). */
   toml: string;
-  /** Effective config used to launch the server. */
   launchConfig: Record<string, unknown>;
 }
 
-/**
- * Resolve a provider spec into the configured-factory `mcp-server`
- * config the factory's `create()` expects.
- */
 export async function resolveProviderSpec(
   providerSpec: string,
   options: { manifestPath?: string } = {},
@@ -80,7 +36,6 @@ export async function resolveProviderSpec(
   manifestDir: string;
   source: string;
 }> {
-  // Path-shaped: launch via node.
   if (
     providerSpec.startsWith("./") ||
     providerSpec.startsWith("../") ||
@@ -94,7 +49,6 @@ export async function resolveProviderSpec(
       source: `path:${providerSpec}`,
     };
   }
-  // npm-shaped: contains a slash AND isn't a bare handle.
   if (providerSpec.includes("/") || providerSpec.startsWith("@")) {
     return {
       config: { npm: providerSpec },
@@ -102,7 +56,6 @@ export async function resolveProviderSpec(
       source: `npm:${providerSpec}`,
     };
   }
-  // Bare handle: requires --manifest to resolve.
   if (!options.manifestPath) {
     throw new LoomError(
       `loom mcp inspect: provider spec '${providerSpec}' looks like a [providers] ` +
@@ -151,10 +104,6 @@ function isConfiguredFactoryEntry(
   );
 }
 
-/**
- * Spawn the server, run `tools/list`, tear it down, and assemble
- * the result.
- */
 export async function inspectMcpServer(
   providerSpec: string,
   options: McpInspectOptions = {},
@@ -169,9 +118,6 @@ export async function inspectMcpServer(
     agentName: "loom-mcp-inspect",
     loomVersion: "0.0.0",
     clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-    // Inspect is transient — spawn / list / kill. Real per-agent
-    // storage would create a `loom-mcp-inspect/` dir per invocation;
-    // tmpdir is the right scope for a throwaway probe.
     storage: transientStorage("loom-mcp-inspect"),
     metadata: {},
   };
@@ -234,42 +180,20 @@ function initArgsFor(
   };
 }
 
-/**
- * Heuristic for the suggested `[providers].handle` name. Strips
- * the npm scope and any `mcp-server-` / `server-` prefix so common
- * MCP packages get short, readable handles.
- */
 export function suggestHandle(providerSpec: string): string {
   let s = providerSpec;
-  // Drop scope (e.g. @modelcontextprotocol/server-filesystem → server-filesystem)
   const slash = s.lastIndexOf("/");
   if (slash >= 0) s = s.slice(slash + 1);
-  // Drop common prefixes.
   s = s.replace(/^server-/, "");
   s = s.replace(/^mcp-server-/, "");
   s = s.replace(/^mcp-/, "");
-  // Drop file extension when the spec was a path.
   s = s.replace(/\.[mc]?js$/, "");
-  // Toml-safe identifier.
   s = s.replace(/[^a-zA-Z0-9_]/g, "_");
   if (!s) s = "mcp_server";
   if (!/^[a-zA-Z_]/.test(s)) s = `mcp_${s}`;
   return s;
 }
 
-/**
- * Render a paste-and-prune TOML snippet describing the server's
- * tools. The output is opinionated:
- *
- *   - A `[providers].<handle>` entry that mirrors the launch config.
- *   - One `[tools.<name>] provider = "<handle>"` block per tool,
- *     with the MCP-side schema dumped as a comment so reviewers see
- *     what they're enabling.
- *   - A `[capabilities]` block listing every tool with a commented-
- *     out hint (each arg defaults to `"*"` — unrestricted — since
- *     unrestricted is the safest default to make EXPLICIT rather
- *     than the silent inference).
- */
 function renderTomlSnippet(args: {
   handle: string;
   providerEntry: Record<string, unknown>;
@@ -332,12 +256,6 @@ function renderTomlSnippet(args: {
   return lines.join("\n") + "\n";
 }
 
-/**
- * Tiny inline-TOML emitter for objects whose values are strings,
- * numbers, booleans, or arrays of strings. The CLI's outputs are
- * always this shape; we deliberately avoid pulling in a full TOML
- * serializer to keep the dependency footprint minimal.
- */
 function renderInlineTable(obj: Record<string, unknown>): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(obj)) {
@@ -358,7 +276,6 @@ function renderTomlValue(v: unknown): string {
   return JSON.stringify(v);
 }
 
-/** One-line schema summary for review comments. */
 function summariseSchema(schema: unknown): string {
   if (!schema || typeof schema !== "object") return JSON.stringify(schema);
   const s = schema as Record<string, unknown>;
@@ -375,12 +292,6 @@ function summariseSchema(schema: unknown): string {
   return JSON.stringify(schema);
 }
 
-/**
- * Suggest a starting `[capabilities].X` grant for a tool. Defaults
- * every property to `"*"` (unrestricted) so the model can use the
- * tool right away; users tighten as needed. Tools with no
- * properties get the whole-tool `"*"`.
- */
 function capabilityHintFor(schema: unknown): string {
   if (!schema || typeof schema !== "object") return `"*"`;
   const s = schema as { type?: unknown; properties?: Record<string, unknown> };

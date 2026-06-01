@@ -1,18 +1,3 @@
-/**
- * Path-aware tools (`read_file`, `write_file`, `edit_file`, `find`)
- * must honour `Session.trustedPaths()`: the effective allowlist at
- * execute time is the manifest grant unioned with session-declared
- * trusted paths (filtered by access semantics — read tools accept
- * any access, write tools require write or read-write).
- *
- * `bash` deliberately does NOT honour `trustedPaths` to preserve its
- * sandbox — that property is tested separately.
- *
- * `edit_file` shares the same `effectivePaths(granted, trusted, "write")`
- * call as `write_file`, so the write-access filtering tests below
- * cover it transitively.
- */
-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -28,24 +13,24 @@ import type {
   TrustedPath,
 } from "../src/types/interfaces.js";
 
-let TMP_GRANTED: string;
-let TMP_TRUSTED: string;
-let TMP_FORBIDDEN: string;
+let grantedDir: string;
+let trustedDir: string;
+let forbiddenDir: string;
 
 beforeEach(async () => {
-  TMP_GRANTED = await fs.mkdtemp(path.join(os.tmpdir(), "loom-grant-"));
-  TMP_TRUSTED = await fs.mkdtemp(path.join(os.tmpdir(), "loom-trust-"));
-  TMP_FORBIDDEN = await fs.mkdtemp(path.join(os.tmpdir(), "loom-forbid-"));
-  await fs.writeFile(path.join(TMP_GRANTED, "ok.txt"), "from-grant", "utf8");
-  await fs.writeFile(path.join(TMP_TRUSTED, "skill.md"), "from-trust", "utf8");
-  await fs.writeFile(path.join(TMP_FORBIDDEN, "secret.txt"), "private", "utf8");
+  grantedDir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-grant-"));
+  trustedDir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-trust-"));
+  forbiddenDir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-forbid-"));
+  await fs.writeFile(path.join(grantedDir, "ok.txt"), "from-grant", "utf8");
+  await fs.writeFile(path.join(trustedDir, "skill.md"), "from-trust", "utf8");
+  await fs.writeFile(path.join(forbiddenDir, "secret.txt"), "private", "utf8");
 });
 
 afterEach(async () => {
   await Promise.all([
-    fs.rm(TMP_GRANTED, { recursive: true, force: true }),
-    fs.rm(TMP_TRUSTED, { recursive: true, force: true }),
-    fs.rm(TMP_FORBIDDEN, { recursive: true, force: true }),
+    fs.rm(grantedDir, { recursive: true, force: true }),
+    fs.rm(trustedDir, { recursive: true, force: true }),
+    fs.rm(forbiddenDir, { recursive: true, force: true }),
   ]);
 });
 
@@ -59,7 +44,6 @@ function makeCtx(session: Session): ToolContext {
   return {
     secrets: {},
     abortSignal: new AbortController().signal,
-    // Deny every permission request (no handler matches the option list).
     requestPermission: async () => ({
       outcome: { outcome: "cancelled" as const },
     }),
@@ -68,109 +52,112 @@ function makeCtx(session: Session): ToolContext {
 }
 
 function sessionWith(trusted: TrustedPath[]): Session {
-  return {
-    trustedPaths: () => trusted,
-  };
+  return { trustedPaths: () => trusted };
 }
 
 describe("read_file honours session.trustedPaths()", () => {
-  it("allows reads inside a trusted path even when not in the manifest grant", async () => {
-    const tool = new ReadFileTool({}, { paths: [TMP_GRANTED] });
+  it("extends the manifest grant with trusted paths while rejecting everything else", async () => {
+    const tool = new ReadFileTool({}, { paths: [grantedDir] });
     const ctx = makeCtx(
       sessionWith([
-        { path: TMP_TRUSTED, access: "read", reason: "test fixture" },
+        { path: trustedDir, access: "read", reason: "test fixture" },
       ]),
     );
-    const result = await tool.execute(
-      { path: path.join(TMP_TRUSTED, "skill.md") },
+
+    const granted = await tool.execute(
+      { path: path.join(grantedDir, "ok.txt") },
       ctx,
     );
-    expect(result.isError).toBeFalsy();
-    expect(result.content).toBe("from-trust");
-  });
+    expect(granted.isError).toBeFalsy();
+    expect(granted.content).toBe("from-grant");
 
-  it("still rejects paths outside both the grant and trusted set", async () => {
-    const tool = new ReadFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
-    const result = await tool.execute(
-      { path: path.join(TMP_FORBIDDEN, "secret.txt") },
+    const trusted = await tool.execute(
+      { path: path.join(trustedDir, "skill.md") },
       ctx,
     );
-    expect(result.isError).toBe(true);
-    expect(result.content).toMatch(/outside the granted paths/);
-  });
+    expect(trusted.isError).toBeFalsy();
+    expect(trusted.content).toBe("from-trust");
 
-  it("read access tools accept write and read-write trusted paths too", async () => {
-    // A trusted path with `write` access still permits reads
-    // (write implies the ability to read).
-    const tool = new ReadFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "write" }]));
-    const result = await tool.execute(
-      { path: path.join(TMP_TRUSTED, "skill.md") },
+    const forbidden = await tool.execute(
+      { path: path.join(forbiddenDir, "secret.txt") },
       ctx,
     );
-    expect(result.isError).toBeFalsy();
+    expect(forbidden.isError).toBe(true);
+    expect(forbidden.content).toMatch(/outside the granted paths/);
   });
 
-  it("still respects the manifest grant when no session is present", async () => {
-    // Agent ref doesn't carry a session that declares trustedPaths.
-    const tool = new ReadFileTool({}, { paths: [TMP_GRANTED] });
+  it("accepts write and read-write trusted paths for reads", async () => {
+    const tool = new ReadFileTool({}, { paths: [grantedDir] });
+    for (const access of ["write", "read-write"] as const) {
+      const ctx = makeCtx(sessionWith([{ path: trustedDir, access }]));
+      const result = await tool.execute(
+        { path: path.join(trustedDir, "skill.md") },
+        ctx,
+      );
+      expect(result.isError).toBeFalsy();
+    }
+  });
+
+  it("falls back to the manifest grant when no session declares trustedPaths", async () => {
+    const tool = new ReadFileTool({}, { paths: [grantedDir] });
     const ctx = makeCtx({});
+
     const ok = await tool.execute(
-      { path: path.join(TMP_GRANTED, "ok.txt") },
+      { path: path.join(grantedDir, "ok.txt") },
       ctx,
     );
     expect(ok.isError).toBeFalsy();
+
     const bad = await tool.execute(
-      { path: path.join(TMP_FORBIDDEN, "secret.txt") },
+      { path: path.join(forbiddenDir, "secret.txt") },
       ctx,
     );
     expect(bad.isError).toBe(true);
   });
 
-  it("a session whose trustedPaths() throws falls back to the manifest grant", async () => {
-    const tool = new ReadFileTool({}, { paths: [TMP_GRANTED] });
+  it("falls back to the manifest grant when trustedPaths() throws", async () => {
+    const tool = new ReadFileTool({}, { paths: [grantedDir] });
     const ctx = makeCtx({
       trustedPaths: () => {
         throw new Error("boom");
       },
     });
-    // Manifest grant still works.
+
     const ok = await tool.execute(
-      { path: path.join(TMP_GRANTED, "ok.txt") },
+      { path: path.join(grantedDir, "ok.txt") },
       ctx,
     );
     expect(ok.isError).toBeFalsy();
-    // Trusted path is treated as not present.
+
     const bad = await tool.execute(
-      { path: path.join(TMP_TRUSTED, "skill.md") },
+      { path: path.join(trustedDir, "skill.md") },
       ctx,
     );
     expect(bad.isError).toBe(true);
   });
 
-  it("an explicitly-empty manifest grant + a trusted path → only the trusted path works", async () => {
-    // `paths: []` is the explicit-no-access form. Trusted paths still
-    // extend it (skills + locked-down manifest is a valid combo).
+  it("extends an explicitly-empty manifest grant with trusted paths", async () => {
     const tool = new ReadFileTool({}, { paths: [] });
-    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
+    const ctx = makeCtx(sessionWith([{ path: trustedDir, access: "read" }]));
+
     const ok = await tool.execute(
-      { path: path.join(TMP_TRUSTED, "skill.md") },
+      { path: path.join(trustedDir, "skill.md") },
       ctx,
     );
     expect(ok.isError).toBeFalsy();
+
     const bad = await tool.execute(
-      { path: path.join(TMP_GRANTED, "ok.txt") },
+      { path: path.join(grantedDir, "ok.txt") },
       ctx,
     );
     expect(bad.isError).toBe(true);
   });
 
-  it("a `*` manifest grant ignores trusted paths (already unrestricted)", async () => {
+  it("ignores trusted paths under an unrestricted `*` manifest grant", async () => {
     const tool = new ReadFileTool({}, { paths: "*" });
-    const ctx = makeCtx(sessionWith([])); // no trusted paths
+    const ctx = makeCtx(sessionWith([]));
     const result = await tool.execute(
-      { path: path.join(TMP_FORBIDDEN, "secret.txt") },
+      { path: path.join(forbiddenDir, "secret.txt") },
       ctx,
     );
     expect(result.isError).toBeFalsy();
@@ -178,77 +165,45 @@ describe("read_file honours session.trustedPaths()", () => {
 });
 
 describe("write_file honours session.trustedPaths() with write-access filtering", () => {
-  it("rejects writes to read-only trusted paths", async () => {
-    const tool = new WriteFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(
-      sessionWith([
-        { path: TMP_TRUSTED, access: "read", reason: "skills root" },
-      ]),
+  it("rejects writes to read-only trusted paths but allows write and read-write ones", async () => {
+    const readOnlyCtx = makeCtx(
+      sessionWith([{ path: trustedDir, access: "read", reason: "skills root" }]),
     );
-    const result = await tool.execute(
-      {
-        path: path.join(TMP_TRUSTED, "new.txt"),
-        content: "hello",
-      },
-      ctx,
+    const rejected = await new WriteFileTool({}, { paths: [grantedDir] }).execute(
+      { path: path.join(trustedDir, "new.txt"), content: "hello" },
+      readOnlyCtx,
     );
-    expect(result.isError).toBe(true);
-    expect(result.content).toMatch(/outside the granted paths/);
-  });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content).toMatch(/outside the granted paths/);
 
-  it("allows writes to trusted paths advertised with write access", async () => {
-    const tool = new WriteFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "write" }]));
-    const result = await tool.execute(
-      {
-        path: path.join(TMP_TRUSTED, "new.txt"),
-        content: "hello",
-      },
-      ctx,
-    );
-    expect(result.isError).toBeFalsy();
-    const written = await fs.readFile(
-      path.join(TMP_TRUSTED, "new.txt"),
-      "utf8",
-    );
-    expect(written).toBe("hello");
-  });
-
-  it("read-write trusted paths also permit writes", async () => {
-    const tool = new WriteFileTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(
-      sessionWith([{ path: TMP_TRUSTED, access: "read-write" }]),
-    );
-    const result = await tool.execute(
-      {
-        path: path.join(TMP_TRUSTED, "rw.txt"),
-        content: "hello",
-      },
-      ctx,
-    );
-    expect(result.isError).toBeFalsy();
+    for (const access of ["write", "read-write"] as const) {
+      const ctx = makeCtx(sessionWith([{ path: trustedDir, access }]));
+      const file = path.join(trustedDir, `${access}.txt`);
+      const result = await new WriteFileTool({}, { paths: [grantedDir] }).execute(
+        { path: file, content: "hello" },
+        ctx,
+      );
+      expect(result.isError).toBeFalsy();
+      expect(await fs.readFile(file, "utf8")).toBe("hello");
+    }
   });
 });
 
 describe("find honours session.trustedPaths()", () => {
-  it("allows listing inside a trusted directory", async () => {
-    const tool = new FindTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
-    const result = await tool.execute(
-      { pattern: "*.md", root: TMP_TRUSTED },
-      ctx,
-    );
-    expect(result.isError).toBeFalsy();
-    expect(result.content).toContain("skill.md");
-  });
+  it("lists inside trusted directories but rejects roots outside the grant", async () => {
+    const ctx = makeCtx(sessionWith([{ path: trustedDir, access: "read" }]));
 
-  it("rejects roots outside both the grant and trusted set", async () => {
-    const tool = new FindTool({}, { paths: [TMP_GRANTED] });
-    const ctx = makeCtx(sessionWith([{ path: TMP_TRUSTED, access: "read" }]));
-    const result = await tool.execute(
-      { pattern: "*", root: TMP_FORBIDDEN },
+    const listed = await new FindTool({}, { paths: [grantedDir] }).execute(
+      { pattern: "*.md", root: trustedDir },
       ctx,
     );
-    expect(result.isError).toBe(true);
+    expect(listed.isError).toBeFalsy();
+    expect(listed.content).toContain("skill.md");
+
+    const rejected = await new FindTool({}, { paths: [grantedDir] }).execute(
+      { pattern: "*", root: forbiddenDir },
+      ctx,
+    );
+    expect(rejected.isError).toBe(true);
   });
 });

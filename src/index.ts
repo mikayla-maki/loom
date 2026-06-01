@@ -1,7 +1,3 @@
-/**
- * Loom — public entry.
- */
-
 export * from "./types/index.js";
 export * from "./sdk/index.js";
 export * as errors from "./errors.js";
@@ -79,9 +75,6 @@ export type {
   TurnStep,
 } from "./builtins/harness/test.js";
 
-// Concrete harness classes — useful when an SDK consumer wants to wire
-// the harness instance themselves rather than going through the
-// `{ provider = "anthropic", … }` factory form.
 export { AnthropicHarness } from "./builtins/harness/anthropic.js";
 export { TestHarness } from "./builtins/harness/test.js";
 export { OpenAIHarness } from "./builtins/harness/openai.js";

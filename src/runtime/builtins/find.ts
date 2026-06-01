@@ -1,18 +1,3 @@
-/**
- * `find` — list files in a directory tree matching a glob pattern.
- *
- * Capability kinds:
- *   optional: ["paths"]
- *
- * Star/list/absent semantics:
- *   paths absent  → smart default `["./"]` (project root)
- *   paths = "*"   → unrestricted
- *   paths = []    → explicit no-access (every call fails)
- *   paths = [...] → allowlist of absolute path roots
- *
- * Glob: `*` matches any non-/ chars; `**` matches any depth.
- */
-
 import * as fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import * as path from "node:path";
@@ -36,10 +21,6 @@ import {
   resolvedPaths,
 } from "./_path.js";
 
-/**
- * Input schema. `ToolTable` validates against this before dispatch —
- * `execute()` may trust the shape.
- */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["pattern"],
@@ -92,8 +73,6 @@ export class FindTool implements Tool {
     } = input as FindInput;
     const root = path.resolve(requestedRoot);
 
-    // Effective path set = manifest grant ∪ session trusted paths
-    // (read access — listing files is a read).
     const trusted = await collectTrustedPaths(ctx);
     const effective = effectivePaths(this.granted, trusted, "read");
     if (!pathAllowed(root, effective)) {

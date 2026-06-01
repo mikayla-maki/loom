@@ -1,14 +1,3 @@
-/**
- * MCP `mcp-server` factory tests.
- *
- * Chunk 2 (lifecycle): proves the factory spawns a real stdio MCP
- * server, completes the initialize handshake, captures server info,
- * and reaps the child on close().
- *
- * Chunk 3 (tool resolution + execution) and beyond extend this file
- * as those chunks land.
- */
-
 import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
@@ -62,27 +51,83 @@ function initArgs(config: Record<string, unknown>): InitArgs {
   };
 }
 
-/** Returns true when a process with `pid` is still alive. */
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ESRCH") return false;
-    // EPERM means the process exists but we can't signal it; still alive.
     if ((e as NodeJS.ErrnoException).code === "EPERM") return true;
     return false;
   }
 }
 
+async function withEchoTools(
+  body: (tools: McpServerTools) => Promise<void>,
+): Promise<void> {
+  const tools = mcpServerToolsFactory.create(
+    { command: process.execPath, args: [ECHO_SERVER] },
+    ctx(),
+    {},
+    undefined,
+  ) as McpServerTools;
+  await tools.init(initArgs({ command: process.execPath, args: [ECHO_SERVER] }));
+  try {
+    await body(tools);
+  } finally {
+    await tools.close();
+  }
+}
+
+function echoServerSpec(
+  name: string,
+  tools: AgentManifest["tools"],
+  capabilities: AgentManifest["capabilities"],
+): AgentManifest {
+  return {
+    name,
+    systemPrompt: "x",
+    harness: { provider: "test" },
+    providers: {
+      echo_mcp: {
+        provider: "mcp-server",
+        command: process.execPath,
+        args: [ECHO_SERVER],
+      },
+    },
+    tools,
+    capabilities,
+  };
+}
+
+function envServerSpec(name: string): AgentManifest {
+  return {
+    name,
+    systemPrompt: "x",
+    harness: { provider: "test" },
+    providers: {
+      env_mcp: {
+        provider: "mcp-server",
+        command: process.execPath,
+        args: [ENV_SERVER],
+        secrets: { MOCK_API_KEY: "MOCK_API_KEY" },
+      },
+    },
+    tools: {
+      whoami: { provider: "env_mcp" },
+    },
+    capabilities: { whoami: "*" },
+  };
+}
+
 describe("mcp-server factory — config parsing", () => {
   it("rejects an empty config", () => {
-    expect(() =>
-      mcpServerToolsFactory.create({}, ctx(), {}, undefined),
-    ).toThrow(ManifestError);
-    expect(() =>
-      mcpServerToolsFactory.create({}, ctx(), {}, undefined),
-    ).toThrow(/'command' or 'npm'/);
+    expect(() => mcpServerToolsFactory.create({}, ctx(), {}, undefined)).toThrow(
+      ManifestError,
+    );
+    expect(() => mcpServerToolsFactory.create({}, ctx(), {}, undefined)).toThrow(
+      /'command' or 'npm'/,
+    );
   });
 
   it("rejects when both command and npm are set", () => {
@@ -118,9 +163,7 @@ describe("mcp-server factory — config parsing", () => {
     ).toThrow(/string->string/);
   });
 
-  it("constructs successfully with command + args", () => {
-    // create() doesn't actually spawn — it just wires up the
-    // transport. The spawn happens at init().
+  it("constructs without spawning (the spawn happens at init)", () => {
     const tools = mcpServerToolsFactory.create(
       { command: "node", args: [ECHO_SERVER] },
       ctx(),
@@ -144,14 +187,11 @@ describe("mcp-server factory — lifecycle", () => {
       initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
     );
 
-    // The initialize handshake populated the serverInfo cache.
     const info = defined(tools.serverInfo, "serverInfo not populated");
     expect(info.name).toBe("loom-test-mcp-echo");
     expect(info.version).toBe("0.0.1");
     expect(info.capabilities).toMatchObject({ tools: {} });
 
-    // Resolve the child PID through the transport's internals (the
-    // factory does the same trick to enforce graceful shutdown).
     const proc = (tools.transport as unknown as { _process?: { pid?: number } })
       ._process;
     const pid = defined(
@@ -161,16 +201,12 @@ describe("mcp-server factory — lifecycle", () => {
     expect(typeof pid).toBe("number");
     expect(isAlive(pid)).toBe(true);
 
-    // resolveTool returns null for unknown names. (Discovery +
-    // execute behaviour gets its own dedicated suite below.)
     expect(
       tools.resolveTool("not_a_real_tool", {}, {} as never, undefined),
     ).toBeNull();
 
     await tools.close();
 
-    // Poll briefly — the SDK closes the transport synchronously but
-    // OS process reaping is asynchronous.
     let alive = isAlive(pid);
     for (let i = 0; i < 20 && alive; i++) {
       await wait(50);
@@ -178,7 +214,6 @@ describe("mcp-server factory — lifecycle", () => {
     }
     expect(alive).toBe(false);
 
-    // close() is idempotent: subsequent calls resolve cleanly.
     await tools.close();
     await tools.close();
   });
@@ -194,110 +229,91 @@ describe("mcp-server factory — lifecycle", () => {
   });
 });
 
-describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
-  it("caches the server's tool list on init() and resolves discovered tools", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    try {
-      await tools.init(
-        initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
-      );
-      // The cache reflects exactly what `tools/list` returned.
+describe("mcp-server factory — tool resolution + execution", () => {
+  it("caches the tools/list result, resolves discovered tools, executes them, and supports the `tool` rename", async () => {
+    await withEchoTools(async (tools) => {
       expect([...tools.toolsCache.keys()].sort()).toEqual(["add", "echo"]);
-      const t = defined(
-        tools.resolveTool("echo", {}, {} as never, undefined),
-        "resolveTool('echo') returned null",
-      );
-      expect(t.name).toBe("echo");
-      expect(t.description).toMatch(/Return the input verbatim/);
-      // The MCP-side schema flows through verbatim (Chunk 5 will
-      // narrow it; for now we mirror it).
-      expect((t.inputSchema as { properties?: unknown }).properties).toEqual({
-        text: expect.objectContaining({ type: "string" }),
-      });
-    } finally {
-      await tools.close();
-    }
-  });
 
-  // (`resolveTool` returning null for unknown names is covered by
-  // the lifecycle suite above; no need to duplicate the spawn here.)
-
-  it("execute() runs the MCP tool and surfaces text content as a Loom ToolResult", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    try {
-      await tools.init(
-        initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
-      );
       const echo = defined(
         tools.resolveTool("echo", {}, {} as never, undefined),
         "resolveTool('echo') returned null",
       );
-      const result = await echo.execute({ text: "hello loom" }, {} as never);
-      expect(result.isError).toBeUndefined();
-      expect(result.content).toBe("hello loom");
-    } finally {
-      await tools.close();
-    }
-  });
+      expect(echo.name).toBe("echo");
+      expect(echo.description).toMatch(/Return the input verbatim/);
+      expect(
+        (echo.inputSchema as { properties?: unknown }).properties,
+      ).toEqual({ text: expect.objectContaining({ type: "string" }) });
 
-  it("supports the `tool` rename so one MCP tool can be exposed under multiple model-facing names", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    try {
-      await tools.init(
-        initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
-      );
-      // `say` is the model-facing name; the underlying MCP tool is
-      // still `echo`.
+      const echoed = await echo.execute({ text: "hello loom" }, {} as never);
+      expect(echoed.isError).toBeUndefined();
+      expect(echoed.content).toBe("hello loom");
+
       const say = defined(
         tools.resolveTool("say", { tool: "echo" }, {} as never, undefined),
         "resolveTool('say') returned null",
       );
       expect(say.name).toBe("say");
-      const result = await say.execute({ text: "renamed!" }, {} as never);
-      expect(result.content).toBe("renamed!");
-    } finally {
-      await tools.close();
-    }
+      const renamed = await say.execute({ text: "renamed!" }, {} as never);
+      expect(renamed.content).toBe("renamed!");
+    });
   });
 
-  it("runs end-to-end through runAgent: configured-factory [providers] → [tools] → executable Tool", async () => {
-    // Full manifest → runtime path. Boots an agent whose [providers]
-    // points the configured-factory `mcp-server` form at our fixture,
-    // exposes one tool, and verifies the ToolTable actually executes
-    // against the live MCP server.
-    const spec: AgentManifest = {
-      name: "mcp-e2e",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        echo_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ECHO_SERVER],
-        },
-      },
-      tools: {
-        echo: { provider: "echo_mcp" },
-      },
-      capabilities: {
-        echo: "*",
-      },
-    };
+  it("appends a secrets-safe host note listing pre-bound args, and omits it when nothing is narrowed", async () => {
+    await withEchoTools(async (tools) => {
+      const plain = defined(
+        tools.resolveTool("add", {}, {} as never, undefined),
+        "resolveTool('add', no grant) returned null",
+      );
+      expect(plain.description).toBe("Add two integers.");
+      expect(plain.description).not.toContain("Host note");
+
+      const bound = defined(
+        tools.resolveTool("add", {}, {} as never, { a: 10, b: "*" }),
+        "resolveTool('add', bound a) returned null",
+      );
+      expect(bound.description).toContain("Add two integers.");
+      expect(bound.description).toContain("Host note");
+      expect(bound.description).toContain("`a`");
+      expect(bound.description).toContain("pre-configured");
+      expect(bound.description).not.toContain("10");
+
+      const bound2 = defined(
+        tools.resolveTool("add", {}, {} as never, { a: 10, b: 20 }),
+        "resolveTool('add', bound a+b) returned null",
+      );
+      expect(bound2.description).toContain("`a`");
+      expect(bound2.description).toContain("`b`");
+      expect(bound2.description).toMatch(/arguments are/);
+
+      const starred = defined(
+        tools.resolveTool("add", {}, {} as never, "*"),
+        "resolveTool('add', '*' grant) returned null",
+      );
+      expect(starred.description).not.toContain("Host note");
+    });
+  });
+
+  it("rejects a non-string `tool` config value", async () => {
+    await withEchoTools(async (tools) => {
+      expect(() =>
+        tools.resolveTool(
+          "foo",
+          { tool: 42 as unknown as string },
+          {} as never,
+          undefined,
+        ),
+      ).toThrow(/'tool'.*must be a non-empty string/);
+    });
+  });
+});
+
+describe("mcp-server factory — end-to-end through runAgent", () => {
+  it("boots [providers] → [tools] and executes against the live MCP server", async () => {
+    const spec = echoServerSpec(
+      "mcp-e2e",
+      { echo: { provider: "echo_mcp" } },
+      { echo: "*" },
+    );
     const agent = await runAgent(spec, {});
     try {
       const names = agent.agentState.toolTable.list().map((t) => t.name);
@@ -314,29 +330,16 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("end-to-end: same MCP tool exposed under multiple model-facing names via the `tool` rename", async () => {
-    const spec: AgentManifest = {
-      name: "mcp-rename-e2e",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        echo_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ECHO_SERVER],
-        },
-      },
-      tools: {
+  it("exposes one MCP tool under multiple model-facing names via the `tool` rename", async () => {
+    const spec = echoServerSpec(
+      "mcp-rename-e2e",
+      {
         echo: { provider: "echo_mcp" },
         say: { provider: "echo_mcp", tool: "echo" },
         shout: { provider: "echo_mcp", tool: "echo" },
       },
-      capabilities: {
-        echo: "*",
-        say: "*",
-        shout: "*",
-      },
-    };
+      { echo: "*", say: "*", shout: "*" },
+    );
     const agent = await runAgent(spec, {});
     try {
       const names = agent.agentState.toolTable
@@ -344,7 +347,6 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
         .map((t) => t.name)
         .sort();
       expect(names).toEqual(["echo", "say", "shout"]);
-      // Each alias dispatches to the same underlying MCP tool.
       const a = await agent.agentState.toolTable.execute({
         id: "a",
         name: "say",
@@ -362,103 +364,21 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("appends a host note to the description when args are pre-bound, listing the bound names", async () => {
-    // The MCP tool's original description references the bound arg.
-    // Without the host note, the model would see a description
-    // saying "a + b" but a schema with only `b` — the note fixes
-    // that mismatch and tells the model explicitly not to include
-    // the bound args.
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    try {
-      await tools.init(
-        initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
-      );
-      // No grant → no annotation; the original description flows through.
-      const plain = defined(
-        tools.resolveTool("add", {}, {} as never, undefined),
-        "resolveTool('add', no grant) returned null",
-      );
-      expect(plain.description).toBe("Add two integers.");
-      expect(plain.description).not.toContain("Host note");
-
-      // Literal binding on `a` → annotation surfaces.
-      const bound = defined(
-        tools.resolveTool("add", {}, {} as never, {
-          a: 10,
-          b: "*",
-        }),
-        "resolveTool('add', bound a) returned null",
-      );
-      expect(bound.description).toContain("Add two integers.");
-      expect(bound.description).toContain("Host note");
-      expect(bound.description).toContain("`a`");
-      expect(bound.description).toContain("pre-configured");
-      // Bound VALUES never appear in the description — secrets-safe.
-      expect(bound.description).not.toContain("10");
-
-      // Multiple bound args → list both, use plural phrasing.
-      const bound2 = defined(
-        tools.resolveTool("add", {}, {} as never, {
-          a: 10,
-          b: 20,
-        }),
-        "resolveTool('add', bound a+b) returned null",
-      );
-      expect(bound2.description).toContain("`a`");
-      expect(bound2.description).toContain("`b`");
-      expect(bound2.description).toMatch(/arguments are/);
-
-      // Whole-tool `"*"` grant → no narrowing, no annotation.
-      const starred = defined(
-        tools.resolveTool("add", {}, {} as never, "*"),
-        "resolveTool('add', '*' grant) returned null",
-      );
-      expect(starred.description).not.toContain("Host note");
-    } finally {
-      await tools.close();
-    }
-  });
-
-  it("end-to-end: capability-based partial application binds an arg the model never sees", async () => {
-    // The fixture's `add(a, b)` tool takes two numbers. Pre-bind
-    // `a = 10` via [capabilities]; the model only chooses `b`. The
-    // resulting Tool's inputSchema should advertise just `b`.
-    const spec: AgentManifest = {
-      name: "mcp-bind-e2e",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        echo_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ECHO_SERVER],
-        },
-      },
-      tools: {
-        // model-facing name `add_to_10`; underlying tool is still `add`.
-        add_to_10: { provider: "echo_mcp", tool: "add" },
-      },
-      capabilities: {
-        add_to_10: { a: 10, b: "*" },
-      },
-    };
+  it("partial-applies a bound arg the model never sees, narrowing the schema", async () => {
+    const spec = echoServerSpec(
+      "mcp-bind-e2e",
+      { add_to_10: { provider: "echo_mcp", tool: "add" } },
+      { add_to_10: { a: 10, b: "*" } },
+    );
     const agent = await runAgent(spec, {});
     try {
       const list = agent.agentState.toolTable.list();
       expect(list).toHaveLength(1);
       const t = defined(list[0], "toolTable.list() returned empty");
-      // The narrowed schema hides `a` from the model.
       const props = (t.inputSchema as { properties: Record<string, unknown> })
         .properties;
       expect(Object.keys(props)).toEqual(["b"]);
       expect((t.inputSchema as { required: string[] }).required).toEqual(["b"]);
-      // Execute with the model-supplied `b`; the bound `a = 10`
-      // gets merged transparently.
       const result = await agent.agentState.toolTable.execute({
         id: "call",
         name: "add_to_10",
@@ -471,31 +391,14 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("end-to-end: model attempting to override a bound arg is rejected with isError", async () => {
-    const spec: AgentManifest = {
-      name: "mcp-bind-override-e2e",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        echo_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ECHO_SERVER],
-        },
-      },
-      tools: {
-        bound_echo: { provider: "echo_mcp", tool: "echo" },
-      },
-      capabilities: {
-        bound_echo: { text: "locked-value" },
-      },
-    };
+  it("rejects (isError, not throw) a model attempt to override a bound arg", async () => {
+    const spec = echoServerSpec(
+      "mcp-bind-override-e2e",
+      { bound_echo: { provider: "echo_mcp", tool: "echo" } },
+      { bound_echo: { text: "locked-value" } },
+    );
     const agent = await runAgent(spec, {});
     try {
-      // The narrowed schema has no `text` property, so Ajv rejects
-      // before we even reach execute(). That's expected and is one
-      // valid layer of defence; we just check the failure surfaces
-      // as isError rather than throwing.
       const result = await agent.agentState.toolTable.execute({
         id: "call",
         name: "bound_echo",
@@ -507,32 +410,8 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("end-to-end: secrets in MCP env (Chunk 6) — Loom secret injected as child env var", async () => {
-    // The env-server fixture's `whoami` tool reports the value of
-    // MOCK_API_KEY from its process env. The manifest declares
-    // `secrets = { MOCK_API_KEY = "MOCK_API_KEY" }` which:
-    //   1. Adds MOCK_API_KEY to the runtime's Phase-1 secret needs.
-    //   2. Filters it into the create() secrets arg.
-    //   3. The factory writes env[MOCK_API_KEY] = secrets[MOCK_API_KEY].
-    // The test loads the secret from a StaticSecretsStore.
-    const spec: AgentManifest = {
-      name: "mcp-secret-e2e",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        env_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ENV_SERVER],
-          secrets: { MOCK_API_KEY: "MOCK_API_KEY" },
-        },
-      },
-      tools: {
-        whoami: { provider: "env_mcp" },
-      },
-      capabilities: { whoami: "*" },
-    };
-    const agent = await runAgent(spec, {
+  it("injects a Loom secret into the MCP child's env", async () => {
+    const agent = await runAgent(envServerSpec("mcp-secret-e2e"), {
       secrets: new StaticSecretsStore({ MOCK_API_KEY: "sek-ret-9000" }),
     });
     try {
@@ -548,48 +427,17 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("end-to-end: secret declared but not present in the store fails boot", async () => {
-    const spec: AgentManifest = {
-      name: "mcp-secret-missing-e2e",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        env_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ENV_SERVER],
-          secrets: { MOCK_API_KEY: "MOCK_API_KEY" },
-        },
-      },
-      tools: {
-        whoami: { provider: "env_mcp" },
-      },
-      capabilities: { whoami: "*" },
-    };
-    // No StaticSecretsStore, no MOCK_API_KEY in env — boot should
-    // fail at the loadSecretsBundle phase before the factory runs.
+  it("fails boot when a declared secret is absent from the store", async () => {
     delete process.env.MOCK_API_KEY;
-    await expect(runAgent(spec, {})).rejects.toThrow(/MOCK_API_KEY/);
+    await expect(
+      runAgent(envServerSpec("mcp-secret-missing-e2e"), {}),
+    ).rejects.toThrow(/MOCK_API_KEY/);
   });
 
-  it("end-to-end: one [providers] handle = one MCP server process, regardless of per-tool config", async () => {
-    // Seven [tools.X] entries, four distinct per-tool shapes, but
-    // ALL pointing at the same [providers].echo_mcp handle. The
-    // resolver must produce exactly ONE provider instance (= one
-    // spawned MCP server); per-tool config is what flows to
-    // resolveTool, never to Tools.create().
-    const spec: AgentManifest = {
-      name: "mcp-single-server",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        echo_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ECHO_SERVER],
-        },
-      },
-      tools: {
+  it("spawns one MCP server per [providers] handle regardless of per-tool config", async () => {
+    const spec = echoServerSpec(
+      "mcp-single-server",
+      {
         echo: { provider: "echo_mcp" },
         say: { provider: "echo_mcp", tool: "echo" },
         shout: { provider: "echo_mcp", tool: "echo" },
@@ -597,7 +445,7 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
         add_to_10: { provider: "echo_mcp", tool: "add" },
         whisper: { provider: "echo_mcp", tool: "echo", note: "extra" },
       },
-      capabilities: {
+      {
         echo: "*",
         say: "*",
         shout: "*",
@@ -605,10 +453,9 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
         add_to_10: { a: 10, b: "*" },
         whisper: "*",
       },
-    };
+    );
     const agent = await runAgent(spec, {});
     try {
-      // All six tool bindings resolve, dispatch correctly.
       const names = agent.agentState.toolTable
         .list()
         .map((t) => t.name)
@@ -622,9 +469,6 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
         "whisper",
       ]);
 
-      // Every tool routes through the same Tools instance —
-      // verified via the audit, which records one provider per
-      // distinct ProviderInstance.
       const { auditAgent } = await import("../src/audit/audit.js");
       const tree = await auditAgent(spec);
       const mcpProviders = tree.providers.filter(
@@ -632,8 +476,6 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       );
       expect(mcpProviders).toHaveLength(1);
 
-      // Spot-check a couple of dispatches to prove the routing is
-      // sound under the shared instance.
       const a = await agent.agentState.toolTable.execute({
         id: "a",
         name: "say",
@@ -651,25 +493,12 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
     }
   });
 
-  it("end-to-end: static enumeration — server tools NOT in [tools] are NOT reachable", async () => {
-    // The fixture advertises `echo` and `add`. The manifest only
-    // names `echo`. `add` must be invisible on the agent.
-    const spec: AgentManifest = {
-      name: "mcp-static-enum-e2e",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        echo_mcp: {
-          provider: "mcp-server",
-          command: process.execPath,
-          args: [ECHO_SERVER],
-        },
-      },
-      tools: {
-        echo: { provider: "echo_mcp" },
-      },
-      capabilities: { echo: "*" },
-    };
+  it("hides server tools that are not named in [tools]", async () => {
+    const spec = echoServerSpec(
+      "mcp-static-enum-e2e",
+      { echo: { provider: "echo_mcp" } },
+      { echo: "*" },
+    );
     const agent = await runAgent(spec, {});
     try {
       const names = agent.agentState.toolTable.list().map((t) => t.name);
@@ -677,30 +506,6 @@ describe("mcp-server factory — tool resolution + execution (Chunk 3)", () => {
       expect(names).not.toContain("add");
     } finally {
       await agent.close();
-    }
-  });
-
-  it("rejects a non-string `tool` config value", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    try {
-      await tools.init(
-        initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
-      );
-      expect(() =>
-        tools.resolveTool(
-          "foo",
-          { tool: 42 as unknown as string },
-          {} as never,
-          undefined,
-        ),
-      ).toThrow(/'tool'.*must be a non-empty string/);
-    } finally {
-      await tools.close();
     }
   });
 });

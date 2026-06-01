@@ -1,27 +1,3 @@
-/**
- * `edit_file` — modify an existing UTF-8 file by exact text
- * replacement. Designed for incremental, model-driven edits where
- * sending the full file every time is wasteful.
- *
- * The model passes one or more `{ old_text, new_text }` pairs. Each
- * `old_text` MUST match a unique substring of the file's current
- * content; all replacements apply against the *original* file (not
- * incrementally), so the model never has to reason about how earlier
- * edits shifted positions. Overlapping or nested matches are
- * rejected.
- *
- * Capability kinds:
- *   optional: ["paths"]
- *
- * Star/list/absent semantics: same as `write_file`/`read_file` —
- *   paths absent  → smart default `["./"]` (project root)
- *   paths = "*"   → unrestricted
- *   paths = []    → explicit no-access (every call fails)
- *   paths = [...] → allowlist of absolute path roots
- *
- * The file MUST already exist. To create a new file, use `write_file`.
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -37,6 +13,8 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
+  canonicalizeForGrant,
+  canonicalizeRoots,
   collectTrustedPaths,
   describePaths,
   effectivePaths,
@@ -112,10 +90,12 @@ export class EditFileTool implements Tool {
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
     const i = input as EditFileInput;
-    const target = path.resolve(i.path);
+    const target = await canonicalizeForGrant(path.resolve(i.path), "write");
 
     const trusted = await collectTrustedPaths(ctx);
-    const effective = effectivePaths(this.granted, trusted, "write");
+    const effective = await canonicalizeRoots(
+      effectivePaths(this.granted, trusted, "write"),
+    );
     if (!pathAllowed(target, effective)) {
       return {
         content: `edit_file: '${i.path}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
@@ -123,9 +103,7 @@ export class EditFileTool implements Tool {
       };
     }
 
-    // Read the current file content. Route through the ACP client
-    // when available so the agent sees the same buffer the editor
-    // has in front of the user (including unsaved changes).
+    // Route through the ACP client so the agent sees unsaved editor changes.
     let oldContent: string;
     try {
       if (ctx.client?.readTextFile) {
@@ -140,10 +118,6 @@ export class EditFileTool implements Tool {
       };
     }
 
-    // Apply edits against the ORIGINAL content. Each match is computed
-    // against `oldContent`; assembly is a single left-to-right pass
-    // so we never feed an earlier edit's output into a later edit's
-    // matcher.
     let newContent: string;
     try {
       newContent = applyEdits(oldContent, i.edits);
@@ -154,7 +128,6 @@ export class EditFileTool implements Tool {
       };
     }
 
-    // Write the result back. Same routing as the read.
     try {
       if (ctx.client?.writeTextFile) {
         await ctx.client.writeTextFile({ path: target, content: newContent });
@@ -168,9 +141,6 @@ export class EditFileTool implements Tool {
       };
     }
 
-    // ACP `Diff` content block lets the client render a real diff
-    // view. We hand over the full before/after; the client owns the
-    // visual layout.
     const diff: ToolCallContent = {
       type: "diff",
       path: target,
@@ -191,15 +161,6 @@ export class EditFileTool implements Tool {
   }
 }
 
-/**
- * Apply each `{ old_text, new_text }` edit to `original`. Throws on
- * any of: empty `edits`, an `old_text` not found, an `old_text`
- * matching multiple times (ambiguous), or overlapping match ranges.
- * All matches are computed against `original`, not after prior edits
- * — the order of entries doesn't change the result.
- *
- * Exported for unit-test convenience.
- */
 export function applyEdits(
   original: string,
   edits: ReadonlyArray<{ old_text: string; new_text: string }>,
@@ -208,7 +169,6 @@ export function applyEdits(
     throw new Error("no edits provided");
   }
 
-  // Compute each edit's match range in the original content.
   const ranges: Array<{
     start: number;
     end: number;
@@ -242,7 +202,6 @@ export function applyEdits(
     });
   }
 
-  // Sort by start position; verify non-overlap.
   ranges.sort((a, b) => a.start - b.start);
   for (let i = 1; i < ranges.length; i++) {
     const prev = ranges[i - 1]!;
@@ -255,9 +214,6 @@ export function applyEdits(
     }
   }
 
-  // Stitch the new content together: unchanged spans + replacements,
-  // in original-order. Because we process ranges left-to-right, each
-  // `cursor` advance is monotonic and we never re-read replaced text.
   let cursor = 0;
   const out: string[] = [];
   for (const r of ranges) {

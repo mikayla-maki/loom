@@ -1,26 +1,3 @@
-/**
- * Test harness — a deterministic, scripted harness for testing the runtime
- * and tool plumbing without an LLM.
- *
- * Two modes:
- *
- * 1. Scripted (default): config holds a `script: TurnScript[]`. Each call to
- *    run() consumes one TurnScript. A TurnScript is a list of "steps":
- *      - { say: "..." }                   -> emit agent_message_chunk
- *      - { call: { tool, input } }        -> dispatch the tool, surface result
- *      - { think: "..." }                 -> emit agent_thought_chunk
- *      - { stop: "end_turn" }             -> finish the turn
- *    Tool-call steps record the result back as an agent_message_chunk by default;
- *    add `surface: false` to omit that.
- *
- * 2. Echo: config { echo: true } — replays the most recent user message back
- *    as an agent message and ends the turn. Useful for smoke tests.
- *
- * The harness is also useful as a *programmatic driver* — you can pass a
- * function in `script` that returns the next step given the runtime, which
- * lets tests express logic.
- */
-
 import { randomUUID } from "node:crypto";
 
 import type {
@@ -61,7 +38,6 @@ export class TestHarness implements Harness {
 
   constructor(private readonly config: TestHarnessConfig) {}
 
-  /** Most-recent params seen by `run()`. Lets tests assert what loom forwarded. */
   public lastParams: RunParameters | undefined;
 
   async run(runtime: Runtime, params?: RunParameters): Promise<TurnResult> {
@@ -147,7 +123,6 @@ export class TestHarness implements Harness {
           name: step.call.tool,
           input: step.call.input,
         });
-        // Split-channel emit (see `Runtime.emitToolResult`).
         await runtime.emitToolResult({
           toolCallId: id,
           status: result.isError ? "failed" : "completed",
@@ -165,9 +140,6 @@ export class TestHarness implements Harness {
       }
     }
     await runtime.update({ sessionUpdate: "stop", stopReason });
-    // "error" is a Loom-internal extension on StopReason; the ACP
-    // server folds it into a JSON-RPC error. Casting here narrows
-    // the return to the SDK-shaped stopReason where appropriate.
     return { stopReason };
   }
 }

@@ -1,21 +1,3 @@
-/**
- * Secrets store.
- *
- * V0 ships several implementations:
- *  - `EnvSecretsStore`      — looks up upper-cased + LOOM_-prefixed env vars.
- *  - `FileSecretsStore`     — reads a JSON or .env-style file (per-agent
- *                             `.loom-secrets`, used in tests too).
- *  - `XDGSecretsStore`      — reads `$XDG_CONFIG_HOME/loom/secrets.toml`,
- *                             defaulting to `~/.config/loom/secrets.toml`.
- *  - `KeychainSecretsStore` — macOS-only via `security find-generic-password`.
- *                             Returns null on non-macOS hosts (degrade silently).
- *  - `StaticSecretsStore`   — caller-supplied dict, top-priority overlay.
- *
- * The runtime never lets a secret value reach the model — it's only ever
- * passed to a tool process via env vars at execute time, or to a factory's
- * `create()` for harnesses/sessions/providers.
- */
-
 import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -26,19 +8,16 @@ import * as TOML from "toml";
 import { SecretError } from "../errors.js";
 
 export interface SecretsStore {
-  /** Return the secret value, or null if missing. */
   get(name: string): Promise<string | null>;
 }
 
 export class EnvSecretsStore implements SecretsStore {
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
   async get(name: string): Promise<string | null> {
-    // Try multiple aliasings: exact, upper, LOOM_ prefixed.
     const candidates = [
       name,
       name.toUpperCase(),
       `LOOM_${name.toUpperCase()}`,
-      // also dot.case → DOT_CASE
       name.replace(/[.\-]/g, "_").toUpperCase(),
       `LOOM_${name.replace(/[.\-]/g, "_").toUpperCase()}`,
     ];
@@ -70,9 +49,14 @@ export class FileSecretsStore implements SecretsStore {
     let text: string;
     try {
       text = await fs.readFile(this.path, "utf8");
-    } catch {
-      this.cache = {};
-      return;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+        this.cache = {};
+        return;
+      }
+      throw new SecretError(
+        `Failed to read secrets file at ${this.path}: ${(e as Error).message}`,
+      );
     }
     text = text.trim();
     if (text.startsWith("{")) {
@@ -84,7 +68,6 @@ export class FileSecretsStore implements SecretsStore {
         );
       }
     } else {
-      // .env style
       const out: Record<string, string> = {};
       for (const line of text.split("\n")) {
         const trimmed = line.trim();
@@ -106,12 +89,6 @@ export class FileSecretsStore implements SecretsStore {
   }
 }
 
-/**
- * Reads `$XDG_CONFIG_HOME/loom/secrets.toml` (fallback `~/.config/loom/secrets.toml`).
- * The TOML file is a flat key→value map. Missing file is silent (returns null).
- *
- * The path can be overridden via the constructor for tests.
- */
 export class XDGSecretsStore implements SecretsStore {
   private cache: Record<string, string> | null = null;
   private readonly path: string;
@@ -129,9 +106,14 @@ export class XDGSecretsStore implements SecretsStore {
     let text: string;
     try {
       text = await fs.readFile(this.path, "utf8");
-    } catch {
-      this.cache = {};
-      return;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+        this.cache = {};
+        return;
+      }
+      throw new SecretError(
+        `Failed to read secrets file at ${this.path}: ${(e as Error).message}`,
+      );
     }
     let parsed: unknown;
     try {
@@ -155,26 +137,9 @@ function defaultXdgSecretsPath(): string {
   return path.join(base, "loom", "secrets.toml");
 }
 
-/**
- * macOS Keychain reader. Each lookup runs:
- *   security find-generic-password -s loom -a <name> -w
- *
- * The `-s loom` service scopes Loom secrets to a single keychain item set;
- * the user can populate it with:
- *   security add-generic-password -s loom -a ANTHROPIC_API_KEY -w sk-ant-...
- *
- * On non-macOS hosts the constructor records `enabled = false` and `get()`
- * returns null without ever spawning. We don't surface an error — the
- * default chain falls through to the file/env stores.
- */
 export class KeychainSecretsStore implements SecretsStore {
   private readonly enabled: boolean;
   private readonly service: string;
-  /**
-   * Test-only override: when set, replaces the spawn() call. Resolves to
-   * the secret value (or null for "not found"); rejects to bubble an
-   * unexpected failure.
-   */
   private readonly lookup:
     | ((name: string) => Promise<string | null>)
     | undefined;
@@ -217,14 +182,12 @@ async function runKeychainLookup(
         const trimmed = stdout.replace(/\n$/, "");
         resolve(trimmed.length > 0 ? trimmed : null);
       } else {
-        // Exit 44 = item not found on macOS; any non-zero is treated as miss.
         resolve(null);
       }
     });
   });
 }
 
-/** Try a list of stores in order; first hit wins. */
 export class ChainedSecretsStore implements SecretsStore {
   constructor(private readonly stores: SecretsStore[]) {}
   async get(name: string): Promise<string | null> {

@@ -1,13 +1,3 @@
-/**
- * Update sink — fan-out of session updates to the session log + all live
- * subscribers (the SDK's `updates()` iterable, ACP clients, etc.).
- *
- * Implementation note: each subscriber gets its own bounded queue. If a
- * subscriber's queue overflows we drop the oldest update and mark the
- * subscriber as lossy — this prevents one slow client from stalling the
- * harness loop.
- */
-
 import type { SessionUpdate } from "../types/acp.js";
 
 interface Subscription {
@@ -21,7 +11,6 @@ export class UpdateSink {
   private readonly subs = new Set<Subscription>();
   private closed = false;
 
-  /** Emit one update to all subscribers. */
   emit(update: SessionUpdate): void {
     if (this.closed) return;
     for (const sub of this.subs) {
@@ -37,7 +26,6 @@ export class UpdateSink {
     }
   }
 
-  /** Close all subscriptions. */
   close(): void {
     this.closed = true;
     for (const sub of this.subs) {

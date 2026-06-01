@@ -1,8 +1,3 @@
-/**
- * Tests for `applyArgGrant` — the schema-narrowing + arg-binding
- * helper used by MCP-style provider tools (Chunk 5).
- */
-
 import { describe, expect, it } from "vitest";
 
 import { applyArgGrant } from "../src/manifest/capabilities.js";
@@ -18,39 +13,33 @@ const docSchema: JSONSchema = {
   additionalProperties: false,
 };
 
+const props = (s: JSONSchema) =>
+  (s as { properties?: Record<string, unknown> }).properties;
+const required = (s: JSONSchema) => (s as { required?: string[] }).required;
+const hasRequired = (s: JSONSchema) => "required" in (s as Record<string, unknown>);
+
 describe("applyArgGrant", () => {
-  it("`*` whole-tool grant leaves the schema and required list intact", () => {
-    const a = applyArgGrant(docSchema, "*");
-    expect(a.schema).toBe(docSchema);
-    expect(a.bound).toEqual({});
-    expect([...a.modelArgs].sort()).toEqual(["doc_id", "text"]);
+  it("`*` and undefined whole-tool grants leave the schema and required list intact", () => {
+    for (const grant of ["*" as const, undefined]) {
+      const a = applyArgGrant(docSchema, grant);
+      expect(a.schema).toBe(docSchema);
+      expect(a.bound).toEqual({});
+      expect([...a.modelArgs].sort()).toEqual(["doc_id", "text"]);
+    }
   });
 
-  it("undefined grant leaves the schema intact (no narrowing, no binding)", () => {
-    const a = applyArgGrant(docSchema, undefined);
-    expect(a.schema).toBe(docSchema);
-    expect(a.bound).toEqual({});
-    expect([...a.modelArgs].sort()).toEqual(["doc_id", "text"]);
-  });
-
-  it("literal-bound arg drops from properties + required and shows up in bound", () => {
-    // Explicitly whitelist `text` alongside the literal-bound
-    // `doc_id` — a per-arg map is a strict whitelist, so any arg
-    // we want the model to still see must appear as a key.
+  it("literal-bound arg drops from properties + required, lands in bound, and keeps additionalProperties", () => {
     const a = applyArgGrant(docSchema, { doc_id: "doc-123", text: "*" });
-    const props = (a.schema as { properties: Record<string, unknown> })
-      .properties;
-    expect(Object.keys(props).sort()).toEqual(["text"]);
-    expect((a.schema as { required: string[] }).required).toEqual(["text"]);
+    expect(Object.keys(props(a.schema)!).sort()).toEqual(["text"]);
+    expect(required(a.schema)).toEqual(["text"]);
     expect(a.bound).toEqual({ doc_id: "doc-123" });
     expect([...a.modelArgs]).toEqual(["text"]);
-    // additionalProperties metadata preserved.
     expect(
       (a.schema as { additionalProperties: boolean }).additionalProperties,
     ).toBe(false);
   });
 
-  it("numeric and boolean literals are also valid bindings", () => {
+  it("numeric and boolean literals are valid bindings", () => {
     const schema: JSONSchema = {
       type: "object",
       required: ["limit", "active"],
@@ -60,14 +49,12 @@ describe("applyArgGrant", () => {
       },
     };
     const a = applyArgGrant(schema, { limit: 42, active: true });
-    expect(
-      (a.schema as { properties: Record<string, unknown> }).properties,
-    ).toEqual({});
-    expect((a.schema as { required?: string[] }).required).toBeUndefined();
+    expect(props(a.schema)).toEqual({});
+    expect(required(a.schema)).toBeUndefined();
     expect(a.bound).toEqual({ limit: 42, active: true });
   });
 
-  it("array grant narrows a property to `enum`, preserving original metadata", () => {
+  it("array grant narrows a property to enum, preserving metadata and required, without binding", () => {
     const schema: JSONSchema = {
       type: "object",
       required: ["status"],
@@ -76,14 +63,12 @@ describe("applyArgGrant", () => {
       },
     };
     const a = applyArgGrant(schema, { status: ["online", "away"] });
-    const status = (a.schema as { properties: { status: unknown } }).properties
-      .status as Record<string, unknown>;
+    const status = (props(a.schema) as { status: Record<string, unknown> })
+      .status;
     expect(status.type).toBe("string");
     expect(status.description).toBe("user state");
     expect(status.enum).toEqual(["online", "away"]);
-    // Still required (enum doesn't drop required).
-    expect((a.schema as { required: string[] }).required).toEqual(["status"]);
-    // Not bound — passed through from the model.
+    expect(required(a.schema)).toEqual(["status"]);
     expect(a.bound).toEqual({});
     expect([...a.modelArgs]).toEqual(["status"]);
   });
@@ -97,55 +82,7 @@ describe("applyArgGrant", () => {
     expect(a.bound).toEqual({});
   });
 
-  it("per-arg map is a whitelist: unlisted args are dropped from the schema", () => {
-    // The MCP server advertises three args; the grant names only two.
-    // The third must disappear from `properties` and `required`. This
-    // is the static-enumeration guarantee at the arg level.
-    const schema: JSONSchema = {
-      type: "object",
-      required: ["a"],
-      properties: {
-        a: { type: "string" },
-        b: { type: "string" },
-        c: { type: "string" },
-      },
-    };
-    const a = applyArgGrant(schema, { a: "*", b: "*" });
-    const props = (a.schema as { properties: Record<string, unknown> })
-      .properties;
-    expect(Object.keys(props).sort()).toEqual(["a", "b"]);
-    expect((a.schema as { required: string[] }).required).toEqual(["a"]);
-    expect([...a.modelArgs].sort()).toEqual(["a", "b"]);
-    expect(a.bound).toEqual({});
-  });
-
-  it("empty per-arg map drops every advertised arg (boot guard catches required-missing separately)", () => {
-    // `{}` is a whitelist of nothing. Optional MCP args vanish from
-    // the model-visible schema; if any MCP-required arg existed, the
-    // boot guard (`assertRequires`) would reject the manifest before
-    // we ever get here. This test exercises the optional-only case.
-    const schema: JSONSchema = {
-      type: "object",
-      properties: {
-        a: { type: "string" },
-        b: { type: "string" },
-      },
-    };
-    const a = applyArgGrant(schema, {});
-    expect(
-      (a.schema as { properties: Record<string, unknown> }).properties,
-    ).toEqual({});
-    expect("required" in (a.schema as Record<string, unknown>)).toBe(false);
-    expect(a.modelArgs.size).toBe(0);
-    expect(a.bound).toEqual({});
-  });
-
-  it("unlisted required args get stripped from `required` too (so the narrowed schema stays valid)", () => {
-    // If we left `required: ['c']` on a schema whose properties no
-    // longer contain `c`, downstream JSON Schema validators would
-    // complain. The boot guard surfaces the real problem (manifest
-    // forgot to grant a required arg); the narrower just ensures the
-    // schema it emits is internally consistent.
+  it("per-arg map is a whitelist: unlisted args drop from properties and required", () => {
     const schema: JSONSchema = {
       type: "object",
       required: ["a", "c"],
@@ -155,11 +92,26 @@ describe("applyArgGrant", () => {
         c: { type: "string" },
       },
     };
-    const a = applyArgGrant(schema, { a: "*" });
-    const props = (a.schema as { properties: Record<string, unknown> })
-      .properties;
-    expect(Object.keys(props)).toEqual(["a"]);
-    expect((a.schema as { required: string[] }).required).toEqual(["a"]);
+    const a = applyArgGrant(schema, { a: "*", b: "*" });
+    expect(Object.keys(props(a.schema)!).sort()).toEqual(["a", "b"]);
+    expect(required(a.schema)).toEqual(["a"]);
+    expect([...a.modelArgs].sort()).toEqual(["a", "b"]);
+    expect(a.bound).toEqual({});
+  });
+
+  it("empty per-arg map drops every advertised arg and the required key", () => {
+    const schema: JSONSchema = {
+      type: "object",
+      properties: {
+        a: { type: "string" },
+        b: { type: "string" },
+      },
+    };
+    const a = applyArgGrant(schema, {});
+    expect(props(a.schema)).toEqual({});
+    expect(hasRequired(a.schema)).toBe(false);
+    expect(a.modelArgs.size).toBe(0);
+    expect(a.bound).toEqual({});
   });
 
   it("mixed grant: one bound, one enum-narrowed, one passthrough", () => {
@@ -177,29 +129,26 @@ describe("applyArgGrant", () => {
       status: ["active", "pending"],
       limit: "*",
     });
-    const props = (a.schema as { properties: Record<string, unknown> })
-      .properties;
-    expect(Object.keys(props).sort()).toEqual(["limit", "status"]);
-    expect((props.status as { enum: string[] }).enum).toEqual([
-      "active",
-      "pending",
-    ]);
-    expect((a.schema as { required: string[] }).required).toEqual(["status"]);
+    expect(Object.keys(props(a.schema)!).sort()).toEqual(["limit", "status"]);
+    expect(
+      (props(a.schema) as { status: { enum: string[] } }).status.enum,
+    ).toEqual(["active", "pending"]);
+    expect(required(a.schema)).toEqual(["status"]);
     expect(a.bound).toEqual({ table: "users" });
     expect([...a.modelArgs].sort()).toEqual(["limit", "status"]);
   });
 
-  it("removing the only required arg deletes the `required` key entirely", () => {
+  it("removing the only required arg deletes the required key entirely", () => {
     const schema: JSONSchema = {
       type: "object",
       required: ["only"],
       properties: { only: { type: "string" } },
     };
     const a = applyArgGrant(schema, { only: "fixed" });
-    expect("required" in (a.schema as Record<string, unknown>)).toBe(false);
+    expect(hasRequired(a.schema)).toBe(false);
   });
 
-  it("doesn't break when schema has no `properties` or `required`", () => {
+  it("doesn't break when schema has no properties or required", () => {
     const schema: JSONSchema = { type: "object" };
     const a = applyArgGrant(schema, "*");
     expect(a.schema).toBe(schema);

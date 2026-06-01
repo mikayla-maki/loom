@@ -16,7 +16,6 @@ const FIXTURES = path.resolve("test/fixtures");
 describe("auditAgent", () => {
   const tmp = useTmpDir("loom-audit-");
 
-  /** Write `agent.toml` with `body` into this test's tmp dir. */
   async function writeManifest(body: string): Promise<string> {
     const p = path.join(tmp(), "agent.toml");
     await fs.writeFile(p, body, "utf8");
@@ -34,30 +33,22 @@ describe("auditAgent", () => {
       "read_file",
       "write_file",
     ]);
-    // FS tools have `optional: ["paths"]` and the fixture grants `paths`.
     const readEntry = tree.tools.find((t) => t.name === "read_file");
     expect(readEntry?.optional).toContain("paths");
-    expect(readEntry?.requires).toEqual([]); // no required kinds
+    expect(readEntry?.requires).toEqual([]);
     expect(readEntry?.granted).toEqual({ paths: ["./"] });
     expect(readEntry?.missing).toEqual([]);
-    // The agent's grant table is exposed under `grants`.
     expect(tree.grants.read_file).toEqual({ paths: ["./"] });
-    // [agent].secrets allowlist surfaces in the tree.
     expect(tree.secretAllowlist).toEqual(["sample_user_name"]);
 
     const printed = formatCapabilityTree(tree, { color: false });
     expect(printed).toContain("sample-agent");
     expect(printed).toContain("read_file");
     expect(printed).toContain("edit_file");
-    // The renderer attributes each tool with `via <provider>`; for
-    // these native builtins that's `via builtin`.
     expect(printed).toMatch(/read_file\s+via\s+builtin/);
   });
 
   it("surfaces tool.audit() findings (bash sandbox availability)", async () => {
-    // Inline manifest with bash + a structured grant. Bash's audit()
-    // checks for /usr/bin/sandbox-exec and reports a finding either
-    // way. We assert that SOME finding shows up in the tree.
     const spec: AgentManifest = {
       name: "audit-bash",
       systemPrompt: "x",
@@ -69,8 +60,6 @@ describe("auditAgent", () => {
     const bashEntry = tree.tools.find((t) => t.name === "bash");
     expect(bashEntry).toBeDefined();
     expect(bashEntry!.findings.length).toBeGreaterThan(0);
-    // The finding's message should mention sandbox-exec on macOS
-    // or the platform's lack of a backend on Linux/other.
     const messages = bashEntry!.findings.map((f) => f.message).join(" ");
     expect(messages).toMatch(/sandbox|bwrap|sandbox-exec/i);
   });
@@ -91,10 +80,6 @@ describe("auditAgent", () => {
   });
 
   it("throws AuditError with the partial tree attached when a source is missing", async () => {
-    // A manifest that references an npm package that doesn't exist
-    // on disk. Audit always validates fully now — there's no lenient
-    // mode — but the thrown `AuditError` carries the partial tree so
-    // callers can still inspect what DID resolve.
     const manifestPath = await writeManifest(
       [
         "[agent]",
@@ -121,12 +106,8 @@ describe("auditAgent", () => {
     expect(err!.tree.unresolvedTools.map((u) => u.name)).toContain(
       "fancy_tool",
     );
-    // health includes both the source AND the tool that depended
-    // on it.
     expect(err!.health.unresolvedSources).toBe(1);
     expect(err!.health.unresolvedTools).toBeGreaterThanOrEqual(1);
-    // The tree is still renderable — callers (the CLI included)
-    // can print it before surfacing the error.
     const printed = formatCapabilityTree(err!.tree);
     expect(printed.toLowerCase()).toContain("unresolved");
   });
@@ -143,18 +124,14 @@ describe("auditAgent", () => {
       ],
     };
     const tree = await auditAgent(spec);
-    // sessionLayers carries one summary per layer, outer-to-inner.
     expect(tree.sessionLayers).toBeDefined();
     expect(tree.sessionLayers!.map((s) => s.factoryName)).toEqual([
       "compacting",
       "in-memory",
     ]);
-    // The back-compat single-`session` field describes the outermost layer.
     expect(tree.session?.factoryName).toBe("compacting");
 
     const printed = formatCapabilityTree(tree, { color: false });
-    // Multi-layer session shows the summary line, both layers, and
-    // their provider sub-lines.
     expect(printed).toMatch(/session:\s*2 layers, outer→inner/);
     expect(printed).toContain("[0]");
     expect(printed).toContain("compacting");
@@ -172,16 +149,11 @@ describe("auditAgent", () => {
     };
     const tree = await auditAgent(spec);
     const printed = formatCapabilityTree(tree, { color: false });
-    // No "N layers" header on the singleton path.
     expect(printed).not.toMatch(/\d+ layers, outer→inner/);
-    // The session: heading still appears with the provider name.
     expect(printed).toMatch(/session:\s*in-memory/);
   });
 
   it("surfaces per-agent storage on the tree and renders it in the formatter", async () => {
-    // Note: separate `withTmpDir` because we need an isolated
-    // LOOM_DATA_HOME, not the per-test tmp from useTmpDir (which is
-    // already used for manifest scratch files when present).
     await withTmpDir("loom-audit-storage-", async (dataHome) => {
       const prev = process.env.LOOM_DATA_HOME;
       process.env.LOOM_DATA_HOME = dataHome;
@@ -240,10 +212,6 @@ describe("auditAgent", () => {
   });
 
   it("recursive health: a broken sub-agent makes the parent fail audit", async () => {
-    // Parent itself is fine. The spawn_subagent tool declares a
-    // sub-agent manifest that names a non-existent npm provider.
-    // Audit must walk into the sub-agent, find the failure, and
-    // roll it up so the parent's `totalProblems > 0`.
     const child: AgentManifest = {
       name: "child",
       manifestPath: "/virtual/child.toml",
@@ -272,21 +240,15 @@ describe("auditAgent", () => {
     }
     expect(err).toBeInstanceOf(AuditError);
 
-    // The parent itself is clean — problems live in the child.
     expect(err!.health.directProblems).toBe(0);
     expect(err!.health.totalProblems).toBeGreaterThan(0);
 
-    // Recursive structure: one sub-agent under parent.spawn_subagent.
     expect(err!.health.subagents).toHaveLength(1);
     const childHealth = err!.health.subagents[0]!;
     expect(childHealth.agentName).toBe("child");
     expect(childHealth.directProblems).toBeGreaterThan(0);
     expect(childHealth.unresolvedSources).toBe(1);
 
-    // Failure message paths the sub-agent so the user sees where
-    // the problem lives. The "across N agent(s)" hint only
-    // appears when MULTIPLE agents have problems — here only the
-    // child does, so the header is the single-agent form.
     expect(err!.message).toMatch(/parent → child:/);
     expect(err!.message).not.toMatch(/across \d+ agent/);
   });
@@ -325,17 +287,12 @@ describe("auditAgent", () => {
     expect(err).toBeInstanceOf(AuditError);
     expect(err!.health.directProblems).toBeGreaterThan(0);
     expect(err!.health.subagents[0]!.directProblems).toBeGreaterThan(0);
-    // Failure message lists both agents.
     expect(err!.message).toMatch(/across 2 agent\(s\)/);
     expect(err!.message).toMatch(/^  parent:/m);
     expect(err!.message).toMatch(/^  parent → child:/m);
   });
 
   it("recursive health: cycle markers don't count as resolution problems", async () => {
-    // A manifest whose spawn_subagent declares itself as the
-    // sub-agent. The audit walker plants a `(cycle)` marker; that's
-    // a diagnostic, not a real unresolved tool, so health should
-    // come back zero.
     const recursive: AgentManifest = {
       name: "self-cycle",
       manifestPath: "/virtual/self-cycle.toml",
@@ -347,25 +304,15 @@ describe("auditAgent", () => {
       spawn_subagent: { provider: "builtin", manifest: recursive },
     };
     recursive.capabilities = { spawn_subagent: "*" };
-    // No throw: cycle marker is filtered from the unresolved-tool count.
     const tree = await auditAgent(recursive);
     const h = summariseAuditHealth(tree);
     expect(h.totalProblems).toBe(0);
-    // The (cycle) marker still lives on the tree for visibility.
     const inner = tree.tools.find((t) => t.name === "spawn_subagent")!
       .subagents[0];
     expect(inner!.unresolvedTools).toContainEqual(
       expect.objectContaining({ name: "(cycle)" }),
     );
   });
-
-  // ─── audit-failure surface area ────────────────────────────────
-  //
-  // Three distinct ways for `auditAgent` to throw: an unresolved
-  // [tools] entry against a built-in provider, an unresolved source
-  // (e.g. missing npm package), and an MCP provider whose init
-  // crashes. Each row asserts the error message + the health
-  // counter that should fire.
 
   it.each([
     {
@@ -424,7 +371,6 @@ describe("auditAgent", () => {
   });
 
   it("audit failure lists every problem category, not just the first", async () => {
-    // Combine: missing source + unresolved tool against builtin.
     const manifestPath = await writeManifest(
       [
         "[agent]",

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,46 +13,44 @@ import { auditAgent } from "../src/audit/audit.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 import type { Harness, Runtime } from "../src/types/interfaces.js";
+import { useTmpDir, withTmpDir } from "./helpers/tmp.js";
 
-/**
- * Skill-suite scratch dir per test. Cleaned up in afterEach.
- *
- * Layout per test under TMP/skills/<skill-name>/SKILL.md, optionally with
- * sub-dirs (scripts/, references/, ...).
- */
-let TMP: string;
-
-beforeEach(async () => {
-  TMP = await fs.mkdtemp(path.join(os.tmpdir(), "loom-skills-"));
-});
-
-afterEach(async () => {
-  await fs.rm(TMP, { recursive: true, force: true });
-});
+const tmp = useTmpDir("loom-skills-");
 
 async function writeSkill(
   rel: string,
   frontmatter: string,
   body = "Body content.",
 ): Promise<string> {
-  const dir = path.join(TMP, rel);
+  const dir = path.join(tmp(), rel);
   await fs.mkdir(dir, { recursive: true });
   const file = path.join(dir, "SKILL.md");
   await fs.writeFile(file, `---\n${frontmatter}\n---\n${body}\n`, "utf8");
   return file;
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Frontmatter parser.
-// ──────────────────────────────────────────────────────────────────────
+function factoryContext(storage: string) {
+  return {
+    manifestDir: storage,
+    agentName: "x",
+    loomVersion: "test",
+    clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    storage,
+    metadata: {},
+  };
+}
+
+const stopHarness: Harness = {
+  async run(rt: Runtime) {
+    await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
+    return { stopReason: "end_turn" as const };
+  },
+};
 
 describe("parseFrontmatter", () => {
   it("extracts required name and description", () => {
     const fm = parseFrontmatter(
-      [
-        "name: pdf-processing",
-        "description: Extract PDF text. Use when handling PDFs.",
-      ].join("\n"),
+      "name: pdf-processing\ndescription: Extract PDF text. Use when handling PDFs.",
     );
     expect(fm.name).toBe("pdf-processing");
     expect(fm.description).toBe("Extract PDF text. Use when handling PDFs.");
@@ -63,24 +61,20 @@ describe("parseFrontmatter", () => {
     expect(() => parseFrontmatter("description: bar")).toThrow(/name/);
   });
 
-  it("handles a literal block scalar (`|`) for description", () => {
-    const fm = parseFrontmatter(
+  it("handles literal and folded block scalars for description", () => {
+    const literal = parseFrontmatter(
       ["name: foo", "description: |", "  Line one.", "  Line two."].join("\n"),
     );
-    expect(fm.description).toBe("Line one.\nLine two.");
-  });
+    expect(literal.description).toBe("Line one.\nLine two.");
 
-  it("handles a folded block scalar (`>`) for description", () => {
-    const fm = parseFrontmatter(
+    const folded = parseFrontmatter(
       ["name: foo", "description: >", "  Line one.", "  Line two."].join("\n"),
     );
-    expect(fm.description).toBe("Line one. Line two.");
+    expect(folded.description).toBe("Line one. Line two.");
   });
 
   it("strips surrounding quotes from inline values", () => {
-    const fm = parseFrontmatter(
-      [`name: "foo"`, `description: 'bar baz'`].join("\n"),
-    );
+    const fm = parseFrontmatter(`name: "foo"\ndescription: 'bar baz'`);
     expect(fm.name).toBe("foo");
     expect(fm.description).toBe("bar baz");
   });
@@ -98,8 +92,8 @@ describe("parseFrontmatter", () => {
     expect(fm.metadata).toEqual({ author: "example-org", version: "1.0" });
   });
 
-  it("reads loom.required-tools from inside metadata", () => {
-    const fm = parseFrontmatter(
+  it("reads loom.required-tools from metadata, blank opts out, absent stays undefined", () => {
+    const declared = parseFrontmatter(
       [
         "name: foo",
         "description: bar",
@@ -107,12 +101,9 @@ describe("parseFrontmatter", () => {
         '  loom.required-tools: "bash read_file"',
       ].join("\n"),
     );
-    expect(fm.requiredTools).toEqual(["bash", "read_file"]);
-  });
+    expect(declared.requiredTools).toEqual(["bash", "read_file"]);
 
-  it("treats loom.required-tools as an empty array when blank", () => {
-    // Explicit opt-out — the skill author wants no tools.
-    const fm = parseFrontmatter(
+    const blank = parseFrontmatter(
       [
         "name: foo",
         "description: bar",
@@ -120,102 +111,80 @@ describe("parseFrontmatter", () => {
         '  loom.required-tools: ""',
       ].join("\n"),
     );
-    expect(fm.requiredTools).toEqual([]);
-  });
+    expect(blank.requiredTools).toEqual([]);
 
-  it("leaves requiredTools undefined when the key is absent", () => {
-    // Absence ≠ empty: the session's `default_tools` will apply.
-    const fm = parseFrontmatter(
+    const absent = parseFrontmatter(
       ["name: foo", "description: bar", "metadata:", "  author: someone"].join(
         "\n",
       ),
     );
-    expect(fm.requiredTools).toBeUndefined();
+    expect(absent.requiredTools).toBeUndefined();
   });
 
   it("captures the spec's allowed-tools field verbatim", () => {
     const fm = parseFrontmatter(
-      [
-        "name: foo",
-        "description: bar",
-        "allowed-tools: Bash(git:*) Bash(jq:*) Read",
-      ].join("\n"),
+      "name: foo\ndescription: bar\nallowed-tools: Bash(git:*) Bash(jq:*) Read",
     );
     expect(fm.allowedTools).toBe("Bash(git:*) Bash(jq:*) Read");
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────
-// Discovery.
-// ──────────────────────────────────────────────────────────────────────
-
 describe("SkillsSession discovery", () => {
-  it("finds skills directly under a root", async () => {
+  it("finds skills directly under a root, sorted by name", async () => {
     await writeSkill("pdf", "name: pdf\ndescription: PDFs.");
     await writeSkill("data", "name: data\ndescription: Data.");
-    const session = new SkillsSession({ roots: [TMP] });
+    const session = new SkillsSession({ roots: [tmp()] });
     const section = await session.systemPromptSection();
     expect(section).toContain("**data**");
     expect(section).toContain("**pdf**");
-    // Sorted by name.
     expect(section.indexOf("**data**")).toBeLessThan(
       section.indexOf("**pdf**"),
     );
   });
 
   it("finds skills nested under category folders", async () => {
-    // Spec lets skills live anywhere under a root; we recurse but
-    // stop descending once we find SKILL.md so a skill's own scripts/
-    // folder isn't mistaken for a sub-skill.
     await writeSkill("docs/pdf", "name: pdf\ndescription: PDFs.");
     await writeSkill("data/csv", "name: csv\ndescription: CSV.");
-    const session = new SkillsSession({ roots: [TMP] });
+    const session = new SkillsSession({ roots: [tmp()] });
     const section = await session.systemPromptSection();
     expect(section).toContain("**csv**");
     expect(section).toContain("**pdf**");
   });
 
-  it("does not descend into a skill's own subdirectories", async () => {
-    // Skill at TMP/wrap with a nested SKILL.md inside scripts/ —
-    // should be ignored because we stop at the outer SKILL.md.
+  it("stops at the outer SKILL.md and ignores nested ones", async () => {
     await writeSkill("wrap", "name: wrap\ndescription: outer.");
-    const innerDir = path.join(TMP, "wrap", "scripts");
+    const innerDir = path.join(tmp(), "wrap", "scripts");
     await fs.mkdir(innerDir, { recursive: true });
     await fs.writeFile(
       path.join(innerDir, "SKILL.md"),
       "---\nname: inner\ndescription: should not be discovered\n---\n",
       "utf8",
     );
-    const session = new SkillsSession({ roots: [TMP] });
+    const session = new SkillsSession({ roots: [tmp()] });
     const section = await session.systemPromptSection();
     expect(section).toContain("**wrap**");
     expect(section).not.toContain("**inner**");
   });
 
-  it("silently skips missing roots", async () => {
-    const session = new SkillsSession({
-      roots: [path.join(TMP, "does-not-exist")],
+  it("returns an empty section for missing roots or no skills", async () => {
+    const missing = new SkillsSession({
+      roots: [path.join(tmp(), "does-not-exist")],
     });
-    const section = await session.systemPromptSection();
-    expect(section).toBe("");
-  });
+    expect(await missing.systemPromptSection()).toBe("");
 
-  it("returns an empty section when no skills are present", async () => {
-    const session = new SkillsSession({ roots: [TMP] });
-    const section = await session.systemPromptSection();
-    expect(section).toBe("");
+    const empty = new SkillsSession({ roots: [tmp()] });
+    expect(await empty.systemPromptSection()).toBe("");
   });
 
   it("skips malformed SKILL.md files without crashing", async () => {
-    // Missing `description` → throws inside readFrontmatter → swallowed.
-    await fs.mkdir(path.join(TMP, "broken"), { recursive: true });
+    await fs.mkdir(path.join(tmp(), "broken"), { recursive: true });
     await fs.writeFile(
-      path.join(TMP, "broken", "SKILL.md"),
+      path.join(tmp(), "broken", "SKILL.md"),
       "---\nname: broken\n---\nbody\n",
       "utf8",
     );
     await writeSkill("good", "name: good\ndescription: Works.");
-    const session = new SkillsSession({ roots: [TMP] });
+    const session = new SkillsSession({ roots: [tmp()] });
     const section = await session.systemPromptSection();
     expect(section).toContain("**good**");
     expect(section).not.toContain("**broken**");
@@ -223,7 +192,7 @@ describe("SkillsSession discovery", () => {
 
   it("rescans on prepareTurn so new skills appear", async () => {
     await writeSkill("a", "name: a\ndescription: First.");
-    const session = new SkillsSession({ roots: [TMP] });
+    const session = new SkillsSession({ roots: [tmp()] });
     let section = await session.systemPromptSection();
     expect(section).toContain("**a**");
     expect(section).not.toContain("**b**");
@@ -236,21 +205,17 @@ describe("SkillsSession discovery", () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────
-// trustedPaths and tools.
-// ──────────────────────────────────────────────────────────────────────
-
 describe("SkillsSession contributions", () => {
   it("advertises configured roots as read-only trusted paths", async () => {
-    const session = new SkillsSession({ roots: [TMP] });
+    const session = new SkillsSession({ roots: [tmp()] });
     const trusted = await session.trustedPaths();
     expect(trusted).toHaveLength(1);
-    expect(trusted[0]?.path).toBe(TMP);
+    expect(trusted[0]?.path).toBe(tmp());
     expect(trusted[0]?.access).toBe("read");
     expect(trusted[0]?.reason).toMatch(/Agent Skills root/i);
   });
 
-  it("aggregates required-tools across skills, deduped", async () => {
+  it("aggregates required-tools across skills, deduped, with no session config", async () => {
     await writeSkill(
       "a",
       [
@@ -269,28 +234,28 @@ describe("SkillsSession contributions", () => {
         '  loom.required-tools: "bash"',
       ].join("\n"),
     );
-    const session = new SkillsSession({ roots: [TMP] });
+    const session = new SkillsSession({ roots: [tmp()] });
     const tools = await session.tools();
     expect(tools.map((t) => t.name).sort()).toEqual(["bash", "read_file"]);
-    // Session never supplies config — manifest owns that.
     for (const t of tools) expect(t.config).toEqual({});
   });
 
-  it("falls back to default_tools for skills that don't declare", async () => {
+  it("applies default_tools to skills that don't declare, honoring overrides", async () => {
     await writeSkill("a", "name: a\ndescription: A.");
-    const session = new SkillsSession({ roots: [TMP] });
-    const tools = await session.tools();
-    expect(tools.map((t) => t.name)).toEqual(["bash"]);
-  });
 
-  it("respects an explicit override of default_tools", async () => {
-    await writeSkill("a", "name: a\ndescription: A.");
-    const session = new SkillsSession({
-      roots: [TMP],
+    const fallback = new SkillsSession({ roots: [tmp()] });
+    expect((await fallback.tools()).map((t) => t.name)).toEqual(["bash"]);
+
+    const overridden = new SkillsSession({
+      roots: [tmp()],
       defaultTools: ["read_file"],
     });
-    const tools = await session.tools();
-    expect(tools.map((t) => t.name)).toEqual(["read_file"]);
+    expect((await overridden.tools()).map((t) => t.name)).toEqual([
+      "read_file",
+    ]);
+
+    const disabled = new SkillsSession({ roots: [tmp()], defaultTools: [] });
+    expect(await disabled.tools()).toEqual([]);
   });
 
   it("an explicit empty required-tools opts that skill out of the default", async () => {
@@ -304,114 +269,54 @@ describe("SkillsSession contributions", () => {
       ].join("\n"),
     );
     await writeSkill("scripted", "name: scripted\ndescription: Uses bash.");
-    const session = new SkillsSession({ roots: [TMP] });
-    // text-only contributes nothing; scripted gets the default (bash).
+    const session = new SkillsSession({ roots: [tmp()] });
     const tools = await session.tools();
     expect(tools.map((t) => t.name)).toEqual(["bash"]);
   });
-
-  it("default_tools = [] disables registration globally", async () => {
-    await writeSkill("a", "name: a\ndescription: A.");
-    const session = new SkillsSession({ roots: [TMP], defaultTools: [] });
-    const tools = await session.tools();
-    expect(tools).toEqual([]);
-  });
 });
-
-// ──────────────────────────────────────────────────────────────────────
-// Factory + manifest integration.
-// ──────────────────────────────────────────────────────────────────────
 
 describe("skillsSessionFactory", () => {
   it("defaults to ~/.skills when no config is given", async () => {
-    const session = skillsSessionFactory.create(
-      {},
-      {
-        manifestDir: TMP,
-        agentName: "x",
-        loomVersion: "test",
-        clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-        storage: TMP,
-        metadata: {},
-      },
-      {},
-    );
-    const trusted = await Promise.resolve(
-      (session as SkillsSession).trustedPaths(),
-    );
+    const session = skillsSessionFactory.create({}, factoryContext(tmp()), {});
+    const trusted = await (session as SkillsSession).trustedPaths();
     expect(trusted[0]?.path).toBe(path.join(os.homedir(), ".skills"));
   });
 
   it("accepts a single `root`", async () => {
     const session = skillsSessionFactory.create(
-      { root: TMP },
-      {
-        manifestDir: process.cwd(),
-        agentName: "x",
-        loomVersion: "test",
-        clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-        storage: TMP,
-        metadata: {},
-      },
+      { root: tmp() },
+      factoryContext(tmp()),
       {},
     );
-    const trusted = await Promise.resolve(
-      (session as SkillsSession).trustedPaths(),
-    );
-    expect(trusted[0]?.path).toBe(TMP);
+    const trusted = await (session as SkillsSession).trustedPaths();
+    expect(trusted[0]?.path).toBe(tmp());
   });
 
   it("accepts a `roots` array", async () => {
-    const other = await fs.mkdtemp(path.join(os.tmpdir(), "loom-skills-2-"));
-    try {
+    await withTmpDir("loom-skills-2-", async (other) => {
       const session = skillsSessionFactory.create(
-        { roots: [TMP, other] },
-        {
-          manifestDir: process.cwd(),
-          agentName: "x",
-          loomVersion: "test",
-          clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-          storage: TMP,
-          metadata: {},
-        },
+        { roots: [tmp(), other] },
+        factoryContext(tmp()),
         {},
       );
-      const trusted = await Promise.resolve(
-        (session as SkillsSession).trustedPaths(),
-      );
-      expect(trusted.map((t) => t.path)).toEqual([TMP, other]);
-    } finally {
-      await fs.rm(other, { recursive: true, force: true });
-    }
+      const trusted = await (session as SkillsSession).trustedPaths();
+      expect(trusted.map((t) => t.path)).toEqual([tmp(), other]);
+    });
   });
 
   it("rejects malformed default_tools", () => {
     expect(() =>
       skillsSessionFactory.create(
         { default_tools: "bash" },
-        {
-          manifestDir: TMP,
-          agentName: "x",
-          loomVersion: "test",
-          clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-          storage: TMP,
-          metadata: {},
-        },
+        factoryContext(tmp()),
         {},
       ),
     ).toThrow(/default_tools/);
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────
-// End-to-end: the session contributes to runAgent's tool table.
-// ──────────────────────────────────────────────────────────────────────
-
 describe("Skills session via runAgent", () => {
   it("registers skill-required tools alongside manifest tools", async () => {
-    // Two skills: one explicitly asks for edit_file, the other says
-    // nothing and so falls back to the session's default_tools (bash).
-    // Together with the manifest's read_file, all three should land.
     await writeSkill(
       "writer",
       [
@@ -425,12 +330,6 @@ describe("Skills session via runAgent", () => {
       "defaulter",
       "name: defaulter\ndescription: Uses default.",
     );
-    const harness: Harness = {
-      async run(rt: Runtime) {
-        await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return { stopReason: "end_turn" as const };
-      },
-    };
     const manifest: AgentManifest = {
       name: "skills-e2e",
       systemPrompt: "x",
@@ -440,30 +339,25 @@ describe("Skills session via runAgent", () => {
         edit_file: { paths: ["./"] },
         bash: { commands: "*", paths: ["./"] },
       },
-      // skills is pass-through; pair with in-memory so the chain has
-      // a storage layer (otherwise the runtime fails with the new
-      // pass-through-only validation).
+      // Pair pass-through skills with in-memory so the chain has a storage layer.
       session: [
-        { provider: "skills", root: TMP, default_tools: ["bash"] },
+        { provider: "skills", root: tmp(), default_tools: ["bash"] },
         { provider: "in-memory" },
       ],
-      harness,
+      harness: stopHarness,
     };
     const agent = await runAgent(manifest);
     try {
       const names = agent.agentState.toolTable.list().map((t) => t.name);
-      expect(names).toContain("read_file"); // from manifest
-      expect(names).toContain("edit_file"); // from `writer` skill
-      expect(names).toContain("bash"); // from `defaulter`'s fallback
+      expect(names).toContain("read_file");
+      expect(names).toContain("edit_file");
+      expect(names).toContain("bash");
     } finally {
       await agent.close();
     }
   });
 
-  it("manifest config wins on tool name conflict", async () => {
-    // Skill says it needs `read_file`. Manifest also has `read_file`
-    // with a custom config. The manifest's ref must be the one
-    // resolved, not the session's empty-config copy.
+  it("manifest config wins on tool name conflict with no double-registration", async () => {
     await writeSkill(
       "reader",
       [
@@ -473,12 +367,6 @@ describe("Skills session via runAgent", () => {
         '  loom.required-tools: "read_file"',
       ].join("\n"),
     );
-    const harness: Harness = {
-      async run(rt: Runtime) {
-        await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return { stopReason: "end_turn" as const };
-      },
-    };
     const manifest: AgentManifest = {
       name: "dedup-e2e",
       systemPrompt: "x",
@@ -486,17 +374,14 @@ describe("Skills session via runAgent", () => {
         read_file: { provider: "builtin", custom_marker: "from-manifest" },
       },
       capabilities: { read_file: { paths: ["./"] } },
-      // skills is pass-through; pair with in-memory for storage.
       session: [
-        { provider: "skills", root: TMP, default_tools: [] },
+        { provider: "skills", root: tmp(), default_tools: [] },
         { provider: "in-memory" },
       ],
-      harness,
+      harness: stopHarness,
     };
     const agent = await runAgent(manifest);
     try {
-      // We can only observe through the public API that read_file
-      // exists and there's exactly one of it (no double-registration).
       const matches = agent.agentState.toolTable
         .list()
         .filter((t) => t.name === "read_file");
@@ -506,10 +391,6 @@ describe("Skills session via runAgent", () => {
     }
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────
-// Audit integration.
-// ──────────────────────────────────────────────────────────────────────
 
 describe("auditAgent + skills session", () => {
   it("surfaces session-introduced tools and trusted paths in the tree", async () => {
@@ -530,21 +411,17 @@ describe("auditAgent + skills session", () => {
         read_file: { paths: ["./"] },
         bash: { commands: "*", paths: ["./"] },
       },
-      session: { provider: "skills", root: TMP, default_tools: [] },
+      session: { provider: "skills", root: tmp(), default_tools: [] },
       harness: { provider: "test" },
     };
     const tree = await auditAgent(manifest);
-    // Both manifest and session tools are in the tree.
-    const names = tree.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["bash", "read_file"]);
-    // Session-introduced tools have a `(session: ...)` origin.
-    const bashEntry = tree.tools.find((t) => t.name === "bash");
-    expect(bashEntry?.introducedBy).toMatch(/session: skills/);
-    // Trusted paths from the session are visible.
+    expect(tree.tools.map((t) => t.name).sort()).toEqual(["bash", "read_file"]);
+    expect(tree.tools.find((t) => t.name === "bash")?.introducedBy).toMatch(
+      /session: skills/,
+    );
     expect(tree.trustedPaths).toHaveLength(1);
-    expect(tree.trustedPaths[0]?.path).toBe(TMP);
+    expect(tree.trustedPaths[0]?.path).toBe(tmp());
     expect(tree.trustedPaths[0]?.access).toBe("read");
-    // No construction error.
     expect(tree.sessionConstructionError).toBeUndefined();
   });
 

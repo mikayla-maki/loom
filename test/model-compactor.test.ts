@@ -16,11 +16,6 @@ import type {
 } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 
-/**
- * Build a fresh compacting-on-memory chain. Returns the composed
- * `Session` plus its component `compactor` so tests can call
- * `compactor.prepareTurn(...)` / `compactor.compactNow()` directly.
- */
 function freshCompactingChain(
   opts: ConstructorParameters<typeof CompactingSession>[0] = {},
 ) {
@@ -43,7 +38,6 @@ function agentMsg(text: string): SessionUpdate {
   };
 }
 
-/** Tiny harness that emits a fixed reply and ends the turn. */
 function fixedTextHarness(reply: string): Harness {
   return {
     async run(rt: Runtime) {
@@ -66,6 +60,18 @@ function fakeAgent(harness: Harness, session: Session): Agent {
   };
 }
 
+function summaryText(out: SessionUpdate[]): string {
+  const body = out[1];
+  if (
+    body &&
+    body.sessionUpdate === "agent_message_chunk" &&
+    body.content.type === "text"
+  ) {
+    return body.content.text;
+  }
+  throw new Error("expected agent_message_chunk with summary");
+}
+
 describe("modelCompactor + Session.prepareTurn", () => {
   it("uses the harness's native summarise() when present", async () => {
     let called = false;
@@ -77,8 +83,7 @@ describe("modelCompactor + Session.prepareTurn", () => {
         called = true;
         expect(args.events.length).toBeGreaterThan(0);
         expect(args.instruction).toMatch(/summari[sz]ing/i);
-        // modelCompactor uses an empty systemPrompt by default — we want
-        // a neutral summary, not one in the parent agent's persona.
+        // Neutral summary, not in the parent agent's persona.
         expect(args.systemPrompt).toBe("");
         return "everything is fine, carry on";
       },
@@ -89,21 +94,12 @@ describe("modelCompactor + Session.prepareTurn", () => {
       compactor: modelCompactor(),
     });
     for (let i = 0; i < 8; i++) await session.push?.(userMsg(`m${i}`));
-    // Pull so the compactor sees `below`.
     await session.pull?.([]);
     await compactor.prepareTurn(fakeAgent(harness, session));
     expect(called).toBe(true);
-    const out = (await session.pull?.([])) ?? [];
-    const body = out[1];
-    if (
-      body &&
-      body.sessionUpdate === "agent_message_chunk" &&
-      body.content.type === "text"
-    ) {
-      expect(body.content.text).toContain("everything is fine");
-    } else {
-      throw new Error("expected agent_message_chunk with model summary");
-    }
+    expect(summaryText((await session.pull?.([])) ?? [])).toContain(
+      "everything is fine",
+    );
   });
 
   it("falls back to summariseViaRun when harness has no native summarise", async () => {
@@ -116,17 +112,9 @@ describe("modelCompactor + Session.prepareTurn", () => {
     for (let i = 0; i < 8; i++) await session.push?.(userMsg(`m${i}`));
     await session.pull?.([]);
     await compactor.prepareTurn(fakeAgent(harness, session));
-    const out = (await session.pull?.([])) ?? [];
-    const body = out[1];
-    if (
-      body &&
-      body.sessionUpdate === "agent_message_chunk" &&
-      body.content.type === "text"
-    ) {
-      expect(body.content.text).toContain("VIA_RUN_SUMMARY");
-    } else {
-      throw new Error("expected fallback synthetic-run summary");
-    }
+    expect(summaryText((await session.pull?.([])) ?? [])).toContain(
+      "VIA_RUN_SUMMARY",
+    );
   });
 
   it("falls back to the heuristic compactor when ctx is null", async () => {
@@ -135,25 +123,10 @@ describe("modelCompactor + Session.prepareTurn", () => {
       keep: 2,
       compactor: modelCompactor(),
     });
-    for (let i = 0; i < 8; i++) {
-      await session.push?.(userMsg(`hello ${i}`));
-    }
-    // Force compaction with no context — modelCompactor should fall
-    // back to heuristic. Pull first so the compactor sees `below`.
+    for (let i = 0; i < 8; i++) await session.push?.(userMsg(`hello ${i}`));
     await session.pull?.([]);
     await compactor.compactNow();
-    const out = (await session.pull?.([])) ?? [];
-    const body = out[1];
-    if (
-      body &&
-      body.sessionUpdate === "agent_message_chunk" &&
-      body.content.type === "text"
-    ) {
-      // Heuristic-style summary contains "user:" prefixes.
-      expect(body.content.text).toContain("user:");
-    } else {
-      throw new Error("expected fallback heuristic output");
-    }
+    expect(summaryText((await session.pull?.([])) ?? [])).toContain("user:");
   });
 
   it("runAgent passes a fresh Agent ref to prepareTurn each turn", async () => {
@@ -164,8 +137,6 @@ describe("modelCompactor + Session.prepareTurn", () => {
       threshold: 1000,
       keep: 2,
     });
-    // Wrap the compactor's prepareTurn so we can observe what loom
-    // passed in. ChainedSession invokes prepareTurn on each child.
     const realPrepare = compactor.prepareTurn.bind(compactor);
     compactor.prepareTurn = async (agent: Agent) => {
       seenHarnesses.push(agent.harness);

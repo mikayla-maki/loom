@@ -1,9 +1,3 @@
-/**
- * RuntimeImpl — what the harness calls during one turn. New instance per
- * prompt(); reads live state from the shared AgentState, emits updates to
- * the shared UpdateSink.
- */
-
 import { randomUUID } from "node:crypto";
 
 import type {
@@ -32,12 +26,6 @@ export interface RuntimeImplOptions {
   agentName: string;
   agentDescription?: string;
   abortSignal: AbortSignal;
-  /**
-   * Pre-resolved section contributed by the session for this turn. The
-   * caller (RunningAgentImpl.prompt) awaits any async
-   * `Session.systemPromptSection()` before constructing the runtime, so
-   * `systemPrompt()` here stays sync.
-   */
   sessionSection?: string;
 }
 
@@ -51,15 +39,10 @@ export class RuntimeImpl implements Runtime {
   }
 
   getEvents(): Promise<SessionUpdate[]> {
-    // Pull the session's view of the context window. Composed
-    // sessions handle the chain internally.
     return Promise.resolve(this.opts.session.pull?.([]) ?? []);
   }
 
   async update(update: SessionUpdate): Promise<void> {
-    // Push to the session (storage / transformation), then fan out to
-    // observers. Update sink sees the original event regardless of
-    // any chain-internal transforms.
     await Promise.resolve(this.opts.session.push?.(update) ?? [update]);
     this.opts.updateSink.emit(update);
   }
@@ -97,26 +80,8 @@ export class RuntimeImpl implements Runtime {
     modelContent: string;
     display?: ToolDisplay;
   }): Promise<void> {
-    // Two updates leave this method: one to the session (event log),
-    // one to the update sink (ACP client).
-    //
-    // The only field that differs between them is `content`. The
-    // session always gets the model-facing text block; the client
-    // gets `display.content` when set (terminal embeds, diff blocks,
-    // other client-renderable shapes that aren't replayable by the
-    // model). Everything else — `title`, `kind`, `locations`,
-    // `rawOutput` — is shared metadata that both audiences want:
-    //   - clients render `rawOutput` in raw-output inspectors and
-    //     use `title`/`kind`/`locations` for affordances;
-    //   - the harness reads `rawOutput` back on replay for tools
-    //     whose API expects structured payloads in subsequent turns
-    //     (Anthropic server tools — `web_search_tool_result` carries
-    //     `encrypted_content` the model needs to re-cite).
-    //
-    // Sessions are free to drop / transform / compact this payload
-    // like any other event field; large `rawOutput` blobs go with
-    // their parent `tool_call_update` when a compacting session
-    // summarises old turns.
+    // Session gets model-facing text; client gets display.content when set. Both
+    // share rawOutput so replay can re-cite server-tool payloads (e.g. web_search).
     const display = args.display;
     const sharedMeta = {
       ...(display?.title ? { title: display.title } : {}),

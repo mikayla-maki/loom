@@ -1,25 +1,3 @@
-/**
- * SkillsSession — discovers Agent Skills folders (per the agentskills.io
- * spec: directories with a `SKILL.md` YAML-frontmatter + markdown file)
- * and contributes them to the agent in three ways:
- *
- *   1. System prompt section: one bullet per skill (name, path,
- *      description) so the model knows what's available.
- *   2. Trusted paths: every root advertised as read-only via
- *      `trustedPaths()`. Read-oriented tools may union with these;
- *      `bash` deliberately does not (executing scripts under a skill
- *      root still requires an explicit `[capabilities.bash]` grant).
- *   3. Required tools: aggregated from each skill's
- *      `metadata.loom.required-tools` (Loom extension under the spec's
- *      metadata point). Skills without an explicit list get the
- *      session's `default_tools` (default `["bash"]`; declaring an
- *      empty list suppresses the default). Manifest `[tools.<name>]`
- *      config + `[capabilities.<name>]` grants still own configuration.
- *
- * `prepareTurn` rescans roots each turn so mid-conversation additions
- * are picked up.
- */
-
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -37,61 +15,30 @@ import type {
 } from "../../types/interfaces.js";
 import { ManifestError } from "../../errors.js";
 
-/** Parsed `SKILL.md` frontmatter, normalised. */
 export interface SkillFrontmatter {
-  /** Required: short identifier (matches parent dir name per spec). */
   name: string;
-  /** Required: what the skill does + when to use it. */
   description: string;
-  /** Optional: license name or reference to a bundled license file. */
   license?: string;
-  /** Optional: environment requirements (intended product, deps, etc.). */
   compatibility?: string;
-  /** Optional: arbitrary string-keyed metadata. */
   metadata?: Record<string, string>;
-  /**
-   * Spec-defined: space-separated pre-approved tools. Surfaced in the
-   * prompt for visibility; not yet acted on by Loom.
-   */
   allowedTools?: string;
-  /**
-   * Loom extension: tools to register on the agent, read from
-   * `metadata.loom.required-tools` (whitespace- or comma-separated
-   * string). Undefined = use session `default_tools`; empty array =
-   * explicitly suppress the default.
-   */
+  /** Undefined = use session `default_tools`; empty array = suppress the default. */
   requiredTools?: string[];
 }
 
-/** A discovered skill on disk. */
 export interface Skill {
-  /** Absolute path to the skill's `SKILL.md`. */
   skillMdPath: string;
-  /** Absolute path to the skill's containing directory. */
   rootDir: string;
-  /** Parsed frontmatter. */
   frontmatter: SkillFrontmatter;
 }
 
-/** Configurable knobs for `SkillsSession`. */
 export interface SkillsSessionOptions {
-  /**
-   * Roots to scan. Relative paths resolved against `manifestDir`; `~`
-   * expands to OS home; missing roots are silently skipped.
-   */
   roots: readonly string[];
-  /**
-   * Tools registered for skills that don't declare
-   * `metadata.loom.required-tools`. Default `["bash"]`; pass `[]` to opt
-   * out. A skill's explicit list (even `[]`) overrides for that skill.
-   */
   defaultTools?: readonly string[];
 }
 
 export class SkillsSession implements Session {
-  /** Cache populated on first read or each `prepareTurn`. */
   private cache: Skill[] | null = null;
-  /** Resolved default-tools list (the option, or `["bash"]`). */
   private readonly defaultTools: readonly string[];
 
   constructor(private readonly options: SkillsSessionOptions) {
@@ -99,7 +46,6 @@ export class SkillsSession implements Session {
   }
 
   async prepareTurn(): Promise<void> {
-    // Refresh each turn so newly-added skills show up.
     this.cache = await scanRoots(this.options.roots);
   }
 
@@ -122,14 +68,11 @@ export class SkillsSession implements Session {
     }));
   }
 
-  // ── helpers ──────────────────────────────────────────────────────
-
   private async ensureCache(): Promise<Skill[]> {
     if (!this.cache) this.cache = await scanRoots(this.options.roots);
     return this.cache;
   }
 
-  /** Substitute `$HOME` back as `~` for nicer audit output. */
   private shortenForReason(p: string): string {
     const home = os.homedir();
     if (home && p === home) return "~";
@@ -140,31 +83,20 @@ export class SkillsSession implements Session {
   }
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Discovery.
-// ──────────────────────────────────────────────────────────────────────
-
 async function scanRoots(roots: readonly string[]): Promise<Skill[]> {
   const acc: Skill[] = [];
   for (const root of roots) {
     try {
       await walk(root, acc);
     } catch (e) {
-      // Missing roots are fine (default `~/.skills` may not exist yet).
       if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw e;
     }
   }
-  // Sort by name for stable prompt output.
   acc.sort((a, b) => a.frontmatter.name.localeCompare(b.frontmatter.name));
   return acc;
 }
 
-/**
- * Recurse into `dir`; any subdirectory containing `SKILL.md` is a skill
- * (don't descend into it). Skills may live at any depth, so users can
- * group them by topic.
- */
 async function walk(dir: string, acc: Skill[]): Promise<void> {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const hasSkillMd = entries.some((e) => e.isFile() && e.name === "SKILL.md");
@@ -174,9 +106,9 @@ async function walk(dir: string, acc: Skill[]): Promise<void> {
       const fm = await readFrontmatter(skillMdPath);
       acc.push({ skillMdPath, rootDir: dir, frontmatter: fm });
     } catch {
-      // Malformed skill — skip silently; boot stays resilient.
+      // Malformed skill: skip so boot stays resilient.
     }
-    return; // don't recurse into a skill's own subdirs (scripts/, etc.)
+    return;
   }
   for (const entry of entries) {
     if (entry.isDirectory()) {
@@ -193,8 +125,6 @@ async function readFrontmatter(skillMdPath: string): Promise<SkillFrontmatter> {
   }
   return parseFrontmatter(match[1] ?? "");
 }
-
-// ─── Frontmatter parser ───────────────────────────────────────────────
 
 const REQUIRED_TOOLS_KEY = "loom.required-tools";
 
@@ -227,8 +157,6 @@ export function parseFrontmatter(yaml: string): SkillFrontmatter {
   const allowedTools = stringOf(obj["allowed-tools"]);
   if (allowedTools) fm.allowedTools = allowedTools;
 
-  // Metadata: spec says string→string. Coerce non-strings (`version: 1.0`
-  // → `"1"`) to stay lenient.
   let metadata: Record<string, string> | undefined;
   if (
     obj.metadata &&
@@ -242,10 +170,6 @@ export function parseFrontmatter(yaml: string): SkillFrontmatter {
     fm.metadata = metadata;
   }
 
-  // `loom.required-tools` lives under `metadata` per the spec's
-  // recommendation for client-specific fields. Presence of the key
-  // (even with an empty string) signals an explicit decision; absence
-  // means "fall back to the session default".
   if (metadata && Object.hasOwn(metadata, REQUIRED_TOOLS_KEY)) {
     fm.requiredTools = toStringList(metadata[REQUIRED_TOOLS_KEY]);
   }
@@ -276,15 +200,10 @@ function toStringList(v: unknown): string[] {
   return [];
 }
 
-// ─── Aggregation + rendering ─────────────────────────────────────────────
-
 function aggregateRequiredTools(
   skills: readonly Skill[],
   defaultTools: readonly string[],
 ): ToolRef[] {
-  // Dedupe across skills. Skills request registration only; manifest's
-  // [tools.<name>] / [capabilities.<name>] still own config (runAgent's
-  // dedup gives manifest refs priority on name conflicts).
   const seen = new Set<string>();
   const out: ToolRef[] = [];
   const add = (name: string) => {
@@ -331,26 +250,14 @@ function displayPath(p: string, home: string): string {
   return p;
 }
 
-// ─── Factory ──────────────────────────────────────────────────────────────
-
-/** Absolute pass-through; `~` expands to OS home; relative resolves against `manifestDir`. */
 function resolveRoot(raw: string, manifestDir: string): string {
   const expanded = expandHome(raw);
   if (path.isAbsolute(expanded)) return expanded;
   return path.resolve(manifestDir, expanded);
 }
 
-/**
- * Config: `root` (single) or `roots` (multiple) — default `~/.skills`.
- * `default_tools` — default `["bash"]`.
- */
 export const skillsSessionFactory: SessionFactory = {
   name: "skills",
-  // SkillsSession contributes a system-prompt section and tool refs
-  // but doesn't override push/pull — events flow through untouched.
-  // It's a pure adornment layer; chains that contain only skills (or
-  // skills + compacting) need a storage layer (in-memory / file)
-  // for events to actually live somewhere.
   passThrough: true,
   create(config: Record<string, unknown>, ctx: FactoryContext): Session {
     const rawRoots = collectRoots(config);

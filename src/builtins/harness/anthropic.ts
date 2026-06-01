@@ -1,46 +1,3 @@
-/**
- * Anthropic harness — Messages API via the official `@anthropic-ai/sdk`.
- *
- * Config:
- *   model: string                   (default `claude-sonnet-4-5-latest`)
- *   apiKey: string                  (optional; otherwise ANTHROPIC_API_KEY)
- *   apiBase: string                 (optional; default api.anthropic.com)
- *   maxTokens: number               (default 4096)
- *   maxTurnRequests: number         (default 16; soft cap on model calls per turn)
- *   stream: boolean                 (default true; emit text + thinking deltas live)
- *
- * Translation:
- *   - `user_message_chunk`   → `{ role: "user", content: [...] }` (text + image)
- *   - `agent_message_chunk`  → `{ role: "assistant", content: [...] }` (text)
- *   - `agent_thought_chunk`  → not echoed back to the API (thinking is one-way)
- *   - `tool_call`            → `tool_use` block on the assistant turn
- *   - `tool_call_update`     → `tool_result` block on the user turn (text only)
- *
- * Image support flows via ACP's `{ type: "image", mimeType, data }`
- * `ContentBlock` (base64). The harness packs it into Anthropic's
- * `{ type: "image", source: { type: "base64", media_type, data } }`.
- *
- * Reasoning ("thinking"):
- *   - `params.thinking` is forwarded verbatim (when set), so callers can
- *     pass the full `ThinkingConfigParam` shape (`{ type: "enabled",
- *     budget_tokens }`, `{ type: "adaptive" }`, `{ type: "disabled" }`).
- *   - `params.effort` is forwarded via `output_config.effort` — Anthropic
- *     accepts the same `low | medium | high | xhigh | max` vocabulary.
- *
- * Loop:
- *   The harness re-requests the model while the assistant returns
- *   `tool_use` blocks; once it returns text-only (no tool_use), the turn
- *   ends with `end_turn`. `maxTurnRequests` is a soft cap on per-turn
- *   API requests so runaway tool loops can't burn through credits.
- *
- * Streaming:
- *   With `stream: true` the SDK's high-level `MessageStream` is consumed
- *   via its `text` / `thinking` events, which emit deltas as they
- *   arrive. The final assembled `Message` is taken from
- *   `stream.finalMessage()` so the post-stream code is identical to the
- *   non-stream path.
- */
-
 import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
 import type {
   ContentBlock as AnthropicContentBlock,
@@ -90,60 +47,23 @@ interface AnthropicConfig {
   stream?: boolean;
 }
 
-// ─── Server-tool catalog ─────────────────────────────────────────────────
-//
-// Tools the harness dispatches API-side (not through the runtime's
-// ToolTable). The manifest opts in by listing one in `[tools.<name>]`
-// with `provider = "anthropic"`; the resolver routes the binding to
-// `Harness.resolveTool`, and `run()` translates it into the API's
-// native server-tool shape on the way out.
-//
-// Pinned to the `_20250305` revision for `web_search` and the
-// `_20250910` revision for `web_fetch`. The Anthropic SDK exposes
-// newer revisions; we'll bump deliberately when their behaviour
-// surface stabilises.
-
 interface ServerToolSpec {
-  /** Model-facing name surfaced via `runtime.listTools()`. */
   name: string;
-  /** What the tool does, for system-prompt enumeration / audit. */
   description: string;
-  /** Input shape the model fills out. Documentation-only — the API enforces. */
   inputSchema: JSONSchema;
-  /**
-   * Capability kinds this tool understands. Listed in the stub Tool's
-   * `optional` array so `assertKnownKinds` accepts grants like
-   * `web_search = { allowed_domains = [...] }`. Per the
-   * positive/declarative/closed-by-default convention, the allow-list
-   * surface lives here; exclusionary (`blocked_domains`) and pure-
-   * knob (`max_uses`, `user_location`) shapes stay as config.
-   */
   capabilityKinds: string[];
-  /**
-   * Build the API-side `ToolUnion` entry from per-tool config and
-   * the granted capability set. `allowed_domains` (when present)
-   * comes from `capabilities`, never from `config`.
-   */
   toApiTool(
     config: ToolConfig,
     capabilities: CapabilitySet | undefined,
   ): AnthropicToolUnion;
 }
 
-/** Helpers for translating common config keys uniformly. */
 function stringArray(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined;
   const arr = v.filter((s): s is string => typeof s === "string");
   return arr.length > 0 ? arr : undefined;
 }
 
-/**
- * Read the `allowed_domains` allow-list from a capability grant.
- * Returns undefined when the capability is missing, `"*"`, or shaped
- * such that no narrowing applies — in which case the API call is
- * sent without an `allowed_domains` filter (Anthropic's default of
- * "any domain" applies).
- */
 function allowedDomainsCapability(
   capabilities: CapabilitySet | undefined,
 ): string[] | undefined {
@@ -182,10 +102,8 @@ const SERVER_TOOLS: Record<string, ServerToolSpec> = {
         name: "web_search",
       };
       if (typeof config.max_uses === "number") out.max_uses = config.max_uses;
-      // `allowed_domains` is the declarative allow-list — a capability.
       const allowed = allowedDomainsCapability(capabilities);
       if (allowed) out.allowed_domains = allowed;
-      // `blocked_domains` is exclusionary — stays in config.
       const blocked = stringArray(config.blocked_domains);
       if (blocked) out.blocked_domains = blocked;
       if (
@@ -235,9 +153,6 @@ const SERVER_TOOLS: Record<string, ServerToolSpec> = {
       if (allowed) out.allowed_domains = allowed;
       const blocked = stringArray(config.blocked_domains);
       if (blocked) out.blocked_domains = blocked;
-      // `citations: { enabled: true }` is the only shape worth
-      // forwarding for now; users who want richer config can pass
-      // the full object through.
       if (
         config.citations !== undefined &&
         config.citations !== null &&
@@ -250,7 +165,6 @@ const SERVER_TOOLS: Record<string, ServerToolSpec> = {
   },
 };
 
-/** Stub Tool for harness-exposed server tools. Defensive `execute()`. */
 class AnthropicServerToolStub implements Tool {
   readonly name: string;
   readonly description: string;
@@ -262,15 +176,9 @@ class AnthropicServerToolStub implements Tool {
     this.description = spec.description;
     this.inputSchema = spec.inputSchema;
     this.capabilities = capabilities;
-    // Declared so `assertKnownKinds` accepts grants like
-    // `web_search = { allowed_domains = [...] }`. None are `requires`
-    // — a missing capability just means no narrowing on the API call.
     this.optional = [...spec.capabilityKinds];
   }
   async execute(): Promise<ToolResult> {
-    // The harness intercepts dispatch for server tools in its run
-    // loop, so this path should be unreachable. We return an error
-    // rather than throwing so a misrouted call surfaces cleanly.
     return {
       content:
         `[anthropic] '${this.name}' is a server-side tool dispatched by ` +
@@ -281,7 +189,6 @@ class AnthropicServerToolStub implements Tool {
   }
 }
 
-/** MIME types Anthropic accepts on `image` content blocks. */
 const ANTHROPIC_IMAGE_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -302,34 +209,13 @@ function isAnthropicImageMediaType(s: string): s is AnthropicImageMediaType {
 export class AnthropicHarness implements Harness {
   private readonly client: Anthropic;
 
-  /**
-   * Lazy cache of `client.models.retrieve(modelId)` responses. Failures
-   * cache `null` so we don't retry every turn.
-   */
   private modelInfoCache = new Map<string, ModelInfo | null>();
   private modelInfoInflight = new Map<string, Promise<ModelInfo | null>>();
 
-  /** Cumulative usage across the current turn. Reset at each `run()` start. */
   private turnUsage: TurnUsage | null = null;
 
-  /**
-   * Per-tool config for harness-exposed server tools, keyed by name.
-   * Populated by {@link resolveTool} as the runtime binds opted-in
-   * tools; read by `run()` when translating `runtime.listTools()`
-   * into the API's `ToolUnion[]`. Cleared when this harness is
-   * cloned via `withModel` because the runtime always re-binds
-   * tools for the cloned agent.
-   */
   private serverToolConfigs = new Map<string, ToolConfig>();
 
-  /**
-   * Per-tool capability grants for harness-exposed server tools.
-   * Populated alongside {@link serverToolConfigs}. Distinct from
-   * config because the manifest's `[capabilities]` block is the
-   * source of declarative allow-lists (`allowed_domains`), kept
-   * separate from knob-style config (`max_uses`, `user_location`,
-   * `blocked_domains`).
-   */
   private serverToolCapabilities = new Map<string, CapabilitySet | undefined>();
 
   constructor(
@@ -343,15 +229,6 @@ export class AnthropicHarness implements Harness {
     this.client = new Anthropic({ apiKey, baseURL: apiBase });
   }
 
-  /**
-   * Implements `Harness.availableTools` — the catalog of server-
-   * side tools the manifest may opt into by listing them under
-   * `[tools.<name>] provider = "anthropic"`. Returning these here
-   * lets the resolver route those bindings to this harness rather
-   * than failing with "no matching [providers] entry or built-in".
-   *
-   * Not auto-added — see the docs on `Harness.availableTools`.
-   */
   availableTools(): { name: string; config: ToolConfig }[] {
     return Object.values(SERVER_TOOLS).map((s) => ({
       name: s.name,
@@ -359,18 +236,6 @@ export class AnthropicHarness implements Harness {
     }));
   }
 
-  /**
-   * Implements `Harness.resolveTool` — returns a stub Tool for a
-   * harness-exposed name, or null when the name isn't in the
-   * catalog. The stub's `execute()` is defensive only; the harness
-   * intercepts dispatch in `run()` because server tools resolve
-   * API-side.
-   *
-   * Side effect: records the per-tool config in
-   * {@link serverToolConfigs} so `run()` can read it when building
-   * the API request body (passing through `max_uses`,
-   * `allowed_domains`, `user_location`, etc.).
-   */
   resolveTool(
     name: string,
     config: ToolConfig,
@@ -384,17 +249,6 @@ export class AnthropicHarness implements Harness {
     return new AnthropicServerToolStub(spec, capabilities);
   }
 
-  /**
-   * Implements the optional `Harness.withModel` API — returns a
-   * sibling harness with the same credentials/transport but a
-   * different model id. Used by parent-derived harness factories
-   * (e.g. `small-model-of-parent`) that want to reuse the parent's
-   * API key + transport but route to a cheaper or faster model.
-   *
-   * Server-tool configs are NOT copied: the sub-agent gets a fresh
-   * binding pass and the runtime will call `resolveTool` again for
-   * any opt-ins it lists.
-   */
   withModel(modelId: string): AnthropicHarness {
     return new AnthropicHarness(
       modelId,
@@ -406,13 +260,6 @@ export class AnthropicHarness implements Harness {
     );
   }
 
-  /**
-   * Implements the optional `Harness.smallModel` API — returns the
-   * id of a smaller/faster sibling of the currently-configured
-   * model. Pattern-matches `sonnet`/`opus` → `haiku` in-family;
-   * falls back to a known fast default (`claude-haiku-4-5`) when
-   * the current model id doesn't match a known pattern.
-   */
   smallModel(): string {
     const m = this.model;
     if (m.includes("haiku")) return m;
@@ -421,29 +268,13 @@ export class AnthropicHarness implements Harness {
     return "claude-haiku-4-5";
   }
 
-  /**
-   * Implements `Harness.currentModel` — the model id this harness
-   * is currently configured to route to.
-   */
   currentModel(): string {
     return this.model;
   }
 
-  /**
-   * Lazy cache of `client.models.list()`. Populated on first call;
-   * a failed list call caches `[]` so the ACP server doesn't spin
-   * on retries.
-   */
   private modelsListCache: HarnessModel[] | null = null;
   private modelsListInflight: Promise<HarnessModel[]> | null = null;
 
-  /**
-   * Implements `Harness.models` — returns the list of models the
-   * Anthropic API advertises for this account, mapped to the
-   * Loom-shaped `HarnessModel`. Cached after the first successful
-   * call. The ACP server uses this to populate the `model` entry
-   * in `configOptions` at `session/new` time.
-   */
   async models(): Promise<HarnessModel[]> {
     if (this.modelsListCache !== null) return this.modelsListCache;
     if (this.modelsListInflight) return this.modelsListInflight;
@@ -459,8 +290,6 @@ export class AnthropicHarness implements Harness {
         this.modelsListCache = out;
         return out;
       } catch {
-        // Cache the empty result so we don't retry on every call.
-        // Callers tolerate an empty array ("no model selector").
         this.modelsListCache = [];
         return [];
       } finally {
@@ -470,11 +299,6 @@ export class AnthropicHarness implements Harness {
     return this.modelsListInflight;
   }
 
-  /**
-   * Native summarisation. The Messages API with no tools and a single
-   * combined prompt is exactly the shape we want, and skips the
-   * synthetic-runtime indirection that `summariseViaRun` would do.
-   */
   async summarise(args: SummariseArgs): Promise<string> {
     const messages = this.eventsToMessages(args.events);
     messages.push({
@@ -487,6 +311,8 @@ export class AnthropicHarness implements Harness {
         max_tokens: this.maxTokens,
         system: args.systemPrompt,
         messages,
+        // Reuse the cached conversation prefix written during run().
+        cache_control: { type: "ephemeral" },
       },
       { signal: args.abortSignal },
     );
@@ -523,16 +349,6 @@ export class AnthropicHarness implements Harness {
 
       const events = await runtime.getEvents();
       const messages = this.eventsToMessages(events);
-      // Partition tools into:
-      //   * client-dispatched ("regular" Tools the model invokes via
-      //     `tool_use` and we run via `runtime.executeTool`), and
-      //   * harness-exposed server tools (translated into the API's
-      //     native server-tool shape; Anthropic runs them in-API
-      //     and returns `server_tool_use` + `*_tool_result` blocks).
-      // The split is by name lookup against the harness's server-
-      // tool catalog — the manifest opted into these by listing
-      // them with `provider = "anthropic"`, which routed binding
-      // through `Harness.resolveTool`.
       const tools: AnthropicToolUnion[] = runtime.listTools().map((t) => {
         const serverSpec = SERVER_TOOLS[t.name];
         if (serverSpec) {
@@ -554,9 +370,14 @@ export class AnthropicHarness implements Harness {
         system: runtime.systemPrompt(),
         messages,
         tools,
+        // Automatic prompt caching: a single top-level breakpoint that the
+        // API applies to the last cacheable block and advances as the
+        // conversation grows. Each request caches the full prefix (tools +
+        // system + prior messages) and reads it back on the next request —
+        // no manual per-block breakpoint bookkeeping. Without this, none of
+        // the request is cached and every turn re-bills the entire prompt.
+        cache_control: { type: "ephemeral" },
       };
-      // `thinking` (when set) wins over `effort` since it's the more
-      // specific knob. Both flow through to the API verbatim.
       if (turnThinking !== undefined) {
         body.thinking = turnThinking as MessageCreateParamsBase["thinking"];
       }
@@ -577,17 +398,12 @@ export class AnthropicHarness implements Harness {
           });
           return this.finishTurn("cancelled");
         }
-        // Don't pollute the session log with the error text — it isn't
-        // an assistant utterance. Stop with `error`; the runtime's
-        // consumer (ACP server, CLI REPL, SDK caller) renders
-        // `result.error.message` however it likes.
         await runtime.update({ sessionUpdate: "stop", stopReason: "error" });
         return this.finishTurn("error", {
           message: `[anthropic] ${(e as Error).message}`,
         });
       }
 
-      // Usage first, so the indicator reflects the true post-response state.
       if (response.usage) {
         this.accumulateUsage(response.usage);
         await this.emitUsageUpdate(
@@ -597,13 +413,6 @@ export class AnthropicHarness implements Harness {
         );
       }
 
-      // Collect client-side `tool_use` blocks for post-turn dispatch
-      // via `runtime.executeTool`. We don't emit any events from
-      // this pass — `tool_call`, `server_tool_use`, and the various
-      // `*_tool_result` blocks are all surfaced inline by
-      // `runStreaming` / `runNonStreaming` as they arrive from the
-      // API (so they interleave with the surrounding text in the
-      // order Anthropic actually produced them).
       const toolUses: Array<{ id: string; name: string; input: unknown }> = [];
       for (const block of response.content) {
         if (block.type === "tool_use") {
@@ -636,9 +445,6 @@ export class AnthropicHarness implements Harness {
         return this.finishTurn("end_turn");
       }
 
-      // Dispatch tools in parallel; surface results as tool_call_update.
-      // Note: server tools are NOT in `toolUses` — they already ran
-      // API-side and their results were emitted above.
       await Promise.all(
         toolUses.map(async (tu) => {
           const result = await runtime.executeTool({
@@ -649,10 +455,6 @@ export class AnthropicHarness implements Harness {
           const status: ToolCallStatus = result.isError
             ? "failed"
             : "completed";
-          // Split: session stores the text-only model-facing record;
-          // ACP clients receive the rich `display` payload (terminal
-          // blocks, diff blocks, kind, locations). See
-          // `Runtime.emitToolResult` for the rationale.
           await runtime.emitToolResult({
             toolCallId: tu.id,
             status,
@@ -661,33 +463,14 @@ export class AnthropicHarness implements Harness {
           });
         }),
       );
-      // Next iteration: messages include the tool_results.
     }
   }
 
-  /**
-   * Render a server-tool result block (`web_search_tool_result` /
-   * `web_fetch_tool_result`) as a `tool_call_update` event. The
-   * model-facing text is a markdown summary; the rich `rawOutput`
-   * carries the raw Anthropic block so ACP clients can render
-   * citations / encrypted content / full document text if they want.
-   *
-   * The paired `server_tool_use` block was already emitted as a
-   * `tool_call`; we look up its name from `serverToolUses` to write
-   * a sensible title on the update.
-   */
   private async emitServerToolResult(
     runtime: Runtime,
     block: WebSearchToolResultBlock | WebFetchToolResultBlock,
     serverToolUses: Map<string, { name: string; input: unknown }>,
   ): Promise<void> {
-    // The raw block goes on `display.rawOutput` — see `runtime.ts`,
-    // `emitToolResult`. That field now flows into the session record
-    // as well as the client emit, so `eventsToMessages` can read it
-    // back on subsequent turns to replay the proper
-    // `server_tool_use` + `*_tool_result` pair (with
-    // `encrypted_content` preserved) without keeping a parallel
-    // in-memory cache.
     const pair = serverToolUses.get(block.tool_use_id);
     const { text, isError } =
       block.type === "web_search_tool_result"
@@ -708,12 +491,6 @@ export class AnthropicHarness implements Harness {
     });
   }
 
-  /**
-   * Non-streaming path: one `messages.create()` call. Walks the
-   * returned content blocks in order and emits each one through
-   * {@link emitContentBlockInline}, so consumers see the same
-   * chronological interleaving they'd see from the streaming path.
-   */
   private async runNonStreaming(
     body: MessageCreateParamsBase,
     runtime: Runtime,
@@ -729,19 +506,6 @@ export class AnthropicHarness implements Harness {
     return response;
   }
 
-  /**
-   * Streaming path: forwards text/thinking *deltas* as they arrive
-   * (for the live-typing UX) and hooks `contentBlock` for everything
-   * else — tool_use, server_tool_use, web_search_tool_result, etc.
-   * — so structured blocks surface at the exact point Anthropic
-   * produced them, interleaved with the surrounding text deltas.
-   *
-   * Without the `contentBlock` hook, structured blocks would only
-   * become visible after `finalMessage()` resolved, bunching them
-   * up at the end of the turn (see the v0.1.x bug report where
-   * `web_search` calls always rendered AFTER all of the model's
-   * text instead of in the middle of it).
-   */
   private async runStreaming(
     body: MessageCreateParamsBase,
     runtime: Runtime,
@@ -750,9 +514,7 @@ export class AnthropicHarness implements Harness {
       { ...body, stream: true },
       { signal: runtime.abortSignal },
     );
-    // Forward emissions sequentially. The SDK event surface is
-    // synchronous, so chaining onto a single promise preserves the
-    // arrival order of `text` / `thinking` / `contentBlock` events.
+    // Chain emissions onto one promise to preserve SDK event arrival order.
     const serverToolUses = new Map<string, { name: string; input: unknown }>();
     let emitChain: Promise<void> = Promise.resolve();
     const enqueue = (action: () => Promise<void>): void => {
@@ -779,36 +541,16 @@ export class AnthropicHarness implements Harness {
       }
     });
     stream.on("contentBlock", (block) => {
-      // Skip text/thinking blocks here — they were already streamed
-      // as deltas above. Everything else (tool_use, server_tool_use,
-      // *_tool_result, etc.) surfaces here at the point of completion.
       if (block.type === "text" || block.type === "thinking") return;
       enqueue(() =>
         this.emitContentBlockInline(runtime, block, serverToolUses),
       );
     });
     const final = await stream.finalMessage();
-    await emitChain; // make sure every queued event has actually flushed
+    await emitChain; // flush queued events before returning
     return final;
   }
 
-  /**
-   * Emit a single API content block as a session event, in the role
-   * the block fills:
-   *   - `text`               → `agent_message_chunk`
-   *   - `thinking`           → `agent_thought_chunk`
-   *   - `tool_use`           → `tool_call`  (client-side; result emitted
-   *                                          later by `runtime.executeTool`)
-   *   - `server_tool_use`    → `tool_call`  (server-side; result is the
-   *                                          NEXT block in the stream)
-   *   - `web_search_tool_result` / `web_fetch_tool_result`
-   *                          → `tool_call_update` (server-side result)
-   *
-   * Blocks of any other shape are silently ignored — we'd rather
-   * the harness keep working than emit confusing surface for content
-   * we don't have a renderer for. (Future server tools — code
-   * execution, etc. — will need their own arms here.)
-   */
   private async emitContentBlockInline(
     runtime: Runtime,
     block: AnthropicContentBlock,
@@ -841,9 +583,6 @@ export class AnthropicHarness implements Harness {
         });
         return;
       case "server_tool_use":
-        // Remember the (id, name, input) so the matching
-        // `*_tool_result` block can attribute itself to the same
-        // call by id.
         serverToolUses.set(block.id, {
           name: block.name,
           input: block.input,
@@ -861,16 +600,10 @@ export class AnthropicHarness implements Harness {
         await this.emitServerToolResult(runtime, block, serverToolUses);
         return;
       default:
-        // Unknown block type — ignore so the harness stays forward-
-        // compatible with future Anthropic content kinds.
         return;
     }
   }
 
-  /**
-   * Wrap a stop reason with the turn's accumulated usage (if any) and
-   * the optional error message (when `stopReason === "error"`).
-   */
   private finishTurn(
     stopReason: StopReason,
     error?: { message: string },
@@ -881,7 +614,6 @@ export class AnthropicHarness implements Harness {
     return result;
   }
 
-  /** Fold a per-request usage payload into the turn's cumulative tally. */
   private accumulateUsage(u: AnthropicUsage): void {
     const cur: TurnUsage = this.turnUsage ?? {
       inputTokens: 0,
@@ -913,13 +645,6 @@ export class AnthropicHarness implements Harness {
     this.turnUsage = cur;
   }
 
-  /**
-   * Emit a `usage_update` SessionUpdate. `used` = the most-recent
-   * request's input + output (close enough to "tokens currently in
-   * context" for the indicator); `size` comes from the lazy model-info
-   * fetch. Missing context window → sentinel 0; clients render "used"
-   * alone.
-   */
   private async emitUsageUpdate(
     runtime: Runtime,
     u: AnthropicUsage,
@@ -935,10 +660,6 @@ export class AnthropicHarness implements Harness {
     });
   }
 
-  /**
-   * Lazy-fetch and cache `client.models.retrieve(modelId)`. Returns
-   * null on failure (also cached so we don't retry per turn).
-   */
   private async fetchModelInfo(
     modelId: string,
     signal: AbortSignal,
@@ -963,13 +684,6 @@ export class AnthropicHarness implements Harness {
     return result;
   }
 
-  /**
-   * Translate the session-side event log into the Anthropic-shaped
-   * message list. Consecutive same-role chunks coalesce into a single
-   * `MessageParam` so the API sees natural turns. Image content blocks
-   * pass through as `image` blocks; unknown MIME types are dropped with
-   * a textual placeholder so the model still gets context.
-   */
   private eventsToMessages(events: SessionUpdate[]): MessageParam[] {
     const messages: MessageParam[] = [];
 
@@ -988,20 +702,10 @@ export class AnthropicHarness implements Harness {
       }
     };
 
-    // Identify server-tool exchanges and collect their replay
-    // payloads in one pre-pass. They're always emitted as a
-    // server_tool_use + *_tool_result pair in the assistant message;
-    // the paired `tool_call_update` event is skipped in the main
-    // pass (sending it as a user tool_result would collide with the
-    // server-tool declaration in the request `tools` array).
-    //
-    // The result block comes from `tool_call_update.rawOutput` —
-    // populated by `emitServerToolResult` and persisted into the
-    // session by `Runtime.emitToolResult` alongside the model-facing
-    // text. When `rawOutput` is missing (e.g., a compacting session
-    // dropped it, or some other path produced an update without the
-    // raw block), we emit a placeholder `error_code: "unavailable"`
-    // result — honest about the loss, structurally valid for the API.
+    // Pre-pass: a server tool replays as a server_tool_use + *_tool_result
+    // pair on the assistant message, so its `tool_call_update` is skipped
+    // below — sending it as a user tool_result would collide with the
+    // server-tool declaration in the request `tools` array.
     const serverPayloads = new Map<
       string,
       {
@@ -1044,15 +748,10 @@ export class AnthropicHarness implements Harness {
           break;
         }
         case "agent_thought_chunk":
-          // Thinking is one-way: we don't echo it back to the API.
           break;
         case "tool_call": {
           const server = serverPayloads.get(e.toolCallId);
           if (server) {
-            // Server-tool path. Always emit the pair; the result block
-            // is the persisted real one when present, else a placeholder
-            // `unavailable` block. Matching `tool_call_update` skipped
-            // below (handled by the same `serverPayloads` membership).
             push({
               role: "assistant",
               content: serverToolPairAsParams(
@@ -1110,13 +809,6 @@ export class AnthropicHarness implements Harness {
   }
 }
 
-/**
- * Type guard for the result blocks the harness recognises on
- * `tool_call_update.rawOutput`. The session field is typed `unknown`
- * because anything can land there; we only treat it as a server-tool
- * result when its `type` matches one of the shapes we know how to
- * round-trip into the API.
- */
 function isServerToolResultBlock(
   v: unknown,
 ): v is WebSearchToolResultBlock | WebFetchToolResultBlock {
@@ -1125,24 +817,6 @@ function isServerToolResultBlock(
   return t === "web_search_tool_result" || t === "web_fetch_tool_result";
 }
 
-/**
- * Build the assistant-content blocks for a server-tool turn: a
- * `server_tool_use` block paired with its `*_tool_result` block,
- * both shaped as `ContentBlockParam`s for the request side.
- *
- * When `result` is present, we use its response shape directly —
- * `WebSearchToolResultBlock` / `WebFetchToolResultBlock` are
- * structurally compatible with their Param counterparts (same
- * fields, the Param versions just make `caller` optional and add
- * `cache_control`). A structural cast preserves `encrypted_content`
- * and any other opaque payload Anthropic adds in future revisions.
- *
- * When `result` is undefined (cache miss across harness lifetimes),
- * we emit a placeholder result block with
- * `error_code: "unavailable"`. The model sees the call happened but
- * understands the content is no longer accessible. Honest and
- * structurally valid; the API accepts it.
- */
 function serverToolPairAsParams(
   toolCallId: string,
   toolName: string,
@@ -1161,12 +835,6 @@ function serverToolPairAsParams(
   return [useBlock, placeholderUnavailableResult(toolCallId, toolName)];
 }
 
-/**
- * Build a placeholder result block for a server-tool call whose
- * original result is no longer in the harness's cache. Uses the
- * `unavailable` error code, which both `WebSearchToolResultErrorCode`
- * and `WebFetchToolResultErrorCode` advertise for this purpose.
- */
 function placeholderUnavailableResult(
   toolCallId: string,
   toolName: string,
@@ -1181,8 +849,6 @@ function placeholderUnavailableResult(
       },
     };
   }
-  // Default to the web_search shape; any future server tool would
-  // need its own arm here.
   return {
     type: "web_search_tool_result",
     tool_use_id: toolCallId,
@@ -1193,18 +859,12 @@ function placeholderUnavailableResult(
   };
 }
 
-/**
- * Render a `web_search_tool_result` block as a markdown summary the
- * model can read in its session log. Citations / encrypted content
- * are dropped here; ACP clients that want them read `display.rawOutput`.
- */
 function renderWebSearchResult(block: WebSearchToolResultBlock): {
   text: string;
   isError: boolean;
 } {
   const c = block.content;
   if (!Array.isArray(c)) {
-    // Error shape: `{ type: "web_search_tool_result_error", error_code }`.
     return {
       text: `[web_search error: ${c.error_code}]`,
       isError: true,
@@ -1223,21 +883,6 @@ function renderWebSearchResult(block: WebSearchToolResultBlock): {
   return { text: lines.join("\n").trimEnd(), isError: false };
 }
 
-/**
- * Render a `web_fetch_tool_result` block as a markdown summary.
- *
- * `WebFetchBlock.content` is a `DocumentBlock` whose `source` is
- * either:
- *   - `PlainTextSource` — the page's extracted text. We pass it
- *     through verbatim (the API already truncates to
- *     `max_content_tokens`).
- *   - `Base64PDFSource` — a fetched PDF. We don't decode it; we
- *     just note the media type and let downstream ACP clients
- *     handle the raw `rawOutput` if they want.
- *
- * Errors include `invalid_tool_input`, `url_not_allowed`,
- * `unsupported_content_type`, etc. — surfaced verbatim.
- */
 function renderWebFetchResult(block: WebFetchToolResultBlock): {
   text: string;
   isError: boolean;
@@ -1249,7 +894,6 @@ function renderWebFetchResult(block: WebFetchToolResultBlock): {
       isError: true,
     };
   }
-  // c.type === "web_fetch_result" — a WebFetchBlock.
   const lines: string[] = [];
   const title = c.content.title ?? c.url;
   lines.push(`# ${title}`);
@@ -1260,17 +904,11 @@ function renderWebFetchResult(block: WebFetchToolResultBlock): {
   if (src.type === "text") {
     lines.push(src.data);
   } else {
-    // base64 PDF — don't dump the bytes into the model context.
     lines.push(`[PDF content; ${src.media_type}; see rawOutput for bytes]`);
   }
   return { text: lines.join("\n").trimEnd(), isError: false };
 }
 
-/**
- * Translate an ACP `ContentBlock` to an Anthropic `ContentBlockParam`.
- * Returns null when the block isn't representable (e.g., a resource
- * block whose MIME isn't supported by the image API).
- */
 function acpToAnthropicContent(
   block: ACPContentBlock,
 ): ContentBlockParam | null {
@@ -1279,7 +917,6 @@ function acpToAnthropicContent(
   }
   if (block.type === "image") {
     if (!isAnthropicImageMediaType(block.mimeType)) {
-      // Drop with a textual placeholder so the model still has context.
       return {
         type: "text",
         text: `[unsupported image type: ${block.mimeType}]`,
@@ -1295,7 +932,6 @@ function acpToAnthropicContent(
     };
   }
   if (block.type === "resource") {
-    // Resource blocks aren't a thing on Anthropic; degrade to text.
     const res = block.resource;
     const text =
       "text" in res && typeof res.text === "string"
@@ -1306,17 +942,12 @@ function acpToAnthropicContent(
   return null;
 }
 
-// Re-exported so the existing `parent-derived.ts` `withModel` consumer
-// keeps working. Not part of the public SDK surface.
+// Re-exported for `parent-derived.ts`; not part of the public SDK surface.
 export type { AnthropicContentBlock };
 
 export const anthropicHarnessFactory: HarnessFactory = {
   name: "anthropic",
   secrets: { required: ["ANTHROPIC_API_KEY"] },
-  // Anthropic Messages API accepts inline image content and embedded
-  // resources in `session/prompt`. Audio isn't supported. Reported at
-  // `initialize` time — the factory doesn't need to instantiate a
-  // harness to know its model family's content capabilities.
   acpCapabilities() {
     return { promptCapabilities: { image: true, embeddedContext: true } };
   },
@@ -1328,8 +959,6 @@ export const anthropicHarnessFactory: HarnessFactory = {
     const c = config as AnthropicConfig;
     const apiKey = secrets.ANTHROPIC_API_KEY;
     if (!apiKey) {
-      // Should never happen — the runtime validates required secrets
-      // before calling create(). Defensive guard for direct callers.
       throw new Error(
         "Anthropic harness was instantiated without ANTHROPIC_API_KEY in its secrets bundle",
       );

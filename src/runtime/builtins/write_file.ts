@@ -32,6 +32,8 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
+  canonicalizeForGrant,
+  canonicalizeRoots,
   collectTrustedPaths,
   describePaths,
   effectivePaths,
@@ -91,11 +93,13 @@ export class WriteFileTool implements Tool {
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
     const i = input as WriteFileInput;
-    const target = path.resolve(i.path);
+    const target = await canonicalizeForGrant(path.resolve(i.path), "write");
     // Effective path set = manifest grant ∪ session trusted paths
     // with write access (`"write"` or `"read-write"`).
     const trusted = await collectTrustedPaths(ctx);
-    const effective = effectivePaths(this.granted, trusted, "write");
+    const effective = await canonicalizeRoots(
+      effectivePaths(this.granted, trusted, "write"),
+    );
     if (!pathAllowed(target, effective)) {
       return {
         content: `write_file: '${i.path}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,

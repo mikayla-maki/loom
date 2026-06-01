@@ -1,16 +1,3 @@
-/**
- * `read_file` — read a UTF-8 file, restricted to the granted paths.
- *
- * Capability kinds:
- *   optional: ["paths"]
- *
- * Star/list/absent semantics:
- *   paths absent  → smart default `["./"]` (project root)
- *   paths = "*"   → unrestricted
- *   paths = []    → explicit no-access (every call fails)
- *   paths = [...] → allowlist of absolute path roots
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -25,6 +12,8 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
+  canonicalizeForGrant,
+  canonicalizeRoots,
   collectTrustedPaths,
   describePaths,
   effectivePaths,
@@ -33,10 +22,6 @@ import {
   resolvedPaths,
 } from "./_path.js";
 
-/**
- * Input schema. `ToolTable` validates against this before dispatch —
- * `execute()` may trust `path` is a non-empty string.
- */
 const SCHEMA: JSONSchema = {
   type: "object",
   required: ["path"],
@@ -72,12 +57,11 @@ export class ReadFileTool implements Tool {
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
     const { path: requested } = input as ReadFileInput;
-    const target = path.resolve(requested);
-    // Effective path set = manifest grant ∪ session trusted paths
-    // (read-or-better). Trusted paths come from the session and may
-    // change per-turn; recomputing here keeps the check honest.
+    const target = await canonicalizeForGrant(path.resolve(requested), "read");
     const trusted = await collectTrustedPaths(ctx);
-    const effective = effectivePaths(this.granted, trusted, "read");
+    const effective = await canonicalizeRoots(
+      effectivePaths(this.granted, trusted, "read"),
+    );
     if (!pathAllowed(target, effective)) {
       return {
         content: `read_file: '${requested}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
@@ -91,7 +75,6 @@ export class ReadFileTool implements Tool {
       locations: [{ path: target }],
     };
 
-    // ── ACP path: client returns unsaved-buffer contents when applicable ──
     if (ctx.client?.readTextFile) {
       try {
         const text = await ctx.client.readTextFile({ path: target });
@@ -105,7 +88,6 @@ export class ReadFileTool implements Tool {
       }
     }
 
-    // ── Fast path: local fs ──
     try {
       const text = await fs.readFile(target, "utf8");
       return { content: text, display };

@@ -5,16 +5,9 @@ import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import { assembleSystemPrompt } from "../src/runtime/system-prompt.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 import type { TurnScript } from "../src/builtins/harness/test.js";
+import type { Runtime } from "../src/types/interfaces.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
 
-/**
- * Build the canonical sample-agent inline spec used by these tests. With
- * the new architecture there's no on-disk tool format and no inline tool
- * shape — the agent uses default builtin tools (the spec leaves [tools]
- * undefined so loom auto-loads `bash`, `read_file`, `write_file`, `find`)
- * plus a one-off `echo` reference for tests that need a deterministic
- * tool call.
- */
 function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
   return {
     name: "sample-agent",
@@ -104,19 +97,27 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
 
   it("cancels an in-flight turn", async () => {
     const spec = sampleAgentSpec();
-    // Long script, but harness checks abortSignal between steps. Use
-    // the function form for `script` (configured inline on the harness).
     if ("provider" in spec.harness) {
-      spec.harness.script = async (rt: unknown) => {
-        const out = [{ say: "starting" }] as Array<
+      // Block the turn until cancellation actually fires, then hand back
+      // steps that must never run because the abort already tripped.
+      // If cancel() is a no-op the abort never resolves and the test
+      // times out — so this only passes when cancellation truly works.
+      spec.harness.script = async (rt: Runtime) => {
+        await new Promise<void>((resolve) => {
+          if (rt.abortSignal.aborted) {
+            resolve();
+            return;
+          }
+          rt.abortSignal.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        });
+        const out = [] as Array<
           | { say: string }
           | { call: { tool: string; input: unknown } }
           | { stop: "end_turn" | "cancelled" }
         >;
         for (let i = 0; i < 50; i++) out.push({ say: `step ${i}` });
-        // Force a yield so the abort can land.
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        void rt;
         out.push({ stop: "end_turn" });
         return out;
       };
@@ -127,12 +128,15 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
     });
     try {
       const p = agent.prompt("go");
-      // Cancel after a beat.
       setTimeout(() => agent.cancel(), 5);
       const result = await p;
-      // Either the harness yields cancelled, or the script completes before the
-      // signal lands. Both are valid; just ensure cancel() completes cleanly.
-      expect(["cancelled", "end_turn"]).toContain(result.stopReason);
+      expect(result.stopReason).toBe("cancelled");
+      const events = (await agent.session.pull?.([])) ?? [];
+      const messages = events
+        .filter((e) => e.sessionUpdate === "agent_message_chunk")
+        .map((e) => (e.content.type === "text" ? e.content.text : ""));
+      // The post-cancel "step N" chunks must not have been emitted.
+      expect(messages.some((m) => m.startsWith("step "))).toBe(false);
     } finally {
       await agent.close();
     }
@@ -142,7 +146,6 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
     const agent = await runAgent(
       sampleAgentSpec([
         [
-          // `echo` requires `{ text: string }`; pass a wrong field to fail.
           { call: { tool: "echo", input: { wrong: "field" } } },
           { stop: "end_turn" },
         ],
@@ -167,48 +170,25 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
 });
 
 describe("system prompt assembly", () => {
-  it("includes the manifest-owned core and the tool reference", () => {
-    const text = assembleSystemPrompt({
-      core: "I am a helpful assistant.",
-      tools: [
-        { name: "greet", description: "Greet", inputSchema: {} },
-        { name: "uppercase", description: "Shout", inputSchema: {} },
-      ],
-      agentName: "tester",
-    });
+  const inputs = {
+    core: "I am a helpful assistant.",
+    tools: [
+      { name: "greet", description: "Greet", inputSchema: {} },
+      { name: "uppercase", description: "Shout", inputSchema: {} },
+    ],
+    agentName: "tester",
+  };
+
+  it("includes the core and tool reference, omits ambient context, and is byte-stable", () => {
+    const text = assembleSystemPrompt(inputs);
     expect(text).toContain("I am a helpful assistant.");
     expect(text).toContain("# Tool Reference");
     expect(text).toContain("`greet`");
     expect(text).toContain("`uppercase`");
-    // Skills are gone — no skill catalog section.
     expect(text).not.toContain("# Available Skills");
-  });
-
-  it("does NOT inject ambient context like the current date — that's the agent's job", () => {
-    // "What does the model need to know about the wall clock?" is an
-    // application-specific question. The runtime stays out of it so
-    // the assembled prompt is byte-stable across turns (implicit
-    // prompt caching keys on the system prompt prefix). Agents that
-    // want a date should put it in their `[agent].system_prompt`
-    // core or contribute a session section.
-    const text = assembleSystemPrompt({
-      core: "core",
-      tools: [{ name: "t", description: "t", inputSchema: {} }],
-      agentName: "tester",
-    });
     expect(text).not.toContain("# Context");
     expect(text).not.toContain("Current date");
     expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}/);
-  });
-
-  it("is byte-stable across calls when inputs don't change (cache-friendly)", () => {
-    // Same inputs → same output, no hidden per-call entropy. Two
-    // assemblies done back-to-back must hash identically.
-    const inputs = {
-      core: "core",
-      tools: [{ name: "t", description: "t", inputSchema: {} }],
-      agentName: "tester",
-    };
-    expect(assembleSystemPrompt(inputs)).toBe(assembleSystemPrompt(inputs));
+    expect(assembleSystemPrompt(inputs)).toBe(text);
   });
 });

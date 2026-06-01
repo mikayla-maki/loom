@@ -1,43 +1,3 @@
-/**
- * `web_search` — query the Brave LLM Context API.
- *
- * Calls Brave's `/res/v1/llm/context` endpoint, which returns
- * pre-extracted, snippet-formatted search results designed for LLM
- * consumption (no scraping, no token-budget surprises). See
- * https://api-dashboard.search.brave.com/documentation/services/llm-context
- *
- * Secrets:
- *   required: BRAVE_SEARCH_API_KEY (the secret name is overridable
- *             via the `secret_name` config — useful when you keep the
- *             key under a different env name).
- *
- * Capabilities: none. The tool only ever talks to one host
- * (`api.search.brave.com`), so manifest capability grants don't have
- * a useful surface here. Configuration goes through `[tools.web_search]`.
- *
- * Per-tool config (all optional, all map to the Brave API params):
- *   count                  → count                            (1–50)
- *   freshness              → freshness                        (pd | pw | pm | py | YYYY-MM-DDtoYYYY-MM-DD)
- *   country                → country                          (2-char code)
- *   search_lang            → search_lang
- *   max_urls               → maximum_number_of_urls           (1–50)
- *   max_tokens             → maximum_number_of_tokens         (1024–32768)
- *   max_snippets           → maximum_number_of_snippets       (1–100)
- *   max_tokens_per_url     → maximum_number_of_tokens_per_url (512–8192)
- *   max_snippets_per_url   → maximum_number_of_snippets_per_url (1–100)
- *   threshold_mode         → context_threshold_mode           (strict | balanced | lenient | disabled)
- *   enable_local           → enable_local                     (true | false)
- *   goggles                → goggles                          (URL or inline definition)
- *   endpoint               → override the API endpoint (handy for tests)
- *   secret_name            → name of the secret to read the API key from
- *                            (default: "BRAVE_SEARCH_API_KEY")
- *
- * Input (model-facing):
- *   query     (required) — the search query
- *   freshness (optional) — overrides the configured default for one call
- *   count     (optional) — overrides the configured default for one call
- */
-
 import type {
   Tool,
   ToolConfig,
@@ -169,7 +129,6 @@ export class WebSearchTool implements Tool {
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
-    // Schema-validated upstream by ToolTable.
     const i = input as WebSearchInput;
     const apiKey = ctx.secrets[this.secretName];
     if (!apiKey) {
@@ -244,8 +203,6 @@ export class WebSearchTool implements Tool {
     };
   }
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────
 
 function parseConfig(raw: ToolConfig): WebSearchConfig {
   if (raw === undefined || raw === null) return {};
@@ -350,7 +307,6 @@ function buildRequestBody(
 ): Record<string, unknown> {
   const body: Record<string, unknown> = { q: input.query };
 
-  // Input-level overrides take precedence over config defaults.
   const count = input.count ?? config.count;
   const freshness = input.freshness ?? config.freshness;
 
@@ -377,20 +333,6 @@ function buildRequestBody(
   return body;
 }
 
-/**
- * Render the Brave LLM Context response as model-facing markdown.
- *
- * Layout:
- *   # Search results for "<query>"
- *   ## <title>
- *   <hostname> — <age?>
- *   <url>
- *   - <snippet>
- *   - <snippet>
- *
- * POI / map results (only present with local recall) are appended
- * after the generic results in dedicated sections.
- */
 function renderResults(query: string, data: BraveResponse): string {
   const generic = data.grounding?.generic ?? [];
   const poi = data.grounding?.poi ?? null;
@@ -453,8 +395,6 @@ function renderResults(query: string, data: BraveResponse): string {
 
 function snippetToString(s: unknown): string {
   if (typeof s === "string") return s.trim();
-  // Brave may return JSON-serialised structured content (tables, code
-  // blocks). Pretty-print it so the model sees the shape.
   try {
     return JSON.stringify(s);
   } catch {
@@ -464,8 +404,7 @@ function snippetToString(s: unknown): string {
 
 function ageString(age: unknown): string {
   if (!Array.isArray(age) || age.length === 0) return "";
-  // Brave returns [pretty, iso, relative]; prefer the relative form
-  // ("380 days ago") if present, else the pretty form.
+  // Brave returns [pretty, iso, relative].
   const relative = age[2];
   if (typeof relative === "string") return relative;
   const pretty = age[0];

@@ -27,14 +27,34 @@ const childManifest: AgentManifest = {
   },
 };
 
+function factoryContext(): FactoryContext {
+  return {
+    manifestDir: process.cwd(),
+    agentName: "child",
+    loomVersion: "test",
+    clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    storage: os.tmpdir(),
+    metadata: {},
+  };
+}
+
+function completedToolCallText(events: SessionUpdate[]): string {
+  const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
+  expect(tu).toBeTruthy();
+  if (!tu || tu.sessionUpdate !== "tool_call_update") return "";
+  expect(tu.status).toBe("completed");
+  return tu.content?.[0]?.type === "content" &&
+    tu.content[0].content.type === "text"
+    ? tu.content[0].content.text
+    : "";
+}
+
 describe("spawn_subagent builtin tool", () => {
   it("runs the configured sub-agent end-to-end and returns its final assistant message", async () => {
     const agent = await runAgent({
       name: "parent-using-builtin",
       systemPrompt: "x",
       tools: {
-        // Pass the sub-manifest under `manifest` so the tool entry can
-        // still carry the required `provider` field.
         spawn_subagent: { provider: "builtin", manifest: childManifest },
       },
       harness: {
@@ -55,17 +75,7 @@ describe("spawn_subagent builtin tool", () => {
     try {
       await agent.prompt("go");
       const events = (await agent.session.pull?.([])) ?? [];
-      const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
-      expect(tu).toBeTruthy();
-      if (tu && tu.sessionUpdate === "tool_call_update") {
-        expect(tu.status).toBe("completed");
-        const text =
-          tu.content?.[0]?.type === "content" &&
-          tu.content[0].content.type === "text"
-            ? tu.content[0].content.text
-            : "";
-        expect(text).toBe("child-says-hello");
-      }
+      expect(completedToolCallText(events)).toBe("child-says-hello");
     } finally {
       await agent.close();
     }
@@ -101,64 +111,38 @@ describe("spawn_subagent self-copy default", () => {
     },
   };
 
-  it("constructs without config when given the owning agent (clones its manifest)", () => {
-    const owning: Agent = {
+  function owningAgent(): Agent {
+    return {
       manifest: parentManifest,
       harness: { run: async () => ({ stopReason: "end_turn" as const }) },
       session: { push: async () => [], pull: async () => [] },
       systemPromptCore: "x",
     };
-    const tool = new SpawnSubagentTool({}, undefined, owning);
+  }
+
+  it("clones the owning agent's manifest, strips spawn_subagent, and leaves the parent untouched", () => {
+    const tool = new SpawnSubagentTool({}, undefined, owningAgent());
+
     expect(tool.isSelfCopy).toBe(true);
+    expect(tool.description).toBe("Delegate a turn to a fresh copy of yourself.");
     expect(tool.dependencies.subagents).toHaveLength(1);
+
     const clone = tool.dependencies.subagents[0]!;
     expect(clone.name).toBe("parent-of-self");
     expect(clone.description).toBe("the original");
-  });
-
-  it("strips spawn_subagent from the clone's tools and capabilities", () => {
-    const owning: Agent = {
-      manifest: parentManifest,
-      harness: { run: async () => ({ stopReason: "end_turn" as const }) },
-      session: { push: async () => [], pull: async () => [] },
-      systemPromptCore: "x",
-    };
-    const tool = new SpawnSubagentTool({}, undefined, owning);
-    const clone = tool.dependencies.subagents[0]!;
-    // Other tools survive; spawn_subagent is gone.
     expect(Object.keys(clone.tools ?? {}).sort()).toEqual(["bash"]);
     expect(Object.keys(clone.capabilities ?? {}).sort()).toEqual(["bash"]);
-    // The parent's manifest is untouched (no in-place mutation).
     expect(Object.keys(parentManifest.tools ?? {}).sort()).toEqual([
       "bash",
       "spawn_subagent",
     ]);
   });
 
-  it("uses the self-copy description", () => {
-    const owning: Agent = {
-      manifest: parentManifest,
-      harness: { run: async () => ({ stopReason: "end_turn" as const }) },
-      session: { push: async () => [], pull: async () => [] },
-      systemPromptCore: "x",
-    };
-    const tool = new SpawnSubagentTool({}, undefined, owning);
-    expect(tool.description).toBe(
-      "Delegate a turn to a fresh copy of yourself.",
-    );
-  });
-
   it("prefers explicit config over the self-copy default", () => {
-    const owning: Agent = {
-      manifest: parentManifest,
-      harness: { run: async () => ({ stopReason: "end_turn" as const }) },
-      session: { push: async () => [], pull: async () => [] },
-      systemPromptCore: "x",
-    };
     const tool = new SpawnSubagentTool(
       { manifest: childManifest } as unknown as Record<string, unknown>,
       undefined,
-      owning,
+      owningAgent(),
     );
     expect(tool.isSelfCopy).toBe(false);
     expect(tool.subagentManifest.name).toBe("child-builtin");
@@ -171,19 +155,6 @@ describe("spawn_subagent self-copy default", () => {
   });
 
   it("end-to-end: an agent with no manifest config spawns a working clone of itself", async () => {
-    // The parent and the clone share the same harness script (the
-    // clone is a structural copy of the parent's manifest). Both
-    // first emit a text message, then attempt to call
-    // spawn_subagent, then end. The clone has spawn_subagent
-    // stripped from its tool table — so the inner call surfaces as
-    // an "Unknown tool" error in the child's session, but the
-    // child's *final agent message* is the text it emitted before
-    // that, which is what `spawn_subagent` returns to the parent.
-    //
-    // What we verify: the parent's `spawn_subagent` call completes
-    // successfully and returns the clone's pre-call agent message.
-    // That proves the clone was constructed, booted, and ran end
-    // to end through `runAgent` with the parent's shape.
     const m: AgentManifest = {
       name: "self-cloner",
       systemPrompt: "x",
@@ -197,9 +168,6 @@ describe("spawn_subagent self-copy default", () => {
                 tool: "spawn_subagent",
                 input: { prompt: "go" },
               },
-              // Don't echo the tool result back as an agent_message_chunk
-              // — we want the child's `say` to remain the last agent
-              // message in its session so `lastAgentMessage` picks it up.
               surface: false,
             },
             { stop: "end_turn" },
@@ -213,30 +181,13 @@ describe("spawn_subagent self-copy default", () => {
     try {
       await agent.prompt("go");
       const events = (await agent.session.pull?.([])) ?? [];
-      const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
-      expect(tu).toBeTruthy();
-      if (tu && tu.sessionUpdate === "tool_call_update") {
-        expect(tu.status).toBe("completed");
-        const text =
-          tu.content?.[0]?.type === "content" &&
-          tu.content[0].content.type === "text"
-            ? tu.content[0].content.text
-            : "";
-        // The clone ran, emitted "from-cloned-agent", then failed
-        // to find spawn_subagent in its (stripped) tool table. The
-        // last agent message is what the clone reported.
-        expect(text).toBe("from-cloned-agent");
-      }
+      expect(completedToolCallText(events)).toBe("from-cloned-agent");
     } finally {
       await agent.close();
     }
   });
 
   describe("audit", () => {
-    // Use an isolated LOOM_DATA_HOME so the audit walker's storage
-    // resolution writes/reads .loom-agent in a tmpdir, not the real
-    // user data home. This makes the storage-warning assertions
-    // below deterministic across machines and test runs.
     let tmpDir = "";
     let prevDataHome: string | undefined;
     beforeAll(async () => {
@@ -253,7 +204,7 @@ describe("spawn_subagent self-copy default", () => {
       if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
     });
 
-    it("a self-cloning agent doesn't infinite-loop (no recursion because clone has no spawn_subagent)", async () => {
+    it("walks the self-clone without recursing and suppresses its storage warnings", async () => {
       const m: AgentManifest = {
         name: "self-cloner-audit",
         manifestPath: "/virtual/self-cloner.toml",
@@ -265,40 +216,13 @@ describe("spawn_subagent self-copy default", () => {
       const tree = await auditAgent(m);
       const spawn = tree.tools.find((t) => t.name === "spawn_subagent");
       expect(spawn).toBeTruthy();
-      // One sub-agent in the tree: the cloned parent. No cycle marker,
-      // because the clone has spawn_subagent stripped.
       expect(spawn!.subagents).toHaveLength(1);
+
       const cloneTree = spawn!.subagents[0]!;
       expect(cloneTree.name).toBe("self-cloner-audit");
       expect(
         cloneTree.tools.find((t) => t.name === "spawn_subagent"),
       ).toBeUndefined();
-    });
-
-    it("suppresses storage-collision warnings on sub-agents (only top-level shows them)", async () => {
-      // The parent's manifestPath is `/virtual/self-cloner.toml`; the
-      // clone's synthesized manifestPath is
-      // `<self-copy:/virtual/self-cloner.toml>`. They share the same
-      // storage dir (same name, no storageId override), so the
-      // storage layer's collision detection fires when the audit
-      // walker opens the clone's storage. Our filter clears that
-      // warning on sub-agent nodes — only the top-level audit
-      // surfaces actionable storage warnings.
-      const m: AgentManifest = {
-        name: "self-cloner-warn",
-        manifestPath: "/virtual/self-cloner-warn.toml",
-        systemPrompt: "x",
-        harness: { provider: "test" },
-        tools: { spawn_subagent: "builtin" },
-        capabilities: { spawn_subagent: "*" },
-      };
-      const tree = await auditAgent(m);
-      // First audit: top-level opens storage fresh; no prior
-      // manifestPath recorded, so no collision warning at the top.
-      // The clone opens second; would warn at the storage layer, but
-      // the audit filter clears it on sub-agent nodes.
-      const spawn = tree.tools.find((t) => t.name === "spawn_subagent")!;
-      const cloneTree = spawn.subagents[0]!;
       expect(cloneTree.storage.warnings).toEqual([]);
     });
   });
@@ -324,21 +248,16 @@ describe("fork-of-parent session", () => {
       session: parentSession,
       systemPromptCore: "core",
     };
-    const ctx: FactoryContext = {
-      manifestDir: process.cwd(),
-      agentName: "child",
-      loomVersion: "test",
-      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-      storage: os.tmpdir(),
-      metadata: {},
-    };
-    const child = await forkOfParentSessionFactory.create({}, ctx, {}, parent);
+    const child = await forkOfParentSessionFactory.create(
+      {},
+      factoryContext(),
+      {},
+      parent,
+    );
 
-    // Child sees the parent's events …
     const childEvents = (await child.pull?.([])) ?? [];
     expect(childEvents).toHaveLength(2);
 
-    // … but appending to the child doesn't bleed back to the parent.
     await Promise.resolve(
       child.push?.({
         sessionUpdate: "user_message_chunk",
@@ -363,6 +282,15 @@ describe("fork-of-parent session", () => {
 });
 
 describe("small-model-of-parent harness", () => {
+  function parentWith(harness: Agent["harness"]): Agent {
+    return {
+      manifest: { name: "parent", harness: { provider: "test" } },
+      harness,
+      session: new InMemorySession(),
+      systemPromptCore: "x",
+    };
+  }
+
   it("requiresParent: top-level boot fails with a clear error", async () => {
     await expect(
       runAgent({
@@ -376,7 +304,7 @@ describe("small-model-of-parent harness", () => {
     );
   });
 
-  it("clones the parent's AnthropicHarness with the configured smaller model", async () => {
+  it("clones the parent's AnthropicHarness with the configured smaller model, reusing the parent's key", async () => {
     const parentHarness = new AnthropicHarness(
       "claude-3-5-sonnet-latest",
       "fake-api-key",
@@ -385,32 +313,15 @@ describe("small-model-of-parent harness", () => {
       16,
       true,
     );
-    const parent: Agent = {
-      manifest: { name: "parent", harness: { provider: "test" } },
-      harness: parentHarness,
-      session: new InMemorySession(),
-      systemPromptCore: "x",
-    };
-    const ctx: FactoryContext = {
-      manifestDir: process.cwd(),
-      agentName: "child",
-      loomVersion: "test",
-      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-      storage: os.tmpdir(),
-      metadata: {},
-    };
     const child = (await smallModelOfParentHarnessFactory.create(
       { model: "claude-3-5-haiku-latest" },
-      ctx,
+      factoryContext(),
       {},
-      parent,
+      parentWith(parentHarness),
     )) as AnthropicHarness;
 
     expect(child).toBeInstanceOf(AnthropicHarness);
     expect(child).not.toBe(parentHarness);
-
-    // Read the private model field via cast so we can assert the new
-    // value without spinning up the API.
     const childModel = (child as unknown as { model: string }).model;
     const childKey = (child as unknown as { apiKey: string }).apiKey;
     const parentKey = (parentHarness as unknown as { apiKey: string }).apiKey;
@@ -419,8 +330,6 @@ describe("small-model-of-parent harness", () => {
   });
 
   it("works with any harness that implements the optional withModel() API", async () => {
-    // OpenAIHarness implements `withModel` too, so the factory should
-    // succeed with it as the parent — no special-case needed.
     const parentHarness = new OpenAIHarness(
       "gpt-4o",
       "fake-api-key",
@@ -429,25 +338,11 @@ describe("small-model-of-parent harness", () => {
       16,
       true,
     );
-    const parent: Agent = {
-      manifest: { name: "parent", harness: { provider: "test" } },
-      harness: parentHarness,
-      session: new InMemorySession(),
-      systemPromptCore: "x",
-    };
-    const ctx: FactoryContext = {
-      manifestDir: process.cwd(),
-      agentName: "child",
-      loomVersion: "test",
-      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-      storage: os.tmpdir(),
-      metadata: {},
-    };
     const child = (await smallModelOfParentHarnessFactory.create(
       { model: "gpt-4o-mini" },
-      ctx,
+      factoryContext(),
       {},
-      parent,
+      parentWith(parentHarness),
     )) as OpenAIHarness;
 
     expect(child).toBeInstanceOf(OpenAIHarness);
@@ -457,32 +352,20 @@ describe("small-model-of-parent harness", () => {
   });
 
   it("rejects parents whose harness has no withModel() method", async () => {
-    // A bare Harness-shape object that satisfies the required `run`
-    // method but doesn't implement the optional `withModel` API.
-    const parent: Agent = {
-      manifest: { name: "parent", harness: { provider: "test" } },
-      harness: { run: async () => ({ stopReason: "end_turn" as const }) },
-      session: new InMemorySession(),
-      systemPromptCore: "x",
-    };
-    const ctx: FactoryContext = {
-      manifestDir: process.cwd(),
-      agentName: "child",
-      loomVersion: "test",
-      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-      storage: os.tmpdir(),
-      metadata: {},
-    };
+    const parent = parentWith({
+      run: async () => ({ stopReason: "end_turn" as const }),
+    });
     await expect(async () =>
-      smallModelOfParentHarnessFactory.create({ model: "x" }, ctx, {}, parent),
+      smallModelOfParentHarnessFactory.create(
+        { model: "x" },
+        factoryContext(),
+        {},
+        parent,
+      ),
     ).rejects.toThrow(/withModel/);
   });
 
   it("falls back to the parent harness's smallModel() when no `model` is configured", async () => {
-    // Parent uses claude-sonnet-4-5. The Anthropic harness's
-    // smallModel() returns the in-family haiku variant, so the
-    // sub-agent should boot without the manifest needing to specify
-    // a model.
     const parentHarness = new AnthropicHarness(
       "claude-sonnet-4-5",
       "fake-api-key",
@@ -491,58 +374,28 @@ describe("small-model-of-parent harness", () => {
       16,
       true,
     );
-    const parent: Agent = {
-      manifest: { name: "parent", harness: { provider: "test" } },
-      harness: parentHarness,
-      session: new InMemorySession(),
-      systemPromptCore: "x",
-    };
-    const ctx: FactoryContext = {
-      manifestDir: process.cwd(),
-      agentName: "child",
-      loomVersion: "test",
-      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-      storage: os.tmpdir(),
-      metadata: {},
-    };
     const child = (await smallModelOfParentHarnessFactory.create(
       {},
-      ctx,
+      factoryContext(),
       {},
-      parent,
+      parentWith(parentHarness),
     )) as AnthropicHarness;
     const childModel = (child as unknown as { model: string }).model;
     expect(childModel).toBe("claude-haiku-4-5");
   });
 
   it("errors helpfully when neither `model` nor smallModel() is available", async () => {
-    // A bare Harness shape with `withModel` but no `smallModel`.
-    const parent: Agent = {
-      manifest: { name: "parent", harness: { provider: "test" } },
-      harness: {
-        run: async () => ({ stopReason: "end_turn" as const }),
-        withModel(modelId: string) {
-          return {
-            run: async () => ({ stopReason: "end_turn" as const }),
-            _model: modelId,
-          } as unknown as ReturnType<
-            NonNullable<Agent["harness"]["withModel"]>
-          >;
-        },
+    const parent = parentWith({
+      run: async () => ({ stopReason: "end_turn" as const }),
+      withModel(modelId: string) {
+        return {
+          run: async () => ({ stopReason: "end_turn" as const }),
+          _model: modelId,
+        } as unknown as ReturnType<NonNullable<Agent["harness"]["withModel"]>>;
       },
-      session: new InMemorySession(),
-      systemPromptCore: "x",
-    };
-    const ctx: FactoryContext = {
-      manifestDir: process.cwd(),
-      agentName: "child",
-      loomVersion: "test",
-      clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
-      storage: os.tmpdir(),
-      metadata: {},
-    };
+    });
     await expect(async () =>
-      smallModelOfParentHarnessFactory.create({}, ctx, {}, parent),
+      smallModelOfParentHarnessFactory.create({}, factoryContext(), {}, parent),
     ).rejects.toThrow(/smallModel/);
   });
 });
@@ -551,9 +404,8 @@ describe("Harness.smallModel built-in implementations", () => {
   it.each([
     ["claude-sonnet-4-5", "claude-haiku-4-5"],
     ["claude-opus-4-5", "claude-haiku-4-5"],
-    // Haiku-family stays put: smallModel() is idempotent for the small variant.
     ["claude-haiku-4-5", "claude-haiku-4-5"],
-  ])("AnthropicHarness: %s \u2192 %s", (model, expected) => {
+  ])("AnthropicHarness: %s → %s", (model, expected) => {
     const h = new AnthropicHarness(
       model,
       "k",
@@ -568,9 +420,8 @@ describe("Harness.smallModel built-in implementations", () => {
   it.each([
     ["gpt-4o", "gpt-4o-mini"],
     ["o1", "o1-mini"],
-    // Mini-family stays put.
     ["gpt-4o-mini", "gpt-4o-mini"],
-  ])("OpenAIHarness: %s \u2192 %s", (model, expected) => {
+  ])("OpenAIHarness: %s → %s", (model, expected) => {
     const h = new OpenAIHarness(
       model,
       "k",
@@ -588,8 +439,6 @@ describe("loom audit recursion", () => {
     const tree = await auditAgent({
       name: "parent",
       systemPrompt: "x",
-      // The spawn_subagent builtin is opt-in; declaring it here pulls
-      // its sub-manifest into the audit walk.
       tools: {
         spawn_subagent: { provider: "builtin", manifest: childManifest },
       },
@@ -604,7 +453,6 @@ describe("loom audit recursion", () => {
     expect(spawn.subagents).toHaveLength(1);
     expect(spawn.subagents[0]?.name).toBe("child-builtin");
 
-    // Pretty-printed output mentions both layers.
     const printed = formatCapabilityTree(tree);
     expect(printed).toContain("parent");
     expect(printed).toContain("spawn_subagent");
@@ -613,9 +461,6 @@ describe("loom audit recursion", () => {
   });
 
   it("detects cycles without infinite recursion", async () => {
-    // A manifest whose spawn_subagent declares itself as the
-    // sub-agent — a degenerate cycle. The recursion should bottom out
-    // with a (cycle) marker rather than spinning.
     const recursive: AgentManifest = {
       name: "recursive",
       manifestPath: "/virtual/recursive.toml",
@@ -623,8 +468,6 @@ describe("loom audit recursion", () => {
       tools: {},
       harness: { provider: "test" },
     };
-    // The tool's sub-manifest is the same manifestPath as the parent
-    // — that's the cycle.
     recursive.tools = {
       spawn_subagent: { provider: "builtin", manifest: recursive },
     };
@@ -635,7 +478,6 @@ describe("loom audit recursion", () => {
       "spawn_subagent tool missing from audit tree",
     );
     expect(spawn.subagents).toHaveLength(1);
-    // Cycle detection short-circuits the inner tree.
     const inner = defined(spawn.subagents[0], "missing inner sub-agent");
     expect(inner.unresolvedTools).toContainEqual(
       expect.objectContaining({ name: "(cycle)" }),

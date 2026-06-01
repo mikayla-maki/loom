@@ -1,13 +1,3 @@
-/**
- * ToolTable — name → Tool registry the runtime executes against.
- *
- * Built once after every provider has resolved their tools. Validates
- * input against each tool's `inputSchema` before dispatch, builds a
- * fresh `ToolContext` per call (with the secret slice filtered to the
- * tool's allowlist), and surfaces tool errors as `isError` results
- * rather than throwing into the harness.
- */
-
 import Ajv, { type ValidateFunction } from "ajv";
 
 import { ToolExecutionError, ToolInputError } from "../errors.js";
@@ -21,22 +11,11 @@ import type {
 
 const ajv = new Ajv({ allErrors: true, strict: false, useDefaults: true });
 
-/**
- * Tool registration entry — Tool plus the secret allowlist filtered
- * into its per-call `ctx.secrets`.
- */
 export interface ToolEntry {
   tool: Tool;
   allowedSecrets: Set<string>;
 }
 
-/**
- * Builds a fresh `ToolContext` per `execute()` call. The runtime
- * supplies this; it captures the runtime primitives the tool's context
- * methods route to. The `tool` is the entry being dispatched —
- * lookups like `ctx.spawnSubagent(name)` read off
- * `tool.dependencies.subagents`.
- */
 export interface ToolContextFactory {
   build(args: { allowedSecrets: Set<string>; tool: Tool }): ToolContext;
 }
@@ -81,11 +60,6 @@ export class ToolTable {
     }));
   }
 
-  /**
-   * The full `Tool` instances backing the table, in insertion order.
-   * Used by aggregation paths (e.g. ACP capability negotiation) that
-   * need to call optional methods like `Tool.acpCapabilities()`.
-   */
   tools(): Tool[] {
     return [...this.byName.values()].map((e) => e.tool);
   }

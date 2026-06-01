@@ -1,28 +1,3 @@
-/**
- * Static capability audit — instantiates the native Tools against an
- * agent manifest and prints what it would expose. No LLM is ever
- * invoked and no provider code runs side-effectfully; audit is
- * conservative and deterministic. Provider-supplied tools don't
- * appear in the resolved tool list (that would require running Tools
- * init — which can have side effects like opening MCP connections)
- * but they DO appear as `unresolvedTools` and the providers they
- * came from are surfaced in the `providers` view.
- *
- * The tree shows per agent:
- *   - PROVIDERS: every external SourceSpec the manifest pulls in
- *     (named in `[providers]`, or referenced inline via `[tools]` /
- *     `[harness]` / `[session]`)
- *   - GRANTS: per-tool capability grants from `[capabilities]`
- *   - REQUIRES: every kind each native-resolved tool declares it needs
- *   - SECRETS: every secret name any component declares it needs
- *   - SUB-AGENTS: recursive audit trees + capability-ceiling checks
- *
- * v5 capability-ceiling check: every sub-agent's effective grants must
- * be a subset of the parent's. Violations are surfaced as
- * `capabilityCeilingViolations` on the parent tree and as boot errors
- * at runtime (see `manifest-v5.md` §1.6).
- */
-
 import * as path from "node:path";
 
 import {
@@ -54,6 +29,7 @@ import {
 import {
   buildSecretStore,
   collectPhase1SecretNeeds,
+  describeSecretStores,
   loadSecretsBundle,
 } from "../sdk/run-agent.js";
 import { resolveAgentStorage } from "../runtime/storage.js";
@@ -84,143 +60,72 @@ export interface SecretRequest {
   name: string;
   required: boolean;
   requestedBy: string[];
-  /** Whether the manifest's [agent].secrets allowlist permits this name. */
   permittedByAllowlist: boolean;
+  /**
+   * Label of the store the secret resolved from (e.g. `"environment"`,
+   * `".loom-secrets (manifest dir)"`), or undefined when no store had it.
+   * See `describeSecretStores`.
+   */
+  resolvedFrom?: string;
 }
 
-/**
- * A provider reference surfaced in the audit. Always non-empty when
- * any external code is loaded by this manifest; covers both
- * `[providers]`-declared handles and inline references from
- * `[tools]` / `[harness]` / `[session]`.
- */
 export interface ProviderSummary {
   /** Canonical structural key (matches `lock.toml`). */
   key: string;
-  /** SourceSpec for source-backed providers; undefined for factory-backed. */
   source?: SourceSpec;
   /** Local `[providers]` handle, when declared. */
   handle?: string;
-  /**
-   * Factory name for `[providers]` configured-factory entries (e.g.
-   * `"mcp-server"`). Source-backed providers don't have one.
-   */
+  /** Factory name for `[providers]` configured-factory entries (e.g. `"mcp-server"`). */
   factoryName?: string;
-  /** Where in the manifest this provider is referenced. */
   origins: string[];
-  /** Set when audit tried to load this provider but couldn't. */
   loadError?: string;
-  /**
-   * Set when audit tried to initialise the Tools instance but the
-   * underlying init() threw. Distinct from `loadError`; that's for
-   * package loading. This catches spawn failures, MCP handshake
-   * errors, etc.
-   */
+  /** init() threw — distinct from `loadError` (package loaded, but spawn/handshake failed). */
   initError?: string;
-  /**
-   * Populated for MCP-backed providers after a successful init().
-   * Carries the server's reported name + version + protocol version
-   * so reviewers see exactly what they're talking to.
-   */
   mcpServer?: {
     name: string;
     version: string;
     protocolVersion: string;
-    /** Names of tools the server advertised but the manifest didn't expose. */
     advertisedButUnexposed: string[];
   };
 }
 
-/**
- * Audit summary of the manifest's harness (or session). Carries the
- * factory selector, where its code came from (when provider-backed),
- * and whether the factory was found at boot time.
- */
 export interface FactoryAuditSummary {
-  /** Human-readable label: factory name, provider handle, or "<pre-built instance>". */
   display: string;
-  /** Factory name the runtime looked up. Empty for pre-built instances. */
   factoryName?: string;
-  /** Factory config (non-secret keys from the `[harness]` / `[session]` block). */
   config: Record<string, unknown>;
-  /** SourceSpec key when the factory came from a provider package. */
   providerKey?: string;
-  /** Local `[providers]` handle when declared. */
   providerHandle?: string;
-  /** True iff the registry knew this factory at audit time. */
   resolved: boolean;
-  /** True when the manifest carries a pre-built `Harness`/`Session` instance. */
   preBuilt: boolean;
-  /**
-   * Catalog of tool names the harness can expose via
-   * `Harness.availableTools()`. Populated for harness summaries only,
-   * when the catalog is non-empty; reviewers can compare this with
-   * the manifest's `[tools]` opt-ins (anything in the catalog but
-   * not in `[tools]` is available-but-unexposed).
-   *
-   * Sessions don't populate this field — session-contributed tools
-   * are auto-added and live on `SessionAuditSummary.contributedTools`.
-   */
+  /** Tool names the harness can expose via `availableTools()`. Harness summaries only. */
   availableTools?: string[];
 }
 
-/** Audit-level view of the manifest's session, including its contributions. */
 export interface SessionAuditSummary extends FactoryAuditSummary {
-  /** Tool names the session contributed via `Session.tools()`. */
   contributedTools: string[];
-  /** Filesystem paths declared trusted by the session. */
   trustedPaths: TrustedPath[];
-  /** Set when audit tried to construct the session factory but couldn't. */
   constructionError?: string;
 }
 
-/**
- * A capability the sub-agent declared but the parent's `[capabilities]`
- * doesn't cover. Surfaced on the *parent* tree; the runtime would
- * reject the sub-agent at spawn time.
- */
 export interface CapabilityCeilingViolation {
-  /** Which sub-agent (by name + manifest path). */
   subagentName: string;
   subagentManifestPath: string;
-  /** The tool key in [capabilities] that the parent doesn't cover. */
   capabilityKey: string;
-  /** What the sub-agent asks for. */
   subagentGrant: CapabilitySet;
-  /** What the parent grants (may be undefined if the parent grants nothing). */
   parentGrant: CapabilitySet | undefined;
 }
 
 export interface CapabilityTree {
   manifestPath: string;
   name: string;
-  /** The agent's `[capabilities]` table — per-tool grants. */
   grants: Capabilities;
-  /** The agent's `[agent].secrets` allowlist (or undefined when unset). */
   secretAllowlist?: SecretAllowlist;
-  /**
-   * Per-agent storage root: absolute path, identifier source
-   * (`storage_id` override vs `name` default), and any collision
-   * warnings produced when the storage dir was opened (e.g. a
-   * different manifest path previously used the same id).
-   */
   storage: {
     path: string;
     source: "storage_id" | "name";
     warnings: string[];
   };
-  /**
-   * Every provider (declared or inline) this manifest pulls in.
-   * Includes load failures (e.g. `npm install` hasn't run); see
-   * `loadError`.
-   */
   providers: ProviderSummary[];
-  /**
-   * Each tool the native Tools could resolve, with its declared
-   * capability requires/optionals, the granted set, the source that
-   * introduced it, and any sub-agent trees reachable through
-   * `tool.dependencies.subagents`.
-   */
   tools: Array<{
     name: string;
     requires: string[];
@@ -230,97 +135,32 @@ export interface CapabilityTree {
     findings: AuditFinding[];
     introducedBy: string;
     subagents: CapabilityTree[];
-    /**
-     * SourceSpec key when this tool was claimed by a provider-
-     * contributed Tools instance. Absent for native (built-in) tools.
-     */
     providerKey?: string;
-    /** Local provider handle when declared. */
     providerHandle?: string;
-    /**
-     * Model-visible JSON Schema (i.e. POST-narrowing for MCP-style
-     * argument-bound tools). Only populated when the tool resolved
-     * successfully; useful for reviewing what the model sees.
-     */
+    /** Model-visible JSON Schema (post-narrowing for argument-bound tools). */
     inputSchema?: unknown;
-    /**
-     * Names of arguments pre-bound via `[capabilities]` for
-     * argument-binding tools. The bound values themselves are NOT
-     * surfaced (they may include user-secret-ish literals).
-     */
     boundArgs?: string[];
   }>;
-  /** Every secret name a component declares it needs. */
   secrets: SecretRequest[];
-  /** Sub-agent trees the session declares it may spawn. */
   sessionSubagents: CapabilityTree[];
-  /**
-   * Tool refs that couldn't be resolved by the native Tools —
-   * typically tools whose `provider` resolves to a provider package
-   * (audit doesn't instantiate provider Tools).
-   */
   unresolvedTools: Array<{ name: string; introducedBy: string }>;
-  /**
-   * Harness summary — always present (harness is required).
-   */
   harness: FactoryAuditSummary;
-  /**
-   * Session summary for the outermost layer (or the pre-built
-   * `Session` instance). Present whenever the manifest declares a
-   * `[session]` block or carries a pre-built instance. Absent when
-   * the session is omitted entirely (the runtime applies the default
-   * chain).
-   *
-   * For a multi-layer session this describes only the outermost
-   * layer; inspect {@link sessionLayers} to walk every layer.
-   */
+  /** Outermost session layer; see {@link sessionLayers} for all layers. */
   session?: SessionAuditSummary;
-  /**
-   * Every layer of the session, outer-to-inner. Present whenever
-   * {@link session} is present. Length 1 for the singleton
-   * `[session]` form or a pre-built instance; length ≥ 1 for the
-   * `[session].layers` form. Each layer carries its own
-   * `contributedTools` / `trustedPaths` so audit consumers can see
-   * which layer contributed what.
-   */
+  /** Every session layer, outer-to-inner. Present whenever {@link session} is. */
   sessionLayers?: SessionAuditSummary[];
-  /**
-   * @deprecated Read `session.trustedPaths` instead. Kept at the top
-   * level for back-compat; mirrors `session?.trustedPaths ?? []`.
-   */
+  /** @deprecated Read `session.trustedPaths` instead. */
   trustedPaths: TrustedPath[];
-  /**
-   * @deprecated Read `session.constructionError` instead. Kept at
-   * the top level for back-compat; mirrors
-   * `session?.constructionError`.
-   */
+  /** @deprecated Read `session.constructionError` instead. */
   sessionConstructionError?: string;
-  /**
-   * Sources audit couldn't load — typically `npm:` packages the user
-   * hasn't installed yet. Kept as a separate list (parallel to
-   * `providers`) because audit needs to surface the gap distinctly.
-   */
   unresolvedSources: Array<{
     spec: string;
     source: SourceSpec;
     reason: string;
   }>;
-  /**
-   * Capability-ceiling violations against this manifest's direct
-   * sub-agents (recursive children are reported on the children
-   * themselves). Empty when every sub-agent's capability set is a
-   * subset of this manifest's. See §1.6 of manifest-v4.md.
-   */
   capabilityCeilingViolations: CapabilityCeilingViolation[];
 }
 
-/**
- * Audit-time options. Currently empty: audit has one behaviour
- * (succeed cleanly, or throw `AuditError` with the partial tree).
- * Reserved for future flags that genuinely vary semantics, not for
- * lenient/strict toggles — "how thoroughly is this manifest
- * actually wired up?" should always have one honest answer.
- */
 export type AuditOptions = Record<string, never>;
 
 const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
@@ -331,26 +171,17 @@ const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
 };
 
 /**
- * Run a static audit against a manifest. Either the manifest is
- * fully resolvable — in which case audit returns a `CapabilityTree`
- * describing what would happen at boot — or it isn't, in which case
- * audit throws `AuditError` with the partial tree + structured
- * problem list attached.
- *
- * There is no "lenient" mode. Before MCP, audit could be a pure
- * static walk that always answered; now that MCP requires init()
- * to populate tool caches, audit may not be able to answer at all,
- * and pretending otherwise would let broken manifests look fine.
- *
- * Callers who want to inspect a partially-resolved tree (UI
- * authoring tools, IDE integrations) should catch `AuditError` and
- * read `error.tree` + `error.health`.
+ * Run a static audit against a manifest. Returns a `CapabilityTree`
+ * when the manifest fully resolves, or throws `AuditError` with the
+ * partial tree + structured problem list attached. Callers wanting
+ * a partially-resolved tree should catch `AuditError` and read
+ * `error.tree` + `error.health`.
  */
 export async function auditAgent(
   source: string | AgentManifest,
   _options: AuditOptions = {},
 ): Promise<CapabilityTree> {
-  void _options; // reserved; see AuditOptions.
+  void _options;
   const tree = await auditAgentInner(source, new Set());
   const health = summariseAuditHealth(tree);
   if (health.totalProblems > 0) {
@@ -359,11 +190,7 @@ export async function auditAgent(
   return tree;
 }
 
-/**
- * Thrown by `auditAgent()` when a manifest doesn't fully resolve.
- * Carries the partial tree + structured health so callers can
- * inspect both without re-running.
- */
+/** Thrown by `auditAgent()` when a manifest doesn't fully resolve. */
 export class AuditError extends LoomError {
   constructor(
     message: string,
@@ -375,90 +202,34 @@ export class AuditError extends LoomError {
 }
 
 /**
- * Audit-health summary: every condition that means "this manifest
- * is NOT fully resolved." Recursive over the agent tree — a
- * sub-agent that doesn't resolve makes the parent unsoundly
- * executable too, so `totalProblems` rolls up through every
- * reachable sub-agent. Use the per-node counts (`unresolvedSources`
- * etc.) for direct attribution; use `subagents` to walk the
- * recursive structure.
+ * Audit-health summary, recursive over the agent tree. `totalProblems`
+ * rolls up through every reachable sub-agent; per-node counts give
+ * direct attribution; `subagents` walks the recursive structure.
  */
 export interface AuditHealth {
-  /**
-   * Name of the agent this health belongs to. Lets callers walk
-   * `subagents` and identify which sub-agent each child belongs
-   * to without cross-referencing the tree.
-   */
   agentName: string;
-  /**
-   * Recursive total: this node's direct problems plus every
-   * sub-agent's `totalProblems`. Zero means the manifest AND every
-   * sub-agent it can reach are fully resolved. Audit succeeds iff
-   * this is zero.
-   */
+  /** This node's problems plus every sub-agent's. Audit succeeds iff zero. */
   totalProblems: number;
-  /**
-   * This node's direct problems, sum of the per-category counts
-   * below. Useful for "which level is broken?" attribution.
-   */
+  /** This node's direct problems, sum of the per-category counts below. */
   directProblems: number;
-  /** Sources audit couldn't load (run `loom install`). */
   unresolvedSources: number;
-  /**
-   * Providers that loaded but failed to construct or initialise.
-   * Distinct from `unresolvedSources` because the package was found;
-   * the side-effecting `init()` is what broke (MCP server didn't
-   * start, declared secret missing, etc.).
-   */
+  /** Providers that loaded but failed to construct or initialise. */
   providerInitErrors: number;
-  /**
-   * Tools named in `[tools]` that no provider claimed at audit time.
-   * Typically follows a provider load/init failure but can also
-   * happen when a provider doesn't recognise the requested name
-   * (typo in the `tool` rename target, etc.).
-   */
+  /** Tools named in `[tools]` that no provider claimed at audit time. */
   unresolvedTools: number;
-  /**
-   * Tools whose `requires` capability kinds aren't granted by
-   * `[capabilities]`. The runtime fails boot on these via
-   * `assertRequires`; audit should match.
-   */
+  /** Tools whose `requires` capability kinds aren't granted by `[capabilities]`. */
   toolsMissingRequires: number;
-  /**
-   * Sub-agent capability ceiling violations (a sub-agent grants
-   * something the parent doesn't allow).
-   */
   capabilityCeilingViolations: number;
-  /**
-   * Tool `audit()` findings with severity `"error"` (e.g. bash
-   * reports sandbox-exec missing on macOS). These would block boot
-   * via the runtime audit.
-   */
+  /** Tool `audit()` findings with severity `"error"`. */
   toolAuditErrors: number;
-  /**
-   * Recursive children — one entry per reachable sub-agent
-   * (tool-declared via `tool.dependencies.subagents` AND
-   * session-declared via `session.dependencies.subagents`). The
-   * order mirrors the audit tree.
-   */
   subagents: AuditHealth[];
 }
 
 export function summariseAuditHealth(tree: CapabilityTree): AuditHealth {
   const unresolvedSources = tree.unresolvedSources.length;
-  // `loadError` providers are already counted under `unresolvedSources`.
-  // `initError` is the disjoint category: package loaded but the
-  // factory's create()/init() threw.
   const providerInitErrors = tree.providers.filter(
     (p) => p.initError && !p.loadError,
   ).length;
-  // The audit walker plants a synthetic `(cycle)` marker when it
-  // bottoms out on a recursive sub-agent declaration. That's a
-  // diagnostic for the user, not a real unresolved tool — the
-  // *parent* (the one declaring the cycle) is the place the
-  // problem materially lives, and is counted via its own
-  // `unresolvedTools` etc. Filter the synthetic markers so they
-  // don't double-count.
   const unresolvedTools = tree.unresolvedTools.filter(
     (u) => u.name !== "(cycle)",
   ).length;
@@ -480,9 +251,6 @@ export function summariseAuditHealth(tree: CapabilityTree): AuditHealth {
     capabilityCeilingViolations +
     toolAuditErrors;
 
-  // Recurse into every reachable sub-agent: those declared by tools
-  // (`tool.dependencies.subagents`) plus those declared by sessions
-  // (`session.dependencies.subagents`, surfaced as `sessionSubagents`).
   const subagentTrees: CapabilityTree[] = [
     ...tree.tools.flatMap((t) => t.subagents),
     ...tree.sessionSubagents,
@@ -505,10 +273,6 @@ export function summariseAuditHealth(tree: CapabilityTree): AuditHealth {
 }
 
 function formatAuditFailure(name: string, h: AuditHealth): string {
-  // Count how many distinct agents in the tree have a non-zero
-  // direct-problem count. Audit consumers want to know "is this
-  // broken at the top level, deep in a sub-agent, or both?" before
-  // they start reading individual messages.
   const affectedAgents = countAffectedAgents(h);
   const headerSuffix =
     affectedAgents > 1 ? ` across ${affectedAgents} agent(s)` : "";
@@ -519,11 +283,6 @@ function formatAuditFailure(name: string, h: AuditHealth): string {
   return lines.join("\n");
 }
 
-/**
- * Walk the recursive health, emitting a section per agent that has
- * direct problems. `path` accumulates the sub-agent chain so deep
- * problems are easy to locate ("parent → child → grandchild").
- */
 function appendHealthLines(
   h: AuditHealth,
   path: string[],
@@ -586,16 +345,12 @@ async function auditAgentInner(
       ? source
       : (source.manifestPath ?? `<inline:${source.name}>`);
 
-  // Cycle detection.
   const cycleKey = manifest.manifestPath ?? `<inline:${manifest.name}>`;
   if (seenManifests.has(cycleKey)) {
     return {
       manifestPath,
       name: manifest.name,
       grants: {},
-      // Storage isn't resolved for the cycle stub — we never
-      // reach the side-effecting path. Surface a placeholder so
-      // the field is non-optional but consumers see it's empty.
       storage: { path: "", source: "name", warnings: [] },
       providers: [],
       harness: {
@@ -619,23 +374,13 @@ async function auditAgentInner(
   const baseDir = manifest.manifestPath
     ? path.dirname(manifest.manifestPath)
     : process.cwd();
-  // Resolve system prompt for parity with runAgent (validates path-form).
   void (await resolveSystemPrompt(manifest, baseDir));
 
-  // ─── resolution ─────────────────────────────────────────────────────
   const builtinToolNames = new Set(nativeBuiltinNames());
   const resolved = resolveManifest(manifest, { builtinToolNames });
 
-  // ─── provider loading (lenient) ─────────────────────────────────
-  // Same machinery as `runAgent` (via `runtime/boot.js`), but where
-  // the runtime treats any provider load failure as fatal, audit
-  // collects them in `unresolvedSources` and keeps walking the tree.
-  //
-  // Storage is resolved here too so plugins that read `ctx.storage`
-  // during init() see a real path. Collision warnings surface on
-  // the audit tree (see `tree.storage.warnings`) rather than via
-  // console.warn — audit's contract is "return everything, log
-  // nothing."
+  // Provider load failures are collected (not thrown like the runtime
+  // does) so audit can keep walking the tree.
   const storage = await resolveAgentStorage(manifest);
   const factoryCtx: FactoryContext = {
     manifestDir: baseDir,
@@ -650,13 +395,9 @@ async function auditAgentInner(
     factoryCtx,
   );
 
-  // Best-effort secrets bundle so audit can construct + init
-  // provider Tools whose `create()` consults secrets (MCP being
-  // the motivating case — it injects them into the spawned
-  // server's env). `allowMissingRequired: true` keeps audit non-
-  // fatal: missing secrets simply aren't in the resulting map; the
-  // factory will surface that as `initError` on the provider
-  // summary if it actually can't proceed.
+  // Best-effort secrets so provider Tools whose `create()` consults
+  // them (e.g. MCP) can construct. Missing secrets stay absent rather
+  // than failing audit.
   let auditSecrets: Record<string, string> = {};
   try {
     const store = buildSecretStore(manifest, {});
@@ -690,10 +431,6 @@ async function auditAgentInner(
       });
     }
     providers.push(summary);
-    // Wire instance → summary lookup so the materialisation loop
-    // below can attach init errors / mcp-server info to the right
-    // entry. Source-backed: every instance pointing at this source
-    // shares the same summary.
     for (const p of resolved.providers) {
       if (
         p.kind === "provider" &&
@@ -704,10 +441,8 @@ async function auditAgentInner(
       }
     }
   }
-  // Configured-factory `[providers]` entries have no SourceSpec
-  // — they're absent from `resolved.sources`. Add a synthetic
-  // ProviderSummary per factory-backed instance so reviewers see
-  // the MCP-style provider in audit output.
+  // Configured-factory `[providers]` entries have no SourceSpec, so
+  // add a synthetic summary per factory-backed instance.
   for (const p of resolved.providers) {
     if (p.kind !== "provider" || p.source || !p.factoryName) continue;
     const summary: ProviderSummary = {
@@ -719,26 +454,20 @@ async function auditAgentInner(
     providers.push(summary);
     providerSummariesByInstanceId.set(p.id, summary);
   }
-  // Stable order: declared handles first (alphabetically), then inline.
+  // Declared handles first (alphabetically), then inline.
   providers.sort((a, b) => {
     if (a.handle && !b.handle) return -1;
     if (!a.handle && b.handle) return 1;
     return (a.handle ?? a.key).localeCompare(b.handle ?? b.key);
   });
 
-  // ─── session construction (best-effort) ────────────────
-  // Instantiate every chain link individually so we can attribute
-  // contributed tools and trusted paths to the link that produced
-  // them. We also compose them via ChainedSession when there's more
-  // than one so the rest of the audit can interact with a uniform
-  // session interface (the same way the runtime would). Per-link
-  // construction errors are recorded; we continue with the links
-  // that did succeed.
+  // Instantiate every chain link individually so contributed tools
+  // and trusted paths can be attributed to the link that produced
+  // them, then compose via ChainedSession when there's more than one.
   const trustedPaths: TrustedPath[] = [];
   let auditSession: Session | null = null;
   let sessionConstructionError: string | undefined;
   const sessionBindings = resolved.session ?? [];
-  /** Tools + trusted paths each link contributed. Aligned with `sessionBindings`. */
   const perLinkContributions: Array<{
     contributedTools: string[];
     trustedPaths: TrustedPath[];
@@ -749,7 +478,6 @@ async function auditAgentInner(
     let linkInstance: Session | null = null;
     let linkError: string | undefined;
     if (isPreBuiltSessionLayer(layer)) {
-      // Pre-built instance — nothing to construct, can't fail here.
       linkInstance = layer.instance;
       auditedSessionLinks.push(layer.instance);
     } else {
@@ -780,27 +508,19 @@ async function auditAgentInner(
       trustedPaths: [],
       ...(linkError ? { constructionError: linkError } : {}),
     });
-    void linkInstance; // populated below from per-link queries
+    void linkInstance;
   }
   if (auditedSessionLinks.length === 1) {
-    // Length-check above narrows index 0 at runtime; TS needs help.
     const [only] = auditedSessionLinks as [Session];
     auditSession = only;
   } else if (auditedSessionLinks.length > 1) {
     auditSession = new ChainedSession(auditedSessionLinks);
   }
 
-  // Per-link tool / trusted-path discovery. Querying per link lets us
-  // attribute contributions to the layer that produced them.
   const sessionToolBindings: typeof resolved.tools = [];
   const claimedSessionTools = new Set(resolved.tools.map((b) => b.toolName));
   let cursor = 0;
   for (const [i, layer] of sessionBindings.entries()) {
-    // Find the i'th layer's instance among auditedSessionLinks.
-    // perLinkContributions[i].constructionError set ⇒ no instance
-    // was created and `cursor` skips it. Both lookups are invariants
-    // of how we just built the parallel arrays, hence the runtime
-    // guards (rather than `!`) to surface any future drift.
     const slot = perLinkContributions[i];
     if (!slot) {
       throw new Error(
@@ -825,9 +545,6 @@ async function auditAgentInner(
         claimedSessionTools.add(ref.name);
         sessionToolBindings.push({
           toolName: ref.name,
-          // Route through the synthetic `"(session)"` Tools instance
-          // (added below) so sessions with their own `resolveTool` get
-          // first shot; skills-style sessions fall back to native.
           providerInstanceId: "(session)",
           toolConfig: typeof ref.config === "string" ? {} : ref.config,
           origin: originLabel,
@@ -853,13 +570,11 @@ async function auditAgentInner(
     }
   }
 
-  // ─── effective grants ───────────────────────────────────────────
   const effectiveGrants: Capabilities =
     manifest.tools === undefined && manifest.capabilities === undefined
       ? DEFAULT_TOP_LEVEL_CAPABILITIES
       : (manifest.capabilities ?? {});
 
-  // ─── tool resolution ──────────────────────────────────
   const native = buildNativeTools();
   const auditAgentRef: Agent = {
     manifest,
@@ -868,13 +583,6 @@ async function auditAgentInner(
     systemPromptCore: "",
   };
 
-  // Materialise each resolver-determined Tools instance the same way
-  // the runtime does (via `materialiseTools` from `boot.ts`).
-  // Differences from the runtime: we never call `Tools.init()` (init
-  // can have side effects), and we catch construction errors so the
-  // rest of the audit tree is still informative. The set we
-  // accumulate here is closed at the end of the function for
-  // symmetry with the runtime's cleanup path.
   const providerByInstanceId = new Map<string, Tools>();
   const auditedProviderTools: Tools[] = [];
   for (const p of resolved.providers) {
@@ -893,10 +601,6 @@ async function auditAgentInner(
         undefined,
       ));
     } catch (e) {
-      // construction failure (e.g. MCP missing a declared secret,
-      // bad config). Tools routing through this instance will
-      // surface as `unresolvedTools`; also record the error on the
-      // summary so reviewers don't have to guess why.
       if (summary) {
         summary.initError = (e as Error).message;
       }
@@ -905,8 +609,7 @@ async function auditAgentInner(
     providerByInstanceId.set(p.id, tools);
     auditedProviderTools.push(tools);
     // Best-effort init() so MCP server info + tool cache populate
-    // before we walk tool bindings. Failures get attributed to the
-    // provider summary; the tools route through unresolvedTools.
+    // before we walk tool bindings.
     if (tools.init) {
       try {
         await tools.init({
@@ -927,17 +630,12 @@ async function auditAgentInner(
         continue;
       }
     }
-    // Pull MCP server info out of the freshly-inited Tools when the
-    // instance is an MCP factory — we identify it duck-typed so we
-    // don't need a runtime import of McpServerTools (audit lives
-    // upstream of builtins/provider).
     if (summary) attachMcpServerInfo(summary, tools, resolved, p.id);
   }
 
   // Mirror the runtime's synthetic `"(session)"` Tools instance.
   // Sessions with `resolveTool` own the tools they advertise; the
-  // skills pattern (advertise without own implementation) falls
-  // through to native below.
+  // skills pattern falls through to native below.
   if (auditSession) {
     const sess = auditSession;
     providerByInstanceId.set("(session)", {
@@ -950,17 +648,10 @@ async function auditAgentInner(
     });
   }
 
-  // Mirror the runtime's synthetic `"(harness)"` Tools instance.
-  // Resolver emits `(harness)` bindings when `[tools.X] provider = "..."`
-  // matches the harness factory name (e.g. `provider = "anthropic"`).
-  // We construct the harness best-effort here so harness-routed
-  // tool bindings can be resolved against its `availableTools` /
-  // `resolveTool`. The harness factory sees the same lenient secret
-  // bundle the rest of audit uses (real keys when present, empty
-  // when not) plus a synthetic `audit-mode` stub for required keys
-  // it didn't find — the latter keeps audit fully informative even
-  // when no API key is configured (harness construction would
-  // otherwise throw, leaving `(harness)`-routed tools dangling).
+  // Mirror the runtime's synthetic `"(harness)"` Tools instance,
+  // constructing the harness best-effort so harness-routed tool
+  // bindings resolve. Required secrets the audit couldn't fetch are
+  // stubbed so construction succeeds — audit never calls the API.
   let auditHarness: Harness | undefined;
   let auditHarnessAvailableTools: string[] = [];
   if (resolved.harness) {
@@ -970,10 +661,6 @@ async function auditAgentInner(
         resolved.harness.source,
         getHarnessFactory,
       );
-      // Synthesise placeholder values for required secrets the audit
-      // couldn't fetch. The audit doesn't actually call the API; it
-      // just needs the factory's constructor to succeed so we can
-      // ask the resulting harness for its `availableTools` catalog.
       const harnessSecrets = { ...auditSecrets };
       for (const name of harnessFactory.secrets?.required ?? []) {
         if (harnessSecrets[name] === undefined) {
@@ -996,15 +683,9 @@ async function auditAgentInner(
         /* harness availableTools threw — leave empty */
       }
     } catch {
-      /* harness construction failed — tools routed through it
-         will show up as unresolved, which is the right signal */
+      /* harness construction failed — tools route as unresolved */
     }
   } else if (!("provider" in manifest.harness)) {
-    // Pre-built `Harness` instance — no factory binding, but we can
-    // still introspect it for the audit. There's no resolver-emitted
-    // `(harness)` binding to satisfy (the resolver doesn't know a
-    // factory name for pre-built instances), but `availableTools`
-    // is informational.
     auditHarness = manifest.harness as Harness;
     try {
       const catalog = (await auditHarness.availableTools?.()) ?? [];
@@ -1025,8 +706,6 @@ async function auditAgentInner(
     });
   }
 
-  // Index resolved Tools instances by id, so we can attribute each
-  // tool to its source provider (when not native).
   const instanceById = new Map<string, (typeof resolved.providers)[number]>();
   for (const p of resolved.providers) instanceById.set(p.id, p);
 
@@ -1056,12 +735,9 @@ async function auditAgentInner(
         ),
       );
     } catch {
-      // Tool construction can throw if capabilities are misconfigured;
-      // surface as unresolved for audit (the runtime will throw clearer).
       t = null;
     }
-    // Mirror the runtime's `"(session)"` → native fallback so the
-    // audit sees the same Tool shape the runtime would resolve.
+    // Mirror the runtime's `"(session)"` → native fallback.
     if (!t && binding.providerInstanceId === "(session)") {
       try {
         t = await Promise.resolve(
@@ -1084,7 +760,6 @@ async function auditAgentInner(
       continue;
     }
     resolvedTools.set(binding.toolName, t);
-    // Recurse into the tool's declared sub-agents.
     const subagents: CapabilityTree[] = [];
     for (const sub of t.dependencies?.subagents ?? []) {
       const subTree = await auditAgentInner(sub, nextSeen);
@@ -1106,20 +781,9 @@ async function auditAgentInner(
         });
       }
     }
-    // Attribute the tool to its provider, if any. Native tools have
-    // no provider attribution.
     let providerKey: string | undefined;
     let providerHandle: string | undefined;
     if (binding.providerInstanceId === "(session)") {
-      // Session-contributed tool. Find which layer claimed it by
-      // checking each link's contributedTools list, then borrow that
-      // layer's source/handle for the attribution. Without this the
-      // tool would render as `provider: builtin` even when a provider
-      // package's session owns the implementation.
-      //
-      // We always prefix with `session:` so the row reads symmetrically
-      // with `harness:anthropic` for harness-exposed tools — making
-      // it visually obvious which kind of indirection owns the tool.
       const layerIdx = perLinkContributions.findIndex((slot) =>
         slot.contributedTools.includes(binding.toolName),
       );
@@ -1128,9 +792,6 @@ async function auditAgentInner(
       const layerLabel = layerBinding
         ? sessionLayerLabel(layerBinding)
         : undefined;
-      // Only factory-backed layers carry source/handle; pre-built
-      // instances have neither (we still prefix — the label says
-      // "<pre-built Session instance>" so the prefix isn't redundant).
       if (layerBinding && !isPreBuiltSessionLayer(layerBinding)) {
         if (layerBinding.source) {
           providerKey = sourceSpecKey(layerBinding.source);
@@ -1140,11 +801,6 @@ async function auditAgentInner(
         ? `session:${layerLabel}`
         : "session:<unknown>";
     } else if (binding.providerInstanceId === "(harness)") {
-      // Harness-exposed server tool. Attribute it to the harness
-      // factory (e.g. "anthropic") so the audit row doesn't render
-      // as `provider: builtin` — these tools are very much not
-      // builtins; they're dispatched API-side by the harness's
-      // upstream provider.
       if (resolved.harness?.factoryName) {
         providerHandle = `harness:${resolved.harness.factoryName}`;
       } else if (!("provider" in manifest.harness)) {
@@ -1161,17 +817,12 @@ async function auditAgentInner(
         !instance.source &&
         instance.factoryName
       ) {
-        // Factory-backed (e.g. MCP) — use the synthetic provider
-        // summary key so the audit attribution lines up.
         providerKey = `factory:${instance.factoryName}#${instance.id}`;
       }
       if (instance?.providerHandle) {
         providerHandle = instance.providerHandle;
       }
     }
-    // For argument-binding tools (MCP), surface the bound arg names
-    // so reviewers see what `[capabilities]` pre-fills without
-    // having to mentally simulate `applyArgGrant`.
     const boundArgs = boundArgsForGrant(grant);
     tools.push({
       name: binding.toolName,
@@ -1189,18 +840,14 @@ async function auditAgentInner(
     });
   }
 
-  // After walking all tool bindings, compute the
-  // "advertised but unexposed" set per factory-backed provider so
-  // audit reviewers can see what the underlying MCP server offered
-  // that the manifest didn't opt into.
+  // Compute the "advertised but unexposed" set per factory-backed
+  // provider — tools the MCP server offered that the manifest didn't
+  // opt into.
   for (const [instanceId, summary] of providerSummariesByInstanceId) {
     if (!summary.mcpServer) continue;
     const exposed = new Set<string>();
     for (const binding of resolved.tools) {
       if (binding.providerInstanceId !== instanceId) continue;
-      // The dispatched MCP-tool name is either `config.tool`
-      // (the provider-agnostic rename field) or the model-facing
-      // binding name. Reflect both for safety.
       const dispatched =
         typeof binding.toolConfig.tool === "string"
           ? (binding.toolConfig.tool as string)
@@ -1216,7 +863,6 @@ async function auditAgentInner(
       .sort();
   }
 
-  // Clean up audit-built Tools instances (skip close errors — they're not fatal here).
   await native.close?.();
   for (const p of auditedProviderTools) {
     try {
@@ -1233,12 +879,30 @@ async function auditAgentInner(
     }
   }
 
-  // ─── secrets ────────────────────────────────────────────────────
   const secrets = collectSecrets(manifest, resolved, resolvedTools, toolsIndex);
 
-  // ─── session-declared subagents (pre-built instance form only) ──
-  // Arrays are SessionSpec[] chains; only the non-array, no-provider
-  // shape is a pre-built `Session` instance.
+  // Annotate each secret with where it would resolve from, walking the same
+  // store tiers the runtime uses (highest priority first). Best-effort: a
+  // misconfigured store never aborts the audit.
+  const secretTiers = describeSecretStores(manifest, {});
+  for (const secret of secrets) {
+    for (const tier of secretTiers) {
+      let value: string | null = null;
+      try {
+        value = await tier.store.get(secret.name);
+      } catch {
+        continue;
+      }
+      if (value !== null && value.length > 0) {
+        secret.resolvedFrom = tier.label;
+        break;
+      }
+    }
+  }
+
+  // Session-declared subagents (pre-built instance form only): arrays
+  // are SessionSpec[] chains; only the non-array, no-provider shape is
+  // a pre-built `Session` instance.
   const sessionSubagents: CapabilityTree[] = [];
   if (
     manifest.session &&
@@ -1253,7 +917,6 @@ async function auditAgentInner(
     }
   }
 
-  // ─── harness / session summaries ──────────────────────────
   const harnessSummary = buildHarnessSummary(
     manifest,
     resolved,
@@ -1267,7 +930,6 @@ async function auditAgentInner(
   );
   const sessionSummary = sessionLayerSummaries?.[0];
 
-  // ─── §1.6: capability-ceiling check ─────────────────────────────
   const capabilityCeilingViolations = checkCapabilityCeiling(
     manifest.name,
     manifestPath,
@@ -1285,11 +947,8 @@ async function auditAgentInner(
     storage: {
       path: storage.path,
       source: storage.source,
-      // Storage collision warnings only surface on the top-level
-      // audit. A sub-agent inherits its identity from a parent that
-      // already opened the same storage (and may have surfaced the
-      // collision there); repeating the warning per sub-agent is
-      // noise the user can't act on from inside a sub-tree.
+      // Collision warnings only on the top-level audit; sub-agents
+      // inherit identity from a parent that already reported them.
       warnings: seenManifests.size === 0 ? storage.warnings : [],
     },
     providers,
@@ -1309,8 +968,6 @@ async function auditAgentInner(
   };
 }
 
-// ─── factory summaries ───────────────────────────────────────────────────
-
 function buildHarnessSummary(
   manifest: AgentManifest,
   resolved: ReturnType<typeof resolveManifest>,
@@ -1329,8 +986,6 @@ function buildHarnessSummary(
   }
   const binding = resolved.harness;
   if (!binding) {
-    // Shouldn't happen — manifest.harness has `kind` but resolver
-    // didn't produce a binding. Defensive fallback.
     return {
       display: "<unknown>",
       config: {},
@@ -1368,10 +1023,9 @@ function buildHarnessSummary(
 }
 
 /**
- * Build one audit summary per session layer (or a single-element
- * array for a pre-built `Session` instance). Returns undefined when
- * the manifest has no `[session]` block at all — the runtime applies
- * the default chain implicitly, which the audit reflects by omission.
+ * One audit summary per session layer. Returns undefined when the
+ * manifest has no `[session]` block (the runtime applies the default
+ * chain implicitly, reflected here by omission).
  */
 function buildSessionLayerSummaries(
   manifest: AgentManifest,
@@ -1385,7 +1039,6 @@ function buildSessionLayerSummaries(
 ): SessionAuditSummary[] | undefined {
   if (!manifest.session) return undefined;
 
-  // Pre-built `Session` instance — single-link summary.
   if (!Array.isArray(manifest.session) && !("provider" in manifest.session)) {
     return [
       {
@@ -1468,23 +1121,15 @@ function buildSessionLayerSummaries(
   });
 }
 
-/**
- * Human-readable identifier for a `ResolvedSessionLayer`, used in
- * audit error messages and origin labels. Factory-backed layers
- * fall back to their factory name; pre-built instances render as
- * `(pre-built)`.
- */
+/** Human-readable identifier for a `ResolvedSessionLayer`. */
 function sessionLayerLabel(layer: ResolvedSessionLayer): string {
   return isPreBuiltSessionLayer(layer)
     ? "(pre-built)"
     : (layer.providerHandle ?? layer.factoryName);
 }
 
-// ─── helpers ──────────────────────────────────────────────────────────────
-
-// `defaultProviderName` and `lookupFactoryByBinding` live in
-// `runtime/boot.ts` and are imported above (aliased) so the audit and
-// the runtime share the same lookup rules.
+// Aliased re-exports of boot helpers so audit and runtime share the
+// same factory lookup rules.
 const defaultProviderName = bootDefaultProviderName;
 const lookupFactoryByBinding = bootLookupFactoryByBinding;
 
@@ -1502,14 +1147,9 @@ function computeMissing(
 }
 
 /**
- * §1.6 implementation. For each sub-agent, check that every entry in
- * its `[capabilities]` table is contained by the parent's grant for
- * the same tool key (using `defaultContains` from manifest/capabilities).
- *
- * This is the **static** version of the runtime check that the
- * sub-agent would perform at spawn time. Audit walks ahead of the
- * runtime so authors see the violation before they hit it during
- * a turn.
+ * Static version of the runtime spawn-time check: each sub-agent's
+ * `[capabilities]` entries must be contained by the parent's grant for
+ * the same tool key. See §1.6 of the manifest spec.
  */
 function checkCapabilityCeiling(
   _parentName: string,
@@ -1536,20 +1176,10 @@ function checkCapabilityCeiling(
 }
 
 /**
- * Roll up every secret name the manifest's components declare.
- *
- * Sources:
- *   - harness factory's `secrets` (when reachable from the registry)
- *   - session factory's `secrets`
- *   - every native-resolved tool's `secrets`
- *   - every provider-Tools contribution's static `secrets` AND
- *     per-instance `instanceSecretNeeds(config)` (the MCP factory's
- *     `secrets = { LOOM_NAME = "ENV_VAR" }` map flows through this
- *     path)
- *
- * The provider walk mirrors the runtime's `collectPhase1SecretNeeds`
- * so reviewers see the same set of names the SDK would actually
- * pull from the secret store at boot.
+ * Roll up every secret name the manifest's components declare —
+ * harness, session, tools, and provider-Tools contributions (both
+ * static `secrets` and per-instance `instanceSecretNeeds(config)`).
+ * Mirrors the runtime's `collectPhase1SecretNeeds`.
  */
 function collectSecrets(
   manifest: AgentManifest,
@@ -1577,8 +1207,6 @@ function collectSecrets(
     }
   };
 
-  // Harness factory needs (skipped when manifest.harness is a pre-built
-  // instance — no factory to query for declared secrets).
   if (resolved.harness) {
     try {
       const f = getHarnessFactory(resolved.harness.factoryName);
@@ -1587,9 +1215,6 @@ function collectSecrets(
       /* unknown harness — skip */
     }
   }
-  // Session factory needs (per chain link). Pre-built instances
-  // bring their own state; the audit can't see what secrets they
-  // closed over at construction time.
   for (const layer of resolved.session ?? []) {
     if (isPreBuiltSessionLayer(layer)) continue;
     try {
@@ -1603,19 +1228,10 @@ function collectSecrets(
       /* unknown session — skip */
     }
   }
-  // Tool needs.
   for (const [name, tool] of tools) {
     addNeeds(tool.secrets, `tool:${name}`);
   }
 
-  // Provider-Tools contribution needs. Walk every materialised
-  // provider instance, locate its contribution registration (via
-  // the source-indexed `toolsIndex` for source-backed providers, or
-  // the built-in/SDK Tools-factory registry for configured-factory
-  // entries), and capture both the static `secrets` field and the
-  // per-instance `instanceSecretNeeds(config)` map. This is what
-  // surfaces e.g. an MCP server's `secrets = { MOCK_API_KEY = "…" }`
-  // on the audit tree without having to call into the live process.
   for (const instance of resolved.providers) {
     if (instance.kind !== "provider") continue;
     let contribution:
@@ -1638,9 +1254,6 @@ function collectSecrets(
       contribution = findToolsFactory(instance.factoryName);
     }
     if (!contribution) continue;
-    // Label: prefer the user-declared `[providers]` handle when
-    // present so reviewers can trace a secret back to the manifest
-    // entry that asked for it; fall back to the contribution name.
     const label = instance.providerHandle
       ? `provider:${instance.providerHandle}`
       : `provider:${contribution.name}`;
@@ -1679,11 +1292,6 @@ function collectSecrets(
   return out;
 }
 
-/**
- * Render an origin label for a factory-backed `ProviderInstance`.
- * Mirrors `resolver.ts`'s `originLabel` but lives here so the audit
- * doesn't need to import the resolver's internals.
- */
 function originLabelFor(
   p: ReturnType<typeof resolveManifest>["providers"][number],
 ): string {
@@ -1693,12 +1301,7 @@ function originLabelFor(
   return "(factory-backed)";
 }
 
-/**
- * If `tools` looks like an MCP `McpServerTools` instance — we duck-
- * type via the public `serverInfo` / `toolsCache` fields — attach
- * the server info to the provider summary so reviewers see
- * `mcp-server-name 1.2.3` in the audit output.
- */
+/** Duck-typed: attach MCP `serverInfo` to the summary when present. */
 function attachMcpServerInfo(
   summary: ProviderSummary,
   tools: Tools,
@@ -1723,11 +1326,7 @@ function attachMcpServerInfo(
   };
 }
 
-/**
- * Surface the arg names that a per-arg capability grant pre-binds.
- * Used by the audit output so reviewers can see which inputs the
- * model never gets to choose.
- */
+/** Arg names a per-arg capability grant pre-binds (scalar literals). */
 function boundArgsForGrant(grant: CapabilitySet | undefined): string[] {
   if (
     !grant ||
@@ -1743,7 +1342,6 @@ function boundArgsForGrant(grant: CapabilitySet | undefined): string[] {
     if (value === "*") continue;
     if (Array.isArray(value)) continue;
     if (typeof value === "object") continue;
-    // Scalar: it's a literal binding.
     out.push(arg);
   }
   return out.sort();
@@ -1768,9 +1366,8 @@ function stubSession(): Session {
   };
 }
 
-/** Render options for `formatCapabilityTree`. */
 export interface FormatCapabilityTreeOptions {
-  /** ANSI colour on/off. Default true. Pass false when piping to a file. */
+  /** ANSI colour on/off. Default true. */
   color?: boolean;
   /** Internal: starting indent depth for recursive calls. */
   indent?: number;
@@ -1798,12 +1395,11 @@ export function formatCapabilityTree(
   const pad = "  ".repeat(indent);
   const lines: string[] = [];
 
-  // Header.
   lines.push(
     `${pad}${p.bold(p.cyan(tree.name))}  ${p.dim(`(${tree.manifestPath})`)}`,
   );
 
-  // Storage. Hidden when the cycle stub left it empty.
+  // Hidden when the cycle stub left storage empty.
   if (tree.storage.path) {
     const sourceTag =
       tree.storage.source === "storage_id"
@@ -1817,11 +1413,9 @@ export function formatCapabilityTree(
     }
   }
 
-  // Providers.
   if (tree.providers.length > 0) {
     lines.push(`${pad}  ${p.bold("providers:")}`);
     for (const pl of tree.providers) {
-      // Factory-backed providers (e.g. MCP) get a `→ factory` hint.
       let label: string;
       if (pl.factoryName) {
         label = pl.handle
@@ -1857,10 +1451,6 @@ export function formatCapabilityTree(
     }
   }
 
-  // Harness. Headline reads `harness: <name> via <source>` so it
-  // mirrors the tools section's `- <name> via <provider>` format.
-  // `source` here is the source key (when factory-backed) or
-  // `builtin` (when the factory is in the built-in registry).
   {
     const h = tree.harness;
     const status = h.resolved
@@ -1875,16 +1465,10 @@ export function formatCapabilityTree(
         `${pad}    ${p.dim("config:")} ${p.dim(formatConfig(h.config))}`,
       );
     }
-    // The catalog of harness-exposed tools (`availableTools`) is
-    // intentionally NOT rendered here — it's discoverable via
-    // `loom providers list` (which surfaces built-in harnesses
-    // alongside installed npm provider packages). Keeping it out of
-    // the per-agent audit avoids a tutorial sentence on every run.
+    // availableTools deliberately not rendered — discoverable via
+    // `loom providers list`.
   }
 
-  // Session. Renders the layers as N indented blocks under a single
-  // `session:` heading. Singleton sessions (no `layers`) produce the
-  // same one-block output as before.
   const layers = tree.sessionLayers ?? (tree.session ? [tree.session] : []);
   if (layers.length > 0) {
     if (layers.length === 1) {
@@ -1912,7 +1496,6 @@ export function formatCapabilityTree(
     }
   }
 
-  // Secret allowlist.
   if (tree.secretAllowlist !== undefined) {
     const txt =
       tree.secretAllowlist === "*"
@@ -1923,24 +1506,13 @@ export function formatCapabilityTree(
     lines.push(`${pad}  ${p.bold("[agent].secrets allowlist:")} ${txt}`);
   }
 
-  // Tools.
   if (tree.tools.length > 0) {
     lines.push(`${pad}  ${p.bold("tools:")}`);
     for (const t of tree.tools) {
-      // Headline: name + provider attribution. The `via` reads
-      // naturally and replaces the older two-line layout (where
-      // `provider:` lived on its own row). Origin (`[tools.X]` /
-      // `(session link N: layer)`) is elided because the `via`
-      // label already carries the kind+name; the per-source
-      // breakdown lives in `providers:` at the top.
       const providerStr = ` ${p.dim("via")} ${toolProviderLabel(t, p)}`;
       lines.push(
         `${pad}    ${p.dim("-")} ${p.bold(p.yellow(t.name))}${providerStr}`,
       );
-      // Capability summary on its own sub-line, with MISSING
-      // annotations folded in alongside. Elide entirely when the
-      // tool has no required/optional kinds and nothing's missing
-      // — the row collapses to a single line in that case.
       const reqStr =
         t.requires.length > 0
           ? `requires ${t.requires.map((r) => p.green(`'${r}'`)).join(", ")}`
@@ -1957,12 +1529,7 @@ export function formatCapabilityTree(
       if (capsLine.length > 0) {
         lines.push(`${pad}      ${capsLine}`);
       }
-      // The grant itself is rendered once in the `capabilities granted:`
-      // section below — repeating it per tool just doubles the noise.
-      // Bound args render below.
       if (t.boundArgs && t.boundArgs.length > 0) {
-        // Surface MCP-style pre-bindings inline so reviewers see
-        // which args the model never gets to choose.
         lines.push(
           `${pad}      ${p.dim("pre-bound args:")} ${p.cyan(t.boundArgs.join(", "))}`,
         );
@@ -1981,13 +1548,6 @@ export function formatCapabilityTree(
     }
   }
 
-  // The `capabilities granted:` summary block was removed: it just
-  // restates each tool's manifest grant verbatim, which reviewers
-  // can already read in `agent.toml`. The audit's job is structural
-  // — it flags MISSING required kinds inline on each tool's caps
-  // line. Grant *values* aren't the audit's concern.
-
-  // Unresolved sources.
   if (tree.unresolvedSources.length > 0) {
     lines.push(
       `${pad}  ${p.bold(p.yellow("unresolved sources"))} ${p.dim("(run `loom install` to materialise):")}`,
@@ -1998,7 +1558,6 @@ export function formatCapabilityTree(
     }
   }
 
-  // Unresolved tools.
   if (tree.unresolvedTools.length > 0) {
     lines.push(`${pad}  ${p.bold(p.yellow("unresolved tools:"))}`);
     for (const u of tree.unresolvedTools) {
@@ -2008,7 +1567,6 @@ export function formatCapabilityTree(
     }
   }
 
-  // Capability-ceiling violations.
   if (tree.capabilityCeilingViolations.length > 0) {
     lines.push(
       `${pad}  ${p.bold(p.red("capability-ceiling violations"))} ${p.dim("(subagent exceeds parent grant):")}`,
@@ -2026,11 +1584,6 @@ export function formatCapabilityTree(
     }
   }
 
-  // Note: trusted paths and session construction errors are rendered
-  // under the `session:` section above. They're also kept at the top
-  // level of CapabilityTree for back-compat.
-
-  // Session sub-agents.
   if (tree.sessionSubagents.length > 0) {
     lines.push(`${pad}  ${p.bold("session sub-agents:")}`);
     for (const sub of tree.sessionSubagents) {
@@ -2038,19 +1591,21 @@ export function formatCapabilityTree(
     }
   }
 
-  // Secrets. `requestedBy` flows inline rather than in a `(needed by ...)`
-  // parenthetical — it's the actually-informative bit for reviewers
-  // chasing who wants a secret.
   if (tree.secrets.length > 0) {
     lines.push(`${pad}  ${p.bold("secrets:")}`);
     for (const s of tree.secrets) {
       const tag = s.required ? p.yellow("[required]") : p.dim("[optional]");
+      const resolution = s.resolvedFrom
+        ? p.green(`✓ ${s.resolvedFrom}`)
+        : s.required
+          ? p.red("✗ not found")
+          : p.dim("· not set");
       const block = s.permittedByAllowlist
         ? ""
         : `  ${p.red("⚠ DENIED by [agent].secrets")}`;
-      const wanters = p.dim(s.requestedBy.join(", "));
+      const wanters = p.dim(`(needed by ${s.requestedBy.join(", ")})`);
       lines.push(
-        `${pad}    ${p.dim("-")} ${p.cyan(s.name)} ${tag}  ${wanters}${block}`,
+        `${pad}    ${p.dim("-")} ${p.cyan(s.name)} ${tag} ${resolution}  ${wanters}${block}`,
       );
     }
   }
@@ -2066,9 +1621,6 @@ function formatSessionLayerBody(
   lines: string[],
   layerIndent: string,
 ): void {
-  // Source attribution now folds into the heading via `via <source>`;
-  // body just carries the layer's config, contributions, trusted
-  // paths, and any construction error.
   const cfgKeys = Object.keys(s.config);
   if (cfgKeys.length > 0) {
     lines.push(
@@ -2108,13 +1660,7 @@ function formatConfig(cfg: Record<string, unknown>): string {
   return JSON.stringify(cfg);
 }
 
-/**
- * Source-only attribution for harness/session headlines: returns just
- * the source key (when factory-backed by a package) or `builtin`
- * (when sourced from the built-in registry). Drops the provider
- * handle because the headline already carries it (e.g. `harness:
- * anthropic via builtin` instead of `harness: anthropic via anthropic`).
- */
+/** Source key (package-backed) or `builtin` for harness/session headlines. */
 function sourceAttribution(
   summary: FactoryAuditSummary,
   p: ReturnType<typeof makePainter>,
@@ -2124,10 +1670,7 @@ function sourceAttribution(
   return p.dim("builtin");
 }
 
-/**
- * Label for the `provider:` line under each tool entry. Same shape as
- * `factoryProviderLabel`, but tools never carry a pre-built instance.
- */
+/** Provider label for a tool entry. */
 function toolProviderLabel(
   t: CapabilityTree["tools"][number],
   p: ReturnType<typeof makePainter>,
@@ -2163,5 +1706,4 @@ function severityIcon(
   return { icon: "✗", paint: p.red };
 }
 
-// Re-export the ResolvedSource type for consumers that read trees.
 export type { ResolvedSource };

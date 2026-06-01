@@ -11,11 +11,8 @@ import {
 } from "../src/runtime/sandbox/sandbox-exec.js";
 
 describe("sandboxEngaged", () => {
-  it("returns false for the whole-tool star grant (opt-out)", () => {
+  it("opts out only for the whole-tool star grant", () => {
     expect(sandboxEngaged("*")).toBe(false);
-  });
-
-  it("returns true for any structured grant, even empty", () => {
     expect(sandboxEngaged({})).toBe(true);
     expect(sandboxEngaged({ commands: "*" })).toBe(true);
     expect(sandboxEngaged({ commands: ["pwd"] })).toBe(true);
@@ -23,47 +20,39 @@ describe("sandboxEngaged", () => {
 });
 
 describe("buildBashProfile", () => {
-  it("throws when given a `*` grant (caller should have checked first)", async () => {
+  it("throws on a `*` grant", async () => {
     await expect(buildBashProfile("*")).rejects.toThrow(/no sandbox/);
   });
 
-  it("emits version + default-deny + bash-baseline rules", async () => {
+  it("emits the version, default-deny, and bash baseline rules", async () => {
     const profile = await buildBashProfile({});
     expect(profile).toContain("(version 1)");
     expect(profile).toContain("(deny default)");
     expect(profile).toContain("(allow process-fork)");
     expect(profile).toContain("(allow signal (target self))");
-    // Metadata everywhere — needed for getcwd() and ls path display
     expect(profile).toContain("(allow file-read-metadata)");
-    // System library reads needed for bash to even load
     expect(profile).toContain('(allow file-read* (subpath "/usr"))');
     expect(profile).toContain('(allow file-read* (subpath "/System"))');
+    // Without this literal bash exits with SIGABRT before any command runs.
+    expect(profile).toContain('(allow file-read* (literal "/"))');
+    expect(profile).not.toContain("(allow network*)");
   });
 
-  it("emits process-exec when commands is granted star (shell mode)", async () => {
-    const profile = await buildBashProfile({ commands: "*" });
-    expect(profile).toContain("(allow process-exec*)");
+  it("allows process-exec for both shell and argv command grants", async () => {
+    expect(await buildBashProfile({ commands: "*" })).toContain(
+      "(allow process-exec*)",
+    );
+    expect(await buildBashProfile({ commands: ["pwd", "cat"] })).toContain(
+      "(allow process-exec*)",
+    );
   });
 
-  it("emits process-exec when commands is a list (argv mode)", async () => {
-    // Argv mode's narrowing is structural at the schema layer; the
-    // sandbox still allows process-exec so the chosen program can
-    // run its own helpers (git → git-helpers, etc.).
-    const profile = await buildBashProfile({ commands: ["pwd", "cat"] });
-    expect(profile).toContain("(allow process-exec*)");
-  });
-
-  it("emits per-path subpath rules for path allowlists", async () => {
-    // Use a real existing dir so canonicalPath returns a stable
-    // canonical form (and on macOS, /tmp/x doesn't exist so canonical
-    // path resolves the existing parent).
+  it("emits canonicalized per-path subpath rules for path allowlists", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sb-paths-"));
     try {
       const profile = await buildBashProfile({ paths: [dir, "/usr/bin"] });
-      // /usr/bin always exists and is itself canonical on macOS.
       expect(profile).toContain('(allow file-read*  (subpath "/usr/bin"))');
       expect(profile).toContain('(allow file-write* (subpath "/usr/bin"))');
-      // The tmp dir is canonicalized (e.g. /var/folders/… → /private/var/folders/…).
       const canonical = await fs.realpath(dir);
       expect(profile).toContain(`(allow file-read*  (subpath "${canonical}"))`);
     } finally {
@@ -77,21 +66,17 @@ describe("buildBashProfile", () => {
     expect(profile).toContain("(allow file-write*)");
   });
 
-  it("emits network rule only when network is granted star", async () => {
+  it("emits the network rule only for network = star", async () => {
     expect(await buildBashProfile({ network: "*" })).toContain(
       "(allow network*)",
     );
     expect(await buildBashProfile({})).not.toContain("(allow network*)");
-    // Empty list = explicit deny; no rule emitted (default-deny covers it)
     expect(await buildBashProfile({ network: [] })).not.toContain(
       "(allow network*)",
     );
   });
 
   it("escapes embedded quotes and backslashes in path strings", async () => {
-    // Non-existent paths fall through canonicalPath's ENOENT recursion
-    // and end up resolving the parent (root) and re-appending the
-    // basename verbatim, so escaping is exercised on the literal value.
     const profile = await buildBashProfile({
       paths: ['/has"quote', "/has\\back"],
     });
@@ -99,12 +84,10 @@ describe("buildBashProfile", () => {
     expect(profile).toContain('(subpath "/has\\\\back")');
   });
 
-  it("resolves `./` against the current process.cwd()", async () => {
-    // The default grant uses `paths: ["./"]`; the profile must embed
-    // the absolute, canonical cwd, not the literal string.
+  it("resolves `./` against the canonical process.cwd()", async () => {
     const profile = await buildBashProfile({ commands: "*", paths: ["./"] });
-    expect(profile).toContain("(allow process-exec*)");
     const canonicalCwd = await fs.realpath(process.cwd());
+    expect(profile).toContain("(allow process-exec*)");
     expect(profile).toContain(
       `(allow file-read*  (subpath "${canonicalCwd}"))`,
     );
@@ -114,63 +97,37 @@ describe("buildBashProfile", () => {
     expect(profile).not.toContain('(subpath "./")');
     expect(profile).not.toContain("(allow network*)");
   });
-
-  it("includes the file-read root literal needed for cwd resolution", async () => {
-    // Without (allow file-read* (literal "/")) bash exits with SIGABRT
-    // before running any user command. Regression guard.
-    const profile = await buildBashProfile({});
-    expect(profile).toContain('(allow file-read* (literal "/"))');
-  });
 });
 
 describe("validateBashGrant", () => {
-  it("`*` whole-tool grant is exempt from validation", () => {
+  it("accepts the star, empty, and command grants", () => {
     expect(() => validateBashGrant("*")).not.toThrow();
-  });
-
-  it("empty `{}` grant is fine (default-deny everywhere)", () => {
     expect(() => validateBashGrant({})).not.toThrow();
-  });
-
-  it("accepts commands = '*' (shell mode)", () => {
     expect(() => validateBashGrant({ commands: "*" })).not.toThrow();
-  });
-
-  it("accepts commands = string[] (argv mode — schema-level narrowing)", () => {
-    // Argv mode is honoured on both platforms because the narrowing
-    // is structural at the bash tool's dispatch layer, not enforced
-    // via sandbox-exec's exec rules.
     expect(() => validateBashGrant({ commands: ["ls", "rg"] })).not.toThrow();
     expect(() => validateBashGrant({ commands: ["pwd"] })).not.toThrow();
   });
 
-  it("rejects empty commands array (would expose a useless tool)", () => {
-    expect(() => validateBashGrant({ commands: [] })).toThrow(
-      /non-empty array/,
-    );
-  });
-
-  it("rejects non-string entries in commands", () => {
+  it("rejects empty or non-string command lists", () => {
+    expect(() => validateBashGrant({ commands: [] })).toThrow(/non-empty array/);
     expect(() =>
       validateBashGrant({ commands: ["ls", 42] } as unknown as never),
     ).toThrow(/non-empty array/);
   });
 
-  it("accepts paths = '*' or string array; rejects other shapes", () => {
+  it("accepts paths = star or string array; rejects other shapes", () => {
     expect(() => validateBashGrant({ paths: "*" })).not.toThrow();
     expect(() => validateBashGrant({ paths: ["./", "/tmp"] })).not.toThrow();
     expect(() => validateBashGrant({ paths: [] })).not.toThrow();
-    // Number is not a valid path value.
     expect(() => validateBashGrant({ paths: 42 } as unknown as never)).toThrow(
       /array of strings/,
     );
-    // Mixed array with non-string is rejected.
     expect(() =>
       validateBashGrant({ paths: ["./", 42] } as unknown as never),
     ).toThrow(/array of strings/);
   });
 
-  it("rejects network host allowlists (sandbox-exec can't filter by host)", () => {
+  it("rejects network host allowlists, which sandbox-exec cannot filter", () => {
     expect(() => validateBashGrant({ network: "*" })).not.toThrow();
     expect(() => validateBashGrant({ network: [] })).not.toThrow();
     expect(() => validateBashGrant({ network: ["example.com"] })).toThrow(
@@ -178,7 +135,7 @@ describe("validateBashGrant", () => {
     );
   });
 
-  it("accepts env = '*' or string array; rejects other shapes", () => {
+  it("accepts env = star or string array; rejects other shapes", () => {
     expect(() => validateBashGrant({ env: "*" })).not.toThrow();
     expect(() => validateBashGrant({ env: ["PATH", "AWS_*"] })).not.toThrow();
     expect(() =>

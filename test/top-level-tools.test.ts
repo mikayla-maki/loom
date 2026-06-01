@@ -1,16 +1,4 @@
-/**
- * Tests for the top-level `[tools]` field on AgentManifest.
- *
- * Semantics under test:
- *   - field absent          → default builtin set auto-loads
- *   - field empty `{}`      → no top-level tools at all
- *   - field with entries    → exactly those, no defaults
- *   - top-level tools surface in audit with introducedBy === "(top-level)"
- */
-
 import { describe, expect, it } from "vitest";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 import { runAgent } from "../src/sdk/run-agent.js";
@@ -19,6 +7,7 @@ import type { AgentManifest, Capabilities } from "../src/types/manifest.js";
 import type { TurnScript, TurnStep } from "../src/builtins/harness/test.js";
 import type { Runtime } from "../src/types/interfaces.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
+import { withTmpDir } from "./helpers/tmp.js";
 
 function buildAgent(opts: {
   tools?: AgentManifest["tools"];
@@ -40,15 +29,23 @@ function buildAgent(opts: {
   };
 }
 
+function toolNames(agent: Awaited<ReturnType<typeof runAgent>>): string[] {
+  return agent.agentState.toolTable
+    .list()
+    .map((t) => t.name)
+    .sort();
+}
+
 describe("top-level [tools]", () => {
   it("absent field auto-loads the default builtin set", async () => {
     const agent = await runAgent(buildAgent({}), {});
     try {
-      const names = agent.agentState.toolTable
-        .list()
-        .map((t) => t.name)
-        .sort();
-      expect(names).toEqual(["bash", "edit_file", "read_file", "write_file"]);
+      expect(toolNames(agent)).toEqual([
+        "bash",
+        "edit_file",
+        "read_file",
+        "write_file",
+      ]);
     } finally {
       await agent.close();
     }
@@ -67,37 +64,24 @@ describe("top-level [tools]", () => {
     const agent = await runAgent(
       buildAgent({
         tools: { bash: "builtin" },
-        // bash requires `commands`; grant it.
         capabilities: { bash: { commands: "*" } },
       }),
       {},
     );
     try {
-      const names = agent.agentState.toolTable.list().map((t) => t.name);
-      expect(names).toEqual(["bash"]);
+      expect(toolNames(agent)).toEqual(["bash"]);
     } finally {
       await agent.close();
     }
   });
 
-  it("explicit [tools] without [capabilities] gets nothing-but-smart-defaults", async () => {
-    // When [tools] is declared explicitly, no default cap bundle
-    // applies. Tools with no `requires` (read_file is `optional`,
-    // not `requires`) construct fine and rely on smart defaults.
-    // We pair read_file (a builtin) with echo from a test provider
-    // to confirm the no-default-cap-bundle path doesn't trip up
-    // either route.
+  it("explicit [tools] without [capabilities] relies on smart defaults", async () => {
     const agent = await runAgent(
-      buildAgent({
-        tools: { read_file: "builtin", echo: "builtin" },
-        // No [capabilities] section at all.
-      }),
+      buildAgent({ tools: { read_file: "builtin", echo: "builtin" } }),
       { providers: [echoTestProvider] },
     );
     try {
-      const names = agent.agentState.toolTable.list().map((t) => t.name);
-      expect(names.sort()).toEqual(["echo", "read_file"]);
-      // read_file should describe its smart default in the description.
+      expect(toolNames(agent)).toEqual(["echo", "read_file"]);
       const rf = agent.agentState.toolTable
         .list()
         .find((t) => t.name === "read_file");
@@ -108,13 +92,9 @@ describe("top-level [tools]", () => {
   });
 
   it("explicit [tools] with bash but no `commands` grant fails boot", async () => {
-    // bash has `requires: ["commands"]`; without a grant, boot fails.
     await expect(
       runAgent(
-        buildAgent({
-          tools: { bash: "builtin" },
-          capabilities: { bash: {} },
-        }),
+        buildAgent({ tools: { bash: "builtin" }, capabilities: { bash: {} } }),
         {},
       ),
     ).rejects.toThrow(/missing required.*commands/);
@@ -122,12 +102,6 @@ describe("top-level [tools]", () => {
 
   it("audit: top-level tools carry a tools-table introducedBy label on the tree", async () => {
     const tree = await auditAgent(buildAgent({}));
-    // v4: each tool's `introducedBy` records its `[tools.<name>]`
-    // origin (or `(default builtin)` for the auto-loaded set when
-    // [tools] is absent). The formatter no longer prints the origin
-    // — the `via <provider>` attribution carries the equivalent info
-    // — but the structured field is still preserved on the tree for
-    // programmatic consumers.
     expect(
       tree.tools.every(
         (t) =>
@@ -136,7 +110,6 @@ describe("top-level [tools]", () => {
       ),
     ).toBe(true);
     const printed = formatCapabilityTree(tree, { color: false });
-    // The headline carries the provider attribution via `via X`.
     expect(printed).toMatch(/\bbash\s+via\s+/);
   });
 
@@ -158,7 +131,6 @@ describe("top-level [tools]", () => {
       await agent.close();
     }
     expect(captured).toContain("You are a focused engineer.");
-    // Tools listed in the Tool Reference section.
     expect(captured).toContain("# Tool Reference");
     expect(captured).toMatch(/`bash`/);
     expect(captured).toMatch(/`read_file`/);
@@ -167,17 +139,11 @@ describe("top-level [tools]", () => {
   });
 
   it("end-to-end: agent uses default tools (write_file then read_file)", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "loom-tlt-e2e-"));
-    try {
+    await withTmpDir("loom-tlt-e2e-", async (root) => {
       const target = path.join(root, "hello.txt");
-      // The default tools are configured for "./" — i.e., process.cwd().
-      // Override to root via [capabilities] so read/write are inside the grant.
       const agent = await runAgent(
         buildAgent({
-          tools: {
-            write_file: "builtin",
-            read_file: "builtin",
-          },
+          tools: { write_file: "builtin", read_file: "builtin" },
           capabilities: {
             write_file: { paths: [root] },
             read_file: { paths: [root] },
@@ -220,8 +186,6 @@ describe("top-level [tools]", () => {
       } finally {
         await agent.close();
       }
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
+    });
   });
 });

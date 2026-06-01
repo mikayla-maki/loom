@@ -1,25 +1,3 @@
-/**
- * runAgent — top-level SDK entry point. Turns an agent.toml (or parsed
- * manifest) into a `RunningAgent`.
- *
- * Boot pipeline (v5):
- *   1. Parse manifest → AgentManifest.
- *   2. Resolve manifest → ResolvedManifest (Tools instances,
- *      tool bindings, distinct SourceSpecs, harness/session bindings).
- *   3. Load each distinct provider source (`register()` runs,
- *      contributing Tools / harness / session registrations).
- *   4. Phase-1 secrets (harness + session + Tools contribution needs).
- *   5. Instantiate harness + session from their bindings.
- *   6. Materialise each Tools instance (`contribution.create(config,
- *      ctx, secrets, parent?)`), then `Tools.init()` in registration
- *      order.
- *   7. Bind each tool to its specific Tools instance (no chain;
- *      one Tools instance per tool per the resolver's output).
- *   8. Phase-2 secrets (per-tool needs).
- *   9. Validate `[capabilities]` grants + secret allowlist; runtime audit.
- *  10. Build ToolTable + AgentState + RunningAgent.
- */
-
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -106,27 +84,9 @@ import { ChainedSession } from "../runtime/session-chain.js";
 
 import { RunningAgentImpl, type RunningAgent } from "./running-agent.js";
 
-/**
- * Loom's package version, read from `package.json` at module load.
- * Surfaced to plugins via {@link FactoryContext.loomVersion},
- * stamped into ACP `agentInfo`, and written to `lock.toml` by
- * `loom install`. Reading it dynamically (rather than hardcoding)
- * keeps every consumer in sync with whatever version this build
- * shipped — no drift between `package.json` and the runtime.
- */
 export const LOOM_VERSION: string = readLoomVersion();
 
 function readLoomVersion(): string {
-  // The compiled CLI / SDK lives at `dist/sdk/run-agent.js`, so
-  // `package.json` is three `..` up. The same path shape holds for
-  // the `src/sdk/run-agent.ts` source under vitest (it's also two
-  // directories deep inside the project root). Resolve relative
-  // to this module's URL so the lookup survives no matter what
-  // CWD the user invokes from.
-  //
-  // Errors fall back to `"0.0.0-unknown"` rather than throwing —
-  // a missing or malformed `package.json` shouldn't take down
-  // every Loom command.
   try {
     const thisFile = fileURLToPath(import.meta.url);
     const pkgPath = path.resolve(thisFile, "..", "..", "..", "package.json");
@@ -141,30 +101,12 @@ function readLoomVersion(): string {
   return "0.0.0-unknown";
 }
 
-/**
- * Default session chain applied when the manifest omits the
- * `[session]` block entirely. Outer-to-inner: `skills` auto-loads
- * any agent skills under `~/.skills` (silently no-op when the
- * directory is absent); `compacting` bounds context growth;
- * `in-memory` owns volatile storage. Users who want different
- * policy write a `[session]` block explicitly.
- *
- * All three layers use their factories' built-in defaults
- * (`skills` scans `~/.skills`; `compacting` threshold 40 / keep 10
- * with the heuristic compactor; `in-memory` is stateless).
- */
 const DEFAULT_SESSION_CHAIN: SessionSpec[] = [
   { provider: "skills" },
   { provider: "compacting" },
   { provider: "in-memory" },
 ];
 
-/**
- * Default capability grants applied when both `[tools]` and
- * `[capabilities]` are absent. Paired with `DEFAULT_BUILTIN_TOOLS`.
- * Opt-in builtins like `find` and `spawn_subagent` carry their own
- * per-tool grants in the manifest when listed explicitly.
- */
 const DEFAULT_TOP_LEVEL_CAPABILITIES = {
   bash: { commands: "*", paths: ["./"] },
   read_file: { paths: ["./"] },
@@ -173,18 +115,17 @@ const DEFAULT_TOP_LEVEL_CAPABILITIES = {
 } as const satisfies Record<string, CapabilitySet>;
 
 export interface RunAgentOptions {
-  /** Top-priority secret store; falls through to env/XDG/keychain/file. */
+  /**
+   * Top-priority secret store. Falls through to the local `.loom-secrets`
+   * files (manifest dir, then cwd), then env, keychain, and the global
+   * `~/.config/loom/secrets.toml`. See {@link buildSecretStore}.
+   */
   secrets?: SecretsStore;
   /** Omit missing required secrets instead of throwing. */
   allowMissingSecrets?: boolean;
   /** Last-chance hook when the chain misses. */
   onMissingSecret?: OnMissingSecret;
-  /**
-   * Extra SDK-supplied Tools instances. Each is bound to a synthetic
-   * source key — tools that should route to one of these need a
-   * binding wired by the caller (the SDK direct path doesn't use
-   * the manifest's `[tools]` `provider` field).
-   */
+  /** Extra SDK-supplied Tools instances, each bound to a synthetic source key. */
   providers?: Tools[];
   /** Consent gate. Defaults to deny-all. */
   permissionHandler?: PermissionHandler;
@@ -215,21 +156,11 @@ export async function runAgent(
   source: string | AgentManifest,
   options: RunAgentOptions = {},
 ): Promise<RunningAgent> {
-  // 1. Manifest + system prompt + per-agent storage + factory context.
   const manifest = await loadManifest(source);
   const baseDir = manifest.manifestPath
     ? path.dirname(manifest.manifestPath)
     : process.cwd();
   const systemPrompt = await resolveSystemPrompt(manifest, baseDir);
-  // Resolve the storage root and surface any collision warnings
-  // via console.warn for top-level runs only. Sub-agents (spawned
-  // via `spawn_subagent` / `agent.spawnSubagent`) inherit their
-  // identity from a parent that already opened the same storage,
-  // so the collision warning has nothing actionable to say at the
-  // sub-agent level — it'd just spam stderr on every spawn.
-  // (Audit surfaces them on its tree; the runtime doesn't have a
-  // dedicated diagnostic channel yet, so stderr is the conservative
-  // default.)
   const storage = await resolveAgentStorage(manifest);
   if (!options.parent) {
     for (const w of storage.warnings) {
@@ -246,15 +177,9 @@ export async function runAgent(
     metadata: manifest.metadata ?? {},
   };
 
-  // 2. Resolve manifest to IR. Pure; throws on ambiguity / missing handles.
   const builtinToolNames = new Set(nativeBuiltinNames());
   const resolved = resolveManifest(manifest, { builtinToolNames });
 
-  // 3. Load each distinct provider source. `register()` registers
-  //    harness/session factories into the global registries and
-  //    returns contributed Tools registrations. The map below keys
-  //    contributions by (sourceKey + contributionName) so the
-  //    per-instance materialisation can look them up.
   const { toolsIndex, loadErrors } = await loadManifestProviders(
     resolved,
     factoryCtx,
@@ -264,15 +189,11 @@ export async function runAgent(
         : {}),
     },
   );
-  // Runtime is strict: any provider load failure aborts boot. (Audit
-  // collects these errors and keeps going.)
   if (loadErrors.size > 0) {
     const [first] = loadErrors.values();
     if (first) throw first;
   }
 
-  // 4. Secrets store + phase-1 needs (harness + session + provider-
-  //    contributed Tools registrations this manifest will instantiate).
   const store = buildSecretStore(manifest, options);
   const phase1Secrets = await loadSecretsBundle(
     store,
@@ -281,9 +202,6 @@ export async function runAgent(
     options.onMissingSecret,
   );
 
-  // 5. Harness + session + the self-Agent ref tools/providers see.
-  //    Pre-built instances pass through unchanged; specs resolve via
-  //    factory + config.
   const harness =
     "provider" in manifest.harness
       ? await instantiateHarness(
@@ -293,8 +211,6 @@ export async function runAgent(
           options.parent,
         )
       : (manifest.harness as Harness);
-  // Detect pre-built `Session` instance: not an array (arrays are
-  // `SessionSpec[]` chains) and not carrying a `provider` field.
   const session =
     manifest.session &&
     !Array.isArray(manifest.session) &&
@@ -308,10 +224,7 @@ export async function runAgent(
         );
   const ownAgent = buildOwnAgent(harness, session, systemPrompt, manifest);
 
-  // 6. Runtime services (per-turn abort + permission handler +
-  //    ACP client bridge). Both handler-shaped slots are `Ref`s so
-  //    the ACP server's `bindSession` can install them after
-  //    `runAgent` has returned.
+  // Ref-wrapped so the ACP server's bindSession can install them after runAgent returns.
   const permissionHolder = ref<PermissionHandler | null>(
     options.permissionHandler ?? null,
   );
@@ -321,11 +234,6 @@ export async function runAgent(
     clientBridgeHolder,
   );
 
-  // 7. Materialise + init each Tools instance the resolver asked for.
-  //    SDK-supplied Tools instances are appended afterwards under a
-  //    synthetic "(sdk)" slot — they don't participate in the
-  //    manifest's bindings but are still init'd and closed with the
-  //    rest.
   const instances = await materialiseTools_all({
     resolved,
     toolsIndex,
@@ -339,8 +247,6 @@ export async function runAgent(
     parent: options.parent,
   });
 
-  // 8. Bind tools (manifest [tools] → resolver bindings + session.tools()).
-  //    Each binding maps to a single provider instance by id.
   const effectiveCapabilities = effectiveCapabilitiesFor(manifest);
   const sessionToolBindings = await collectSessionToolBindings(session);
   const allBindings: ToolBinding[] = [
@@ -354,7 +260,6 @@ export async function runAgent(
     instances,
   );
 
-  // 9. Phase-2 secrets (per-tool needs).
   const phase2Secrets = await loadSecretsBundle(
     store,
     collectToolSecretNeeds(resolvedTools),
@@ -363,7 +268,6 @@ export async function runAgent(
   );
   const allSecrets = { ...phase1Secrets, ...phase2Secrets };
 
-  // 10. Validate grants + secret allowlist; runtime tool audit.
   assertKnownKinds(resolvedTools, effectiveCapabilities);
   assertRequires(resolvedTools, effectiveCapabilities);
   assertSecretAllowlist(resolvedTools, manifest.secrets);
@@ -371,7 +275,6 @@ export async function runAgent(
     await runRuntimeAudit(resolvedTools, options.onAuditFinding);
   }
 
-  // 11. ToolTable + AgentState + RunningAgent.
   const toolTable = buildToolTable(
     resolvedTools,
     allSecrets,
@@ -398,8 +301,6 @@ export async function runAgent(
   });
 }
 
-// ─── 1. manifest loading ──────────────────────────────────────────────────
-
 async function loadManifest(
   source: string | AgentManifest,
 ): Promise<AgentManifest> {
@@ -407,8 +308,6 @@ async function loadManifest(
   const { parseAgentManifest } = await import("../manifest/parser.js");
   return parseAgentManifest(source);
 }
-
-// ─── self-agent ref ───────────────────────────────────────────────────────
 
 function buildOwnAgent(
   harness: Harness,
@@ -424,47 +323,14 @@ function buildOwnAgent(
   };
 }
 
-// ─── 3. provider loading ────────────────────────────────────────────────────
-
-/**
- * Index of provider-contributed Tools registrations, keyed by source
- * + contribution name.
- *
- * Built when we load each distinct SourceSpec the manifest references.
- * `ToolsIndex` is the shared shape (handled by `loadManifestProviders`
- * in `runtime/boot.ts`). Each provider's contributions are indexed
- * both under their declared name AND under the package's default name
- * so the v5 "primary contribution = package name" convention
- * resolves cleanly.
- */
-
-// ─── 7. Tools instance materialisation ──────────────────────────────────
-
-/**
- * Materialised Tools instance — paired with its boot inputs so we
- * can call `init()` and report it back to the RunningAgent for cleanup.
- */
 interface MaterialisedTools {
-  /** Resolver-assigned id (`"native"`, `"p1"`, `"p2"`, …) or `"(sdk-N)"`. */
   id: string;
   tools: Tools;
-  /** Config passed to the contribution's `create()`. */
   config: Record<string, unknown>;
-  /** Filtered secrets the contribution asked for. */
   secrets: Record<string, string>;
-  /** Contribution name for diagnostics. */
   contributionName: string;
 }
 
-/**
- * Adapt a `Session` (typically the composed `ChainedSession`) into
- * the `Tools` interface so the rest of the binding flow can route
- * session-contributed tool names through it uniformly. The session
- * is reachable in the materialised list under the synthetic id
- * `"(session)"`. Sessions without `resolveTool` produce a Tools
- * whose `resolveTool` always returns null — the binding flow's
- * existing fallback chain (native → SDK) takes over.
- */
 function sessionAsTools(session: Session): Tools {
   return {
     async resolveTool(name, config, agent, capabilities) {
@@ -476,16 +342,6 @@ function sessionAsTools(session: Session): Tools {
   };
 }
 
-/**
- * Adapt a `Harness` into the `Tools` interface so the binding flow
- * can route harness-exposed tool names through it. The harness is
- * reachable in the materialised list under the synthetic id
- * `"(harness)"`. Harnesses without `resolveTool` produce a Tools
- * whose `resolveTool` always returns null — the binding will then
- * surface as unresolved (no native/SDK fallback for harness-routed
- * bindings; if the user wrote `provider = "anthropic"` they meant
- * the harness, not something else).
- */
 function harnessAsTools(harness: Harness): Tools {
   return {
     async resolveTool(name, config, agent, capabilities) {
@@ -511,10 +367,6 @@ async function materialiseTools_all(args: {
 }): Promise<MaterialisedTools[]> {
   const out: MaterialisedTools[] = [];
 
-  // Always materialise the native Tools instance, even when the
-  // resolver didn't reference it. It's stateless and cheap;
-  // session-contributed tools and SDK-direct paths can route through
-  // it without the manifest having an explicit binding.
   const hasNative = args.resolved.providers.some((p) => p.kind === "native");
   if (!hasNative) {
     out.push({
@@ -537,11 +389,6 @@ async function materialiseTools_all(args: {
       });
       continue;
     }
-    // Provider-backed instance: shared construction via boot.ts.
-    // Filter secrets to what the contribution declared interest in;
-    // we need to peek at the contribution first to do this. Both
-    // the static `secrets` field AND per-instance needs (Chunk 6's
-    // `instanceSecretNeeds(config)`) contribute to the filter.
     const peek = peekToolsContribution(args.toolsIndex, instance);
     const merged = mergeSecretNeeds(
       peek?.secrets,
@@ -564,10 +411,6 @@ async function materialiseTools_all(args: {
     });
   }
 
-  // The agent's session, adapted to the Tools interface. Routes
-  // session-contributed tool names through `session.resolveTool` (or
-  // returns null when the session doesn't implement it, in which case
-  // the binding flow's native+SDK fallback kicks in).
   out.push({
     id: "(session)",
     tools: sessionAsTools(args.session),
@@ -576,12 +419,6 @@ async function materialiseTools_all(args: {
     contributionName: "(session)",
   });
 
-  // The agent's harness, adapted to the Tools interface. Routes
-  // bindings whose `provider` matches the harness factory name
-  // through `harness.resolveTool` (used for provider-native server
-  // tools like Anthropic's `web_search`). Opt-in only — the resolver
-  // emits `(harness)` bindings only when `[tools.X] provider = "..."`
-  // explicitly names the harness factory; nothing is auto-added.
   out.push({
     id: "(harness)",
     tools: harnessAsTools(args.harness),
@@ -590,8 +427,6 @@ async function materialiseTools_all(args: {
     contributionName: "(harness)",
   });
 
-  // SDK-supplied Tools instances are appended; they're addressable only
-  // by SDK-direct callers (not by manifest [tools] entries).
   args.sdkTools.forEach((inst, i) => {
     out.push({
       id: `(sdk-${i})`,
@@ -602,9 +437,7 @@ async function materialiseTools_all(args: {
     });
   });
 
-  // Init phase. Tools instances must NOT call runtime methods inside
-  // their own init(); the contract is "init runs in registration
-  // order; runtime methods are usable once all inits have returned."
+  // Contract: init runs in registration order and must not call runtime methods until all inits return.
   for (const m of out) {
     if (!m.tools.init) continue;
     const initArgs: InitArgs = {
@@ -620,7 +453,6 @@ async function materialiseTools_all(args: {
   return out;
 }
 
-/** Best-effort peek at the contribution registration for a provider instance. */
 function peekToolsContribution(
   index: ToolsIndex,
   instance: ProviderInstance,
@@ -641,20 +473,11 @@ function peekToolsContribution(
     return undefined;
   }
   if (instance.factoryName) {
-    // Factory-backed instance — look up the built-in / SDK-registered
-    // Tools factory by name. Returns the registration directly
-    // (which is the contribution shape).
     return findToolsFactory(instance.factoryName);
   }
   return undefined;
 }
 
-// ─── 8. tool binding ──────────────────────────────────────────────────────
-
-/**
- * Per-manifest effective capability set. Defaults apply only when
- * BOTH `[tools]` and `[capabilities]` are absent.
- */
 function effectiveCapabilitiesFor(manifest: AgentManifest): Capabilities {
   if (manifest.tools === undefined && manifest.capabilities === undefined) {
     return DEFAULT_TOP_LEVEL_CAPABILITIES;
@@ -671,12 +494,6 @@ async function bindTools(
   const byId = new Map<string, MaterialisedTools>(
     instances.map((m) => [m.id, m]),
   );
-  // SDK-supplied Tools instances act as a fallback chain when the
-  // resolver-assigned instance returns null for a tool. This preserves
-  // the SDK-direct pattern (caller wires a custom Tools instance,
-  // manifest's `[tools]` doesn't specify a `provider` field, custom
-  // names get claimed by the SDK Tools) without requiring per-tool
-  // bindings.
   const sdkChain = instances.filter((m) => m.id.startsWith("(sdk-"));
   const nativeInstance = instances.find((m) => m.id === "native");
 
@@ -699,12 +516,6 @@ async function bindTools(
         grant,
       ),
     );
-    // Fallback chain. Two cases:
-    //   * native bindings fall back to SDK-supplied Tools.
-    //   * session-contributed bindings (`(session)`) fall back to
-    //     native first, then SDK — this is how skills-style sessions
-    //     (advertise `bash` without owning it) keep working alongside
-    //     self-implementing sessions (own their own tools' impls).
     if (!tool) {
       const fallbackChain: MaterialisedTools[] = [];
       if (binding.providerInstanceId === "(session)") {
@@ -740,16 +551,10 @@ async function bindTools(
   return resolved;
 }
 
-/** Session-contributed tools, fed into the resolver's binding shape. */
 async function collectSessionToolBindings(
   session: Session,
 ): Promise<ToolBinding[]> {
   const tools = (await session.tools?.()) ?? [];
-  // Route session-contributed names through the synthetic
-  // `"(session)"` Tools instance materialised in `materialiseTools_all`.
-  // That instance's `resolveTool` calls back into the session's own
-  // `resolveTool` if it has one; if not (skills pattern) it returns
-  // null and the fallback chain in `bindTools` kicks over to native.
   return tools.map((ref) => ({
     toolName: ref.name,
     providerInstanceId: "(session)",
@@ -758,18 +563,12 @@ async function collectSessionToolBindings(
   }));
 }
 
-// ─── 5. harness + session instantiation ───────────────────────────────────
-
 async function instantiateHarness(
   binding: HarnessBinding,
   factoryCtx: FactoryContext,
   phase1Secrets: Record<string, string>,
   parent: Agent | undefined,
 ): Promise<Harness> {
-  // Two-phase secret filter: look up the factory first (with the
-  // package-name fallback in boot.ts), then pass it the secrets
-  // it declared interest in. We need a peek-then-create dance
-  // because `instantiateFromBinding` takes already-filtered secrets.
   const factory = lookupFactoryByBinding(
     binding.factoryName,
     binding.source,
@@ -792,9 +591,6 @@ async function instantiateSession(
   phase1Secrets: Record<string, string>,
   parent: Agent | undefined,
 ): Promise<Session> {
-  // Default chain when the manifest omits the session section: build
-  // bindings from DEFAULT_SESSION_CHAIN. Each spec has only a
-  // `provider` field, so config is empty.
   const effective: ResolvedSessionLayer[] =
     layers && layers.length > 0
       ? layers
@@ -805,18 +601,10 @@ async function instantiateSession(
           }),
         );
 
-  // Track which factory-based layers are pass-through (declare
-  // `passThrough: true`). Pre-built layers given to us by the SDK
-  // consumer are treated as storage — we don't know what they do
-  // internally and the user clearly meant for them to be part of
-  // the chain. The validation below then asks: "is there ANY layer
-  // here that can actually retain events?"
   const instances: Session[] = [];
   let hasStorageLayer = false;
   for (const layer of effective) {
     if (isPreBuiltSessionLayer(layer)) {
-      // SDK-supplied instances are opaque to the storage check.
-      // Trust them.
       instances.push(layer.instance);
       hasStorageLayer = true;
       continue;
@@ -837,15 +625,7 @@ async function instantiateSession(
     );
     instances.push(instance);
   }
-  // Guard against the silent-loss-of-events configuration: a chain
-  // composed entirely of pass-through layers (e.g. `[skills,
-  // compacting]` with no `in-memory` or `file` at the end) has no
-  // session that actually retains events. Pushes propagate but
-  // nothing keeps them; the next `pull` returns the empty
-  // bottom, and every turn sees an empty history. The user reported
-  // this manifesting as "every invocation failed" — the harness sees
-  // no user message and the API rejects the empty request. Fail fast
-  // with a structured diagnostic instead.
+  // An all-pass-through chain retains no events, so every turn sees an empty history; fail fast.
   if (!hasStorageLayer) {
     const factoryNames = effective
       .filter((l): l is SessionBinding => !isPreBuiltSessionLayer(l))
@@ -860,8 +640,6 @@ async function instantiateSession(
         `(or \`session.layers\`) block.`,
     );
   }
-  // Length-1 chains return the inner session directly: keeps the
-  // trivial case cheap and avoids a no-op ChainedSession wrapper.
   if (instances.length === 1) {
     const [only] = instances as [Session];
     return only;
@@ -873,10 +651,6 @@ function requireHarnessBinding(
   binding: HarnessBinding | undefined,
 ): HarnessBinding {
   if (!binding) {
-    // The caller already proved `"provider" in manifest.harness`, so
-    // resolveManifest must have produced a binding. The runtime
-    // guard turns any future drift into a loud failure instead of a
-    // silent crash on the call below.
     throw new Error(
       "runAgent: harness binding missing despite spec-form manifest.harness",
     );
@@ -884,31 +658,75 @@ function requireHarnessBinding(
   return binding;
 }
 
-// ─── 4 + 9. secrets pipeline ──────────────────────────────────────────────
-
 interface SecretRequest {
   name: string;
   required: boolean;
   requestedBy: string;
 }
 
+/** A secret store in the resolution chain, paired with a human label. */
+export interface LabeledSecretStore {
+  label: string;
+  store: SecretsStore;
+}
+
+/**
+ * The ordered secret-store tiers, highest priority first. Resolution is
+ * dotenv-style: the most *local*, explicit secret wins and we work outward
+ * to progressively more global sources. A `.loom-secrets` checked into the
+ * agent's own directory is the most intentional, agent-scoped secret, so it
+ * overrides an ambient env var (which is often exported globally for an
+ * unrelated tool) rather than the other way around.
+ *
+ *   1. SDK-supplied store (an explicit programmatic override)
+ *   2. `.loom-secrets` next to the manifest (most local to THIS agent)
+ *   3. `.loom-secrets` in the cwd (the invocation's working dir)
+ *   4. environment variables
+ *   5. macOS keychain
+ *   6. `~/.config/loom/secrets.toml` (the global fallback)
+ *
+ * The single source of truth for both {@link buildSecretStore} (runtime) and
+ * `loom audit` (which labels where each secret resolved from).
+ */
+export function describeSecretStores(
+  manifest: AgentManifest,
+  options: RunAgentOptions,
+): LabeledSecretStore[] {
+  const tiers: LabeledSecretStore[] = [];
+  if (options.secrets) {
+    tiers.push({ label: "SDK-supplied store", store: options.secrets });
+  }
+
+  const seenFiles = new Set<string>();
+  const pushFile = (label: string, filePath: string): void => {
+    if (seenFiles.has(filePath)) return;
+    seenFiles.add(filePath);
+    tiers.push({ label, store: new FileSecretsStore(filePath) });
+  };
+  if (manifest.manifestPath) {
+    pushFile(
+      ".loom-secrets (manifest dir)",
+      path.join(path.dirname(manifest.manifestPath), ".loom-secrets"),
+    );
+  }
+  pushFile(".loom-secrets (cwd)", path.join(process.cwd(), ".loom-secrets"));
+
+  tiers.push({ label: "environment", store: new EnvSecretsStore() });
+  tiers.push({ label: "macOS keychain", store: new KeychainSecretsStore() });
+  tiers.push({
+    label: "~/.config/loom/secrets.toml",
+    store: new XDGSecretsStore(),
+  });
+  return tiers;
+}
+
 export function buildSecretStore(
   manifest: AgentManifest,
   options: RunAgentOptions,
 ): SecretsStore {
-  const stores: SecretsStore[] = [];
-  if (options.secrets) stores.push(options.secrets);
-  stores.push(new EnvSecretsStore());
-  stores.push(new XDGSecretsStore());
-  stores.push(new KeychainSecretsStore());
-  if (manifest.manifestPath) {
-    stores.push(
-      new FileSecretsStore(
-        path.join(path.dirname(manifest.manifestPath), ".loom-secrets"),
-      ),
-    );
-  }
-  return new ChainedSecretsStore(stores);
+  return new ChainedSecretsStore(
+    describeSecretStores(manifest, options).map((tier) => tier.store),
+  );
 }
 
 export function collectPhase1SecretNeeds(
@@ -916,18 +734,6 @@ export function collectPhase1SecretNeeds(
   toolsIndex: ToolsIndex,
 ): SecretRequest[] {
   const out: SecretRequest[] = [];
-  // Harness factory needs (only when a HarnessBinding is present —
-  // pre-built instances bring their own state and don't need secrets
-  // resolved at the SDK layer).
-  //
-  // Resolution goes through `lookupFactoryByBinding` so the
-  // package-name fallback engages — a provider-package harness
-  // registered under its primary name (the v5 convention) is
-  // reachable even when the manifest references it by a different
-  // `[providers]` handle. Without the fallback, secrets declared by
-  // such a harness silently fail to flow into the phase-1 bundle
-  // and construction errors out later complaining about an unset
-  // secret it had no chance to ask for.
   if (resolved.harness) {
     try {
       const f = lookupFactoryByBinding(
@@ -940,9 +746,6 @@ export function collectPhase1SecretNeeds(
       // Surfaced later by instantiateHarness.
     }
   }
-  // Session factory needs (per chain link). Pre-built layers have no
-  // factory to consult — their secrets, if any, are the SDK consumer's
-  // problem. Same `lookupFactoryByBinding` story as the harness path.
   for (const layer of resolved.session ?? []) {
     if (isPreBuiltSessionLayer(layer)) continue;
     try {
@@ -956,15 +759,6 @@ export function collectPhase1SecretNeeds(
       // Surfaced later by instantiateSession.
     }
   }
-  // Tools-contribution needs (one entry per *distinct* materialised
-  // instance — we collect needs per contribution by visiting each
-  // instance's source/factory). Each contribution may declare:
-  //   - static `secrets`            — always-needed
-  //   - `instanceSecretNeeds(config)` — derived from instance config
-  //
-  // The MCP factory uses the per-instance path to honour the
-  // user-authored `secrets = { ... }` map on `[tools.X]` /
-  // `[providers]` entries (Chunk 6).
   for (const instance of resolved.providers) {
     if (instance.kind === "native") continue;
     let contribution:
@@ -1108,9 +902,11 @@ function formatMissingSecrets(missing: SecretRequest[]): string {
   }
   lines.push("");
   lines.push(
-    "Set them via: an env var (`LOOM_<NAME>` or `<NAME>`); a `.loom-secrets` " +
-      "file next to the agent's `agent.toml`; or a custom `SecretsStore` " +
-      "passed via `RunAgentOptions.secrets`.",
+    "Set them via (highest priority first): a `.loom-secrets` file next to " +
+      "the agent's `agent.toml` or in the cwd (`<NAME>=value` per line); an " +
+      "env var (`LOOM_<NAME>` or `<NAME>`); the macOS keychain; or " +
+      "`~/.config/loom/secrets.toml`. SDK callers can also pass a custom " +
+      "`SecretsStore` via `RunAgentOptions.secrets`.",
   );
   return lines.join("\n");
 }
@@ -1128,7 +924,6 @@ export function secretsFor(
   return out;
 }
 
-/** Merge two `SecretNeeds` records (used to combine static + per-instance needs). */
 function mergeSecretNeeds(
   a: SecretNeeds | undefined,
   b: SecretNeeds | undefined,
@@ -1149,8 +944,6 @@ function secretAllowlist(needs: {
 }): Set<string> {
   return new Set([...(needs.required ?? []), ...(needs.optional ?? [])]);
 }
-
-// ─── 11. tool table + runtime audit ───────────────────────────────────────
 
 function buildToolTable(
   resolvedTools: Map<string, Tool>,
@@ -1230,8 +1023,6 @@ async function runRuntimeAudit(
   }
 }
 
-// ─── runtime services ─────────────────────────────────────────────────────
-
 class RuntimeServicesImpl implements RuntimePrimitives {
   private abortSignal: AbortSignal = new AbortController().signal;
 
@@ -1256,15 +1047,12 @@ class RuntimeServicesImpl implements RuntimePrimitives {
     return Promise.resolve(handler(req));
   }
 
-  /** Current `ClientBridge` (null in CLI / SDK-direct / test modes). */
   currentClientBridge(): ClientBridge | null {
     return this.clientBridgeHolder.current;
   }
 }
 
 export type { RuntimeServicesImpl };
-
-// ─── subagent scope ───────────────────────────────────────────────────────
 
 function agentWithScopedSpawn(
   base: Agent,

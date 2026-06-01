@@ -1,26 +1,3 @@
-/**
- * Composition primitive for session chains.
- *
- * Pipelines N `Session`s in outer-to-inner order. The chain protocol is
- * the Session interface itself:
- *
- *   - `push(event)` flows top-to-bottom. Each layer may transform,
- *     drop, or fan-out the event before the next layer sees it.
- *   - `pull(below)` flows bottom-to-top. Each layer receives what the
- *     layers below it produced and may rewrite/replace it.
- *
- * Other hooks (`prepareTurn`, `systemPromptSection`, `tools`,
- * `trustedPaths`, `dependencies`, `close`) are aggregated across all
- * children.
- *
- * Two consumers compose chains this way:
- *   - The runtime, when a manifest's `session` field is a
- *     `SessionSpec[]` (each spec is instantiated, then composed).
- *   - SDK code that wants direct references to specific layers —
- *     e.g. holding the `CompactingSession` to wire `compactNow()`
- *     to a `/compact` slash command. See `examples/sdk-agent/`.
- */
-
 import type {
   Agent,
   Session,
@@ -79,15 +56,6 @@ export class ChainedSession implements Session {
     return all;
   }
 
-  /**
-   * Walk children in declaration order; the first one whose
-   * `resolveTool` returns a non-null `Tool` wins. This lets a chain
-   * combine layers that contribute tool names without owning them
-   * (e.g. `SkillsSession` → native) with layers that DO own the
-   * implementation (e.g. a memory-tagging session). Returns `null`
-   * when no child claims the name, and the runtime falls back to
-   * native + SDK Tools.
-   */
   async resolveTool(
     name: string,
     config: ToolConfig,
@@ -105,7 +73,6 @@ export class ChainedSession implements Session {
   }
 
   async trustedPaths(): Promise<TrustedPath[]> {
-    // Concat without dedup; the audit/consuming layer merges duplicates.
     const all: TrustedPath[] = [];
     for (const c of this.children) {
       const ps = (await c.trustedPaths?.()) ?? [];

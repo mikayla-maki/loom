@@ -10,29 +10,32 @@ import {
   StaticSecretsStore,
   XDGSecretsStore,
 } from "../src/runtime/secrets.js";
+import { buildSecretStore } from "../src/sdk/run-agent.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 import { SecretError } from "../src/errors.js";
 import { useTmpDir } from "./helpers/tmp.js";
 
 describe("XDGSecretsStore", () => {
   const tmp = useTmpDir("loom-xdg-");
 
-  it("reads a flat key→value TOML file", async () => {
+  it("reads string values and ignores non-strings, missing keys, and missing files", async () => {
     const p = path.join(tmp(), "secrets.toml");
     await fs.writeFile(
       p,
-      `# top-level secrets\nANTHROPIC_API_KEY = "sk-test"\nFOO = "bar"\n`,
+      `ANTHROPIC_API_KEY = "sk-test"\nFOO = "bar"\nN = 42\nA = ["x"]\n[t]\nnested = "v"\n`,
     );
     const s = new XDGSecretsStore({ path: p });
     expect(await s.get("ANTHROPIC_API_KEY")).toBe("sk-test");
     expect(await s.get("FOO")).toBe("bar");
+    expect(await s.get("N")).toBeNull();
+    expect(await s.get("A")).toBeNull();
+    expect(await s.get("t")).toBeNull();
     expect(await s.get("MISSING")).toBeNull();
-  });
 
-  it("returns null when the file is missing (silent)", async () => {
-    const s = new XDGSecretsStore({
+    const missing = new XDGSecretsStore({
       path: "/nonexistent/loom/secrets.toml",
     });
-    expect(await s.get("ANYTHING")).toBeNull();
+    expect(await missing.get("ANYTHING")).toBeNull();
   });
 
   it("throws SecretError on malformed TOML", async () => {
@@ -41,25 +44,15 @@ describe("XDGSecretsStore", () => {
     const s = new XDGSecretsStore({ path: p });
     await expect(s.get("X")).rejects.toBeInstanceOf(SecretError);
   });
-
-  it("ignores non-string TOML values (tables, numbers, arrays)", async () => {
-    const p = path.join(tmp(), "secrets.toml");
-    await fs.writeFile(p, `S = "ok"\nN = 42\nA = ["x"]\n[t]\nnested = "v"\n`);
-    const s = new XDGSecretsStore({ path: p });
-    expect(await s.get("S")).toBe("ok");
-    expect(await s.get("N")).toBeNull();
-    expect(await s.get("A")).toBeNull();
-    expect(await s.get("t")).toBeNull();
-  });
 });
 
 describe("KeychainSecretsStore", () => {
-  it("returns null on non-darwin platforms (silent fall-through)", async () => {
+  it("returns null on non-darwin platforms without invoking lookup", async () => {
     const s = new KeychainSecretsStore({ forcePlatform: "linux" });
     expect(await s.get("ANYTHING")).toBeNull();
   });
 
-  it("uses the injected lookup function on any platform", async () => {
+  it("uses the injected lookup function", async () => {
     const calls: string[] = [];
     const s = new KeychainSecretsStore({
       lookup: async (name) => {
@@ -77,12 +70,7 @@ describe("KeychainSecretsStore", () => {
 describe("ChainedSecretsStore default-chain priority", () => {
   const tmp = useTmpDir("loom-chain-");
 
-  /**
-   * Wires up the same chain `runAgent` builds (caller → env → XDG →
-   * keychain → file) and asserts each tier wins when its predecessors
-   * miss.
-   */
-  it("first hit wins; later tiers don't get queried for the same name", async () => {
+  it("first hit wins and later tiers aren't queried for the same name", async () => {
     const xdgPath = path.join(tmp(), "xdg.toml");
     const filePath = path.join(tmp(), ".loom-secrets");
     await fs.writeFile(
@@ -111,11 +99,45 @@ describe("ChainedSecretsStore default-chain priority", () => {
     expect(await chain.get("XDG_ONLY")).toBe("from-xdg");
     expect(await chain.get("KEYCHAIN_ONLY")).toBe("from-keychain");
     expect(await chain.get("FILE_ONLY")).toBe("from-file");
-
-    // SHARED hits XDG before file: XDG value wins.
     expect(await chain.get("SHARED")).toBe("xdg-shared");
 
-    // STATIC/ENV/XDG hits don't touch the keychain.
-    expect(keychainCalls).toBe(2); // KEYCHAIN_ONLY + SHARED-miss
+    expect(keychainCalls).toBe(2);
+  });
+});
+
+describe("buildSecretStore precedence (dotenv-style: local file wins)", () => {
+  const tmp = useTmpDir("loom-buildsecrets-");
+
+  it("a manifest-dir .loom-secrets overrides an env var of the same name", async () => {
+    const manifestDir = tmp();
+    await fs.writeFile(
+      path.join(manifestDir, ".loom-secrets"),
+      `LOOM_TEST_SHARED=from-manifest-file\nLOOM_TEST_FILE_ONLY=file-only\n`,
+    );
+    const manifest = {
+      name: "t",
+      harness: { provider: "test" },
+      manifestPath: path.join(manifestDir, "agent.toml"),
+    } as AgentManifest;
+
+    const prevShared = process.env.LOOM_TEST_SHARED;
+    const prevEnvOnly = process.env.LOOM_TEST_ENV_ONLY;
+    process.env.LOOM_TEST_SHARED = "from-env";
+    process.env.LOOM_TEST_ENV_ONLY = "env-only";
+    try {
+      const store = buildSecretStore(manifest, {});
+      // Local file beats env for a name they share — the whole point of the
+      // dotenv-style ordering.
+      expect(await store.get("LOOM_TEST_SHARED")).toBe("from-manifest-file");
+      // File-only name resolves from the file.
+      expect(await store.get("LOOM_TEST_FILE_ONLY")).toBe("file-only");
+      // A name absent from the local files still falls through to env.
+      expect(await store.get("LOOM_TEST_ENV_ONLY")).toBe("env-only");
+    } finally {
+      if (prevShared === undefined) delete process.env.LOOM_TEST_SHARED;
+      else process.env.LOOM_TEST_SHARED = prevShared;
+      if (prevEnvOnly === undefined) delete process.env.LOOM_TEST_ENV_ONLY;
+      else process.env.LOOM_TEST_ENV_ONLY = prevEnvOnly;
+    }
   });
 });

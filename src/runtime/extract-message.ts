@@ -1,5 +1,3 @@
-/** Best-effort extraction of an agent's last assistant message. */
-
 import type { Session } from "../types/interfaces.js";
 
 export async function lastAgentMessage(session: Session): Promise<string> {

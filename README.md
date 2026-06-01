@@ -635,14 +635,16 @@ in the wire `tool_call_update` for IDE-client rendering.
 | `path` | string (required) | Resolved against cwd unless absolute. |
 | `content` | string (required) | Full file contents. |
 | `append` | bool | Append instead of overwriting. Default false. |
-| `create_dirs` | bool | Create missing parent dirs. Default false. |
+
+Missing parent directories are created automatically, so writing to a
+not-yet-existing path just works rather than failing with `ENOENT`.
 
 - **Capability kinds:** optional `paths`.
 - **ACP routing:** when the client advertises `fs.writeTextFile`,
   the write goes through the editor (surfaces as an in-editor change
-  with diff + approval UI). `append` / `create_dirs` fall back to
-  local `fs` since ACP's `fs/writeTextFile` is full-file-replacement
-  only.
+  with diff + approval UI). `append` falls back to local `fs` since
+  ACP's `fs/writeTextFile` is full-file-replacement only. Parent dirs
+  are always created locally first (the bridge has no mkdir affordance).
 
 #### `edit_file`
 
@@ -857,17 +859,25 @@ manifests via `substituteEnv(manifest)` exported from `@mcmaki/loom`.
 
 ### Secret stores
 
-Chained in order; the first store with a hit wins:
+Chained in order; the first store with a hit wins. Resolution is
+dotenv-style — the most *local*, explicit secret wins and we work outward
+to progressively more global sources, so a `.loom-secrets` checked into an
+agent's own directory overrides an ambient env var (which is often exported
+globally for some unrelated tool):
 
 1. **Caller-supplied store** — `runAgent(manifest, { secrets })`.
-2. **Environment variables** — `process.env[NAME]`.
-3. **XDG file** — `$XDG_CONFIG_HOME/loom/secrets` (KEY=value lines).
-4. **OS keychain** — macOS Keychain / libsecret / Windows Credential Manager.
-5. **Per-manifest file** — `.loom-secrets` next to the manifest.
+2. **Per-manifest file** — `.loom-secrets` next to the manifest (most local).
+3. **Per-cwd file** — `.loom-secrets` in the working directory.
+4. **Environment variables** — `process.env[NAME]` (also tries
+   `LOOM_<NAME>` and the uppercased `-`/`.`→`_` forms).
+5. **OS keychain** — macOS Keychain (service `loom`).
+6. **XDG file** — `$XDG_CONFIG_HOME/loom/secrets.toml` (the global fallback).
 
-The SDK exports each layer (`EnvSecretsStore`, `FileSecretsStore`,
-`XDGSecretsStore`, `KeychainSecretsStore`, `StaticSecretsStore`,
-`ChainedSecretsStore`) so you can compose your own pipeline.
+`.loom-secrets` files are `KEY=value` lines (or a JSON object); the XDG file
+is flat TOML (`KEY = "value"`). The SDK exports each layer
+(`EnvSecretsStore`, `FileSecretsStore`, `XDGSecretsStore`,
+`KeychainSecretsStore`, `StaticSecretsStore`, `ChainedSecretsStore`) so you
+can compose your own pipeline.
 
 ### Per-agent storage
 

@@ -1,26 +1,3 @@
-/**
- * Loom provider loader — locates and loads provider packages from disk.
- *
- * A Loom provider is an npm-shaped package whose `package.json` has a
- * `loom.provider` field pointing at an entry that exports
- * `register(api)`. The entry, when imported, registers harness,
- * session, and Tools contributions against the host runtime via the
- * `LoomProviderApi` it receives.
- *
- * Discovery walks: `<manifestDir>/.loom/node_modules` → ancestor
- * `node_modules` → `npm root -g` → `~/.loom/providers`. Activation is
- * explicit — the runtime only loads packages referenced from
- * `[providers]`, `[tools]`, `[harness]`, or `[session]` in the
- * manifest. There is no global side-effect registration.
- *
- * v5 unifies the registration shape: `registerTools`,
- * `registerHarness`, and `registerSession` all take a
- * `ContributionRegistration<T>` and produce a `T`. The provider
- * decides how many of each kind to contribute; the runtime calls
- * `create(config, ctx, secrets, parent?)` once per instance the
- * manifest asks for.
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -47,49 +24,14 @@ import { registerHarness, registerSession } from "../builtins/index.js";
 
 const exec = promisify(execFile);
 
-/**
- * One contribution a provider's `register()` declares. Used uniformly
- * across `registerTools`, `registerHarness`, and `registerSession`;
- * what differs is the type the factory returns from `create()`.
- *
- * Convention: a provider's *primary* contribution of each kind is
- * registered under its package name. That's what makes
- * `provider = "<handle>"` work without the provider author knowing
- * what handle the manifest used — the runtime falls back to the
- * package name when the handle lookup misses.
- */
 export interface ContributionRegistration<T> {
-  /** Name the manifest references via `provider = "<this>"`. */
   readonly name: string;
-  /** Secret names this contribution wants. Resolved before `create` runs. */
   readonly secrets?: SecretNeeds;
-  /**
-   * Per-INSTANCE secret-need callback. Some factories (notably the
-   * built-in `mcp-server`) can only know which secrets they need by
-   * inspecting the user's instance config. Implement this when the
-   * static `secrets` field can't cover it; the runtime merges the
-   * returned needs into Phase 1 of secret loading and passes the
-   * resolved values to `create()` alongside the static set.
-   *
-   * Return `undefined` when this instance needs no extra secrets.
-   */
   instanceSecretNeeds?(
     config: Record<string, unknown>,
   ): SecretNeeds | undefined;
-  /** Optional JSON schema for the contribution's per-instance config. */
   readonly configSchema?: JSONSchema;
-  /**
-   * Sessions / harnesses that need a parent agent set this. Ignored
-   * for tools (the manifest can't address a Tools contribution from a
-   * sub-agent slot). Enforced at boot.
-   */
   readonly requiresParent?: boolean;
-  /**
-   * Construct the contribution. Called once per instance the manifest
-   * asks for; the runtime dedupes anonymous Tools instances by
-   * `(source, config)` so multiple references with the same config
-   * share one `T`.
-   */
   create(
     config: Record<string, unknown>,
     ctx: FactoryContext,
@@ -98,20 +40,11 @@ export interface ContributionRegistration<T> {
   ): T | Promise<T>;
 }
 
-/**
- * The API a provider's `register()` function sees. The three
- * `register<X>` methods accept the same `ContributionRegistration<T>`
- * shape; what differs is `T`.
- */
 export interface LoomProviderApi {
   registerTools(reg: ContributionRegistration<Tools>): void;
   registerHarness(reg: ContributionRegistration<Harness>): void;
   registerSession(reg: ContributionRegistration<Session>): void;
 
-  /**
-   * This provider's handle from `[providers]`, or its package name
-   * when referenced inline.
-   */
   readonly providerName: string;
   readonly agentName: string;
   readonly manifestDir: string;
@@ -126,43 +59,23 @@ export interface LoomProviderModule {
 }
 
 export interface ProviderPackageInfo {
-  /** Package name from `package.json` (or fallback to dir basename). */
   name: string;
   packageDir: string;
-  /** Absolute path to the registered entry file. */
   entryPath: string;
   version?: string;
   description?: string;
 }
 
 export interface LoadOptions {
-  /** Extra roots tried first (used in tests to point at fixtures). */
   searchPaths?: string[];
-  /** Override `npm root -g` lookup. */
   npmGlobalRoot?: string;
-  /** Override `~/.loom/providers`. */
   loomProvidersDir?: string;
 }
 
-/**
- * Result of loading one provider: its metadata plus the contributions
- * its `register()` produced. Harness and session contributions are
- * deposited as `HarnessFactory` / `SessionFactory` shapes into the
- * global registries during load; Tools contributions are returned to
- * the caller so the runtime can instantiate them per the manifest's
- * `(source, config)` dedup.
- */
 export interface LoadedProvider {
   info: ProviderPackageInfo;
-  /**
-   * Tools contributions this provider declared (zero or more). Each
-   * has a `name` (defaulted to the package name when the provider
-   * omits it) and `create(config, ctx, secrets, parent?) → Tools`.
-   */
   toolsContributions: ContributionRegistration<Tools>[];
 }
-
-// ─── Locate / load by npm name ────────────────────────────────────────────
 
 export async function locateProviderPackage(
   name: string,
@@ -195,11 +108,6 @@ export async function loadProviderByName(
   return loadProviderFromInfo(info, loadCtx);
 }
 
-/**
- * Load a provider from an absolute path (used for `{ path = "..." }`
- * SourceSpecs). Skips the `node_modules` search; still requires a
- * `package.json` with a `loom.provider` entry.
- */
 export async function loadProviderFromPath(
   absPath: string,
   loadCtx: {
@@ -219,12 +127,6 @@ export async function loadProviderFromPath(
   return loadProviderFromInfo(info, loadCtx);
 }
 
-/**
- * Dispatch a `SourceSpec` to the right loader. "builtin" isn't a
- * SourceSpec — built-in factories are looked up via registries by
- * bare-handle name, not loaded from disk — so this function never
- * returns null.
- */
 export async function loadProviderFromSource(
   source: SourceSpec,
   loadCtx: {
@@ -239,8 +141,7 @@ export async function loadProviderFromSource(
     return loadProviderByName(source.npm, loadCtx, options);
   }
   if ("path" in source) {
-    // `expandHome` first so `~/loom-providers/foo` resolves to the
-    // user's home dir instead of `<manifestDir>/~/loom-providers/foo`.
+    // expandHome before resolve so a leading `~` is not treated as a relative segment.
     const expanded = expandHome(source.path);
     const abs = path.isAbsolute(expanded)
       ? expanded
@@ -249,8 +150,6 @@ export async function loadProviderFromSource(
   }
   throw new LoomError(`Unknown SourceSpec shape: ${JSON.stringify(source)}`);
 }
-
-// ─── Common load path ────────────────────────────────────────────────────
 
 async function loadProviderFromInfo(
   info: ProviderPackageInfo,
@@ -293,12 +192,6 @@ async function loadProviderFromInfo(
   return { info, toolsContributions };
 }
 
-/**
- * Adapt a `ContributionRegistration<Harness>` to the `HarnessFactory`
- * shape consumed by the global registry. The shapes differ only in
- * vocabulary (`secrets`, `requiresParent`, `create` are identical);
- * the registry sees the same interface either way.
- */
 function toHarnessFactory(
   reg: ContributionRegistration<Harness>,
 ): HarnessFactory {
@@ -323,14 +216,6 @@ function toSessionFactory(
   };
 }
 
-// ─── Listing (introspection) ──────────────────────────────────────────────
-
-/**
- * Enumerate every Loom provider discoverable from a base directory.
- * Used by `loom providers list` (and future audit affordances). The
- * search walks the same roots `loadProviderByName` uses; resolution
- * winner is the *first* hit.
- */
 export async function listInstalledProviders(
   loadCtx: { agentManifestDir?: string } = {},
   options: LoadOptions = {},
@@ -380,8 +265,6 @@ async function listPackageNames(root: string): Promise<string[]> {
   return out;
 }
 
-// ─── package.json introspection ──────────────────────────────────────────
-
 function pickRegisterFn(mod: LoomProviderModule): RegisterFn | undefined {
   if (typeof mod.register === "function") return mod.register;
   const d = mod.default;
@@ -427,20 +310,15 @@ async function tryLoadPackageJson(
   };
 }
 
-// ─── Search-root assembly ────────────────────────────────────────────────
-
 async function collectSearchRoots(
   agentManifestDir: string,
   options: LoadOptions,
 ): Promise<string[]> {
   const roots: string[] = [...(options.searchPaths ?? [])];
 
-  // `loom install` writes into <manifest-dir>/.loom/node_modules/,
-  // isolated from the user's own package.json. Check there first so
-  // loom-installed packages take precedence over the surrounding tree.
+  // Loom-installed packages must win over the surrounding tree, so check here first.
   roots.push(path.join(agentManifestDir, ".loom", "node_modules"));
 
-  // Walk up node_modules (mirrors Node's resolver, capped at 8 levels).
   let dir = agentManifestDir;
   roots.push(path.join(dir, "node_modules"));
   for (let i = 0; i < 8; i++) {

@@ -1,21 +1,12 @@
-/**
- * ACP `initialize` handshake and capability aggregation.
- *
- * Tests the contract:
- *   - `initialize` round-trip with negotiated capabilities
- *   - aggregation across harness + session + tools (SDK shape)
- *   - client capabilities visible in `FactoryContext` at boot time
- */
-
 import { describe, expect, it } from "vitest";
 
 import { serveOverStream, ACP_PROTOCOL_VERSION } from "../src/acp/server.js";
-import { runAgent } from "../src/sdk/run-agent.js";
+import { runAgent, type RunAgentOptions } from "../src/sdk/run-agent.js";
 import {
   aggregateAcpCapabilities,
   DEFAULT_CLIENT_ACP_CAPABILITIES,
 } from "../src/runtime/acp-capabilities.js";
-import type { AgentManifest, Reference } from "../src/types/manifest.js";
+import type { AgentManifest } from "../src/types/manifest.js";
 import type { AcpCapabilityContribution } from "../src/types/interfaces.js";
 import {
   ClientSideConnection,
@@ -45,10 +36,6 @@ function makeClient(stream: Stream): ClientSideConnection {
   return new ClientSideConnection(() => noopClient, stream);
 }
 
-// ───────────────────────────────────────────────────────────────────
-// Aggregation unit tests (no transport).
-// ───────────────────────────────────────────────────────────────────
-
 describe("aggregateAcpCapabilities", () => {
   it("emits an empty object when no contributor claims anything", () => {
     const caps = aggregateAcpCapabilities([]);
@@ -71,14 +58,12 @@ describe("aggregateAcpCapabilities", () => {
     });
   });
 
-  it("loadSession reflects any contributor saying true", () => {
+  it("propagates loadSession and sessionCapabilities from contributors", () => {
     expect(aggregateAcpCapabilities([{ loadSession: true }]).loadSession).toBe(
       true,
     );
     expect(aggregateAcpCapabilities([{}]).loadSession).toBeUndefined();
-  });
 
-  it("sessionCapabilities propagate from contributors", () => {
     const caps = aggregateAcpCapabilities([
       { sessionCapabilities: { resume: {}, close: {} } },
     ]);
@@ -101,10 +86,6 @@ describe("aggregateAcpCapabilities", () => {
     });
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────
-// `initialize` end-to-end (in-process streams).
-// ──────────────────────────────────────────────────────────────────────
 
 describe("ACP initialize handshake", () => {
   it("returns aggregated capabilities + agentInfo", async () => {
@@ -131,7 +112,6 @@ describe("ACP initialize handshake", () => {
 
     expect(result.protocolVersion).toBe(ACP_PROTOCOL_VERSION);
     expect(result.agentInfo?.name).toBe("init-test");
-    // No tools registered, no session.resume — capabilities are empty.
     expect(result.agentCapabilities?.promptCapabilities).toBeUndefined();
     expect(result.agentCapabilities?.loadSession).toBeUndefined();
 
@@ -163,150 +143,70 @@ describe("ACP initialize handshake", () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────
-// Client capabilities reach the runtime (via DEFAULT for SDK direct).
-// ──────────────────────────────────────────────────────────────────────
-
-describe("FactoryContext.clientCapabilities", () => {
-  it("defaults to full-local capabilities for SDK-direct runAgent calls", async () => {
-    let captured: unknown = null;
-    const captureFactory = {
-      name: "capture-caps",
+describe("FactoryContext", () => {
+  async function captureContext(
+    name: string,
+    spec: Partial<AgentManifest>,
+    options?: RunAgentOptions,
+  ): Promise<{ clientCapabilities?: unknown; metadata?: unknown }> {
+    const captured: { clientCapabilities?: unknown; metadata?: unknown } = {};
+    const { registerSession } = await import("../src/builtins/index.js");
+    registerSession({
+      name,
       create(
         _cfg: Record<string, unknown>,
-        ctx: { clientCapabilities?: unknown },
+        ctx: { clientCapabilities?: unknown; metadata?: unknown },
       ) {
-        captured = ctx.clientCapabilities;
+        captured.clientCapabilities = ctx.clientCapabilities;
+        captured.metadata = ctx.metadata;
         return { push: async () => [], pull: async () => [] };
       },
-    };
-    const { registerSession } = await import("../src/builtins/index.js");
-    registerSession(captureFactory);
-
-    const ref: Reference = "capture-caps";
-    const agent = await runAgent({
-      name: "ctx-test",
-      systemPrompt: "x",
-      tools: {},
-      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
-      session: { provider: ref },
-      capabilities: {},
     });
-    try {
-      expect(captured).toEqual(DEFAULT_CLIENT_ACP_CAPABILITIES);
-    } finally {
-      await agent.close();
-    }
-  });
-
-  it("can be overridden via RunAgentOptions.clientAcpCapabilities", async () => {
-    let captured: unknown = null;
-    const captureFactory = {
-      name: "capture-caps-2",
-      create(
-        _cfg: Record<string, unknown>,
-        ctx: { clientCapabilities?: unknown },
-      ) {
-        captured = ctx.clientCapabilities;
-        return { push: async () => [], pull: async () => [] };
-      },
-    };
-    const { registerSession } = await import("../src/builtins/index.js");
-    registerSession(captureFactory);
 
     const agent = await runAgent(
       {
-        name: "override-test",
+        name: `${name}-agent`,
         systemPrompt: "x",
         tools: {},
         harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
-        session: { provider: "capture-caps-2" },
+        session: { provider: name },
         capabilities: {},
-      },
-      {
-        clientAcpCapabilities: {
-          fs: { readTextFile: true },
-          terminal: false,
-        },
-      },
+        ...spec,
+      } as AgentManifest,
+      options,
     );
     try {
-      expect(captured).toEqual({
-        fs: { readTextFile: true },
-        terminal: false,
-      });
+      return captured;
     } finally {
       await agent.close();
     }
+  }
+
+  it("defaults clientCapabilities to full-local for SDK-direct runAgent calls", async () => {
+    const { clientCapabilities } = await captureContext("capture-caps", {});
+    expect(clientCapabilities).toEqual(DEFAULT_CLIENT_ACP_CAPABILITIES);
   });
 
-  it("surfaces [agent.metadata] to plugins via FactoryContext.metadata", async () => {
-    let captured: unknown = null;
-    const captureFactory = {
-      name: "capture-metadata",
-      create(
-        _cfg: Record<string, unknown>,
-        ctx: { metadata?: Record<string, unknown> },
-      ) {
-        captured = ctx.metadata;
-        return { push: async () => [], pull: async () => [] };
-      },
-    };
-    const { registerSession } = await import("../src/builtins/index.js");
-    registerSession(captureFactory);
-
-    const agent = await runAgent({
-      name: "metadata-roundtrip",
-      systemPrompt: "x",
-      tools: {},
-      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
-      session: { provider: "capture-metadata" },
-      capabilities: {},
-      metadata: {
-        team: "platform-eng",
-        owners: ["alice"],
-        rollout: { region: "us-east-1" },
-      },
-    });
-    try {
-      expect(captured).toEqual({
-        team: "platform-eng",
-        owners: ["alice"],
-        rollout: { region: "us-east-1" },
-      });
-    } finally {
-      await agent.close();
-    }
+  it("overrides clientCapabilities via RunAgentOptions.clientAcpCapabilities", async () => {
+    const override = { fs: { readTextFile: true }, terminal: false };
+    const { clientCapabilities } = await captureContext(
+      "capture-caps-2",
+      {},
+      { clientAcpCapabilities: override },
+    );
+    expect(clientCapabilities).toEqual(override);
   });
 
-  it("defaults FactoryContext.metadata to {} when [agent.metadata] is absent", async () => {
-    let captured: unknown = null;
-    const captureFactory = {
-      name: "capture-metadata-default",
-      create(
-        _cfg: Record<string, unknown>,
-        ctx: { metadata?: Record<string, unknown> },
-      ) {
-        captured = ctx.metadata;
-        return { push: async () => [], pull: async () => [] };
-      },
+  it("surfaces [agent.metadata] to plugins and defaults it to {} when absent", async () => {
+    const metadata = {
+      team: "platform-eng",
+      owners: ["alice"],
+      rollout: { region: "us-east-1" },
     };
-    const { registerSession } = await import("../src/builtins/index.js");
-    registerSession(captureFactory);
+    const present = await captureContext("capture-metadata", { metadata });
+    expect(present.metadata).toEqual(metadata);
 
-    const agent = await runAgent({
-      name: "metadata-default",
-      systemPrompt: "x",
-      tools: {},
-      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
-      session: { provider: "capture-metadata-default" },
-      capabilities: {},
-      // No metadata field.
-    });
-    try {
-      expect(captured).toEqual({});
-    } finally {
-      await agent.close();
-    }
+    const absent = await captureContext("capture-metadata-default", {});
+    expect(absent.metadata).toEqual({});
   });
 });
