@@ -64,14 +64,21 @@ Loom is based on Anthropic's [Scaling Managed Agents: Decoupling the brain from 
 - **Tools** are the foundation of any agent. They are the agent's only sense organs, as well as its only way to interact with the world. Loom allows you to configure tools individually but also provides a way to control tools with **capabilities**.
 - **Capabilities** are a contextual description of what a tool may do. For example, a `read_file` tool has capabilities for describing which paths it can read, while a `send_discord_dm` tool has capabilities for describing which users it can send DMs to. Capabilities are closed, no other mechanism can add capabilities to a manifest. 
 - A **provider**, is a library that supplies any of the above components. This could be a git repo, an npm package, or a local directory.
-- Loom has first class support for **ACP**, and each component can implement their own parts of the protocol. However, Loom is primarily intended for non-interactive use cases.
+- Loom has first class support for **ACP**, and each component can implement their own parts of the protocol. 
 
-Loom comes with a simple CLI for installing and running these agents:
+Together, these pieces let you define the dependencies and configuration for a single agentic turn. To do more than one turn, you need to build a client that calls loom multiple times.
+
+## The client
+
+Loom ships with a simple, no-frills CLI for debugging or interacting with an agent: 
 
 - `$ loom install <agent.toml>` to resolve and install a harness from a manifest.
 - `$ loom prompt <agent.toml> [text]` to send a prompt to a harness and run it for a single turn
 - `$ loom run <agent.toml>` to run a simple client for interacting with the agent instantiated by the manifest 
 - `$ loom audit <agent.toml>` to see the full list of every component that will be used to run a given agent.
+
+Loom is intended to be embedded in a larger agent system, called a "client", that orchestrates the loom invocations. This could be a discord bot, a multi agent system, or anything else that needs to safely build and invoke an agent turn.
+
 
 ## Security Model
 
