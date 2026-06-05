@@ -1,6 +1,6 @@
 {
   "name": "@mcmaki/loom",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Loom — A manifest-driven agent meta-harness",
   "type": "module",
   "main": "dist/index.js",
