@@ -60,7 +60,9 @@ async function agentMessages(session: AgentSession): Promise<string[]> {
 async function toolStatus(session: AgentSession): Promise<string | undefined> {
   const events = (await session.pull?.([])) ?? [];
   const tool = events.find((e) => e.sessionUpdate === "tool_call_update");
-  return tool?.sessionUpdate === "tool_call_update" ? tool.status : undefined;
+  return tool?.sessionUpdate === "tool_call_update"
+    ? (tool.status ?? undefined)
+    : undefined;
 }
 
 describe("runAgent → end-to-end with TestHarness + memory session", () => {
@@ -115,7 +117,7 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
           once: true,
         });
       });
-      const out: TurnScript[number][] = [];
+      const out: TurnStep[] = [];
       for (let i = 0; i < 50; i++) out.push({ say: `step ${i}` });
       out.push({ stop: "end_turn" });
       return out;
