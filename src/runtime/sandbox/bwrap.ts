@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
+import { expandHome } from "../../internal/util.js";
 import type { CapabilitySet } from "../../types/manifest.js";
 
 const BWRAP_CANDIDATES = [
@@ -158,7 +159,7 @@ export async function maybeBwrapPrefix(
 }
 
 async function canonicalPath(p: string): Promise<string> {
-  const abs = nodePath.resolve(p);
+  const abs = nodePath.resolve(expandHome(p));
   try {
     return await fs.realpath(abs);
   } catch (e) {

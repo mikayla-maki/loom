@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as nodePath from "node:path";
 
 import {
   buildBashProfile,
@@ -54,6 +56,17 @@ describe("buildBashProfile", () => {
       const canonical = await fs.realpath(dir);
       expect(profile).toContain(`(allow file-read*  (subpath "${canonical}"))`);
     });
+  });
+
+  it("expands a leading ~ to the home directory before resolving", async () => {
+    const profile = await buildBashProfile({ paths: ["~/loom-tilde-grant"] });
+    const expected = nodePath.join(
+      await fs.realpath(os.homedir()),
+      "loom-tilde-grant",
+    );
+    expect(profile).toContain(`(allow file-read*  (subpath "${expected}"))`);
+    expect(profile).not.toContain('subpath "~');
+    expect(profile).not.toContain(`${process.cwd()}/~`);
   });
 
   it("emits unrestricted FS rules for paths = star", async () => {

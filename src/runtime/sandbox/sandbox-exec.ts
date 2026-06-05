@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as nodePath from "node:path";
 
+import { expandHome } from "../../internal/util.js";
 import type { CapabilitySet } from "../../types/manifest.js";
 
 const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
@@ -149,7 +150,7 @@ function escapeSbpl(s: string): string {
 }
 
 async function canonicalPath(p: string): Promise<string> {
-  const abs = nodePath.resolve(p);
+  const abs = nodePath.resolve(expandHome(p));
   try {
     return await fs.realpath(abs);
   } catch (e) {
