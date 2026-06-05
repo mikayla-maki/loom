@@ -1,5 +1,10 @@
 # Loom
 
+[![npm version](https://img.shields.io/npm/v/@mcmaki/loom.svg)](https://www.npmjs.com/package/@mcmaki/loom)
+[![npm downloads](https://img.shields.io/npm/dm/@mcmaki/loom.svg)](https://www.npmjs.com/package/@mcmaki/loom)
+[![license](https://img.shields.io/npm/l/@mcmaki/loom.svg)](./LICENSE)
+[![node](https://img.shields.io/node/v/@mcmaki/loom.svg)](https://nodejs.org)
+
 > A capability-secure, manifest-driven agent runtime.
 
 >[!NOTE]
@@ -42,6 +47,28 @@ bash       = { commands = "*", paths = ["./"] } # Sandboxed by default, no netwo
 write_file = { paths = ["./"] }
 edit_file  = { paths = ["./"] }
 ```
+
+## Install
+
+Install the CLI globally (requires Node ≥ 20):
+
+```sh
+npm install -g @mcmaki/loom
+```
+
+Or run it without installing:
+
+```sh
+npx @mcmaki/loom run agent.toml
+```
+
+To use Loom as a library in your own project:
+
+```sh
+npm install @mcmaki/loom
+```
+
+Then point it at your manifest:
 
 ```sh
 ANTHROPIC_API_KEY=... loom run agent.toml
