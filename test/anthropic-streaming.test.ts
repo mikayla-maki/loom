@@ -5,6 +5,21 @@ import { InMemorySession } from "../src/builtins/session/memory.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
+import { defined } from "./helpers/assert.js";
+
+type Event = Record<string, unknown>;
+
+const textDelta = (text: string): Event => ({
+  type: "content_block_delta",
+  index: 0,
+  delta: { type: "text_delta", text },
+});
+
+const messageDelta = (stopReason: string, outputTokens: number): Event => ({
+  type: "message_delta",
+  delta: { stop_reason: stopReason, stop_sequence: null },
+  usage: { output_tokens: outputTokens },
+});
 
 function eventStream(
   events: Array<Record<string, unknown>>,
@@ -122,6 +137,16 @@ function stubFetch(events: Array<Record<string, unknown>>): void {
   }) as typeof fetch;
 }
 
+function startAgent(
+  config: Parameters<typeof runAgent>[0],
+  options?: Parameters<typeof runAgent>[1],
+) {
+  return runAgent(config, {
+    secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }),
+    ...options,
+  });
+}
+
 describe("AnthropicHarness streaming", () => {
   beforeEach(() => {
     capturedRequest = null;
@@ -138,35 +163,20 @@ describe("AnthropicHarness streaming", () => {
         index: 0,
         content_block: { type: "text", text: "" },
       },
-      {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text: "Hello" },
-      },
-      {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text: ", world" },
-      },
+      textDelta("Hello"),
+      textDelta(", world"),
       { type: "content_block_stop", index: 0 },
-      {
-        type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { output_tokens: 14 },
-      },
+      messageDelta("end_turn", 14),
       { type: "message_stop" },
     ]);
 
-    const agent = await runAgent(
-      {
-        name: "stream-test",
-        tools: {},
-        harness: { provider: "anthropic", model: "x" },
-        // Plain memory session keeps usage_update events visible in pull().
-        session: new InMemorySession(),
-      },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
-    );
+    const agent = await startAgent({
+      name: "stream-test",
+      tools: {},
+      harness: { provider: "anthropic", model: "x" },
+      // Plain memory session keeps usage_update events visible in pull().
+      session: new InMemorySession(),
+    });
     try {
       const result = await agent.prompt("hi");
       expect(result.stopReason).toBe("end_turn");
@@ -188,12 +198,12 @@ describe("AnthropicHarness streaming", () => {
       );
       expect(texts).toEqual(["Hello", ", world"]);
 
-      const usage = events.find((e) => e.sessionUpdate === "usage_update");
-      expect(usage).toBeDefined();
-      if (usage && usage.sessionUpdate === "usage_update") {
-        expect(usage.used).toBe(25 + 14);
-        expect(usage.size).toBe(200000);
-      }
+      const usage = defined(
+        events.find((e) => e.sessionUpdate === "usage_update"),
+      );
+      if (usage.sessionUpdate !== "usage_update") throw new Error("unreachable");
+      expect(usage.used).toBe(25 + 14);
+      expect(usage.size).toBe(200000);
     } finally {
       await agent.close();
     }
@@ -230,11 +240,7 @@ describe("AnthropicHarness streaming", () => {
                 delta: { type: "input_json_delta", partial_json: 'hi"}' },
               },
               { type: "content_block_stop", index: 0 },
-              {
-                type: "message_delta",
-                delta: { stop_reason: "tool_use", stop_sequence: null },
-                usage: { output_tokens: 7 },
-              },
+              messageDelta("tool_use", 7),
               { type: "message_stop" },
             ]
           : [
@@ -244,33 +250,22 @@ describe("AnthropicHarness streaming", () => {
                 index: 0,
                 content_block: { type: "text", text: "" },
               },
-              {
-                type: "content_block_delta",
-                index: 0,
-                delta: { type: "text_delta", text: "done" },
-              },
+              textDelta("done"),
               { type: "content_block_stop", index: 0 },
-              {
-                type: "message_delta",
-                delta: { stop_reason: "end_turn", stop_sequence: null },
-                usage: { output_tokens: 1 },
-              },
+              messageDelta("end_turn", 1),
               { type: "message_stop" },
             ];
       return streamResponse(events);
     }) as typeof fetch;
 
-    const agent = await runAgent(
+    const agent = await startAgent(
       {
         name: "tool-stream",
         tools: { echo: "builtin" },
         capabilities: { echo: "*" },
         harness: { provider: "anthropic", model: "x" },
       },
-      {
-        secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }),
-        providers: [echoTestProvider],
-      },
+      { providers: [echoTestProvider] },
     );
     try {
       const result = await agent.prompt("call echo");
@@ -309,39 +304,35 @@ describe("AnthropicHarness streaming", () => {
       );
     }) as typeof fetch;
 
-    const agent = await runAgent(
-      {
-        name: "nostream",
-        tools: {},
-        harness: { provider: "anthropic", model: "x", stream: false },
-        session: new InMemorySession(),
-      },
-      { secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }) },
-    );
+    const agent = await startAgent({
+      name: "nostream",
+      tools: {},
+      harness: { provider: "anthropic", model: "x", stream: false },
+      session: new InMemorySession(),
+    });
     try {
       const result = await agent.prompt("hi");
       expect(capturedRequest?.body).not.toMatchObject({ stream: true });
       expect(result.usage).toMatchObject({ inputTokens: 100, outputTokens: 5 });
 
       const events = (await agent.session.pull?.([])) ?? [];
-      const text = events.find(
-        (e) => e.sessionUpdate === "agent_message_chunk",
+      const text = defined(
+        events.find((e) => e.sessionUpdate === "agent_message_chunk"),
       );
       if (
-        text?.sessionUpdate === "agent_message_chunk" &&
-        text.content.type === "text"
+        text.sessionUpdate !== "agent_message_chunk" ||
+        text.content.type !== "text"
       ) {
-        expect(text.content.text).toBe("non-streamed");
-      } else {
         throw new Error("expected agent text");
       }
+      expect(text.content.text).toBe("non-streamed");
 
-      const usage = events.find((e) => e.sessionUpdate === "usage_update");
-      expect(usage).toBeDefined();
-      if (usage && usage.sessionUpdate === "usage_update") {
-        expect(usage.used).toBe(105);
-        expect(usage.size).toBe(200000);
-      }
+      const usage = defined(
+        events.find((e) => e.sessionUpdate === "usage_update"),
+      );
+      if (usage.sessionUpdate !== "usage_update") throw new Error("unreachable");
+      expect(usage.used).toBe(105);
+      expect(usage.size).toBe(200000);
     } finally {
       await agent.close();
     }

@@ -27,6 +27,29 @@ function asSessionBinding(
   return layer;
 }
 
+/** Manifest with the common defaults filled in. */
+function spec(overrides: Partial<AgentManifest>): AgentManifest {
+  return {
+    name: "test",
+    systemPrompt: "x",
+    harness: { provider: "test" },
+    ...overrides,
+  };
+}
+
+/** Runs an agent and guarantees it is closed afterward. */
+async function withAgent(
+  manifest: AgentManifest,
+  fn: (agent: Awaited<ReturnType<typeof runAgent>>) => Promise<void>,
+): Promise<void> {
+  const agent = await runAgent(manifest, {});
+  try {
+    await fn(agent);
+  } finally {
+    await agent.close();
+  }
+}
+
 describe("manifest walk via runAgent", () => {
   it("resolves the file-based sample agent end-to-end", async () => {
     const agent = await runAgent(
@@ -48,52 +71,36 @@ describe("manifest walk via runAgent", () => {
   });
 
   it("empty [tools] table opts out of the default builtin set", async () => {
-    const spec: AgentManifest = {
-      name: "no-defaults",
-      systemPrompt: "be brief",
-      tools: {},
-      harness: { provider: "test" },
-    };
-    const agent = await runAgent(spec, {});
-    try {
+    await withAgent(spec({ tools: {} }), (agent) => {
       expect(agent.agentState.toolTable.list()).toHaveLength(0);
-    } finally {
-      await agent.close();
-    }
+      return Promise.resolve();
+    });
   });
 
   it("rejects when a tool's `requires` aren't granted", async () => {
-    const spec: AgentManifest = {
-      name: "snoopy",
-      systemPrompt: "x",
-      tools: { bash: "builtin" },
-      harness: { provider: "test" },
-      capabilities: { bash: {} },
-    };
-    await expect(runAgent(spec, {})).rejects.toThrow(CapabilityError);
+    await expect(
+      runAgent(
+        spec({ tools: { bash: "builtin" }, capabilities: { bash: {} } }),
+        {},
+      ),
+    ).rejects.toThrow(CapabilityError);
   });
 
   it("fails when no provider claims a referenced tool name", async () => {
-    const spec: AgentManifest = {
-      name: "unknown-tool",
-      systemPrompt: "x",
-      tools: { not_a_real_tool: "builtin" },
-      harness: { provider: "test" },
-    };
-    await expect(runAgent(spec, {})).rejects.toThrow(ResolutionError);
+    await expect(
+      runAgent(spec({ tools: { not_a_real_tool: "builtin" } }), {}),
+    ).rejects.toThrow(ResolutionError);
   });
 
   it("produces ordered chain bindings from a SessionSpec[] manifest", () => {
-    const spec: AgentManifest = {
-      name: "chain-resolver",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      session: [
-        { provider: "compacting", threshold: 60 },
-        { provider: "in-memory" },
-      ],
-    };
-    const r = resolveManifest(spec);
+    const r = resolveManifest(
+      spec({
+        session: [
+          { provider: "compacting", threshold: 60 },
+          { provider: "in-memory" },
+        ],
+      }),
+    );
     expect(Array.isArray(r.session)).toBe(true);
     expect(r.session).toHaveLength(2);
     const layer0 = asSessionBinding(r.session?.[0]);
@@ -104,53 +111,37 @@ describe("manifest walk via runAgent", () => {
   });
 
   it("wraps singleton SessionSpec into a length-1 binding array", () => {
-    const spec: AgentManifest = {
-      name: "singleton-resolver",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      session: { provider: "in-memory" },
-    };
-    const r = resolveManifest(spec);
+    const r = resolveManifest(spec({ session: { provider: "in-memory" } }));
     expect(r.session).toHaveLength(1);
     expect(asSessionBinding(r.session?.[0]).factoryName).toBe("in-memory");
   });
 
   it("pre-built Session instance leaves resolved.session undefined", () => {
-    const spec: AgentManifest = {
-      name: "prebuilt-resolver",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      session: new InMemorySession(),
-    };
-    const r = resolveManifest(spec);
+    const r = resolveManifest(spec({ session: new InMemorySession() }));
     expect(r.session).toBeUndefined();
   });
 
   it("resolves [agent].system_prompt as inline string when not path-like", async () => {
-    const spec: AgentManifest = {
-      name: "inline-sp",
-      systemPrompt: "Be concise. Use only tools provided.",
-      tools: {},
-      harness: { provider: "test" },
-    };
-    const sp = await resolveSystemPrompt(spec, process.cwd());
-    expect(sp).toBe("Be concise. Use only tools provided.");
+    const inline = "Be concise. Use only tools provided.";
+    const sp = await resolveSystemPrompt(
+      spec({ systemPrompt: inline, tools: {} }),
+      process.cwd(),
+    );
+    expect(sp).toBe(inline);
   });
 
   it("resolves [tools.X] entries through a configured-factory [providers] handle", () => {
-    const spec: AgentManifest = {
-      name: "cf-tool",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        fs_mcp: { provider: "test-meta", npm: "@example/mcp-fs" },
-      },
-      tools: {
-        read_text_file: { provider: "fs_mcp" },
-        list_directory: { provider: "fs_mcp" },
-      },
-    };
-    const r = resolveManifest(spec);
+    const r = resolveManifest(
+      spec({
+        providers: {
+          fs_mcp: { provider: "test-meta", npm: "@example/mcp-fs" },
+        },
+        tools: {
+          read_text_file: { provider: "fs_mcp" },
+          list_directory: { provider: "fs_mcp" },
+        },
+      }),
+    );
 
     expect(r.tools).toHaveLength(2);
     const t0 = defined(r.tools[0]);
@@ -176,23 +167,21 @@ describe("manifest walk via runAgent", () => {
   });
 
   it("keeps provider-level and per-tool config separate, deduping to one instance", () => {
-    const spec: AgentManifest = {
-      name: "cf-split",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        fs_mcp: {
-          provider: "test-meta",
-          npm: "@example/mcp-fs",
-          shared: "from-provider",
+    const r = resolveManifest(
+      spec({
+        providers: {
+          fs_mcp: {
+            provider: "test-meta",
+            npm: "@example/mcp-fs",
+            shared: "from-provider",
+          },
         },
-      },
-      tools: {
-        plain: { provider: "fs_mcp", flavour: "vanilla" },
-        override: { provider: "fs_mcp", shared: "from-tool" },
-      },
-    };
-    const r = resolveManifest(spec);
+        tools: {
+          plain: { provider: "fs_mcp", flavour: "vanilla" },
+          override: { provider: "fs_mcp", shared: "from-tool" },
+        },
+      }),
+    );
     const t0 = defined(r.tools[0]);
     const t1 = defined(r.tools[1]);
 
@@ -211,37 +200,31 @@ describe("manifest walk via runAgent", () => {
   });
 
   it("dedupes tools pointing at the same configured-factory handle, even with different per-tool config", () => {
-    const spec: AgentManifest = {
-      name: "cf-dedup",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        fs_mcp: { provider: "test-meta", npm: "@example/mcp-fs" },
-      },
-      tools: {
-        a: { provider: "fs_mcp" },
-        b: { provider: "fs_mcp", tool: "something_else" },
-        c: { provider: "fs_mcp", note: "per-tool-only" },
-      },
-    };
-    const r = resolveManifest(spec);
+    const r = resolveManifest(
+      spec({
+        providers: {
+          fs_mcp: { provider: "test-meta", npm: "@example/mcp-fs" },
+        },
+        tools: {
+          a: { provider: "fs_mcp" },
+          b: { provider: "fs_mcp", tool: "something_else" },
+          c: { provider: "fs_mcp", note: "per-tool-only" },
+        },
+      }),
+    );
     const ids = new Set(r.tools.map((t) => t.providerInstanceId));
     expect(ids.size).toBe(1);
   });
 
   it("resolves [harness] through a configured-factory [providers] handle, with call-site config winning", () => {
-    const spec: AgentManifest = {
-      name: "cf-harness",
-      systemPrompt: "x",
-      providers: {
-        configured: {
-          provider: "test",
-          locked_config_key: "locked_value",
+    const r = resolveManifest(
+      spec({
+        providers: {
+          configured: { provider: "test", locked_config_key: "locked_value" },
         },
-      },
-      harness: { provider: "configured", call_site_key: "call_site_value" },
-    };
-    const r = resolveManifest(spec);
+        harness: { provider: "configured", call_site_key: "call_site_value" },
+      }),
+    );
     expect(r.harness?.factoryName).toBe("test");
     expect(r.harness?.providerHandle).toBe("configured");
     expect(r.harness?.source).toBeUndefined();
@@ -252,20 +235,18 @@ describe("manifest walk via runAgent", () => {
   });
 
   it("keeps source-form [providers] entries working in parallel with configured-factory entries", () => {
-    const spec: AgentManifest = {
-      name: "mixed-providers",
-      systemPrompt: "x",
-      harness: { provider: "test" },
-      providers: {
-        loaded: { path: "./loaded-provider" },
-        configured: { provider: "test-meta", flavour: "a" },
-      },
-      tools: {
-        from_loaded: { provider: "loaded" },
-        from_configured: { provider: "configured" },
-      },
-    };
-    const r = resolveManifest(spec);
+    const r = resolveManifest(
+      spec({
+        providers: {
+          loaded: { path: "./loaded-provider" },
+          configured: { provider: "test-meta", flavour: "a" },
+        },
+        tools: {
+          from_loaded: { provider: "loaded" },
+          from_configured: { provider: "configured" },
+        },
+      }),
+    );
     const t0 = defined(r.tools[0]);
     const t1 = defined(r.tools[1]);
     const loaded = defined(

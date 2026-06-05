@@ -25,6 +25,18 @@ function freshCompactingChain(
   return { session, compactor, memory };
 }
 
+/** Chain with a small threshold, pre-loaded with 8 user messages ready to compact. */
+async function loadedChain() {
+  const chain = freshCompactingChain({
+    threshold: 6,
+    keep: 2,
+    compactor: modelCompactor(),
+  });
+  for (let i = 0; i < 8; i++) await chain.session.push?.(userMsg(`m${i}`));
+  await chain.session.pull?.([]);
+  return chain;
+}
+
 function userMsg(text: string): SessionUpdate {
   return {
     sessionUpdate: "user_message_chunk",
@@ -88,13 +100,7 @@ describe("modelCompactor + Session.prepareTurn", () => {
         return "everything is fine, carry on";
       },
     };
-    const { session, compactor } = freshCompactingChain({
-      threshold: 6,
-      keep: 2,
-      compactor: modelCompactor(),
-    });
-    for (let i = 0; i < 8; i++) await session.push?.(userMsg(`m${i}`));
-    await session.pull?.([]);
+    const { session, compactor } = await loadedChain();
     await compactor.prepareTurn(fakeAgent(harness, session));
     expect(called).toBe(true);
     expect(summaryText((await session.pull?.([])) ?? [])).toContain(
@@ -104,13 +110,7 @@ describe("modelCompactor + Session.prepareTurn", () => {
 
   it("falls back to summariseViaRun when harness has no native summarise", async () => {
     const harness = fixedTextHarness("VIA_RUN_SUMMARY");
-    const { session, compactor } = freshCompactingChain({
-      threshold: 6,
-      keep: 2,
-      compactor: modelCompactor(),
-    });
-    for (let i = 0; i < 8; i++) await session.push?.(userMsg(`m${i}`));
-    await session.pull?.([]);
+    const { session, compactor } = await loadedChain();
     await compactor.prepareTurn(fakeAgent(harness, session));
     expect(summaryText((await session.pull?.([])) ?? [])).toContain(
       "VIA_RUN_SUMMARY",
@@ -118,13 +118,7 @@ describe("modelCompactor + Session.prepareTurn", () => {
   });
 
   it("falls back to the heuristic compactor when ctx is null", async () => {
-    const { session, compactor } = freshCompactingChain({
-      threshold: 6,
-      keep: 2,
-      compactor: modelCompactor(),
-    });
-    for (let i = 0; i < 8; i++) await session.push?.(userMsg(`hello ${i}`));
-    await session.pull?.([]);
+    const { session, compactor } = await loadedChain();
     await compactor.compactNow();
     expect(summaryText((await session.pull?.([])) ?? [])).toContain("user:");
   });

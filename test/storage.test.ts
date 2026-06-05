@@ -67,14 +67,14 @@ async function readMeta(storagePath: string) {
 
 describe("resolveAgentStorage", () => {
   const tmp = useTmpDir("loom-storage-");
+  const open = (m: AgentManifest) =>
+    resolveAgentStorage(m, { LOOM_DATA_HOME: tmp() });
 
   it("creates <dataHome>/agents/<name>/ on first open and drops .loom-agent metadata", async () => {
-    const dataHome = tmp();
-    const r = await resolveAgentStorage(
+    const r = await open(
       manifest({ name: "scribe", manifestPath: "/abs/path/agent.toml" }),
-      { LOOM_DATA_HOME: dataHome },
     );
-    expect(r.path).toBe(path.join(dataHome, "agents", "scribe"));
+    expect(r.path).toBe(path.join(tmp(), "agents", "scribe"));
     expect(r.source).toBe("name");
     expect(r.warnings).toEqual([]);
     expect((await fs.stat(r.path)).isDirectory()).toBe(true);
@@ -85,22 +85,16 @@ describe("resolveAgentStorage", () => {
     expect(meta.createdByManifest).toBe("/abs/path/agent.toml");
     expect(meta.knownManifests).toEqual(["/abs/path/agent.toml"]);
 
-    const reopened = await resolveAgentStorage(
+    const reopened = await open(
       manifest({ name: "scribe", manifestPath: "/abs/path/agent.toml" }),
-      { LOOM_DATA_HOME: dataHome },
     );
     expect(reopened.warnings).toEqual([]);
   });
 
   it("warns when a different manifest path opens an existing storage, and records both in knownManifests", async () => {
-    const dataHome = tmp();
-    await resolveAgentStorage(
-      manifest({ name: "scribe", manifestPath: "/path/one.toml" }),
-      { LOOM_DATA_HOME: dataHome },
-    );
-    const r2 = await resolveAgentStorage(
+    await open(manifest({ name: "scribe", manifestPath: "/path/one.toml" }));
+    const r2 = await open(
       manifest({ name: "scribe", manifestPath: "/path/two.toml" }),
-      { LOOM_DATA_HOME: dataHome },
     );
     expect(r2.warnings).toHaveLength(1);
     expect(r2.warnings[0]).toMatch(/previously opened by \/path\/one\.toml/);
@@ -112,31 +106,22 @@ describe("resolveAgentStorage", () => {
   });
 
   it("[agent].storage_id overrides [agent].name and is reported as the source", async () => {
-    const r = await resolveAgentStorage(
-      manifest({ name: "scribe", storageId: "my-pinned-id" }),
-      { LOOM_DATA_HOME: tmp() },
-    );
+    const r = await open(manifest({ name: "scribe", storageId: "my-pinned-id" }));
     expect(r.path).toBe(path.join(tmp(), "agents", "my-pinned-id"));
     expect(r.source).toBe("storage_id");
   });
 
   it("sanitises punctuation in identifiers and rejects path separators", async () => {
-    const r = await resolveAgentStorage(manifest({ name: "my agent v2.0" }), {
-      LOOM_DATA_HOME: tmp(),
-    });
+    const r = await open(manifest({ name: "my agent v2.0" }));
     expect(path.basename(r.path)).toBe("my_agent_v2.0");
 
-    await expect(
-      resolveAgentStorage(manifest({ name: "evil/../escape" }), {
-        LOOM_DATA_HOME: tmp(),
-      }),
-    ).rejects.toThrow(/path separator/);
+    await expect(open(manifest({ name: "evil/../escape" }))).rejects.toThrow(
+      /path separator/,
+    );
   });
 
   it("creates storage for manifests without a manifestPath (pre-built / SDK callers)", async () => {
-    const r = await resolveAgentStorage(manifest({ name: "in-memory" }), {
-      LOOM_DATA_HOME: tmp(),
-    });
+    const r = await open(manifest({ name: "in-memory" }));
     expect(r.warnings).toEqual([]);
     const meta = await readMeta(r.path);
     expect(meta.createdByManifest).toBeNull();

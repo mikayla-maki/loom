@@ -78,15 +78,7 @@ describe("Session.systemPromptSection", () => {
   });
 
   it("a thrown systemPromptSection doesn't kill the turn", async () => {
-    let ran = false;
-    const harness: Harness = {
-      async run(rt: Runtime) {
-        ran = true;
-        expect(rt.systemPrompt()).not.toContain("# Session");
-        await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return { stopReason: "end_turn" as const };
-      },
-    };
+    const { harness, captured } = recordingHarness();
     const session = makeSession(() => {
       throw new Error("boom");
     });
@@ -99,7 +91,9 @@ describe("Session.systemPromptSection", () => {
     });
     try {
       await agent.prompt("hi");
-      expect(ran).toBe(true);
+      // turn still ran, and the failed section was omitted from the prompt
+      expect(captured()).not.toBeNull();
+      expect(captured()!).not.toContain("# Session");
     } finally {
       await agent.close();
     }

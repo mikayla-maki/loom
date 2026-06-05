@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import * as os from "node:os";
 
 import { EditFileTool } from "../src/runtime/builtins/edit_file.js";
 import type { Agent, ToolContext } from "../src/types/interfaces.js";
-import { useTmpDir } from "./helpers/tmp.js";
+import { useTmpDir, withTmpDir } from "./helpers/tmp.js";
 
 function makeCtx(): ToolContext {
   const agent: Agent = {
@@ -27,11 +26,16 @@ function makeCtx(): ToolContext {
 describe("edit_file applies exact-text replacements", () => {
   const root = useTmpDir("loom-edit-");
 
-  it("applies a single edit", async () => {
+  // A tool granted the tmp root plus a note file inside it.
+  async function setup(content: string) {
     const tool = new EditFileTool({}, { paths: [root()] });
     const file = path.join(root(), "note.txt");
-    await fs.writeFile(file, "hello world", "utf8");
+    await fs.writeFile(file, content, "utf8");
+    return { tool, file };
+  }
 
+  it("applies a single edit", async () => {
+    const { tool, file } = await setup("hello world");
     const result = await tool.execute(
       { path: file, edits: [{ old_text: "world", new_text: "loom" }] },
       makeCtx(),
@@ -41,10 +45,7 @@ describe("edit_file applies exact-text replacements", () => {
   });
 
   it("applies multiple non-overlapping edits against the original content", async () => {
-    const tool = new EditFileTool({}, { paths: [root()] });
-    const file = path.join(root(), "note.txt");
-    await fs.writeFile(file, "alpha beta gamma", "utf8");
-
+    const { tool, file } = await setup("alpha beta gamma");
     const result = await tool.execute(
       {
         path: file,
@@ -60,24 +61,18 @@ describe("edit_file applies exact-text replacements", () => {
   });
 
   it("errors when old_text matches more than once", async () => {
-    const tool = new EditFileTool({}, { paths: [root()] });
-    const file = path.join(root(), "note.txt");
-    await fs.writeFile(file, "dup dup", "utf8");
-
+    const { tool, file } = await setup("dup dup");
     const result = await tool.execute(
       { path: file, edits: [{ old_text: "dup", new_text: "x" }] },
       makeCtx(),
     );
     expect(result.isError).toBe(true);
-    // Original content is left untouched.
+    // Failed edit leaves the file untouched.
     expect(await fs.readFile(file, "utf8")).toBe("dup dup");
   });
 
   it("errors when old_text is not found", async () => {
-    const tool = new EditFileTool({}, { paths: [root()] });
-    const file = path.join(root(), "note.txt");
-    await fs.writeFile(file, "hello world", "utf8");
-
+    const { tool, file } = await setup("hello world");
     const result = await tool.execute(
       { path: file, edits: [{ old_text: "missing", new_text: "x" }] },
       makeCtx(),
@@ -87,9 +82,9 @@ describe("edit_file applies exact-text replacements", () => {
   });
 
   it("denies a path outside the granted paths", async () => {
-    const tool = new EditFileTool({}, { paths: [root()] });
-    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "loom-edit-out-"));
-    try {
+    // Tool granted only `root()`; the target file lives elsewhere.
+    await withTmpDir("loom-edit-out-", async (outside) => {
+      const tool = new EditFileTool({}, { paths: [root()] });
       const file = path.join(outside, "note.txt");
       await fs.writeFile(file, "hello world", "utf8");
 
@@ -98,10 +93,7 @@ describe("edit_file applies exact-text replacements", () => {
         makeCtx(),
       );
       expect(result.isError).toBe(true);
-      // The denied edit must not modify the out-of-grant file.
       expect(await fs.readFile(file, "utf8")).toBe("hello world");
-    } finally {
-      await fs.rm(outside, { recursive: true, force: true });
-    }
+    });
   });
 });

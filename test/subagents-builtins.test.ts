@@ -291,6 +291,19 @@ describe("small-model-of-parent harness", () => {
     };
   }
 
+  function deriveChild(config: Record<string, unknown>, parent: Agent) {
+    return smallModelOfParentHarnessFactory.create(
+      config,
+      factoryContext(),
+      {},
+      parent,
+    );
+  }
+
+  function modelOf(h: unknown): string {
+    return (h as { model: string }).model;
+  }
+
   it("requiresParent: top-level boot fails with a clear error", async () => {
     await expect(
       runAgent({
@@ -313,19 +326,16 @@ describe("small-model-of-parent harness", () => {
       16,
       true,
     );
-    const child = (await smallModelOfParentHarnessFactory.create(
+    const child = (await deriveChild(
       { model: "claude-3-5-haiku-latest" },
-      factoryContext(),
-      {},
       parentWith(parentHarness),
     )) as AnthropicHarness;
 
     expect(child).toBeInstanceOf(AnthropicHarness);
     expect(child).not.toBe(parentHarness);
-    const childModel = (child as unknown as { model: string }).model;
+    expect(modelOf(child)).toBe("claude-3-5-haiku-latest");
     const childKey = (child as unknown as { apiKey: string }).apiKey;
     const parentKey = (parentHarness as unknown as { apiKey: string }).apiKey;
-    expect(childModel).toBe("claude-3-5-haiku-latest");
     expect(childKey).toBe(parentKey);
   });
 

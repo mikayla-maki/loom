@@ -8,6 +8,7 @@ import { serveOverStream } from "../src/acp/server.js";
 import { ACP_PROTOCOL_VERSION } from "../src/acp/server.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
+import { withTmpDir } from "./helpers/tmp.js";
 import {
   ClientSideConnection,
   ndJsonStream,
@@ -171,6 +172,8 @@ describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
       prefix: string;
       manifest: string;
       spawnCwd?: string;
+      // Runs after the agent dir exists but before spawn (e.g. copy fixtures).
+      prepare?: (agentDir: string) => Promise<void>;
     },
     run: (ctx: {
       agentDir: string;
@@ -179,10 +182,10 @@ describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
       collected: SessionNotification[];
     }) => Promise<void>,
   ): Promise<void> {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), args.prefix));
-    try {
+    await withTmpDir(args.prefix, async (tmp) => {
       const agentDir = path.join(tmp, "agent");
       await fs.mkdir(agentDir, { recursive: true });
+      await args.prepare?.(agentDir);
       await fs.writeFile(path.join(agentDir, "agent.toml"), args.manifest);
       const { client, collected, shutdown } = await spawnLoomAcp({
         cliEntry: CLI_ENTRY,
@@ -194,23 +197,19 @@ describe("ACP over spawned `loom acp serve` (subprocess, real stdio)", () => {
       } finally {
         shutdown();
       }
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    });
   }
 
   sit("drives the sample agent end-to-end via stdio", async () => {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "loom-acp-cli-"));
-    try {
-      const agentDir = path.join(tmp, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.cp(
-        path.join(FIXTURES, "sample-agent", "identity.md"),
-        path.join(agentDir, "identity.md"),
-      );
-      await fs.writeFile(
-        path.join(agentDir, "agent.toml"),
-        `[agent]
+    await withSpawnedAgent(
+      {
+        prefix: "loom-acp-cli-",
+        prepare: (agentDir) =>
+          fs.cp(
+            path.join(FIXTURES, "sample-agent", "identity.md"),
+            path.join(agentDir, "identity.md"),
+          ),
+        manifest: `[agent]
 name = "acp-sample"
 system_prompt = "./identity.md"
 secrets = []
@@ -223,13 +222,8 @@ echo = true
 provider = "file"
 path = "./session.jsonl"
 `,
-      );
-
-      const { client, shutdown } = await spawnLoomAcp({
-        cliEntry: CLI_ENTRY,
-        manifestPath: path.join(agentDir, "agent.toml"),
-      });
-      try {
+      },
+      async ({ agentDir, client }) => {
         await client.initialize({ protocolVersion: ACP_PROTOCOL_VERSION });
         const ns = await client.newSession({ cwd: agentDir, mcpServers: [] });
         const result = await client.prompt({
@@ -237,12 +231,8 @@ path = "./session.jsonl"
           prompt: [{ type: "text", text: "hello acp" }],
         });
         expect(result.stopReason).toBe("end_turn");
-      } finally {
-        shutdown();
-      }
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+      },
+    );
   });
 
   sit("honors the client's `cwd` for tool path resolution", async () => {

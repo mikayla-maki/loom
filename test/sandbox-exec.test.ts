@@ -1,14 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 
 import {
   buildBashProfile,
   sandboxEngaged,
   validateBashGrant,
 } from "../src/runtime/sandbox/sandbox-exec.js";
+import { withTmpDir } from "./helpers/tmp.js";
 
 describe("sandboxEngaged", () => {
   it("opts out only for the whole-tool star grant", () => {
@@ -48,16 +47,13 @@ describe("buildBashProfile", () => {
   });
 
   it("emits canonicalized per-path subpath rules for path allowlists", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "loom-sb-paths-"));
-    try {
+    await withTmpDir("loom-sb-paths-", async (dir) => {
       const profile = await buildBashProfile({ paths: [dir, "/usr/bin"] });
       expect(profile).toContain('(allow file-read*  (subpath "/usr/bin"))');
       expect(profile).toContain('(allow file-write* (subpath "/usr/bin"))');
       const canonical = await fs.realpath(dir);
       expect(profile).toContain(`(allow file-read*  (subpath "${canonical}"))`);
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   it("emits unrestricted FS rules for paths = star", async () => {

@@ -88,58 +88,56 @@ describe("aggregateAcpCapabilities", () => {
 });
 
 describe("ACP initialize handshake", () => {
-  it("returns aggregated capabilities + agentInfo", async () => {
+  // Serves `spec` over an in-process pipe and runs `body` against a connected
+  // client, tearing everything down afterwards.
+  async function withInitializedAgent(
+    spec: AgentManifest,
+    body: (conn: ClientSideConnection) => Promise<void>,
+  ): Promise<void> {
     const { serverStream, clientStream } = makeInProcessPipe();
-
-    const spec: AgentManifest = {
-      name: "init-test",
-      description: "Initialize round-trip",
-      systemPrompt: "x",
-      tools: {},
-      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
-      capabilities: {},
-    };
     const agent = await runAgent(spec);
-
     const { closeAll } = serveOverStream(async () => agent, serverStream);
+    try {
+      await body(makeClient(clientStream));
+    } finally {
+      await closeAll();
+      serverStream.writable.close().catch(() => undefined);
+      await agent.close();
+    }
+  }
 
-    const conn = makeClient(clientStream);
-    const result = await conn.initialize({
-      protocolVersion: ACP_PROTOCOL_VERSION,
-      clientCapabilities: {},
-      clientInfo: { name: "test-client", version: "0.0.1" },
-    });
+  const baseSpec = (name: string): AgentManifest => ({
+    name,
+    systemPrompt: "x",
+    tools: {},
+    harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
+    capabilities: {},
+  });
 
-    expect(result.protocolVersion).toBe(ACP_PROTOCOL_VERSION);
-    expect(result.agentInfo?.name).toBe("init-test");
-    expect(result.agentCapabilities?.promptCapabilities).toBeUndefined();
-    expect(result.agentCapabilities?.loadSession).toBeUndefined();
+  it("returns aggregated capabilities + agentInfo", async () => {
+    await withInitializedAgent(
+      { ...baseSpec("init-test"), description: "Initialize round-trip" },
+      async (conn) => {
+        const result = await conn.initialize({
+          protocolVersion: ACP_PROTOCOL_VERSION,
+          clientCapabilities: {},
+          clientInfo: { name: "test-client", version: "0.0.1" },
+        });
 
-    await closeAll();
-    serverStream.writable.close().catch(() => undefined);
-    await agent.close();
+        expect(result.protocolVersion).toBe(ACP_PROTOCOL_VERSION);
+        expect(result.agentInfo?.name).toBe("init-test");
+        expect(result.agentCapabilities?.promptCapabilities).toBeUndefined();
+        expect(result.agentCapabilities?.loadSession).toBeUndefined();
+      },
+    );
   });
 
   it("rejects unsupported protocolVersion", async () => {
-    const { serverStream, clientStream } = makeInProcessPipe();
-    const spec: AgentManifest = {
-      name: "init-bad-version",
-      systemPrompt: "x",
-      tools: {},
-      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
-      capabilities: {},
-    };
-    const agent = await runAgent(spec);
-    const { closeAll } = serveOverStream(async () => agent, serverStream);
-    const conn = makeClient(clientStream);
-
-    await expect(
-      conn.initialize({ protocolVersion: 999 } as never),
-    ).rejects.toThrow(/protocolVersion/);
-
-    await closeAll();
-    serverStream.writable.close().catch(() => undefined);
-    await agent.close();
+    await withInitializedAgent(baseSpec("init-bad-version"), async (conn) => {
+      await expect(
+        conn.initialize({ protocolVersion: 999 } as never),
+      ).rejects.toThrow(/protocolVersion/);
+    });
   });
 });
 

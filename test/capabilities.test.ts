@@ -40,6 +40,16 @@ function toolMap(...tools: Tool[]): Map<string, Tool> {
   return new Map(tools.map((t) => [t.name, t]));
 }
 
+/** Runs `fn`, returning the thrown error (failing the test if it doesn't throw). */
+function catchError(fn: () => unknown): unknown {
+  try {
+    fn();
+  } catch (e) {
+    return e;
+  }
+  throw new Error("expected function to throw");
+}
+
 describe("grant lookup helpers", () => {
   it("grantFor returns the manifest entry or undefined", () => {
     expect(grantFor({ a: { paths: ["/x"] } }, "a")).toEqual({ paths: ["/x"] });
@@ -129,12 +139,9 @@ describe("assertRequires", () => {
       makeTool({ name: "a", requires: ["x"] }),
       makeTool({ name: "b", requires: ["y", "z"] }),
     );
-    let caught: unknown;
-    try {
-      assertRequires(tools, { a: {}, b: { y: "*" } });
-    } catch (e) {
-      caught = e;
-    }
+    const caught = catchError(() =>
+      assertRequires(tools, { a: {}, b: { y: "*" } }),
+    );
     expect(caught).toBeInstanceOf(CapabilityError);
     expect(String(caught)).toContain("a");
     expect(String(caught)).toContain("'x'");
@@ -166,12 +173,9 @@ describe("assertKnownKinds", () => {
 
   it("throws on an undeclared granted kind and suggests the intended name", () => {
     const tools = toolMap(makeTool({ name: "read_file", optional: ["paths"] }));
-    let caught: unknown;
-    try {
-      assertKnownKinds(tools, { read_file: { pahts: ["./"] } });
-    } catch (e) {
-      caught = e;
-    }
+    const caught = catchError(() =>
+      assertKnownKinds(tools, { read_file: { pahts: ["./"] } }),
+    );
     expect(caught).toBeInstanceOf(CapabilityError);
     expect(String(caught)).toContain("read_file");
     expect(String(caught)).toContain("'pahts'");
@@ -190,12 +194,9 @@ describe("assertKnownKinds", () => {
       makeTool({ name: "a", optional: ["x"] }),
       makeTool({ name: "b", optional: ["y"] }),
     );
-    let caught: unknown;
-    try {
-      assertKnownKinds(tools, { a: { z: "*" }, b: { wat: "*" } });
-    } catch (e) {
-      caught = e;
-    }
+    const caught = catchError(() =>
+      assertKnownKinds(tools, { a: { z: "*" }, b: { wat: "*" } }),
+    );
     expect(caught).toBeInstanceOf(CapabilityError);
     expect(String(caught)).toContain("'z'");
     expect(String(caught)).toContain("'wat'");

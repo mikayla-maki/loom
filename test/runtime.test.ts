@@ -4,11 +4,15 @@ import { runAgent } from "../src/sdk/run-agent.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import { assembleSystemPrompt } from "../src/runtime/system-prompt.js";
 import type { AgentManifest } from "../src/types/manifest.js";
-import type { TurnScript } from "../src/builtins/harness/test.js";
+import type { TurnScript, TurnStep } from "../src/builtins/harness/test.js";
 import type { Runtime } from "../src/types/interfaces.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
 
-function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
+// Either per-turn scripts, or a function that produces a turn's steps (used
+// to drive timing-sensitive paths like cancellation).
+type HarnessScript = TurnScript[] | ((runtime: Runtime) => Promise<TurnStep[]>);
+
+function sampleAgentSpec(harnessScript?: HarnessScript): AgentManifest {
   return {
     name: "sample-agent",
     description: "An end-to-end Loom v0 demo agent.",
@@ -35,47 +39,52 @@ function sampleAgentSpec(harnessScript?: TurnScript[]): AgentManifest {
   };
 }
 
+// The sample agent never reads its secret, so the user name is irrelevant
+// to behavior — any value works.
+function startAgent(harnessScript?: HarnessScript) {
+  return runAgent(sampleAgentSpec(harnessScript), {
+    secrets: new StaticSecretsStore({ sample_user_name: "TESTER" }),
+    providers: [echoTestProvider],
+  });
+}
+
+type AgentSession = Awaited<ReturnType<typeof startAgent>>["session"];
+
+async function agentMessages(session: AgentSession): Promise<string[]> {
+  const events = (await session.pull?.([])) ?? [];
+  return events
+    .filter((e) => e.sessionUpdate === "agent_message_chunk")
+    .map((e) => (e.content.type === "text" ? e.content.text : ""));
+}
+
+async function toolStatus(session: AgentSession): Promise<string | undefined> {
+  const events = (await session.pull?.([])) ?? [];
+  const tool = events.find((e) => e.sessionUpdate === "tool_call_update");
+  return tool?.sessionUpdate === "tool_call_update" ? tool.status : undefined;
+}
+
 describe("runAgent → end-to-end with TestHarness + memory session", () => {
   it("runs scripted steps including a tool call", async () => {
-    const agent = await runAgent(
-      sampleAgentSpec([
-        [
-          { say: "On it." },
-          { call: { tool: "echo", input: { text: "hello, alice" } } },
-          { stop: "end_turn" },
-        ],
-      ]),
-      {
-        secrets: new StaticSecretsStore({ sample_user_name: "ALICE" }),
-        providers: [echoTestProvider],
-      },
-    );
+    const agent = await startAgent([
+      [
+        { say: "On it." },
+        { call: { tool: "echo", input: { text: "hello, alice" } } },
+        { stop: "end_turn" },
+      ],
+    ]);
     try {
       const result = await agent.prompt("Hi there!");
       expect(result.stopReason).toBe("end_turn");
-      const events = (await agent.session.pull?.([])) ?? [];
-      const messages = events
-        .filter((e) => e.sessionUpdate === "agent_message_chunk")
-        .map((e) => (e.content.type === "text" ? e.content.text : ""));
+      const messages = await agentMessages(agent.session);
       expect(messages.join(" | ")).toContain("On it.");
-      const tool = events.find((e) => e.sessionUpdate === "tool_call_update");
-      expect(tool).toBeTruthy();
-      if (tool && tool.sessionUpdate === "tool_call_update") {
-        expect(tool.status).toBe("completed");
-      }
+      expect(await toolStatus(agent.session)).toBe("completed");
     } finally {
       await agent.close();
     }
   });
 
   it("emits live updates to subscribers", async () => {
-    const agent = await runAgent(
-      sampleAgentSpec([[{ say: "ack" }, { stop: "end_turn" }]]),
-      {
-        secrets: new StaticSecretsStore({ sample_user_name: "BOB" }),
-        providers: [echoTestProvider],
-      },
-    );
+    const agent = await startAgent([[{ say: "ack" }, { stop: "end_turn" }]]);
     const seen: string[] = [];
     const sub = agent.updates();
     const consumer = (async () => {
@@ -96,46 +105,28 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
   });
 
   it("cancels an in-flight turn", async () => {
-    const spec = sampleAgentSpec();
-    if ("provider" in spec.harness) {
-      // Block the turn until cancellation actually fires, then hand back
-      // steps that must never run because the abort already tripped.
-      // If cancel() is a no-op the abort never resolves and the test
-      // times out — so this only passes when cancellation truly works.
-      spec.harness.script = async (rt: Runtime) => {
-        await new Promise<void>((resolve) => {
-          if (rt.abortSignal.aborted) {
-            resolve();
-            return;
-          }
-          rt.abortSignal.addEventListener("abort", () => resolve(), {
-            once: true,
-          });
+    // Block the turn until the abort fires, then return steps that must
+    // never run. If cancel() were a no-op the abort would never resolve and
+    // the test would time out, so this only passes when cancellation works.
+    const script: TurnScript = async (rt: Runtime) => {
+      await new Promise<void>((resolve) => {
+        if (rt.abortSignal.aborted) return resolve();
+        rt.abortSignal.addEventListener("abort", () => resolve(), {
+          once: true,
         });
-        const out = [] as Array<
-          | { say: string }
-          | { call: { tool: string; input: unknown } }
-          | { stop: "end_turn" | "cancelled" }
-        >;
-        for (let i = 0; i < 50; i++) out.push({ say: `step ${i}` });
-        out.push({ stop: "end_turn" });
-        return out;
-      };
-    }
-    const agent = await runAgent(spec, {
-      secrets: new StaticSecretsStore({ sample_user_name: "CARL" }),
-      providers: [echoTestProvider],
-    });
+      });
+      const out: TurnScript[number][] = [];
+      for (let i = 0; i < 50; i++) out.push({ say: `step ${i}` });
+      out.push({ stop: "end_turn" });
+      return out;
+    };
+    const agent = await startAgent(script as unknown as TurnScript[]);
     try {
       const p = agent.prompt("go");
       setTimeout(() => agent.cancel(), 5);
       const result = await p;
       expect(result.stopReason).toBe("cancelled");
-      const events = (await agent.session.pull?.([])) ?? [];
-      const messages = events
-        .filter((e) => e.sessionUpdate === "agent_message_chunk")
-        .map((e) => (e.content.type === "text" ? e.content.text : ""));
-      // The post-cancel "step N" chunks must not have been emitted.
+      const messages = await agentMessages(agent.session);
       expect(messages.some((m) => m.startsWith("step "))).toBe(false);
     } finally {
       await agent.close();
@@ -143,26 +134,15 @@ describe("runAgent → end-to-end with TestHarness + memory session", () => {
   });
 
   it("validates tool input against the JSON schema", async () => {
-    const agent = await runAgent(
-      sampleAgentSpec([
-        [
-          { call: { tool: "echo", input: { wrong: "field" } } },
-          { stop: "end_turn" },
-        ],
-      ]),
-      {
-        secrets: new StaticSecretsStore({ sample_user_name: "DIANA" }),
-        providers: [echoTestProvider],
-      },
-    );
+    const agent = await startAgent([
+      [
+        { call: { tool: "echo", input: { wrong: "field" } } },
+        { stop: "end_turn" },
+      ],
+    ]);
     try {
       await agent.prompt("go");
-      const events = (await agent.session.pull?.([])) ?? [];
-      const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
-      expect(tu).toBeTruthy();
-      if (tu && tu.sessionUpdate === "tool_call_update") {
-        expect(tu.status).toBe("failed");
-      }
+      expect(await toolStatus(agent.session)).toBe("failed");
     } finally {
       await agent.close();
     }

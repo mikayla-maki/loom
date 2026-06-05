@@ -92,6 +92,18 @@ export function describeBashIntegration(backend: BashBackend): void {
     });
   };
 
+  // One scratch dir per describe, shared across its tests. Returns a
+  // getter since the dir is allocated in beforeAll.
+  const useScratch = (tag: string): (() => string) => {
+    let scratch = "";
+    beforeAll(async () => {
+      scratch = await fs.mkdtemp(
+        path.join(os.tmpdir(), `loom-${backend.name}-${tag}-`),
+      );
+    });
+    return () => scratch;
+  };
+
   describe(`${backend.name}: cwd-relative grant`, () => {
     let scratch: string;
     /** Kernel-canonical form (macOS `/var/folders/…` → `/private/var/…`). */
@@ -109,26 +121,26 @@ export function describeBashIntegration(backend: BashBackend): void {
       );
     });
 
-    dit("pwd succeeds in granted cwd", async () => {
+    dit("pwd reports the canonical granted cwd", async () => {
       const r = await runBash(grantFor(scratch), "pwd", scratch);
       expect(r.isError).toBeFalsy();
       expect(r.content.trim()).toBe(canonicalScratch);
     });
 
-    dit("ls -la succeeds in granted cwd", async () => {
+    dit("ls -la lists files in the grant", async () => {
       const r = await runBash(grantFor(scratch), "ls -la", scratch);
       expect(r.isError).toBeFalsy();
       expect(r.content).toContain("hello.txt");
       expect(r.content).toContain("package.json");
     });
 
-    dit("cat succeeds for a file in the grant", async () => {
+    dit("cat reads a file in the grant", async () => {
       const r = await runBash(grantFor(scratch), "cat hello.txt", scratch);
       expect(r.isError).toBeFalsy();
       expect(r.content.trim()).toBe("world");
     });
 
-    dit("write via redirection succeeds in granted cwd", async () => {
+    dit("write via redirection succeeds in the grant", async () => {
       const r = await runBash(
         grantFor(scratch),
         `echo "from-bash" > out.txt && cat out.txt`,
@@ -138,7 +150,7 @@ export function describeBashIntegration(backend: BashBackend): void {
       expect(r.content.trim()).toBe("from-bash");
     });
 
-    dit("shell pipeline (echo | wc) succeeds", async () => {
+    dit("shell pipeline (echo | wc) works", async () => {
       const r = await runBash(
         grantFor(scratch),
         "echo hi there | wc -w",
@@ -164,29 +176,24 @@ export function describeBashIntegration(backend: BashBackend): void {
   });
 
   describe(`${backend.name}: denials`, () => {
-    let scratch: string;
-    beforeAll(async () => {
-      scratch = await fs.mkdtemp(
-        path.join(os.tmpdir(), `loom-${backend.name}-deny-`),
-      );
-    });
+    const scratch = useScratch("deny");
 
-    dit("reading a file outside grant fails", async () => {
+    dit("reading a file outside the grant fails", async () => {
       // Use $HOME — neither backend bind-mounts/exposes it, so reads
       // fail with the backend's denial text.
       const r = await runBash(
-        grantFor(scratch),
+        grantFor(scratch()),
         `cat "$HOME/.bashrc" 2>&1 || true`,
-        scratch,
+        scratch(),
       );
       expect(r.content).toMatch(backend.deniedReadPattern);
     });
 
     dit("network is denied when not granted", async () => {
       const r = await runBash(
-        grantFor(scratch),
+        grantFor(scratch()),
         `curl --max-time 1 -s https://example.com 2>&1; echo "exit:$?"`,
-        scratch,
+        scratch(),
       );
       expect(r.content).toMatch(/exit:[1-9]/);
       expect(r.content).not.toMatch(/exit:0/);
@@ -194,18 +201,13 @@ export function describeBashIntegration(backend: BashBackend): void {
   });
 
   describe(`${backend.name}: scripting language interpreters`, () => {
-    let scratch: string;
-    beforeAll(async () => {
-      scratch = await fs.mkdtemp(
-        path.join(os.tmpdir(), `loom-${backend.name}-lang-`),
-      );
-    });
+    const scratch = useScratch("lang");
 
     dit("python3 -c works (when installed)", async () => {
       const r = await runBash(
-        grantFor(scratch),
+        grantFor(scratch()),
         `command -v python3 >/dev/null && python3 -c 'print("hello python")' || echo missing`,
-        scratch,
+        scratch(),
       );
       expect(r.isError).toBeFalsy();
       expect(r.content.trim()).toMatch(/^hello python$|^missing$/);
@@ -213,9 +215,9 @@ export function describeBashIntegration(backend: BashBackend): void {
 
     dit("perl -e works (when installed)", async () => {
       const r = await runBash(
-        grantFor(scratch),
+        grantFor(scratch()),
         `command -v perl >/dev/null && perl -e 'print "hello perl\\n"' || echo missing`,
-        scratch,
+        scratch(),
       );
       expect(r.isError).toBeFalsy();
       expect(r.content.trim()).toMatch(/^hello perl$|^missing$/);
@@ -226,15 +228,10 @@ export function describeBashIntegration(backend: BashBackend): void {
     // Git reads ~/.gitconfig at startup. Without that path in the
     // baseline, every git command fails with "unable to access …".
     // Regression guard for both backends' carve-outs.
-    let scratch: string;
-    beforeAll(async () => {
-      scratch = await fs.mkdtemp(
-        path.join(os.tmpdir(), `loom-${backend.name}-git-`),
-      );
-    });
+    const scratch = useScratch("git");
 
     dit("git --version runs without config errors", async () => {
-      const r = await runBash(grantFor(scratch), "git --version", scratch);
+      const r = await runBash(grantFor(scratch()), "git --version", scratch());
       expect(r.isError).toBeFalsy();
       expect(r.content).toMatch(/git version/);
       expect(r.content).not.toMatch(/Operation not permitted/);
@@ -244,10 +241,10 @@ export function describeBashIntegration(backend: BashBackend): void {
     dit(
       "git init + commit roundtrip works inside the granted dir",
       async () => {
-        const repo = path.join(scratch, "repo");
+        const repo = path.join(scratch(), "repo");
         await fs.mkdir(repo, { recursive: true });
         const r = await runBash(
-          grantFor(scratch),
+          grantFor(scratch()),
           [
             "git init -q",
             "echo hi > a.txt",

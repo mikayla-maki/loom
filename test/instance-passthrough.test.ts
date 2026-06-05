@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { defined } from "./helpers/assert.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import type {
   Harness,
@@ -31,15 +32,12 @@ describe("manifest accepts instances directly", () => {
       expect(result.stopReason).toBe("end_turn");
       expect(runs).toBe(1);
       const events = (await agent.session.pull?.([])) ?? [];
-      const said = events.find(
-        (e) => e.sessionUpdate === "agent_message_chunk",
+      const said = defined(
+        events.find((e) => e.sessionUpdate === "agent_message_chunk"),
       );
-      expect(said).toBeTruthy();
-      if (said?.sessionUpdate === "agent_message_chunk") {
-        expect(said.content.type === "text" && said.content.text).toBe(
-          "hi from instance",
-        );
-      }
+      expect(said.sessionUpdate === "agent_message_chunk" && said.content).toEqual(
+        { type: "text", text: "hi from instance" },
+      );
     } finally {
       await agent.close();
     }
@@ -148,9 +146,10 @@ describe("manifest accepts instances directly", () => {
     try {
       await agent.prompt("go");
       const events = (await agent.session.pull?.([])) ?? [];
-      const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
-      expect(tu).toBeTruthy();
-      if (tu?.sessionUpdate === "tool_call_update") {
+      const tu = defined(
+        events.find((e) => e.sessionUpdate === "tool_call_update"),
+      );
+      if (tu.sessionUpdate === "tool_call_update") {
         expect(tu.status).toBe("completed");
         const text =
           tu.content?.[0]?.type === "content" &&

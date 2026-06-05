@@ -117,32 +117,26 @@ provider = { npm = "@my-org/harness", greeting = "hi" }
   });
 
   it("distinguishes absent [tools] (defaults) from empty [tools] (opt-out)", async () => {
-    const absent = path.join(tmp(), "absent.toml");
-    await fs.writeFile(
-      absent,
-      `[agent]
+    const absent = await parseAgentManifest(
+      await writeManifest(`[agent]
 name = "absent"
 system_prompt = "x"
 [harness]
 provider = "test"
-`,
-      "utf8",
+`),
     );
-    expect((await parseAgentManifest(absent)).tools).toBeUndefined();
+    expect(absent.tools).toBeUndefined();
 
-    const empty = path.join(tmp(), "empty.toml");
-    await fs.writeFile(
-      empty,
-      `[agent]
+    const empty = await parseAgentManifest(
+      await writeManifest(`[agent]
 name = "empty"
 system_prompt = "x"
 [harness]
 provider = "test"
 [tools]
-`,
-      "utf8",
+`),
     );
-    expect((await parseAgentManifest(empty)).tools).toEqual({});
+    expect(empty.tools).toEqual({});
   });
 
   it("parses system_prompt as a literal string (inline or path-like)", async () => {

@@ -30,6 +30,21 @@ function agentMsg(text: string): SessionUpdate {
   };
 }
 
+// Emits each upstream event twice.
+const doubler: Session = {
+  async pull(below) {
+    const out: SessionUpdate[] = [];
+    for (const e of below) out.push(e, e);
+    return out;
+  },
+};
+// Prepends a synthetic agent message to the upstream events.
+const prefixer: Session = {
+  async pull(below) {
+    return [agentMsg("[prefix]"), ...below];
+  },
+};
+
 describe("Session push/pull semantics", () => {
   it("treats absent push/pull as passthrough at the chain level", async () => {
     const promptOnly: Session = {
@@ -92,25 +107,6 @@ describe("Session push/pull semantics", () => {
 
   it("lets a leaf session replace upstream events on pull", async () => {
     const log = new InMemorySession();
-    const doubler: Session = {
-      async pull(below) {
-        const out: SessionUpdate[] = [];
-        for (const e of below) out.push(e, e);
-        return out;
-      },
-    };
-    const prefixer: Session = {
-      async pull(below) {
-        return [
-          {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "[prefix]" },
-          },
-          ...below,
-        ];
-      },
-    };
-
     const chained = new ChainedSession([log, doubler, prefixer]);
     await chained.push(userMsg("a"));
 
@@ -125,25 +121,6 @@ describe("Session push/pull semantics", () => {
         return below;
       },
     };
-    const doubler: Session = {
-      async pull(below) {
-        const out: SessionUpdate[] = [];
-        for (const e of below) out.push(e, e);
-        return out;
-      },
-    };
-    const prefixer: Session = {
-      async pull(below) {
-        return [
-          {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "[prefix]" },
-          },
-          ...below,
-        ];
-      },
-    };
-
     const chained = new ChainedSession([passthroughLeaf, doubler, prefixer]);
     const events = await chained.pull([userMsg("a"), userMsg("b")]);
     expect(events).toHaveLength(6);

@@ -11,6 +11,7 @@ import { runAgent } from "../src/sdk/run-agent.js";
 import { parseAgentManifest } from "../src/manifest/parser.js";
 import { LoomError } from "../src/errors.js";
 import { useTmpDir } from "./helpers/tmp.js";
+import { defined } from "./helpers/assert.js";
 
 async function buildExtensionFixture(opts: {
   rootDir: string;
@@ -132,14 +133,15 @@ describe("provider package loader", () => {
   });
 
   it("loadProviderByName runs register() and surfaces Tools contributions", async () => {
+    const root = tmp();
     await buildExtensionFixture({
-      rootDir: tmp(),
+      rootDir: root,
       packageName: "register-side-effect-ext",
     });
     const { toolsContributions } = await loadProviderByName(
       "register-side-effect-ext",
       {
-        agentManifestDir: tmp(),
+        agentManifestDir: root,
         agentName: "test",
         loomVersion: "0.1.0",
         providerName: "register-side-effect-ext",
@@ -151,7 +153,8 @@ describe("provider package loader", () => {
   });
 
   it("rejects packages whose entry doesn't export register()", async () => {
-    const pkgDir = path.join(tmp(), "node_modules", "no-register");
+    const root = tmp();
+    const pkgDir = path.join(root, "node_modules", "no-register");
     await fs.mkdir(pkgDir, { recursive: true });
     await fs.writeFile(
       path.join(pkgDir, "package.json"),
@@ -165,7 +168,7 @@ describe("provider package loader", () => {
     await fs.writeFile(path.join(pkgDir, "index.js"), `export const noop = true;`);
     await expect(
       loadProviderByName("no-register", {
-        agentManifestDir: tmp(),
+        agentManifestDir: root,
         agentName: "x",
         loomVersion: "0",
         providerName: "no-register",
@@ -210,17 +213,16 @@ greeting = "yo"
     try {
       await agent.prompt("go");
       const events = (await agent.session.pull?.([])) ?? [];
-      const tu = events.find((e) => e.sessionUpdate === "tool_call_update");
-      expect(tu).toBeTruthy();
-      if (tu && tu.sessionUpdate === "tool_call_update") {
-        expect(tu.status).toBe("completed");
-        const text =
-          tu.content?.[0]?.type === "content" &&
-          tu.content[0].content.type === "text"
-            ? tu.content[0].content.text
-            : "";
-        expect(text).toBe("yo: world");
-      }
+      const tu = defined(
+        events.find((e) => e.sessionUpdate === "tool_call_update"),
+      );
+      expect(tu.status).toBe("completed");
+      const text =
+        tu.content?.[0]?.type === "content" &&
+        tu.content[0].content.type === "text"
+          ? tu.content[0].content.text
+          : "";
+      expect(text).toBe("yo: world");
     } finally {
       await agent.close();
     }

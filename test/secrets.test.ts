@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { runAgent, StaticSecretsStore } from "../src/sdk/run-agent.js";
 import { SecretError } from "../src/errors.js";
+import { defined } from "./helpers/assert.js";
 import type {
   FactoryContext,
   Harness,
@@ -129,12 +130,11 @@ describe("secrets pipeline", () => {
       const tcus = events.filter((e) => e.sessionUpdate === "tool_call_update");
       expect(tcus).toHaveLength(2);
       const parse = (idx: number) => {
-        const e = tcus[idx];
-        if (!e || e.sessionUpdate !== "tool_call_update") return null;
+        const e = defined(tcus[idx]);
+        const block = e.content?.[0];
         const text =
-          e.content?.[0]?.type === "content" &&
-          e.content[0].content.type === "text"
-            ? e.content[0].content.text
+          block?.type === "content" && block.content.type === "text"
+            ? block.content.text
             : "";
         return JSON.parse(text) as Record<string, string | null>;
       };

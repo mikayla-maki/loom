@@ -121,7 +121,6 @@ export class WriteFileTool implements Tool {
       priorContent = null;
     }
 
-    // ── ACP path: client renders the edit in the editor with diff UI ──
     // ACP `fs/writeTextFile` is full-file replacement; we can't satisfy
     // append-mode or create_dirs via the bridge, so fall through to
     // local fs in those cases.

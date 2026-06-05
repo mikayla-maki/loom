@@ -9,23 +9,35 @@ import type {
   ToolResult,
 } from "../src/types/interfaces.js";
 
-function manifestWith(tool: Tool): AgentManifest {
+function provider(...tools: Tool[]): Tools {
+  return {
+    resolveTool(name) {
+      return tools.find((t) => t.name === name) ?? null;
+    },
+    close: () => {},
+  };
+}
+
+function manifestWith(...tools: Tool[]): AgentManifest {
   return {
     name: "audit-test",
     systemPrompt: "x",
-    tools: { [tool.name]: "builtin" },
-    capabilities: { [tool.name]: "*" },
+    tools: Object.fromEntries(tools.map((t) => [t.name, "builtin"])),
+    capabilities: Object.fromEntries(tools.map((t) => [t.name, "*"])),
     harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
   };
 }
 
-function provider(tool: Tool): Tools {
-  return {
-    resolveTool(name) {
-      return name === tool.name ? tool : null;
-    },
-    close: () => {},
-  };
+/** Runs the agent and returns whatever it threw (or undefined on success). */
+async function runAndCatch(
+  ...args: Parameters<typeof runAgent>
+): Promise<unknown> {
+  try {
+    await runAgent(...args);
+  } catch (e) {
+    return e;
+  }
+  return undefined;
 }
 
 function makeTool(opts: {
@@ -44,7 +56,7 @@ function makeTool(opts: {
 }
 
 describe("runAgent runtime audit", () => {
-  it("throws CapabilityError naming the tool and finding when audit reports an error", async () => {
+  it("throws CapabilityError naming the tool, message, and remediation when audit reports an error", async () => {
     const tool = makeTool({
       name: "broken",
       audit: () => [
@@ -55,12 +67,9 @@ describe("runAgent runtime audit", () => {
         },
       ],
     });
-    let caught: unknown;
-    try {
-      await runAgent(manifestWith(tool), { providers: [provider(tool)] });
-    } catch (e) {
-      caught = e;
-    }
+    const caught = await runAndCatch(manifestWith(tool), {
+      providers: [provider(tool)],
+    });
     expect(caught).toBeInstanceOf(CapabilityError);
     const msg = String(caught);
     expect(msg).toContain("broken");
@@ -77,27 +86,9 @@ describe("runAgent runtime audit", () => {
       name: "b",
       audit: () => [{ severity: "error", message: "B is broken" }],
     });
-    const manifest: AgentManifest = {
-      name: "multi",
-      systemPrompt: "x",
-      tools: { a: "builtin", b: "builtin" },
-      capabilities: { a: "*", b: "*" },
-      harness: { provider: "test", script: [[{ stop: "end_turn" }]] },
-    };
-    const aggregateProvider: Tools = {
-      resolveTool(name) {
-        if (name === "a") return a;
-        if (name === "b") return b;
-        return null;
-      },
-      close: () => {},
-    };
-    let caught: unknown;
-    try {
-      await runAgent(manifest, { providers: [aggregateProvider] });
-    } catch (e) {
-      caught = e;
-    }
+    const caught = await runAndCatch(manifestWith(a, b), {
+      providers: [provider(a, b)],
+    });
     expect(String(caught)).toContain("A is broken");
     expect(String(caught)).toContain("B is broken");
   });
@@ -154,12 +145,9 @@ describe("runAgent runtime audit", () => {
         throw new Error("boom from audit");
       },
     });
-    let caught: unknown;
-    try {
-      await runAgent(manifestWith(tool), { providers: [provider(tool)] });
-    } catch (e) {
-      caught = e;
-    }
+    const caught = await runAndCatch(manifestWith(tool), {
+      providers: [provider(tool)],
+    });
     expect(caught).toBeInstanceOf(CapabilityError);
     expect(String(caught)).toContain("boom from audit");
   });

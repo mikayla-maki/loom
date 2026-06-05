@@ -1,19 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { runAgent } from "../src/sdk/run-agent.js";
 import { TestHarness } from "../src/builtins/harness/test.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
-import type { Harness } from "../src/types/interfaces.js";
 
 describe("RunParameters", () => {
-  it("loom forwards params to the harness on each turn", async () => {
+  it("forwards per-turn params through to the harness", async () => {
     const test = new TestHarness({});
-    const harness: Harness = test;
 
     const agent = await runAgent({
       name: "params-forward",
       tools: {},
-      harness,
+      harness: test,
     });
     try {
       await agent.prompt("a", { effort: "high" });
@@ -29,33 +27,32 @@ describe("RunParameters", () => {
     }
   });
 
-  it("Anthropic harness translates effort + thinking + per-call model", async () => {
-    let captured: Record<string, unknown> | null = null;
+  describe("Anthropic harness param translation", () => {
     const realFetch = global.fetch;
-    global.fetch = (async (url: string | URL, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/v1/models/")) {
-        const modelId = u.split("/v1/models/")[1] ?? "unknown";
-        return new Response(
-          JSON.stringify({ id: modelId, context_window: 200000 }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
-      captured = init?.body ? JSON.parse(String(init.body)) : null;
-      return new Response(
-        JSON.stringify({
+    afterEach(() => {
+      global.fetch = realFetch;
+    });
+
+    it("translates effort, thinking, per-call model, and max tokens", async () => {
+      // Body of the last messages request, so we can assert how params
+      // were mapped onto the Anthropic wire format.
+      let captured: Record<string, unknown> | null = null;
+      global.fetch = (async (url: string | URL, init?: RequestInit) => {
+        if (String(url).includes("/v1/models/")) {
+          const modelId = String(url).split("/v1/models/")[1] ?? "unknown";
+          return Response.json({ id: modelId, context_window: 200000 });
+        }
+        captured = init?.body ? JSON.parse(String(init.body)) : null;
+        return Response.json({
           id: "msg_1",
           role: "assistant",
           model: "claude-haiku-4-5",
           content: [{ type: "text", text: "ok" }],
           stop_reason: "end_turn",
           usage: { input_tokens: 10, output_tokens: 2 },
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    }) as typeof fetch;
+        });
+      }) as typeof fetch;
 
-    try {
       const agent = await runAgent(
         {
           name: "params-anthropic",
@@ -95,8 +92,6 @@ describe("RunParameters", () => {
       } finally {
         await agent.close();
       }
-    } finally {
-      global.fetch = realFetch;
-    }
+    });
   });
 });

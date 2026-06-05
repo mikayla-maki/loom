@@ -85,6 +85,23 @@ const anthropicSecrets = () => ({
   secrets: new StaticSecretsStore({ ANTHROPIC_API_KEY: "k" }),
 });
 
+// Standard anthropic agent over an in-memory session; `extra` adds/overrides
+// fields like tools, capabilities, or a stubbing session.
+const startAgent = (
+  name: string,
+  extra: Record<string, unknown>,
+  harnessOverrides?: Record<string, unknown>,
+) =>
+  runAgent(
+    {
+      name,
+      harness: anthropicHarness(harnessOverrides),
+      session: new InMemorySession(),
+      ...extra,
+    },
+    anthropicSecrets(),
+  );
+
 describe("AnthropicHarness server-tool catalog", () => {
   function makeHarness(): Harness {
     return anthropicHarnessFactory.create(
@@ -234,16 +251,10 @@ describe("anthropic web_search end-to-end", () => {
 
   it("translates [tools] config + [capabilities] grants into web_search_20250305 on the wire", async () => {
     const captured = stubServerToolResponse();
-    const agent = await runAgent(
-      {
-        name: "ws-e2e",
-        harness: anthropicHarness(),
-        session: new InMemorySession(),
-        tools: { web_search: { provider: "anthropic", max_uses: 3 } },
-        capabilities: { web_search: { allowed_domains: ["docs.python.org"] } },
-      },
-      anthropicSecrets(),
-    );
+    const agent = await startAgent("ws-e2e", {
+      tools: { web_search: { provider: "anthropic", max_uses: 3 } },
+      capabilities: { web_search: { allowed_domains: ["docs.python.org"] } },
+    });
     try {
       await agent.prompt("search please");
       const webSearch = resolveByName(captured.body, "web_search");
@@ -264,15 +275,7 @@ describe("anthropic web_search end-to-end", () => {
   // capability must omit the field entirely rather than send [].
   it("omits allowed_domains on the wire when the capability isn't granted", async () => {
     const captured = stubServerToolResponse();
-    const agent = await runAgent(
-      {
-        name: "ws-no-cap",
-        harness: anthropicHarness(),
-        session: new InMemorySession(),
-        tools: { web_search: "anthropic" },
-      },
-      anthropicSecrets(),
-    );
+    const agent = await startAgent("ws-no-cap", { tools: { web_search: "anthropic" } });
     try {
       await agent.prompt("search");
       expect(resolveByName(captured.body, "web_search")?.allowed_domains).toBeUndefined();
@@ -283,15 +286,9 @@ describe("anthropic web_search end-to-end", () => {
 
   it("surfaces server_tool_use + web_search_tool_result as tool_call events", async () => {
     stubServerToolResponse();
-    const agent = await runAgent(
-      {
-        name: "ws-events",
-        harness: anthropicHarness(),
-        session: new InMemorySession(),
-        tools: { web_search: { provider: "anthropic" } },
-      },
-      anthropicSecrets(),
-    );
+    const agent = await startAgent("ws-events", {
+      tools: { web_search: { provider: "anthropic" } },
+    });
     try {
       const result = await agent.prompt("search please");
       expect(result.stopReason).toBe("end_turn");
@@ -366,18 +363,12 @@ describe("anthropic web_fetch end-to-end", () => {
 
   it("emits web_fetch_20250910 with config (max_uses, max_content_tokens) + capability (allowed_domains)", async () => {
     const captured = stubFetchResponse();
-    const agent = await runAgent(
-      {
-        name: "wf-e2e",
-        harness: anthropicHarness(),
-        session: new InMemorySession(),
-        tools: {
-          web_fetch: { provider: "anthropic", max_uses: 2, max_content_tokens: 8000 },
-        },
-        capabilities: { web_fetch: { allowed_domains: ["example.com"] } },
+    const agent = await startAgent("wf-e2e", {
+      tools: {
+        web_fetch: { provider: "anthropic", max_uses: 2, max_content_tokens: 8000 },
       },
-      anthropicSecrets(),
-    );
+      capabilities: { web_fetch: { allowed_domains: ["example.com"] } },
+    });
     try {
       await agent.prompt("fetch please");
       expect(resolveByName(captured.body, "web_fetch")).toMatchObject({
@@ -396,17 +387,11 @@ describe("anthropic web_fetch end-to-end", () => {
   // under [tools] is silently dropped rather than reaching the wire.
   it("does not pass allowed_domains from [tools] config", async () => {
     const captured = stubFetchResponse();
-    const agent = await runAgent(
-      {
-        name: "wf-misplaced",
-        harness: anthropicHarness(),
-        session: new InMemorySession(),
-        tools: {
-          web_fetch: { provider: "anthropic", allowed_domains: ["misplaced.example.com"] },
-        },
+    const agent = await startAgent("wf-misplaced", {
+      tools: {
+        web_fetch: { provider: "anthropic", allowed_domains: ["misplaced.example.com"] },
       },
-      anthropicSecrets(),
-    );
+    });
     try {
       await agent.prompt("fetch");
       expect(resolveByName(captured.body, "web_fetch")?.allowed_domains).toBeUndefined();
@@ -417,15 +402,9 @@ describe("anthropic web_fetch end-to-end", () => {
 
   it("renders web_fetch_tool_result text into the tool_call_update content", async () => {
     stubFetchResponse();
-    const agent = await runAgent(
-      {
-        name: "wf-events",
-        harness: anthropicHarness(),
-        session: new InMemorySession(),
-        tools: { web_fetch: { provider: "anthropic" } },
-      },
-      anthropicSecrets(),
-    );
+    const agent = await startAgent("wf-events", {
+      tools: { web_fetch: { provider: "anthropic" } },
+    });
     try {
       await agent.prompt("fetch");
       const events = await pull(agent);
@@ -534,14 +513,10 @@ describe("anthropic server-tool event order during streaming", () => {
       });
     }) as typeof fetch;
 
-    const agent = await runAgent(
-      {
-        name: "streaming-order",
-        harness: anthropicHarness({ stream: true }),
-        session: new InMemorySession(),
-        tools: { web_search: "anthropic" },
-      },
-      anthropicSecrets(),
+    const agent = await startAgent(
+      "streaming-order",
+      { tools: { web_search: "anthropic" } },
+      { stream: true },
     );
     try {
       await agent.prompt("search please");
@@ -622,15 +597,9 @@ describe("anthropic server-tool replay within a session", () => {
       );
     }) as typeof fetch;
 
-    const agent = await runAgent(
-      {
-        name: "replay",
-        harness: anthropicHarness(),
-        session: new InMemorySession(),
-        tools: { web_search: { provider: "anthropic" } },
-      },
-      anthropicSecrets(),
-    );
+    const agent = await startAgent("replay", {
+      tools: { web_search: { provider: "anthropic" } },
+    });
     try {
       await agent.prompt("search please");
       await agent.prompt("now tell me more");

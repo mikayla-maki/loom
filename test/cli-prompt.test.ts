@@ -349,49 +349,39 @@ describe("runPromptCommand (end-to-end)", () => {
   });
 
   it("text mode: with a tool dispatch, only the final answer reaches stdout", async () => {
-    const cap = captureStreams();
-    const harness: Harness = {
-      async run(rt: Runtime) {
-        await rt.update({
+    const r = await runScenario({
+      updates: [
+        {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Let me check..." },
-        });
-        await rt.update({
+        },
+        {
           sessionUpdate: "tool_call",
           toolCallId: "t1",
           title: "stub",
           status: "in_progress",
           rawInput: {},
-        });
-        await rt.update({
+        },
+        {
           sessionUpdate: "tool_call_update",
           toolCallId: "t1",
           status: "completed",
           content: [
-            {
-              type: "content",
-              content: { type: "text", text: "tool-output" },
-            },
+            { type: "content", content: { type: "text", text: "tool-output" } },
           ],
-        });
-        await rt.update({
+        },
+        {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Result: 42." },
-        });
-        await rt.update({ sessionUpdate: "stop", stopReason: "end_turn" });
-        return { stopReason: "end_turn" as const };
-      },
-    };
-    const manifest: AgentManifest = { name: "txt-tools", tools: {}, harness };
-    const code = await runPromptCommand({
-      manifest,
-      text: "go",
+        },
+        { sessionUpdate: "stop", stopReason: "end_turn" },
+      ],
       format: "text",
-      streams: cap.streams,
+      text: "go",
     });
-    expect(code).toBe(0);
-    expect(cap.stdout()).toBe("Result: 42.\n");
-    expect(cap.stderr()).toBe("");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("Result: 42.\n");
+    expect(r.stderr).toBe("");
   });
 
   it("text mode: a final-message image becomes a stderr placeholder", async () => {

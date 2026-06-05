@@ -13,6 +13,19 @@ import { useTmpDir, withTmpDir } from "./helpers/tmp.js";
 
 const FIXTURES = path.resolve("test/fixtures");
 
+/** Runs `auditAgent` expecting it to throw, and returns the AuditError. */
+async function expectAuditError(
+  spec: AgentManifest | string,
+): Promise<AuditError> {
+  try {
+    await auditAgent(spec);
+  } catch (e) {
+    expect(e).toBeInstanceOf(AuditError);
+    return e as AuditError;
+  }
+  throw new Error("expected auditAgent to throw");
+}
+
 describe("auditAgent", () => {
   const tmp = useTmpDir("loom-audit-");
 
@@ -91,24 +104,18 @@ describe("auditAgent", () => {
         'provider = { npm = "@nonexistent/loom-pkg" }',
       ].join("\n"),
     );
-    let err: AuditError | undefined;
-    try {
-      await auditAgent(manifestPath);
-    } catch (e) {
-      err = e as AuditError;
-    }
-    expect(err).toBeInstanceOf(AuditError);
-    expect(err!.tree.unresolvedSources).toHaveLength(1);
-    expect(err!.tree.unresolvedSources[0]?.spec).toBe(
+    const err = await expectAuditError(manifestPath);
+    expect(err.tree.unresolvedSources).toHaveLength(1);
+    expect(err.tree.unresolvedSources[0]?.spec).toBe(
       "npm:@nonexistent/loom-pkg@*",
     );
-    expect(err!.tree.unresolvedSources[0]?.reason).toMatch(/Cannot find/);
-    expect(err!.tree.unresolvedTools.map((u) => u.name)).toContain(
+    expect(err.tree.unresolvedSources[0]?.reason).toMatch(/Cannot find/);
+    expect(err.tree.unresolvedTools.map((u) => u.name)).toContain(
       "fancy_tool",
     );
-    expect(err!.health.unresolvedSources).toBe(1);
-    expect(err!.health.unresolvedTools).toBeGreaterThanOrEqual(1);
-    const printed = formatCapabilityTree(err!.tree);
+    expect(err.health.unresolvedSources).toBe(1);
+    expect(err.health.unresolvedTools).toBeGreaterThanOrEqual(1);
+    const printed = formatCapabilityTree(err.tree);
     expect(printed.toLowerCase()).toContain("unresolved");
   });
 
@@ -232,25 +239,18 @@ describe("auditAgent", () => {
       },
       capabilities: { spawn_subagent: "*" },
     };
-    let err: AuditError | undefined;
-    try {
-      await auditAgent(parent);
-    } catch (e) {
-      err = e as AuditError;
-    }
-    expect(err).toBeInstanceOf(AuditError);
+    const err = await expectAuditError(parent);
+    expect(err.health.directProblems).toBe(0);
+    expect(err.health.totalProblems).toBeGreaterThan(0);
 
-    expect(err!.health.directProblems).toBe(0);
-    expect(err!.health.totalProblems).toBeGreaterThan(0);
-
-    expect(err!.health.subagents).toHaveLength(1);
-    const childHealth = err!.health.subagents[0]!;
+    expect(err.health.subagents).toHaveLength(1);
+    const childHealth = err.health.subagents[0]!;
     expect(childHealth.agentName).toBe("child");
     expect(childHealth.directProblems).toBeGreaterThan(0);
     expect(childHealth.unresolvedSources).toBe(1);
 
-    expect(err!.message).toMatch(/parent → child:/);
-    expect(err!.message).not.toMatch(/across \d+ agent/);
+    expect(err.message).toMatch(/parent → child:/);
+    expect(err.message).not.toMatch(/across \d+ agent/);
   });
 
   it("recursive health: a broken parent AND a broken child both surface", async () => {
@@ -278,18 +278,12 @@ describe("auditAgent", () => {
         spawn_subagent: "*",
       },
     };
-    let err: AuditError | undefined;
-    try {
-      await auditAgent(parent);
-    } catch (e) {
-      err = e as AuditError;
-    }
-    expect(err).toBeInstanceOf(AuditError);
-    expect(err!.health.directProblems).toBeGreaterThan(0);
-    expect(err!.health.subagents[0]!.directProblems).toBeGreaterThan(0);
-    expect(err!.message).toMatch(/across 2 agent\(s\)/);
-    expect(err!.message).toMatch(/^  parent:/m);
-    expect(err!.message).toMatch(/^  parent → child:/m);
+    const err = await expectAuditError(parent);
+    expect(err.health.directProblems).toBeGreaterThan(0);
+    expect(err.health.subagents[0]!.directProblems).toBeGreaterThan(0);
+    expect(err.message).toMatch(/across 2 agent\(s\)/);
+    expect(err.message).toMatch(/^  parent:/m);
+    expect(err.message).toMatch(/^  parent → child:/m);
   });
 
   it("recursive health: cycle markers don't count as resolution problems", async () => {
@@ -358,16 +352,10 @@ describe("auditAgent", () => {
       healthField: "providerInitErrors" as const,
     },
   ])("audit throws on $label", async ({ spec, message, healthField }) => {
-    let err: AuditError | undefined;
-    try {
-      await auditAgent(spec);
-    } catch (e) {
-      err = e as AuditError;
-    }
-    expect(err).toBeInstanceOf(AuditError);
-    expect(err!.message).toMatch(message);
-    expect(err!.health[healthField]).toBeGreaterThanOrEqual(1);
-    expect(err!.health.totalProblems).toBeGreaterThan(0);
+    const err = await expectAuditError(spec);
+    expect(err.message).toMatch(message);
+    expect(err.health[healthField]).toBeGreaterThanOrEqual(1);
+    expect(err.health.totalProblems).toBeGreaterThan(0);
   });
 
   it("audit failure lists every problem category, not just the first", async () => {
@@ -384,13 +372,8 @@ describe("auditAgent", () => {
         'provider = "builtin"',
       ].join("\n"),
     );
-    try {
-      await auditAgent(manifestPath);
-      throw new Error("expected throw");
-    } catch (e) {
-      const msg = (e as Error).message;
-      expect(msg).toMatch(/unresolved source/);
-      expect(msg).toMatch(/unresolved \[tools\] entr/);
-    }
+    const err = await expectAuditError(manifestPath);
+    expect(err.message).toMatch(/unresolved source/);
+    expect(err.message).toMatch(/unresolved \[tools\] entr/);
   });
 });

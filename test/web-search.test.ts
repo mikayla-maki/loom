@@ -12,6 +12,7 @@ import type {
   ToolContext,
   ToolResult,
 } from "../src/types/interfaces.js";
+import { defined } from "./helpers/assert.js";
 
 type FetchCall = { url: string; init: RequestInit };
 

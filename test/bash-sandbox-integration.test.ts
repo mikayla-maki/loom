@@ -65,13 +65,7 @@ describe("sandbox-exec extras (macOS-only)", () => {
     );
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/Operation not permitted/);
-    let exists = true;
-    try {
-      await fs.access(target);
-    } catch {
-      exists = false;
-    }
-    expect(exists).toBe(false);
+    await expect(fs.access(target)).rejects.toThrow();
   });
 
   dit("ruby -e works under sandbox (when installed)", async () => {

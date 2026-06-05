@@ -5,6 +5,7 @@ import { InMemorySession } from "../src/builtins/session/memory.js";
 import { StaticSecretsStore } from "../src/runtime/secrets.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
+import { defined } from "./helpers/assert.js";
 
 // The OpenAI harness drives `client.responses.stream(...)`, which consumes a
 // Responses-API SSE stream. Each SSE message must carry a JSON `data` payload
@@ -179,16 +180,15 @@ describe("OpenAIHarness streaming", () => {
       // Each delta is surfaced as its own chunk, in order.
       expect(texts).toEqual(["Hello", ", world"]);
 
-      const usageUpdate = events.find(
-        (e) => e.sessionUpdate === "usage_update",
+      const usageUpdate = defined(
+        events.find((e) => e.sessionUpdate === "usage_update"),
       );
-      expect(usageUpdate).toBeDefined();
-      if (usageUpdate && usageUpdate.sessionUpdate === "usage_update") {
-        // used = input_tokens + output_tokens; the harness reports size 0
-        // (it does not fetch model context-window info).
-        expect(usageUpdate.used).toBe(25 + 14);
-        expect(usageUpdate.size).toBe(0);
-      }
+      if (usageUpdate.sessionUpdate !== "usage_update")
+        throw new Error("unreachable");
+      // used = input + output tokens; size is 0 since the harness does not
+      // fetch model context-window info.
+      expect(usageUpdate.used).toBe(25 + 14);
+      expect(usageUpdate.size).toBe(0);
     } finally {
       await agent.close();
     }
@@ -324,9 +324,9 @@ describe("OpenAIHarness streaming", () => {
           e.sessionUpdate === "tool_call",
       );
       expect(toolCalls).toHaveLength(1);
-      expect(toolCalls[0]?.title).toBe("echo");
+      expect(defined(toolCalls[0]).title).toBe("echo");
       // The split arguments are buffered into the final snapshot and parsed.
-      expect(toolCalls[0]?.rawInput).toEqual({ text: "hi" });
+      expect(defined(toolCalls[0]).rawInput).toEqual({ text: "hi" });
     } finally {
       await agent.close();
     }

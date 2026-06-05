@@ -62,20 +62,37 @@ function isAlive(pid: number): boolean {
   }
 }
 
-async function withEchoTools(
-  body: (tools: McpServerTools) => Promise<void>,
-): Promise<void> {
-  const tools = mcpServerToolsFactory.create(
+function echoTools(): McpServerTools {
+  return mcpServerToolsFactory.create(
     { command: process.execPath, args: [ECHO_SERVER] },
     ctx(),
     {},
     undefined,
   ) as McpServerTools;
+}
+
+async function withEchoTools(
+  body: (tools: McpServerTools) => Promise<void>,
+): Promise<void> {
+  const tools = echoTools();
   await tools.init(initArgs({ command: process.execPath, args: [ECHO_SERVER] }));
   try {
     await body(tools);
   } finally {
     await tools.close();
+  }
+}
+
+async function withAgent(
+  spec: AgentManifest,
+  opts: Parameters<typeof runAgent>[1],
+  body: (agent: Awaited<ReturnType<typeof runAgent>>) => Promise<void>,
+): Promise<void> {
+  const agent = await runAgent(spec, opts);
+  try {
+    await body(agent);
+  } finally {
+    await agent.close();
   }
 }
 
@@ -176,13 +193,7 @@ describe("mcp-server factory — config parsing", () => {
 
 describe("mcp-server factory — lifecycle", () => {
   it("spawns the server, completes the handshake, surfaces serverInfo, and reaps the child on close()", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-
+    const tools = echoTools();
     await tools.init(
       initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
     );
@@ -219,13 +230,7 @@ describe("mcp-server factory — lifecycle", () => {
   });
 
   it("close() before init() is a no-op", async () => {
-    const tools = mcpServerToolsFactory.create(
-      { command: process.execPath, args: [ECHO_SERVER] },
-      ctx(),
-      {},
-      undefined,
-    ) as McpServerTools;
-    await tools.close();
+    await echoTools().close();
   });
 });
 
@@ -314,8 +319,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       { echo: { provider: "echo_mcp" } },
       { echo: "*" },
     );
-    const agent = await runAgent(spec, {});
-    try {
+    await withAgent(spec, {}, async (agent) => {
       const names = agent.agentState.toolTable.list().map((t) => t.name);
       expect(names).toEqual(["echo"]);
       const result = await agent.agentState.toolTable.execute({
@@ -325,9 +329,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       });
       expect(result.isError).toBeUndefined();
       expect(result.content).toBe("hello from runAgent");
-    } finally {
-      await agent.close();
-    }
+    });
   });
 
   it("exposes one MCP tool under multiple model-facing names via the `tool` rename", async () => {
@@ -340,8 +342,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       },
       { echo: "*", say: "*", shout: "*" },
     );
-    const agent = await runAgent(spec, {});
-    try {
+    await withAgent(spec, {}, async (agent) => {
       const names = agent.agentState.toolTable
         .list()
         .map((t) => t.name)
@@ -359,9 +360,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       });
       expect(a.content).toBe("hi");
       expect(b.content).toBe("HI");
-    } finally {
-      await agent.close();
-    }
+    });
   });
 
   it("partial-applies a bound arg the model never sees, narrowing the schema", async () => {
@@ -370,8 +369,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       { add_to_10: { provider: "echo_mcp", tool: "add" } },
       { add_to_10: { a: 10, b: "*" } },
     );
-    const agent = await runAgent(spec, {});
-    try {
+    await withAgent(spec, {}, async (agent) => {
       const list = agent.agentState.toolTable.list();
       expect(list).toHaveLength(1);
       const t = defined(list[0], "toolTable.list() returned empty");
@@ -386,9 +384,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       });
       expect(result.isError).toBeUndefined();
       expect(result.content).toBe("17");
-    } finally {
-      await agent.close();
-    }
+    });
   });
 
   it("rejects (isError, not throw) a model attempt to override a bound arg", async () => {
@@ -397,34 +393,30 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       { bound_echo: { provider: "echo_mcp", tool: "echo" } },
       { bound_echo: { text: "locked-value" } },
     );
-    const agent = await runAgent(spec, {});
-    try {
+    await withAgent(spec, {}, async (agent) => {
       const result = await agent.agentState.toolTable.execute({
         id: "call",
         name: "bound_echo",
         input: { text: "attempted override" },
       });
       expect(result.isError).toBe(true);
-    } finally {
-      await agent.close();
-    }
+    });
   });
 
   it("injects a Loom secret into the MCP child's env", async () => {
-    const agent = await runAgent(envServerSpec("mcp-secret-e2e"), {
-      secrets: new StaticSecretsStore({ MOCK_API_KEY: "sek-ret-9000" }),
-    });
-    try {
-      const result = await agent.agentState.toolTable.execute({
-        id: "call",
-        name: "whoami",
-        input: {},
-      });
-      expect(result.isError).toBeUndefined();
-      expect(result.content).toBe("sek-ret-9000");
-    } finally {
-      await agent.close();
-    }
+    await withAgent(
+      envServerSpec("mcp-secret-e2e"),
+      { secrets: new StaticSecretsStore({ MOCK_API_KEY: "sek-ret-9000" }) },
+      async (agent) => {
+        const result = await agent.agentState.toolTable.execute({
+          id: "call",
+          name: "whoami",
+          input: {},
+        });
+        expect(result.isError).toBeUndefined();
+        expect(result.content).toBe("sek-ret-9000");
+      },
+    );
   });
 
   it("fails boot when a declared secret is absent from the store", async () => {
@@ -454,8 +446,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
         whisper: "*",
       },
     );
-    const agent = await runAgent(spec, {});
-    try {
+    await withAgent(spec, {}, async (agent) => {
       const names = agent.agentState.toolTable
         .list()
         .map((t) => t.name)
@@ -488,9 +479,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
         input: { b: 5 },
       });
       expect(b.content).toBe("15");
-    } finally {
-      await agent.close();
-    }
+    });
   });
 
   it("hides server tools that are not named in [tools]", async () => {
@@ -499,13 +488,10 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
       { echo: { provider: "echo_mcp" } },
       { echo: "*" },
     );
-    const agent = await runAgent(spec, {});
-    try {
+    await withAgent(spec, {}, async (agent) => {
       const names = agent.agentState.toolTable.list().map((t) => t.name);
       expect(names).toEqual(["echo"]);
       expect(names).not.toContain("add");
-    } finally {
-      await agent.close();
-    }
+    });
   });
 });

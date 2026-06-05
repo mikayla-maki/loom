@@ -13,6 +13,21 @@ import { runAgent } from "../src/sdk/run-agent.js";
 import type { Session } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 import { withTmpDir } from "./helpers/tmp.js";
+import { defined } from "./helpers/assert.js";
+
+// Returns the text of a user/agent message chunk, failing the test if the
+// event is the wrong shape.
+function chunkText(event: SessionUpdate | undefined): string {
+  const e = defined(event, "expected a message chunk event");
+  if (
+    (e.sessionUpdate === "user_message_chunk" ||
+      e.sessionUpdate === "agent_message_chunk") &&
+    e.content.type === "text"
+  ) {
+    return e.content.text;
+  }
+  throw new Error(`expected a text message chunk, got ${e.sessionUpdate}`);
+}
 
 function userMsg(text: string): SessionUpdate {
   return {
@@ -88,20 +103,10 @@ describe("CompactingSession", () => {
     expect(out[0]?.sessionUpdate).toBe("user_message_chunk");
     expect(out[1]?.sessionUpdate).toBe("agent_message_chunk");
 
-    const lastInfo = events[events.length - 1];
-    expect(lastInfo).toBeDefined();
-    if (lastInfo) expect(lastInfo.after).toBeLessThan(lastInfo.before);
+    const lastInfo = defined(events[events.length - 1]);
+    expect(lastInfo.after).toBeLessThan(lastInfo.before);
 
-    const last = out[out.length - 1];
-    if (
-      last &&
-      last.sessionUpdate === "agent_message_chunk" &&
-      last.content.type === "text"
-    ) {
-      expect(last.content.text).toBe("a11");
-    } else {
-      throw new Error("expected last event to be agent_message_chunk");
-    }
+    expect(chunkText(out[out.length - 1])).toBe("a11");
   });
 
   it("never splits a tool_call from its update", async () => {
@@ -208,21 +213,11 @@ describe("CompactingSession", () => {
     ];
     const out = await Promise.resolve(heuristicCompactor(events, null));
     expect(out).toHaveLength(2);
-    const head = out[0];
-    const body = out[1];
-    if (
-      head &&
-      body &&
-      head.sessionUpdate === "user_message_chunk" &&
-      body.sessionUpdate === "agent_message_chunk" &&
-      body.content.type === "text"
-    ) {
-      expect(body.content.text).toContain("user:");
-      expect(body.content.text).toContain("agent:");
-      expect(body.content.text).toContain("tool bash");
-    } else {
-      throw new Error("unexpected compactor output shape");
-    }
+    expect(out[0]?.sessionUpdate).toBe("user_message_chunk");
+    const body = chunkText(out[1]);
+    expect(body).toContain("user:");
+    expect(body).toContain("agent:");
+    expect(body).toContain("tool bash");
   });
 
   it("plugs into runAgent as a Session instance", async () => {
@@ -247,16 +242,7 @@ describe("CompactingSession", () => {
       await agent.prompt("p3");
       await agent.prompt("p4");
       const events = (await agent.session.pull?.([])) ?? [];
-      const first = events[0];
-      if (
-        first &&
-        first.sessionUpdate === "user_message_chunk" &&
-        first.content.type === "text"
-      ) {
-        expect(first.content.text).toMatch(/summary/i);
-      } else {
-        throw new Error("expected first event to be the summary");
-      }
+      expect(chunkText(events[0])).toMatch(/summary/i);
     } finally {
       await agent.close();
     }
@@ -368,16 +354,7 @@ describe("CompactingSession — persistence", () => {
 
       const out = (await session.pull?.([])) ?? [];
       expect(out).toHaveLength(4); // 2 summary + memory.slice(3)
-      const first = out[0];
-      if (
-        first &&
-        first.sessionUpdate === "user_message_chunk" &&
-        first.content.type === "text"
-      ) {
-        expect(first.content.text).toContain("Liouville");
-      } else {
-        throw new Error("expected loaded summary as first event");
-      }
+      expect(chunkText(out[0])).toContain("Liouville");
     });
   });
 

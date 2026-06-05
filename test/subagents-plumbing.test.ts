@@ -84,15 +84,25 @@ function trivialManifest(name: string): AgentManifest {
 }
 
 function firstAgentMessage(events: SessionUpdate[]): string | undefined {
-  const msg = events.find((e) => e.sessionUpdate === "agent_message_chunk");
-  if (
-    msg &&
-    msg.sessionUpdate === "agent_message_chunk" &&
-    msg.content.type === "text"
-  ) {
-    return msg.content.text;
+  for (const e of events) {
+    if (e.sessionUpdate === "agent_message_chunk" && e.content.type === "text") {
+      return e.content.text;
+    }
   }
   return undefined;
+}
+
+function toolCallText(events: SessionUpdate[]): string {
+  for (const e of events) {
+    if (
+      e.sessionUpdate === "tool_call_update" &&
+      e.content?.[0]?.type === "content" &&
+      e.content[0].content.type === "text"
+    ) {
+      return e.content[0].content.text;
+    }
+  }
+  return "";
 }
 
 describe("RunAgentOptions.parent", () => {

@@ -1,27 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import { BashTool } from "../src/runtime/builtins/bash.js";
-import type {
-  Agent,
-  ToolContext,
-  ToolResult,
-} from "../src/types/interfaces.js";
+import type { ToolResult } from "../src/types/interfaces.js";
 import type { CapabilitySet } from "../src/types/manifest.js";
-
-function makeCtx(): ToolContext {
-  const stubAgent: Agent = {
-    manifest: { name: "test", harness: { provider: "test" } },
-    harness: { run: async () => ({ stopReason: "end_turn" }) },
-    session: { push: async () => [], pull: async () => [] },
-    systemPromptCore: "",
-  };
-  return {
-    secrets: {},
-    abortSignal: new AbortController().signal,
-    requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
-    agent: stubAgent,
-  };
-}
+import { makeCtx } from "./helpers/bash-integration.js";
 
 describe("bash: shell mode (commands = '*')", () => {
   it("exposes the free-form { command: string } schema", () => {

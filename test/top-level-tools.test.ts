@@ -8,6 +8,7 @@ import type { TurnScript, TurnStep } from "../src/builtins/harness/test.js";
 import type { Runtime } from "../src/types/interfaces.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
 import { withTmpDir } from "./helpers/tmp.js";
+import { defined } from "./helpers/assert.js";
 
 function buildAgent(opts: {
   tools?: AgentManifest["tools"];
@@ -29,11 +30,25 @@ function buildAgent(opts: {
   };
 }
 
-function toolNames(agent: Awaited<ReturnType<typeof runAgent>>): string[] {
+type Agent = Awaited<ReturnType<typeof runAgent>>;
+
+function toolNames(agent: Agent): string[] {
   return agent.agentState.toolTable
     .list()
     .map((t) => t.name)
     .sort();
+}
+
+async function withAgent<T>(
+  agent: Promise<Agent>,
+  fn: (agent: Agent) => Promise<T>,
+): Promise<T> {
+  const a = await agent;
+  try {
+    return await fn(a);
+  } finally {
+    await a.close();
+  }
 }
 
 describe("top-level [tools]", () => {

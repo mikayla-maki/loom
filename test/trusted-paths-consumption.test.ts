@@ -55,14 +55,16 @@ function sessionWith(trusted: TrustedPath[]): Session {
   return { trustedPaths: () => trusted };
 }
 
+function ctxWith(trusted: TrustedPath[]): ToolContext {
+  return makeCtx(sessionWith(trusted));
+}
+
 describe("read_file honours session.trustedPaths()", () => {
   it("extends the manifest grant with trusted paths while rejecting everything else", async () => {
     const tool = new ReadFileTool({}, { paths: [grantedDir] });
-    const ctx = makeCtx(
-      sessionWith([
-        { path: trustedDir, access: "read", reason: "test fixture" },
-      ]),
-    );
+    const ctx = ctxWith([
+      { path: trustedDir, access: "read", reason: "test fixture" },
+    ]);
 
     const granted = await tool.execute(
       { path: path.join(grantedDir, "ok.txt") },

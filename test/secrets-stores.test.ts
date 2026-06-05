@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -107,6 +107,7 @@ describe("ChainedSecretsStore default-chain priority", () => {
 
 describe("buildSecretStore precedence (dotenv-style: local file wins)", () => {
   const tmp = useTmpDir("loom-buildsecrets-");
+  afterEach(() => vi.unstubAllEnvs());
 
   it("a manifest-dir .loom-secrets overrides an env var of the same name", async () => {
     const manifestDir = tmp();
@@ -120,24 +121,14 @@ describe("buildSecretStore precedence (dotenv-style: local file wins)", () => {
       manifestPath: path.join(manifestDir, "agent.toml"),
     } as AgentManifest;
 
-    const prevShared = process.env.LOOM_TEST_SHARED;
-    const prevEnvOnly = process.env.LOOM_TEST_ENV_ONLY;
-    process.env.LOOM_TEST_SHARED = "from-env";
-    process.env.LOOM_TEST_ENV_ONLY = "env-only";
-    try {
-      const store = buildSecretStore(manifest, {});
-      // Local file beats env for a name they share — the whole point of the
-      // dotenv-style ordering.
-      expect(await store.get("LOOM_TEST_SHARED")).toBe("from-manifest-file");
-      // File-only name resolves from the file.
-      expect(await store.get("LOOM_TEST_FILE_ONLY")).toBe("file-only");
-      // A name absent from the local files still falls through to env.
-      expect(await store.get("LOOM_TEST_ENV_ONLY")).toBe("env-only");
-    } finally {
-      if (prevShared === undefined) delete process.env.LOOM_TEST_SHARED;
-      else process.env.LOOM_TEST_SHARED = prevShared;
-      if (prevEnvOnly === undefined) delete process.env.LOOM_TEST_ENV_ONLY;
-      else process.env.LOOM_TEST_ENV_ONLY = prevEnvOnly;
-    }
+    vi.stubEnv("LOOM_TEST_SHARED", "from-env");
+    vi.stubEnv("LOOM_TEST_ENV_ONLY", "env-only");
+
+    const store = buildSecretStore(manifest, {});
+    // Local file beats env for a shared name — the point of dotenv ordering.
+    expect(await store.get("LOOM_TEST_SHARED")).toBe("from-manifest-file");
+    expect(await store.get("LOOM_TEST_FILE_ONLY")).toBe("file-only");
+    // A name absent from the local files falls through to env.
+    expect(await store.get("LOOM_TEST_ENV_ONLY")).toBe("env-only");
   });
 });
