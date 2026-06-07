@@ -257,7 +257,10 @@ export async function runAgent(
   }
 
   const augmented = applied.augmented;
-  const resolvedFull = resolveManifest(augmented, { builtinToolNames });
+  const resolvedFull = resolveManifest(augmented, {
+    builtinToolNames,
+    toolOrigins: applied.origins,
+  });
   const { toolsIndex: toolsIndexFull, loadErrors: loadErrorsFull } =
     await loadManifestProviders(resolvedFull, factoryCtx, {
       ...(options.providerLoadOptions

@@ -196,6 +196,11 @@ export interface ResolvedSource {
 export interface ResolveOptions {
   builtinToolNames?: Set<string>;
   harnessFactoryName?: string;
+  // Per-tool-instance override for a source's origin label, keyed by instance
+  // name. Lets a source a contributed tool group brought in be attributed to
+  // that group (e.g. "skill 'echo-notes'") instead of the synthetic
+  // `[tools.X]` entry the augmented manifest folds it into.
+  toolOrigins?: Record<string, string>;
 }
 
 export function resolveManifest(
@@ -257,7 +262,12 @@ export function resolveManifest(
         ...(providerHandle ? { providerHandle } : {}),
         origin,
       });
-      addSource(sources, binding.source, originLabel(origin), providerHandle);
+      addSource(
+        sources,
+        binding.source,
+        sourceOriginLabel(origin, options.toolOrigins),
+        providerHandle,
+      );
     } else {
       providers.push({
         id,
@@ -749,6 +759,20 @@ function addSource(
     ...(handle ? { handle } : {}),
     origins: [origin],
   });
+}
+
+function sourceOriginLabel(
+  origin: ProviderOrigin,
+  overrides: Record<string, string> | undefined,
+): string {
+  if (
+    origin.kind === "inline-anonymous" &&
+    origin.toolName &&
+    overrides?.[origin.toolName]
+  ) {
+    return overrides[origin.toolName] as string;
+  }
+  return originLabel(origin);
 }
 
 function originLabel(origin: ProviderOrigin): string {

@@ -32,6 +32,8 @@ export interface ToolGroupPlan {
   ceiling: Capabilities;
   verdicts: ToolGroupVerdict[];
   augmented: AgentManifest;
+  // Instance name → contributing group label, for source attribution.
+  origins: Record<string, string>;
 }
 
 // The boot sequence shared by runAgent and audit. Sets

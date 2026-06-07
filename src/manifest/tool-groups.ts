@@ -28,6 +28,12 @@ export interface AppliedToolGroups {
    */
   ceiling: Capabilities;
   verdicts: ToolGroupVerdict[];
+  /**
+   * Source-origin labels for instances a group newly contributed (instance
+   * name → the group's label). Manifest instances are omitted. Threaded into
+   * `resolveManifest` so a skill-shipped source is attributed to its skill.
+   */
+  origins: Record<string, string>;
 }
 
 interface InstanceState {
@@ -245,10 +251,14 @@ export function applyToolGroups(args: {
   }
 
   const tools: Record<string, ToolEntry> = {};
+  const origins: Record<string, string> = {};
   for (const [name, state] of instances) {
     tools[name] = state.entry;
+    // Manifest instances carry the default `[tools.X]` origin; anything else
+    // is a group's label, worth attributing the instance's source to.
+    if (state.origin !== `[tools.${name}]`) origins[name] = state.origin;
   }
-  return { tools, ceiling, verdicts };
+  return { tools, ceiling, verdicts, origins };
 }
 
 // Same implementation (provider reference + underlying name): grants

@@ -201,12 +201,16 @@ describe("loom install", () => {
     const noteSource = result.sources.find((s) => s.spec.includes("note-pkg"));
     expect(noteSource).toBeDefined();
     expect(noteSource?.spec.startsWith("path:")).toBe(true);
+    // The source is attributed to the skill that shipped it, not the
+    // synthetic [tools.X] entry it was folded into.
+    expect(noteSource?.origins).toContain("skill 'noteskill'");
 
     const lock = await fs.readFile(
       path.join(agentDir, ".loom", "lock.toml"),
       "utf8",
     );
     expect(lock).toContain("note-pkg");
+    expect(lock).toContain("skill 'noteskill'");
   });
 
   it("does not install a skill's provider that the ceiling doesn't accept", async () => {

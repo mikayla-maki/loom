@@ -518,6 +518,7 @@ async function auditAgentInner(
 
   const resolvedFull = resolveManifest(applied.augmented, {
     builtinToolNames,
+    toolOrigins: applied.origins,
   });
   const { toolsIndex: toolsIndexFull, loadErrors: loadErrorsFull } =
     await loadManifestProviders(resolvedFull, factoryCtx);

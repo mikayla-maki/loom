@@ -13,6 +13,7 @@ import {
   resolveManifest,
   sourceSpecKey,
   isPreBuiltSessionLayer,
+  type ResolvedSource,
 } from "../manifest/resolver.js";
 import { collectToolGroups } from "../manifest/tool-groups.js";
 import { planToolGroups } from "../manifest/ceiling.js";
@@ -44,6 +45,9 @@ export interface InstallSourceRecord {
   spec: string;
   resolved?: string;
   location: string;
+  /** Where the source was referenced from (e.g. `[providers].x` or the
+   * label of the skill whose group contributed it). */
+  origins: string[];
 }
 
 export async function installManifest(
@@ -91,7 +95,7 @@ export async function installManifest(
     // catches it.
     const lockedSpecs = new Set((existing.source ?? []).map((s) => s.spec));
     const currentSpecs = new Set(
-      [...sources.values()].map((s) => sourceSpecToKey(s)),
+      [...sources.values()].map((s) => sourceSpecToKey(s.spec)),
     );
     if (!sameSet(lockedSpecs, currentSpecs)) {
       throw new LoomError(
@@ -111,10 +115,13 @@ export async function installManifest(
     key: string;
     source: { path: string; subpath?: string };
   }> = [];
-  for (const [key, source] of sources) {
-    if ("npm" in source) npmSources.push({ key, source });
-    else if ("path" in source) pathSources.push({ key, source });
+  for (const [key, rs] of sources) {
+    if ("npm" in rs.spec) npmSources.push({ key, source: rs.spec });
+    else if ("path" in rs.spec) pathSources.push({ key, source: rs.spec });
   }
+  const originsFor = (key: string): string[] => [
+    ...(sources.get(key)?.origins ?? []),
+  ];
 
   for (const { source } of pathSources) {
     const abs = path.isAbsolute(source.path)
@@ -185,16 +192,17 @@ export async function installManifest(
       spec: sourceSpecToKey(source),
       ...(resolved ? { resolved } : {}),
       location: path.relative(manifestDir, pkgDir),
+      origins: originsFor(key),
     });
-    void key;
   }
-  for (const { source } of pathSources) {
+  for (const { key, source } of pathSources) {
     const abs = path.isAbsolute(source.path)
       ? source.path
       : path.resolve(manifestDir, source.path);
     records.push({
       spec: sourceSpecToKey(source),
       location: path.relative(manifestDir, abs) || ".",
+      origins: originsFor(key),
     });
   }
 
@@ -212,23 +220,19 @@ export async function installManifest(
 
 async function harvestSources(
   manifest: AgentManifest,
-): Promise<Map<string, SourceSpec>> {
+): Promise<Map<string, ResolvedSource>> {
   const builtinToolNames = new Set(nativeBuiltinNames());
   // Fold in tool groups the session chain contributes (e.g. a skill that
   // ships its own npm- or path-sourced provider via loom.providers) before
   // harvesting, so those sources install and lock alongside the manifest's
   // own. resolveManifest sees the contributed source because the group's
-  // provider is inlined onto the tool entry.
-  const augmented = await augmentWithContributedGroups(
+  // provider is inlined onto the tool entry; `toolOrigins` re-attributes that
+  // source to the contributing skill rather than the synthetic tool entry.
+  const { augmented, toolOrigins } = await augmentWithContributedGroups(
     manifest,
     builtinToolNames,
   );
-  const resolved = resolveManifest(augmented, { builtinToolNames });
-  const out = new Map<string, SourceSpec>();
-  for (const [key, rs] of resolved.sources) {
-    out.set(key, rs.spec);
-  }
-  return out;
+  return resolveManifest(augmented, { builtinToolNames, toolOrigins }).sources;
 }
 
 // Build the session chain just far enough to collect contributed tool
@@ -239,16 +243,17 @@ async function harvestSources(
 async function augmentWithContributedGroups(
   manifest: AgentManifest,
   builtinToolNames: Set<string>,
-): Promise<AgentManifest> {
+): Promise<{ augmented: AgentManifest; toolOrigins: Record<string, string> }> {
+  const bare = { augmented: manifest, toolOrigins: {} };
   const resolved = resolveManifest(manifest, { builtinToolNames });
   const sessionBindings = resolved.session ?? [];
-  if (sessionBindings.length === 0) return manifest;
+  if (sessionBindings.length === 0) return bare;
 
   let storagePath: string;
   try {
     storagePath = (await resolveAgentStorage(manifest)).path;
   } catch {
-    return manifest;
+    return bare;
   }
   const factoryCtx: FactoryContext = {
     manifestDir: manifest.manifestPath
@@ -282,7 +287,7 @@ async function augmentWithContributedGroups(
       // A layer we can't construct yet just doesn't contribute sources.
     }
   }
-  if (links.length === 0) return manifest;
+  if (links.length === 0) return bare;
   const session =
     links.length === 1 ? (links[0] as Session) : new ChainedSession(links);
 
@@ -290,9 +295,9 @@ async function augmentWithContributedGroups(
   try {
     groups = await collectToolGroups(session);
   } catch {
-    return manifest;
+    return bare;
   }
-  if (groups.length === 0) return manifest;
+  if (groups.length === 0) return bare;
 
   try {
     const plan = planToolGroups({
@@ -300,9 +305,9 @@ async function augmentWithContributedGroups(
       groups,
       agent: stubInstallAgent(manifest),
     });
-    return plan.augmented;
+    return { augmented: plan.augmented, toolOrigins: plan.origins };
   } catch {
-    return manifest;
+    return bare;
   }
 }
 
@@ -359,6 +364,7 @@ interface LockfileShape {
     spec: string;
     resolved?: string;
     location: string;
+    origins?: string[];
   }>;
 }
 
@@ -379,6 +385,7 @@ async function writeLockfile(
       spec: r.spec,
       ...(r.resolved !== undefined ? { resolved: r.resolved } : {}),
       location: r.location,
+      ...(r.origins.length > 0 ? { origins: r.origins } : {}),
     })),
   };
   const text = TOMLWriter.stringify(lock as unknown as TOMLWriter.JsonMap);

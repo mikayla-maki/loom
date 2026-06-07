@@ -12,8 +12,8 @@
 
 Loom is a package manager and runtime for agent harnesses. Define
 your agent's features and capabilities in an `agent.toml` manifest,
-check what it can do via `loom audit`, then prompt it anywhere, anytime
-via `loom prompt`:
+install any skills as you need, check what it can do via `loom audit`, 
+then prompt it via `loom prompt`:
 
 ```toml
 [agent]
@@ -43,9 +43,29 @@ find       = "builtin"
 read_file  = { paths = ["./", "../other-files"] }
 find       = { paths = ["./", "../other-files"] }
 # Writing + editing files is restricted to the current directory
-bash       = { commands = "*", paths = ["./"] } # Sandboxed by default, no network access
+bash       = [
+  # Commands are sandboxed by default
+  { commands = "*", paths = ["./"] } 
+  # But individual programs can have their own permissions
+  { commands = [ "gcalcli" ], network = "*" },
+]
 write_file = { paths = ["./"] }
 edit_file  = { paths = ["./"] }
+```
+
+And skills can participate too, by defining their own tools and capabilities, that is enforced by your agent.toml above:
+
+```calendar_skill.md
+---
+name: gcalcli
+description: Instructions to use gcalcli...
+metadata:
+  loom.tools: |
+    bash = { capabilities = { commands = ["gcalcli"], network = "*" } }
+---
+
+# DNS lookup
+
 ```
 
 ## Install
