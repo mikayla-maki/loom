@@ -11,7 +11,11 @@ import type {
 } from "../types/interfaces.js";
 import type { PermissionHandler } from "../types/permissions.js";
 import type { ClientBridge } from "../runtime/client-bridge.js";
-import type { AgentManifest, Capabilities } from "../types/manifest.js";
+import type {
+  AgentManifest,
+  Capabilities,
+  ToolGroupVerdict,
+} from "../types/manifest.js";
 import type { Ref } from "../internal/util.js";
 
 import { RuntimeImpl } from "../runtime/runtime.js";
@@ -31,6 +35,7 @@ export interface RunningAgent {
   readonly manifest: AgentManifest;
   readonly systemPrompt: string;
   readonly capabilities: Capabilities;
+  readonly toolVerdicts: ToolGroupVerdict[];
   readonly secretNames: string[];
   readonly agentState: AgentState;
   setPermissionHandler(handler: PermissionHandler | null): void;
@@ -42,6 +47,7 @@ interface RunningAgentImplOptions {
   manifest: AgentManifest;
   systemPrompt: string;
   capabilities: Capabilities;
+  toolVerdicts: ToolGroupVerdict[];
   secrets: Record<string, string>;
   session: Session;
   harness: Harness;
@@ -57,6 +63,7 @@ export class RunningAgentImpl implements RunningAgent {
   public readonly manifest: AgentManifest;
   public readonly systemPrompt: string;
   public readonly capabilities: Capabilities;
+  public readonly toolVerdicts: ToolGroupVerdict[];
   public readonly session: Session;
   public readonly harness: Harness;
   public readonly secretNames: string[];
@@ -75,6 +82,7 @@ export class RunningAgentImpl implements RunningAgent {
     this.manifest = opts.manifest;
     this.systemPrompt = opts.systemPrompt;
     this.capabilities = opts.capabilities;
+    this.toolVerdicts = opts.toolVerdicts;
     this.session = opts.session;
     this.harness = opts.harness;
     this.state = opts.state;
@@ -128,6 +136,8 @@ export class RunningAgentImpl implements RunningAgent {
       harness: this.harness,
       session: this.session,
       systemPromptCore: this.systemPrompt,
+      capabilities: this.capabilities,
+      toolVerdicts: this.toolVerdicts,
     };
     const agentRef = agentForSession(baseAgent, this.session);
     if (this.session.prepareTurn) {

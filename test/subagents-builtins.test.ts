@@ -21,6 +21,10 @@ const childManifest: AgentManifest = {
   name: "child-builtin",
   systemPrompt: "x",
   tools: {},
+  // No tools, so an explicit empty ceiling: the audit's strict containment
+  // check would otherwise treat the default capability pool as this child's
+  // grants and flag them against the parent's ceiling.
+  capabilities: {},
   harness: {
     provider: "test",
     script: [[{ say: "child-says-hello" }, { stop: "end_turn" }]],
@@ -50,12 +54,15 @@ function completedToolCallText(events: SessionUpdate[]): string {
 }
 
 describe("spawn_subagent builtin tool", () => {
-  it("runs the configured sub-agent end-to-end and returns its final assistant message", async () => {
+  it("runs the granted sub-agent end-to-end and returns its final assistant message", async () => {
     const agent = await runAgent({
       name: "parent-using-builtin",
       systemPrompt: "x",
-      tools: {
-        spawn_subagent: { provider: "builtin", manifest: childManifest },
+      tools: { spawn_subagent: "builtin" },
+      capabilities: {
+        spawn_subagent: {
+          manifest: childManifest as unknown as Record<string, unknown>,
+        },
       },
       harness: {
         provider: "test",
@@ -83,8 +90,8 @@ describe("spawn_subagent builtin tool", () => {
 
   it("declares its sub-manifest in dependencies.subagents (so audit walks it)", () => {
     const tool = new SpawnSubagentTool(
-      { manifest: childManifest } as unknown as Record<string, unknown>,
-      undefined,
+      {},
+      { manifest: childManifest as unknown as Record<string, unknown> },
     );
     expect(tool.dependencies.subagents).toHaveLength(1);
     expect(tool.dependencies.subagents[0]?.name).toBe("child-builtin");
@@ -124,7 +131,9 @@ describe("spawn_subagent self-copy default", () => {
     const tool = new SpawnSubagentTool({}, undefined, owningAgent());
 
     expect(tool.isSelfCopy).toBe(true);
-    expect(tool.description).toBe("Delegate a turn to a fresh copy of yourself.");
+    expect(tool.description).toBe(
+      "Delegate a turn to a fresh copy of yourself.",
+    );
     expect(tool.dependencies.subagents).toHaveLength(1);
 
     const clone = tool.dependencies.subagents[0]!;
@@ -138,10 +147,10 @@ describe("spawn_subagent self-copy default", () => {
     ]);
   });
 
-  it("prefers explicit config over the self-copy default", () => {
+  it("prefers an explicit grant over the self-copy default", () => {
     const tool = new SpawnSubagentTool(
-      { manifest: childManifest } as unknown as Record<string, unknown>,
-      undefined,
+      {},
+      { manifest: childManifest as unknown as Record<string, unknown> },
       owningAgent(),
     );
     expect(tool.isSelfCopy).toBe(false);
@@ -449,8 +458,11 @@ describe("loom audit recursion", () => {
     const tree = await auditAgent({
       name: "parent",
       systemPrompt: "x",
-      tools: {
-        spawn_subagent: { provider: "builtin", manifest: childManifest },
+      tools: { spawn_subagent: "builtin" },
+      capabilities: {
+        spawn_subagent: {
+          manifest: childManifest as unknown as Record<string, unknown>,
+        },
       },
       harness: { provider: "test" },
     });
@@ -475,11 +487,13 @@ describe("loom audit recursion", () => {
       name: "recursive",
       manifestPath: "/virtual/recursive.toml",
       systemPrompt: "x",
-      tools: {},
+      tools: { spawn_subagent: "builtin" },
       harness: { provider: "test" },
     };
-    recursive.tools = {
-      spawn_subagent: { provider: "builtin", manifest: recursive },
+    recursive.capabilities = {
+      spawn_subagent: {
+        manifest: recursive as unknown as Record<string, unknown>,
+      },
     };
 
     const tree = await auditAgent(recursive);

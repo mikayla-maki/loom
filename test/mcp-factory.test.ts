@@ -75,7 +75,9 @@ async function withEchoTools(
   body: (tools: McpServerTools) => Promise<void>,
 ): Promise<void> {
   const tools = echoTools();
-  await tools.init(initArgs({ command: process.execPath, args: [ECHO_SERVER] }));
+  await tools.init(
+    initArgs({ command: process.execPath, args: [ECHO_SERVER] }),
+  );
   try {
     await body(tools);
   } finally {
@@ -139,12 +141,12 @@ function envServerSpec(name: string): AgentManifest {
 
 describe("mcp-server factory — config parsing", () => {
   it("rejects an empty config", () => {
-    expect(() => mcpServerToolsFactory.create({}, ctx(), {}, undefined)).toThrow(
-      ManifestError,
-    );
-    expect(() => mcpServerToolsFactory.create({}, ctx(), {}, undefined)).toThrow(
-      /'command' or 'npm'/,
-    );
+    expect(() =>
+      mcpServerToolsFactory.create({}, ctx(), {}, undefined),
+    ).toThrow(ManifestError);
+    expect(() =>
+      mcpServerToolsFactory.create({}, ctx(), {}, undefined),
+    ).toThrow(/'command' or 'npm'/);
   });
 
   it("rejects when both command and npm are set", () => {
@@ -245,9 +247,9 @@ describe("mcp-server factory — tool resolution + execution", () => {
       );
       expect(echo.name).toBe("echo");
       expect(echo.description).toMatch(/Return the input verbatim/);
-      expect(
-        (echo.inputSchema as { properties?: unknown }).properties,
-      ).toEqual({ text: expect.objectContaining({ type: "string" }) });
+      expect((echo.inputSchema as { properties?: unknown }).properties).toEqual(
+        { text: expect.objectContaining({ type: "string" }) },
+      );
 
       const echoed = await echo.execute({ text: "hello loom" }, {} as never);
       expect(echoed.isError).toBeUndefined();
@@ -426,7 +428,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
     ).rejects.toThrow(/MOCK_API_KEY/);
   });
 
-  it("spawns one MCP server per [providers] handle regardless of per-tool config", async () => {
+  it("spawns one MCP server per [providers] handle regardless of instance count", async () => {
     const spec = echoServerSpec(
       "mcp-single-server",
       {
@@ -435,7 +437,7 @@ describe("mcp-server factory — end-to-end through runAgent", () => {
         shout: { provider: "echo_mcp", tool: "echo" },
         add: { provider: "echo_mcp" },
         add_to_10: { provider: "echo_mcp", tool: "add" },
-        whisper: { provider: "echo_mcp", tool: "echo", note: "extra" },
+        whisper: { provider: "echo_mcp", tool: "echo" },
       },
       {
         echo: "*",

@@ -1,6 +1,7 @@
 import * as path from "node:path";
 
 import {
+  DEFAULT_BUILTIN_TOOLS,
   isPreBuiltSessionLayer,
   resolveManifest,
   resolveSystemPrompt,
@@ -8,6 +9,8 @@ import {
   type ResolvedSessionLayer,
   type ResolvedSource,
 } from "../manifest/resolver.js";
+import { ceilingEntryFor, collectToolGroups } from "../manifest/tool-groups.js";
+import { planToolGroups } from "../manifest/ceiling.js";
 import {
   findToolsFactory,
   getHarnessFactory,
@@ -43,6 +46,9 @@ import type {
   CapabilitySet,
   SecretAllowlist,
   SourceSpec,
+  ToolEntry,
+  ToolGroup,
+  ToolGroupVerdict,
 } from "../types/manifest.js";
 import type {
   Agent,
@@ -53,7 +59,6 @@ import type {
   Session,
   Tool,
   Tools,
-  TrustedPath,
 } from "../types/interfaces.js";
 
 export interface SecretRequest {
@@ -61,11 +66,8 @@ export interface SecretRequest {
   required: boolean;
   requestedBy: string[];
   permittedByAllowlist: boolean;
-  /**
-   * Label of the store the secret resolved from (e.g. `"environment"`,
-   * `".loom-secrets (manifest dir)"`), or undefined when no store had it.
-   * See `describeSecretStores`.
-   */
+  /** Label of the store the secret resolved from (see `describeSecretStores`),
+   * or undefined when no store had it. */
   resolvedFrom?: string;
 }
 
@@ -102,8 +104,10 @@ export interface FactoryAuditSummary {
 }
 
 export interface SessionAuditSummary extends FactoryAuditSummary {
+  /** Instance names across this layer's contributed groups. */
   contributedTools: string[];
-  trustedPaths: TrustedPath[];
+  /** Tool groups this layer contributed; verdicts live on `CapabilityTree.toolGroups`. */
+  toolGroups: ToolGroup[];
   constructionError?: string;
 }
 
@@ -149,8 +153,8 @@ export interface CapabilityTree {
   session?: SessionAuditSummary;
   /** Every session layer, outer-to-inner. Present whenever {@link session} is. */
   sessionLayers?: SessionAuditSummary[];
-  /** @deprecated Read `session.trustedPaths` instead. */
-  trustedPaths: TrustedPath[];
+  /** Boot-time tool-group verdicts; rejected groups are inactive at runtime. */
+  toolGroups: ToolGroupVerdict[];
   /** @deprecated Read `session.constructionError` instead. */
   sessionConstructionError?: string;
   unresolvedSources: Array<{
@@ -163,19 +167,10 @@ export interface CapabilityTree {
 
 export type AuditOptions = Record<string, never>;
 
-const DEFAULT_TOP_LEVEL_CAPABILITIES: Capabilities = {
-  bash: { commands: "*", paths: ["./"] },
-  read_file: { paths: ["./"] },
-  write_file: { paths: ["./"] },
-  edit_file: { paths: ["./"] },
-};
-
 /**
- * Run a static audit against a manifest. Returns a `CapabilityTree`
- * when the manifest fully resolves, or throws `AuditError` with the
- * partial tree + structured problem list attached. Callers wanting
- * a partially-resolved tree should catch `AuditError` and read
- * `error.tree` + `error.health`.
+ * Run a static audit against a manifest. Returns a `CapabilityTree` when the
+ * manifest fully resolves, or throws `AuditError` with the partial tree and
+ * structured problem list attached (`error.tree`, `error.health`).
  */
 export async function auditAgent(
   source: string | AgentManifest,
@@ -202,9 +197,8 @@ export class AuditError extends LoomError {
 }
 
 /**
- * Audit-health summary, recursive over the agent tree. `totalProblems`
- * rolls up through every reachable sub-agent; per-node counts give
- * direct attribution; `subagents` walks the recursive structure.
+ * Audit-health summary, recursive over the agent tree. `totalProblems` rolls
+ * up through every reachable sub-agent; per-node counts give direct attribution.
  */
 export interface AuditHealth {
   agentName: string;
@@ -220,6 +214,9 @@ export interface AuditHealth {
   /** Tools whose `requires` capability kinds aren't granted by `[capabilities]`. */
   toolsMissingRequires: number;
   capabilityCeilingViolations: number;
+  /** Contributed tool groups the capability ceiling doesn't cover. Rejection
+   * is fail-soft (their tools just aren't bound) but still counts as a problem. */
+  rejectedToolGroups: number;
   /** Tool `audit()` findings with severity `"error"`. */
   toolAuditErrors: number;
   subagents: AuditHealth[];
@@ -237,6 +234,7 @@ export function summariseAuditHealth(tree: CapabilityTree): AuditHealth {
     (t) => t.missing.length > 0,
   ).length;
   const capabilityCeilingViolations = tree.capabilityCeilingViolations.length;
+  const rejectedToolGroups = tree.toolGroups.filter((g) => !g.accepted).length;
   let toolAuditErrors = 0;
   for (const t of tree.tools) {
     for (const f of t.findings) {
@@ -249,6 +247,7 @@ export function summariseAuditHealth(tree: CapabilityTree): AuditHealth {
     unresolvedTools +
     toolsMissingRequires +
     capabilityCeilingViolations +
+    rejectedToolGroups +
     toolAuditErrors;
 
   const subagentTrees: CapabilityTree[] = [
@@ -267,6 +266,7 @@ export function summariseAuditHealth(tree: CapabilityTree): AuditHealth {
     unresolvedTools,
     toolsMissingRequires,
     capabilityCeilingViolations,
+    rejectedToolGroups,
     toolAuditErrors,
     subagents,
   };
@@ -317,6 +317,11 @@ function appendHealthLines(
         `    - ${h.capabilityCeilingViolations} sub-agent capability-ceiling violation(s)`,
       );
     }
+    if (h.rejectedToolGroups > 0) {
+      out.push(
+        `    - ${h.rejectedToolGroups} rejected tool group(s) — declarations exceed [capabilities]; their tools won't be bound (fail-soft)`,
+      );
+    }
     if (h.toolAuditErrors > 0) {
       out.push(
         `    - ${h.toolAuditErrors} tool.audit() error finding(s) — tools that would fail at runtime`,
@@ -363,7 +368,7 @@ async function auditAgentInner(
       secrets: [],
       sessionSubagents: [],
       unresolvedTools: [{ name: "(cycle)", introducedBy: cycleKey }],
-      trustedPaths: [],
+      toolGroups: [],
       unresolvedSources: [],
       capabilityCeilingViolations: [],
     };
@@ -379,25 +384,22 @@ async function auditAgentInner(
   const builtinToolNames = new Set(nativeBuiltinNames());
   const resolved = resolveManifest(manifest, { builtinToolNames });
 
-  // Provider load failures are collected (not thrown like the runtime
-  // does) so audit can keep walking the tree.
+  // Provider load failures are collected (not thrown like the runtime does)
+  // so audit can keep walking the tree.
   const storage = await resolveAgentStorage(manifest);
   const factoryCtx: FactoryContext = {
     manifestDir: baseDir,
     agentName: manifest.name,
     loomVersion: "audit",
     clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    purpose: "audit",
     storage: storage.path,
     metadata: manifest.metadata ?? {},
   };
-  const { toolsIndex, loadErrors } = await loadManifestProviders(
-    resolved,
-    factoryCtx,
-  );
+  const { toolsIndex } = await loadManifestProviders(resolved, factoryCtx);
 
-  // Best-effort secrets so provider Tools whose `create()` consults
-  // them (e.g. MCP) can construct. Missing secrets stay absent rather
-  // than failing audit.
+  // Best-effort secrets so provider Tools whose create() consults them can
+  // construct; missing secrets stay absent rather than failing audit.
   let auditSecrets: Record<string, string> = {};
   try {
     const store = buildSecretStore(manifest, {});
@@ -411,66 +413,14 @@ async function auditAgentInner(
     /* fall through with empty secrets */
   }
 
-  const unresolvedSources: CapabilityTree["unresolvedSources"] = [];
-  const providers: ProviderSummary[] = [];
-  const providerSummariesByInstanceId = new Map<string, ProviderSummary>();
-  for (const [key, resolvedSrc] of resolved.sources) {
-    const summary: ProviderSummary = {
-      key,
-      source: resolvedSrc.spec,
-      ...(resolvedSrc.handle ? { handle: resolvedSrc.handle } : {}),
-      origins: [...resolvedSrc.origins],
-    };
-    const err = loadErrors.get(key);
-    if (err) {
-      summary.loadError = err.message;
-      unresolvedSources.push({
-        spec: key,
-        source: resolvedSrc.spec,
-        reason: err.message,
-      });
-    }
-    providers.push(summary);
-    for (const p of resolved.providers) {
-      if (
-        p.kind === "provider" &&
-        p.source &&
-        sourceSpecKey(p.source) === key
-      ) {
-        providerSummariesByInstanceId.set(p.id, summary);
-      }
-    }
-  }
-  // Configured-factory `[providers]` entries have no SourceSpec, so
-  // add a synthetic summary per factory-backed instance.
-  for (const p of resolved.providers) {
-    if (p.kind !== "provider" || p.source || !p.factoryName) continue;
-    const summary: ProviderSummary = {
-      key: `factory:${p.factoryName}#${p.id}`,
-      factoryName: p.factoryName,
-      ...(p.providerHandle ? { handle: p.providerHandle } : {}),
-      origins: [originLabelFor(p)],
-    };
-    providers.push(summary);
-    providerSummariesByInstanceId.set(p.id, summary);
-  }
-  // Declared handles first (alphabetically), then inline.
-  providers.sort((a, b) => {
-    if (a.handle && !b.handle) return -1;
-    if (!a.handle && b.handle) return 1;
-    return (a.handle ?? a.key).localeCompare(b.handle ?? b.key);
-  });
-
-  // Instantiate every chain link individually so contributed tools
-  // and trusted paths can be attributed to the link that produced
-  // them, then compose via ChainedSession when there's more than one.
-  const trustedPaths: TrustedPath[] = [];
+  // Each chain link is instantiated individually so contributed tool groups
+  // can be attributed to the link that produced them.
   let auditSession: Session | null = null;
   let sessionConstructionError: string | undefined;
   const sessionBindings = resolved.session ?? [];
   const perLinkContributions: Array<{
     contributedTools: string[];
-    trustedPaths: TrustedPath[];
+    toolGroups: ToolGroup[];
     constructionError?: string;
   }> = [];
   const auditedSessionLinks: Session[] = [];
@@ -505,7 +455,7 @@ async function auditAgentInner(
     }
     perLinkContributions.push({
       contributedTools: [],
-      trustedPaths: [],
+      toolGroups: [],
       ...(linkError ? { constructionError: linkError } : {}),
     });
     void linkInstance;
@@ -517,63 +467,38 @@ async function auditAgentInner(
     auditSession = new ChainedSession(auditedSessionLinks);
   }
 
-  const sessionToolBindings: typeof resolved.tools = [];
-  const claimedSessionTools = new Set(resolved.tools.map((b) => b.toolName));
-  let cursor = 0;
-  for (const [i, layer] of sessionBindings.entries()) {
-    const slot = perLinkContributions[i];
-    if (!slot) {
-      throw new Error(
-        `audit: perLinkContributions missing slot for layer ${i}`,
-      );
-    }
-    if (slot.constructionError) continue;
-    const linkInstance = auditedSessionLinks[cursor++];
-    if (!linkInstance) {
-      throw new Error(`audit: auditedSessionLinks exhausted before layer ${i}`);
-    }
-    const layerLabel = sessionLayerLabel(layer);
-    const originLabel =
-      sessionBindings.length === 1
-        ? `(session: ${layerLabel})`
-        : `(session link ${i}: ${layerLabel})`;
-    try {
-      const refs = (await linkInstance.tools?.()) ?? [];
-      for (const ref of refs) {
-        slot.contributedTools.push(ref.name);
-        if (claimedSessionTools.has(ref.name)) continue;
-        claimedSessionTools.add(ref.name);
-        sessionToolBindings.push({
-          toolName: ref.name,
-          providerInstanceId: "(session)",
-          toolConfig: typeof ref.config === "string" ? {} : ref.config,
-          origin: originLabel,
-        });
+  {
+    let cursor = 0;
+    for (const [i, layer] of sessionBindings.entries()) {
+      const slot = perLinkContributions[i];
+      if (!slot) {
+        throw new Error(
+          `audit: perLinkContributions missing slot for layer ${i}`,
+        );
       }
-    } catch (e) {
-      sessionConstructionError =
-        (sessionConstructionError ? sessionConstructionError + "; " : "") +
-        `session link ${i} ('${layerLabel}') .tools() threw: ${
-          (e as Error).message
-        }`;
-    }
-    try {
-      const tp = (await linkInstance.trustedPaths?.()) ?? [];
-      slot.trustedPaths.push(...tp);
-      trustedPaths.push(...tp);
-    } catch (e) {
-      sessionConstructionError =
-        (sessionConstructionError ? sessionConstructionError + "; " : "") +
-        `session link ${i} ('${layerLabel}') .trustedPaths() threw: ${
-          (e as Error).message
-        }`;
+      if (slot.constructionError) continue;
+      const linkInstance = auditedSessionLinks[cursor++];
+      if (!linkInstance) {
+        throw new Error(
+          `audit: auditedSessionLinks exhausted before layer ${i}`,
+        );
+      }
+      const layerLabel = sessionLayerLabel(layer);
+      try {
+        const groups = await collectToolGroups(linkInstance);
+        slot.toolGroups.push(...groups);
+        for (const group of groups) {
+          slot.contributedTools.push(...Object.keys(group.tools));
+        }
+      } catch (e) {
+        sessionConstructionError =
+          (sessionConstructionError ? sessionConstructionError + "; " : "") +
+          `session link ${i} ('${layerLabel}') .tools() threw: ${
+            (e as Error).message
+          }`;
+      }
     }
   }
-
-  const effectiveGrants: Capabilities =
-    manifest.tools === undefined && manifest.capabilities === undefined
-      ? DEFAULT_TOP_LEVEL_CAPABILITIES
-      : (manifest.capabilities ?? {});
 
   const native = buildNativeTools();
   const auditAgentRef: Agent = {
@@ -583,9 +508,74 @@ async function auditAgentInner(
     systemPromptCore: "",
   };
 
+  const groups = perLinkContributions.flatMap((slot) => slot.toolGroups);
+  const applied = planToolGroups({
+    manifest,
+    manifestDir: baseDir,
+    sessionLayers: resolved.session,
+    groups,
+    agent: auditAgentRef,
+  });
+  const ceiling = applied.ceiling;
+
+  const resolvedFull = resolveManifest(applied.augmented, {
+    builtinToolNames,
+  });
+  const { toolsIndex: toolsIndexFull, loadErrors: loadErrorsFull } =
+    await loadManifestProviders(resolvedFull, factoryCtx);
+
+  const unresolvedSources: CapabilityTree["unresolvedSources"] = [];
+  const providers: ProviderSummary[] = [];
+  const providerSummariesByInstanceId = new Map<string, ProviderSummary>();
+  for (const [key, resolvedSrc] of resolvedFull.sources) {
+    const summary: ProviderSummary = {
+      key,
+      source: resolvedSrc.spec,
+      ...(resolvedSrc.handle ? { handle: resolvedSrc.handle } : {}),
+      origins: [...resolvedSrc.origins],
+    };
+    const err = loadErrorsFull.get(key);
+    if (err) {
+      summary.loadError = err.message;
+      unresolvedSources.push({
+        spec: key,
+        source: resolvedSrc.spec,
+        reason: err.message,
+      });
+    }
+    providers.push(summary);
+    for (const p of resolvedFull.providers) {
+      if (
+        p.kind === "provider" &&
+        p.source &&
+        sourceSpecKey(p.source) === key
+      ) {
+        providerSummariesByInstanceId.set(p.id, summary);
+      }
+    }
+  }
+  // Configured-factory `[providers]` entries have no SourceSpec, so add a
+  // synthetic summary per factory-backed instance.
+  for (const p of resolvedFull.providers) {
+    if (p.kind !== "provider" || p.source || !p.factoryName) continue;
+    const summary: ProviderSummary = {
+      key: `factory:${p.factoryName}#${p.id}`,
+      factoryName: p.factoryName,
+      ...(p.providerHandle ? { handle: p.providerHandle } : {}),
+      origins: [originLabelFor(p)],
+    };
+    providers.push(summary);
+    providerSummariesByInstanceId.set(p.id, summary);
+  }
+  providers.sort((a, b) => {
+    if (a.handle && !b.handle) return -1;
+    if (!a.handle && b.handle) return 1;
+    return (a.handle ?? a.key).localeCompare(b.handle ?? b.key);
+  });
+
   const providerByInstanceId = new Map<string, Tools>();
   const auditedProviderTools: Tools[] = [];
-  for (const p of resolved.providers) {
+  for (const p of resolvedFull.providers) {
     if (p.kind === "native") {
       providerByInstanceId.set(p.id, native);
       continue;
@@ -595,7 +585,7 @@ async function auditAgentInner(
     try {
       ({ tools } = await bootMaterialiseTools(
         p,
-        toolsIndex,
+        toolsIndexFull,
         factoryCtx,
         auditSecrets,
         undefined,
@@ -608,8 +598,8 @@ async function auditAgentInner(
     }
     providerByInstanceId.set(p.id, tools);
     auditedProviderTools.push(tools);
-    // Best-effort init() so MCP server info + tool cache populate
-    // before we walk tool bindings.
+    // Best-effort init() so MCP server info + tool cache populate before we
+    // walk tool bindings.
     if (tools.init) {
       try {
         await tools.init({
@@ -630,12 +620,10 @@ async function auditAgentInner(
         continue;
       }
     }
-    if (summary) attachMcpServerInfo(summary, tools, resolved, p.id);
+    if (summary) attachMcpServerInfo(summary, tools, resolvedFull, p.id);
   }
 
   // Mirror the runtime's synthetic `"(session)"` Tools instance.
-  // Sessions with `resolveTool` own the tools they advertise; the
-  // skills pattern falls through to native below.
   if (auditSession) {
     const sess = auditSession;
     providerByInstanceId.set("(session)", {
@@ -648,10 +636,9 @@ async function auditAgentInner(
     });
   }
 
-  // Mirror the runtime's synthetic `"(harness)"` Tools instance,
-  // constructing the harness best-effort so harness-routed tool
-  // bindings resolve. Required secrets the audit couldn't fetch are
-  // stubbed so construction succeeds — audit never calls the API.
+  // Mirror the runtime's synthetic `"(harness)"` Tools instance. Missing
+  // required secrets are stubbed so construction succeeds — audit never calls
+  // the API.
   let auditHarness: Harness | undefined;
   let auditHarnessAvailableTools: string[] = [];
   if (resolved.harness) {
@@ -706,15 +693,18 @@ async function auditAgentInner(
     });
   }
 
-  const instanceById = new Map<string, (typeof resolved.providers)[number]>();
-  for (const p of resolved.providers) instanceById.set(p.id, p);
+  const instanceById = new Map<
+    string,
+    (typeof resolvedFull.providers)[number]
+  >();
+  for (const p of resolvedFull.providers) instanceById.set(p.id, p);
 
   const tools: CapabilityTree["tools"] = [];
   const resolvedTools = new Map<string, Tool>();
   const unresolvedTools: CapabilityTree["unresolvedTools"] = [];
   const directSubagentTrees: CapabilityTree[] = [];
 
-  for (const binding of [...resolved.tools, ...sessionToolBindings]) {
+  for (const binding of resolvedFull.tools) {
     const provider = providerByInstanceId.get(binding.providerInstanceId);
     if (!provider) {
       unresolvedTools.push({
@@ -723,7 +713,10 @@ async function auditAgentInner(
       });
       continue;
     }
-    const grant = effectiveGrants[binding.toolName];
+    // Same per-binding rule as the runtime's bindTools.
+    const grant =
+      binding.requestedGrant ??
+      ceilingEntryFor(ceiling, binding.toolName, binding.underlyingName)?.grant;
     let t: Tool | null = null;
     try {
       t = await Promise.resolve(
@@ -840,19 +833,14 @@ async function auditAgentInner(
     });
   }
 
-  // Compute the "advertised but unexposed" set per factory-backed
-  // provider — tools the MCP server offered that the manifest didn't
-  // opt into.
+  // "Advertised but unexposed": tools the MCP server offered that the
+  // manifest didn't opt into.
   for (const [instanceId, summary] of providerSummariesByInstanceId) {
     if (!summary.mcpServer) continue;
     const exposed = new Set<string>();
-    for (const binding of resolved.tools) {
+    for (const binding of resolvedFull.tools) {
       if (binding.providerInstanceId !== instanceId) continue;
-      const dispatched =
-        typeof binding.toolConfig.tool === "string"
-          ? (binding.toolConfig.tool as string)
-          : binding.toolName;
-      exposed.add(dispatched);
+      exposed.add(binding.underlyingName);
     }
     const tools = providerByInstanceId.get(instanceId);
     const cache = (tools as unknown as { toolsCache?: Map<string, unknown> })
@@ -879,11 +867,16 @@ async function auditAgentInner(
     }
   }
 
-  const secrets = collectSecrets(manifest, resolved, resolvedTools, toolsIndex);
+  const secrets = collectSecrets(
+    manifest,
+    resolvedFull,
+    resolvedTools,
+    toolsIndexFull,
+  );
 
   // Annotate each secret with where it would resolve from, walking the same
-  // store tiers the runtime uses (highest priority first). Best-effort: a
-  // misconfigured store never aborts the audit.
+  // store tiers as the runtime. Best-effort: a misconfigured store never
+  // aborts the audit.
   const secretTiers = describeSecretStores(manifest, {});
   for (const secret of secrets) {
     for (const tier of secretTiers) {
@@ -900,9 +893,8 @@ async function auditAgentInner(
     }
   }
 
-  // Session-declared subagents (pre-built instance form only): arrays
-  // are SessionSpec[] chains; only the non-array, no-provider shape is
-  // a pre-built `Session` instance.
+  // Only the non-array, no-provider shape is a pre-built `Session` instance
+  // that can declare subagents.
   const sessionSubagents: CapabilityTree[] = [];
   if (
     manifest.session &&
@@ -933,22 +925,21 @@ async function auditAgentInner(
   const capabilityCeilingViolations = checkCapabilityCeiling(
     manifest.name,
     manifestPath,
-    effectiveGrants,
+    ceiling,
     directSubagentTrees,
   );
 
   return {
     manifestPath,
     name: manifest.name,
-    grants: effectiveGrants,
+    grants: ceiling,
     ...(manifest.secrets !== undefined
       ? { secretAllowlist: manifest.secrets }
       : {}),
     storage: {
       path: storage.path,
       source: storage.source,
-      // Collision warnings only on the top-level audit; sub-agents
-      // inherit identity from a parent that already reported them.
+      // Collision warnings only at top level; a parent already reported them.
       warnings: seenManifests.size === 0 ? storage.warnings : [],
     },
     providers,
@@ -959,7 +950,7 @@ async function auditAgentInner(
     secrets,
     sessionSubagents,
     unresolvedTools,
-    trustedPaths,
+    toolGroups: applied.verdicts,
     unresolvedSources,
     capabilityCeilingViolations,
     ...(sessionConstructionError !== undefined
@@ -1022,17 +1013,14 @@ function buildHarnessSummary(
   };
 }
 
-/**
- * One audit summary per session layer. Returns undefined when the
- * manifest has no `[session]` block (the runtime applies the default
- * chain implicitly, reflected here by omission).
- */
+// Undefined when the manifest has no [session] block (the runtime's implicit
+// default chain is reflected by omission).
 function buildSessionLayerSummaries(
   manifest: AgentManifest,
   resolved: ReturnType<typeof resolveManifest>,
   perLinkContributions: ReadonlyArray<{
     contributedTools: string[];
-    trustedPaths: TrustedPath[];
+    toolGroups: ToolGroup[];
     constructionError?: string;
   }>,
   topLevelConstructionError: string | undefined,
@@ -1047,7 +1035,7 @@ function buildSessionLayerSummaries(
         resolved: true,
         preBuilt: true,
         contributedTools: [],
-        trustedPaths: [],
+        toolGroups: [],
         ...(topLevelConstructionError
           ? { constructionError: topLevelConstructionError }
           : {}),
@@ -1064,7 +1052,7 @@ function buildSessionLayerSummaries(
         resolved: false,
         preBuilt: false,
         contributedTools: [],
-        trustedPaths: [],
+        toolGroups: [],
         ...(topLevelConstructionError
           ? { constructionError: topLevelConstructionError }
           : {}),
@@ -1075,7 +1063,7 @@ function buildSessionLayerSummaries(
   return bindings.map((layer, i) => {
     const slot = perLinkContributions[i] ?? {
       contributedTools: [],
-      trustedPaths: [],
+      toolGroups: [],
     };
     if (isPreBuiltSessionLayer(layer)) {
       return {
@@ -1084,7 +1072,7 @@ function buildSessionLayerSummaries(
         resolved: true,
         preBuilt: true,
         contributedTools: [...slot.contributedTools],
-        trustedPaths: [...slot.trustedPaths],
+        toolGroups: [...slot.toolGroups],
         ...(slot.constructionError
           ? { constructionError: slot.constructionError }
           : {}),
@@ -1113,7 +1101,7 @@ function buildSessionLayerSummaries(
       resolved: registryHit,
       preBuilt: false,
       contributedTools: [...slot.contributedTools],
-      trustedPaths: [...slot.trustedPaths],
+      toolGroups: [...slot.toolGroups],
       ...(slot.constructionError
         ? { constructionError: slot.constructionError }
         : {}),
@@ -1121,15 +1109,13 @@ function buildSessionLayerSummaries(
   });
 }
 
-/** Human-readable identifier for a `ResolvedSessionLayer`. */
 function sessionLayerLabel(layer: ResolvedSessionLayer): string {
   return isPreBuiltSessionLayer(layer)
     ? "(pre-built)"
     : (layer.providerHandle ?? layer.factoryName);
 }
 
-// Aliased re-exports of boot helpers so audit and runtime share the
-// same factory lookup rules.
+// Aliased so audit and runtime share the same factory lookup rules.
 const defaultProviderName = bootDefaultProviderName;
 const lookupFactoryByBinding = bootLookupFactoryByBinding;
 
@@ -1146,11 +1132,8 @@ function computeMissing(
   return missing;
 }
 
-/**
- * Static version of the runtime spawn-time check: each sub-agent's
- * `[capabilities]` entries must be contained by the parent's grant for
- * the same tool key. See §1.6 of the manifest spec.
- */
+// Static version of the runtime spawn-time check (§1.6 of the manifest spec):
+// each sub-agent grant must be contained by the parent's grant for the key.
 function checkCapabilityCeiling(
   _parentName: string,
   _parentManifestPath: string,
@@ -1175,12 +1158,7 @@ function checkCapabilityCeiling(
   return violations;
 }
 
-/**
- * Roll up every secret name the manifest's components declare —
- * harness, session, tools, and provider-Tools contributions (both
- * static `secrets` and per-instance `instanceSecretNeeds(config)`).
- * Mirrors the runtime's `collectPhase1SecretNeeds`.
- */
+// Mirrors the runtime's `collectPhase1SecretNeeds`.
 function collectSecrets(
   manifest: AgentManifest,
   resolved: ReturnType<typeof resolveManifest>,
@@ -1301,7 +1279,7 @@ function originLabelFor(
   return "(factory-backed)";
 }
 
-/** Duck-typed: attach MCP `serverInfo` to the summary when present. */
+// Duck-typed: any Tools exposing `serverInfo` is treated as an MCP server.
 function attachMcpServerInfo(
   summary: ProviderSummary,
   tools: Tools,
@@ -1326,7 +1304,7 @@ function attachMcpServerInfo(
   };
 }
 
-/** Arg names a per-arg capability grant pre-binds (scalar literals). */
+// Scalar literals in a grant are pre-bound args.
 function boundArgsForGrant(grant: CapabilitySet | undefined): string[] {
   if (
     !grant ||
@@ -1465,8 +1443,7 @@ export function formatCapabilityTree(
         `${pad}    ${p.dim("config:")} ${p.dim(formatConfig(h.config))}`,
       );
     }
-    // availableTools deliberately not rendered — discoverable via
-    // `loom providers list`.
+    // availableTools deliberately not rendered — see `loom providers list`.
   }
 
   const layers = tree.sessionLayers ?? (tree.session ? [tree.session] : []);
@@ -1548,6 +1525,31 @@ export function formatCapabilityTree(
     }
   }
 
+  if (tree.toolGroups.length > 0) {
+    lines.push(`${pad}  ${p.bold("contributed tools:")}`);
+    for (const f of tree.toolGroups) {
+      const status = f.accepted ? p.green("ACTIVE") : p.yellow("INACTIVE");
+      lines.push(`${pad}    ${p.dim("-")} ${p.cyan(f.label)}  ${status}`);
+      for (const d of f.declarations) {
+        if (d.ok) {
+          const against = d.against
+            ? `  ${p.dim(`(granted by [capabilities].${d.against})`)}`
+            : "";
+          lines.push(`${pad}      ${p.green("✓")} ${d.instance}${against}`);
+        } else {
+          lines.push(
+            `${pad}      ${p.yellow("✗")} ${d.instance}${d.reason ? `: ${d.reason}` : ""}`,
+          );
+          if (d.remediation) {
+            lines.push(
+              `${pad}        ${p.dim(`to accept, add to [capabilities]: ${d.remediation}`)}`,
+            );
+          }
+        }
+      }
+    }
+  }
+
   if (tree.unresolvedSources.length > 0) {
     lines.push(
       `${pad}  ${p.bold(p.yellow("unresolved sources"))} ${p.dim("(run `loom install` to materialise):")}`,
@@ -1613,7 +1615,6 @@ export function formatCapabilityTree(
   return lines.join("\n");
 }
 
-/** Print one session layer's body (everything under its heading). */
 function formatSessionLayerBody(
   s: SessionAuditSummary,
   pad: string,
@@ -1634,14 +1635,12 @@ function formatSessionLayerBody(
         .join(", ")}`,
     );
   }
-  if (s.trustedPaths.length > 0) {
-    lines.push(`${pad}${layerIndent}${p.dim("trusted paths:")}`);
-    for (const tp of s.trustedPaths) {
-      const reason = tp.reason ? p.dim(` — ${tp.reason}`) : "";
-      lines.push(
-        `${pad}${layerIndent}  ${p.dim("-")} ${tp.path} ${p.magenta(`[${tp.access}]`)}${reason}`,
-      );
-    }
+  if (s.toolGroups.length > 0) {
+    lines.push(
+      `${pad}${layerIndent}${p.dim("contributes tool groups:")} ${s.toolGroups
+        .map((g) => p.magenta(g.label))
+        .join(", ")}`,
+    );
   }
   if (s.constructionError) {
     lines.push(
@@ -1660,7 +1659,6 @@ function formatConfig(cfg: Record<string, unknown>): string {
   return JSON.stringify(cfg);
 }
 
-/** Source key (package-backed) or `builtin` for harness/session headlines. */
 function sourceAttribution(
   summary: FactoryAuditSummary,
   p: ReturnType<typeof makePainter>,
@@ -1670,7 +1668,6 @@ function sourceAttribution(
   return p.dim("builtin");
 }
 
-/** Provider label for a tool entry. */
 function toolProviderLabel(
   t: CapabilityTree["tools"][number],
   p: ReturnType<typeof makePainter>,

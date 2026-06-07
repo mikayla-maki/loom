@@ -8,7 +8,8 @@ import {
   formatCapabilityTree,
   summariseAuditHealth,
 } from "../src/audit/audit.js";
-import type { AgentManifest } from "../src/types/manifest.js";
+import type { AgentManifest, ToolGroup } from "../src/types/manifest.js";
+import type { Session } from "../src/types/interfaces.js";
 import { useTmpDir, withTmpDir } from "./helpers/tmp.js";
 
 const FIXTURES = path.resolve("test/fixtures");
@@ -110,9 +111,7 @@ describe("auditAgent", () => {
       "npm:@nonexistent/loom-pkg@*",
     );
     expect(err.tree.unresolvedSources[0]?.reason).toMatch(/Cannot find/);
-    expect(err.tree.unresolvedTools.map((u) => u.name)).toContain(
-      "fancy_tool",
-    );
+    expect(err.tree.unresolvedTools.map((u) => u.name)).toContain("fancy_tool");
     expect(err.health.unresolvedSources).toBe(1);
     expect(err.health.unresolvedTools).toBeGreaterThanOrEqual(1);
     const printed = formatCapabilityTree(err.tree);
@@ -214,8 +213,10 @@ describe("auditAgent", () => {
     expect(h.providerInitErrors).toBe(0);
     expect(h.unresolvedTools).toBe(0);
     expect(h.toolsMissingRequires).toBe(0);
+    expect(h.rejectedToolGroups).toBe(0);
     expect(h.toolAuditErrors).toBe(0);
     expect(h.subagents).toEqual([]);
+    expect(tree.toolGroups).toEqual([]);
   });
 
   it("recursive health: a broken sub-agent makes the parent fail audit", async () => {
@@ -234,10 +235,9 @@ describe("auditAgent", () => {
       manifestPath: "/virtual/parent.toml",
       systemPrompt: "x",
       harness: { provider: "test" },
-      tools: {
-        spawn_subagent: { provider: "builtin", manifest: child },
-      },
-      capabilities: { spawn_subagent: "*" },
+      tools: {},
+      capabilities: { broken: "*" },
+      session: { dependencies: { subagents: [child] } },
     };
     const err = await expectAuditError(parent);
     expect(err.health.directProblems).toBe(0);
@@ -271,12 +271,12 @@ describe("auditAgent", () => {
       harness: { provider: "test" },
       tools: {
         broken_in_parent: { provider: { npm: "@nonexistent/in-parent" } },
-        spawn_subagent: { provider: "builtin", manifest: child },
       },
       capabilities: {
         broken_in_parent: "*",
-        spawn_subagent: "*",
+        broken_in_child: "*",
       },
+      session: { dependencies: { subagents: [child] } },
     };
     const err = await expectAuditError(parent);
     expect(err.health.directProblems).toBeGreaterThan(0);
@@ -294,15 +294,11 @@ describe("auditAgent", () => {
       tools: {},
       harness: { provider: "test" },
     };
-    recursive.tools = {
-      spawn_subagent: { provider: "builtin", manifest: recursive },
-    };
-    recursive.capabilities = { spawn_subagent: "*" };
+    recursive.session = { dependencies: { subagents: [recursive] } };
     const tree = await auditAgent(recursive);
     const h = summariseAuditHealth(tree);
     expect(h.totalProblems).toBe(0);
-    const inner = tree.tools.find((t) => t.name === "spawn_subagent")!
-      .subagents[0];
+    const inner = tree.sessionSubagents[0];
     expect(inner!.unresolvedTools).toContainEqual(
       expect.objectContaining({ name: "(cycle)" }),
     );
@@ -356,6 +352,222 @@ describe("auditAgent", () => {
     expect(err.message).toMatch(message);
     expect(err.health[healthField]).toBeGreaterThanOrEqual(1);
     expect(err.health.totalProblems).toBeGreaterThan(0);
+  });
+
+  it("accepted tool groups bind their tools and surface ACTIVE verdicts", async () => {
+    const group: ToolGroup = {
+      label: "skill 'docs'",
+      tools: {
+        read_docs: {
+          provider: "builtin",
+          tool: "read_file",
+          capabilities: { paths: ["/docs"] },
+        },
+      },
+    };
+    const contributingSession: Session = {
+      tools: () => [group],
+      pull: async () => [],
+    };
+    const spec: AgentManifest = {
+      name: "audit-tool-groups",
+      systemPrompt: "x",
+      harness: { provider: "test" },
+      tools: { read_file: "builtin" },
+      capabilities: { read_file: { paths: ["./", "/docs"] } },
+      session: [contributingSession, { provider: "in-memory" }],
+    };
+    const tree = await auditAgent(spec);
+
+    expect(tree.toolGroups).toEqual([
+      {
+        label: "skill 'docs'",
+        accepted: true,
+        declarations: [
+          {
+            instance: "read_docs",
+            underlying: "read_file",
+            ok: true,
+            against: "read_file",
+          },
+        ],
+      },
+    ]);
+    expect(tree.sessionLayers?.[0]?.toolGroups).toEqual([group]);
+    expect(tree.sessionLayers?.[0]?.contributedTools).toEqual(["read_docs"]);
+    expect(tree.sessionLayers?.[1]?.toolGroups).toEqual([]);
+
+    expect(tree.tools.map((t) => t.name).sort()).toEqual([
+      "read_docs",
+      "read_file",
+    ]);
+    const readDocs = tree.tools.find((t) => t.name === "read_docs");
+    expect(readDocs?.granted).toEqual({ paths: ["/docs"] });
+    const readFile = tree.tools.find((t) => t.name === "read_file");
+    expect(readFile?.granted).toEqual({ paths: ["./", "/docs"] });
+    expect(tree.grants).toEqual({ read_file: { paths: ["./", "/docs"] } });
+
+    const printed = formatCapabilityTree(tree, { color: false });
+    expect(printed).toContain("contributed tools:");
+    expect(printed).toContain("skill 'docs'  ACTIVE");
+    expect(printed).toContain("contributes tool groups: skill 'docs'");
+  });
+
+  it("rejected tool groups stay unbound, count as warnings, and print remediation", async () => {
+    const contributingSession: Session = {
+      tools: () => [
+        {
+          label: "skill 'evil'",
+          tools: {
+            write_file: {
+              provider: "builtin",
+              capabilities: { paths: ["/etc"] },
+            },
+          },
+        },
+      ],
+      pull: async () => [],
+    };
+    const spec: AgentManifest = {
+      name: "audit-rejected-group",
+      systemPrompt: "x",
+      harness: { provider: "test" },
+      tools: { write_file: "builtin" },
+      capabilities: { write_file: { paths: ["./"] } },
+      session: [contributingSession, { provider: "in-memory" }],
+    };
+    const err = await expectAuditError(spec);
+
+    expect(err.health.rejectedToolGroups).toBe(1);
+    expect(err.health.directProblems).toBe(1);
+    expect(err.health.totalProblems).toBe(1);
+    expect(err.message).toMatch(/1 rejected tool group\(s\)/);
+    expect(err.message).toMatch(/fail-soft/);
+
+    expect(err.tree.toolGroups).toEqual([
+      {
+        label: "skill 'evil'",
+        accepted: false,
+        declarations: [
+          {
+            instance: "write_file",
+            underlying: "write_file",
+            ok: false,
+            against: "write_file",
+            reason: "request exceeds [capabilities].write_file",
+            remediation: 'write_file = { paths = ["/etc"] }',
+          },
+        ],
+      },
+    ]);
+    // Fail-soft: the manifest's own write_file binds with its ceiling grant.
+    expect(err.tree.tools.map((t) => t.name)).toEqual(["write_file"]);
+    expect(err.tree.tools[0]?.granted).toEqual({ paths: ["./"] });
+
+    const printed = formatCapabilityTree(err.tree, { color: false });
+    expect(printed).toContain("contributed tools:");
+    expect(printed).toContain("skill 'evil'  INACTIVE");
+    expect(printed).toContain(
+      "✗ write_file: request exceeds [capabilities].write_file",
+    );
+    expect(printed).toContain(
+      'to accept, add to [capabilities]: write_file = { paths = ["/etc"] }',
+    );
+  });
+
+  it('session-implemented tools flow through provider = "session"', async () => {
+    const contributingSession: Session = {
+      tools: () => [
+        {
+          label: "notes provider",
+          tools: { take_note: { provider: "session" } },
+        },
+      ],
+      resolveTool: (name) =>
+        name === "take_note"
+          ? {
+              name: "take_note",
+              description: "Append a note.",
+              inputSchema: { type: "object" },
+              execute: async () => ({ content: "ok" }),
+            }
+          : null,
+      pull: async () => [],
+    };
+    const spec: AgentManifest = {
+      name: "audit-session-tool",
+      systemPrompt: "x",
+      harness: { provider: "test" },
+      tools: {},
+      capabilities: {},
+      session: [contributingSession, { provider: "in-memory" }],
+    };
+    const tree = await auditAgent(spec);
+
+    // A bare contributed entry requests nothing and is trivially granted.
+    expect(tree.toolGroups).toEqual([
+      {
+        label: "notes provider",
+        accepted: true,
+        declarations: [
+          { instance: "take_note", underlying: "take_note", ok: true },
+        ],
+      },
+    ]);
+    expect(tree.tools.map((t) => t.name)).toEqual(["take_note"]);
+    expect(tree.tools[0]?.granted).toBeUndefined();
+    expect(tree.tools[0]?.introducedBy).toBe("[tools.take_note]");
+  });
+
+  it("root inline capabilities are self-authorizing and widen the ceiling", async () => {
+    const spec: AgentManifest = {
+      name: "audit-self-authorizing",
+      systemPrompt: "x",
+      harness: { provider: "test" },
+      tools: {
+        bash: {
+          provider: "builtin",
+          capabilities: { commands: "*", paths: ["./"] },
+        },
+      },
+      capabilities: {},
+    };
+    const tree = await auditAgent(spec);
+    expect(tree.grants).toEqual({ bash: { commands: "*", paths: ["./"] } });
+    const bash = tree.tools.find((t) => t.name === "bash");
+    expect(bash?.granted).toEqual({ commands: "*", paths: ["./"] });
+    expect(bash?.missing).toEqual([]);
+  });
+
+  it("strict ceiling: a sub-agent grant with no parent counterpart violates", async () => {
+    const child: AgentManifest = {
+      name: "wide-child",
+      manifestPath: "/virtual/wide-child.toml",
+      systemPrompt: "x",
+      harness: { provider: "test" },
+      tools: {},
+      capabilities: { bash: { commands: "*" } },
+    };
+    const parent: AgentManifest = {
+      name: "narrow-parent",
+      manifestPath: "/virtual/narrow-parent.toml",
+      systemPrompt: "x",
+      harness: { provider: "test" },
+      tools: {},
+      capabilities: { read_file: { paths: ["./"] } },
+      session: { dependencies: { subagents: [child] } },
+    };
+    const err = await expectAuditError(parent);
+    expect(err.health.capabilityCeilingViolations).toBe(1);
+    expect(err.tree.capabilityCeilingViolations).toEqual([
+      {
+        subagentName: "wide-child",
+        subagentManifestPath: "/virtual/wide-child.toml",
+        capabilityKey: "bash",
+        subagentGrant: { commands: "*" },
+        parentGrant: undefined,
+      },
+    ]);
   });
 
   it("audit failure lists every problem category, not just the first", async () => {

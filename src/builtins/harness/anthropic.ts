@@ -38,6 +38,7 @@ import type {
 } from "../../types/interfaces.js";
 import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
+import { valueFor } from "../../manifest/capabilities.js";
 
 interface AnthropicConfig {
   model?: string;
@@ -52,10 +53,7 @@ interface ServerToolSpec {
   description: string;
   inputSchema: JSONSchema;
   capabilityKinds: string[];
-  toApiTool(
-    config: ToolConfig,
-    capabilities: CapabilitySet | undefined,
-  ): AnthropicToolUnion;
+  toApiTool(capabilities: CapabilitySet | undefined): AnthropicToolUnion;
 }
 
 function stringArray(v: unknown): string[] | undefined {
@@ -64,13 +62,32 @@ function stringArray(v: unknown): string[] | undefined {
   return arr.length > 0 ? arr : undefined;
 }
 
-function allowedDomainsCapability(
+function domainsCapability(
   capabilities: CapabilitySet | undefined,
+  kind: string,
 ): string[] | undefined {
-  if (!capabilities || capabilities === "*") return undefined;
-  const raw = (capabilities as Record<string, unknown>).allowed_domains;
-  if (raw === "*") return undefined;
+  const raw = valueFor(capabilities, kind);
+  if (raw === undefined || raw === "*") return undefined;
   return stringArray(raw);
+}
+
+function numberCapability(
+  capabilities: CapabilitySet | undefined,
+  kind: string,
+): number | undefined {
+  const raw = valueFor(capabilities, kind);
+  return typeof raw === "number" ? raw : undefined;
+}
+
+function objectCapability(
+  capabilities: CapabilitySet | undefined,
+  kind: string,
+): Record<string, unknown> | undefined {
+  const raw = valueFor(capabilities, kind);
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  return undefined;
 }
 
 const SERVER_TOOLS: Record<string, ServerToolSpec> = {
@@ -92,27 +109,27 @@ const SERVER_TOOLS: Record<string, ServerToolSpec> = {
         },
       },
     },
-    capabilityKinds: ["allowed_domains"],
-    toApiTool(
-      config: ToolConfig,
-      capabilities: CapabilitySet | undefined,
-    ): WebSearchTool20250305 {
+    capabilityKinds: [
+      "allowed_domains",
+      "blocked_domains",
+      "max_uses",
+      "user_location",
+    ],
+    toApiTool(capabilities: CapabilitySet | undefined): WebSearchTool20250305 {
       const out: WebSearchTool20250305 = {
         type: "web_search_20250305",
         name: "web_search",
       };
-      if (typeof config.max_uses === "number") out.max_uses = config.max_uses;
-      const allowed = allowedDomainsCapability(capabilities);
+      const maxUses = numberCapability(capabilities, "max_uses");
+      if (maxUses !== undefined) out.max_uses = maxUses;
+      const allowed = domainsCapability(capabilities, "allowed_domains");
       if (allowed) out.allowed_domains = allowed;
-      const blocked = stringArray(config.blocked_domains);
+      const blocked = domainsCapability(capabilities, "blocked_domains");
       if (blocked) out.blocked_domains = blocked;
-      if (
-        config.user_location !== undefined &&
-        config.user_location !== null &&
-        typeof config.user_location === "object"
-      ) {
+      const location = objectCapability(capabilities, "user_location");
+      if (location) {
         out.user_location =
-          config.user_location as WebSearchTool20250305["user_location"];
+          location as unknown as WebSearchTool20250305["user_location"];
       }
       return out;
     },
@@ -136,29 +153,34 @@ const SERVER_TOOLS: Record<string, ServerToolSpec> = {
         },
       },
     },
-    capabilityKinds: ["allowed_domains"],
-    toApiTool(
-      config: ToolConfig,
-      capabilities: CapabilitySet | undefined,
-    ): WebFetchTool20250910 {
+    capabilityKinds: [
+      "allowed_domains",
+      "blocked_domains",
+      "max_uses",
+      "max_content_tokens",
+      "citations",
+    ],
+    toApiTool(capabilities: CapabilitySet | undefined): WebFetchTool20250910 {
       const out: WebFetchTool20250910 = {
         type: "web_fetch_20250910",
         name: "web_fetch",
       };
-      if (typeof config.max_uses === "number") out.max_uses = config.max_uses;
-      if (typeof config.max_content_tokens === "number") {
-        out.max_content_tokens = config.max_content_tokens;
+      const maxUses = numberCapability(capabilities, "max_uses");
+      if (maxUses !== undefined) out.max_uses = maxUses;
+      const maxContentTokens = numberCapability(
+        capabilities,
+        "max_content_tokens",
+      );
+      if (maxContentTokens !== undefined) {
+        out.max_content_tokens = maxContentTokens;
       }
-      const allowed = allowedDomainsCapability(capabilities);
+      const allowed = domainsCapability(capabilities, "allowed_domains");
       if (allowed) out.allowed_domains = allowed;
-      const blocked = stringArray(config.blocked_domains);
+      const blocked = domainsCapability(capabilities, "blocked_domains");
       if (blocked) out.blocked_domains = blocked;
-      if (
-        config.citations !== undefined &&
-        config.citations !== null &&
-        typeof config.citations === "object"
-      ) {
-        out.citations = config.citations as WebFetchTool20250910["citations"];
+      const citations = objectCapability(capabilities, "citations");
+      if (citations) {
+        out.citations = citations as WebFetchTool20250910["citations"];
       }
       return out;
     },
@@ -214,8 +236,6 @@ export class AnthropicHarness implements Harness {
 
   private turnUsage: TurnUsage | null = null;
 
-  private serverToolConfigs = new Map<string, ToolConfig>();
-
   private serverToolCapabilities = new Map<string, CapabilitySet | undefined>();
 
   constructor(
@@ -238,13 +258,12 @@ export class AnthropicHarness implements Harness {
 
   resolveTool(
     name: string,
-    config: ToolConfig,
+    _config: ToolConfig,
     _agent: Agent,
     capabilities: CapabilitySet | undefined,
   ): Tool | null {
     const spec = SERVER_TOOLS[name];
     if (!spec) return null;
-    this.serverToolConfigs.set(name, config);
     this.serverToolCapabilities.set(name, capabilities);
     return new AnthropicServerToolStub(spec, capabilities);
   }
@@ -352,9 +371,8 @@ export class AnthropicHarness implements Harness {
       const tools: AnthropicToolUnion[] = runtime.listTools().map((t) => {
         const serverSpec = SERVER_TOOLS[t.name];
         if (serverSpec) {
-          const cfg = this.serverToolConfigs.get(t.name) ?? {};
           const caps = this.serverToolCapabilities.get(t.name);
-          return serverSpec.toApiTool(cfg, caps);
+          return serverSpec.toApiTool(caps);
         }
         const userTool: AnthropicTool = {
           name: t.name,
@@ -370,12 +388,8 @@ export class AnthropicHarness implements Harness {
         system: runtime.systemPrompt(),
         messages,
         tools,
-        // Automatic prompt caching: a single top-level breakpoint that the
-        // API applies to the last cacheable block and advances as the
-        // conversation grows. Each request caches the full prefix (tools +
-        // system + prior messages) and reads it back on the next request —
-        // no manual per-block breakpoint bookkeeping. Without this, none of
-        // the request is cached and every turn re-bills the entire prompt.
+        // Top-level breakpoint the API advances automatically, caching the
+        // full prefix; without it every turn re-bills the entire prompt.
         cache_control: { type: "ephemeral" },
       };
       if (turnThinking !== undefined) {
@@ -702,10 +716,9 @@ export class AnthropicHarness implements Harness {
       }
     };
 
-    // Pre-pass: a server tool replays as a server_tool_use + *_tool_result
-    // pair on the assistant message, so its `tool_call_update` is skipped
-    // below — sending it as a user tool_result would collide with the
-    // server-tool declaration in the request `tools` array.
+    // Server tools replay as a server_tool_use + *_tool_result pair on the
+    // assistant message; sending their tool_call_update as a user tool_result
+    // would collide with the server-tool declaration in `tools`.
     const serverPayloads = new Map<
       string,
       {

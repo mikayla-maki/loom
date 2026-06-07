@@ -75,6 +75,25 @@ describe("buildBashProfile", () => {
     expect(profile).toContain("(allow file-write*)");
   });
 
+  it("network grants include DNS config reads (/etc/resolv.conf symlinks into /private/var/run)", async () => {
+    const networked = await buildBashProfile({ network: "*" });
+    expect(networked).toContain(
+      '(allow file-read* (subpath "/private/var/run"))',
+    );
+    const dark = await buildBashProfile({});
+    expect(dark).not.toContain('(subpath "/private/var/run")');
+  });
+
+  it("bwrap network grants bind the resolved-DNS runtime dirs", async () => {
+    const { buildBwrapArgs } = await import("../src/runtime/sandbox/bwrap.js");
+    const networked = await buildBwrapArgs({ network: "*" });
+    expect(networked).toContain("/run/systemd/resolve");
+    expect(networked).not.toContain("--unshare-net");
+    const dark = await buildBwrapArgs({});
+    expect(dark).toContain("--unshare-net");
+    expect(dark).not.toContain("/run/systemd/resolve");
+  });
+
   it("emits the network rule only for network = star", async () => {
     expect(await buildBashProfile({ network: "*" })).toContain(
       "(allow network*)",
@@ -118,7 +137,9 @@ describe("validateBashGrant", () => {
   });
 
   it("rejects empty or non-string command lists", () => {
-    expect(() => validateBashGrant({ commands: [] })).toThrow(/non-empty array/);
+    expect(() => validateBashGrant({ commands: [] })).toThrow(
+      /non-empty array/,
+    );
     expect(() =>
       validateBashGrant({ commands: ["ls", 42] } as unknown as never),
     ).toThrow(/non-empty array/);

@@ -5,7 +5,7 @@ end-to-end story: **a notes-taking session for persistent recall**
 across runs of the agent.
 
 This is the canonical reference for what a Loom provider looks like.
-It's consumed by both the [`../minimal-agent/`](../minimal-agent/)
+It's consumed by both the [`../full-agent/`](../full-agent/)
 and [`../sdk-agent/`](../sdk-agent/) examples — open either of their
 manifests and look for the `[providers]` block pointing at
 `../notes-provider`.
@@ -111,6 +111,6 @@ sections:
   provider"** for the broader provider surface (Tools vs. Session
   vs. Harness contributions, the `loom.provider` field, the
   `register(api)` shape, secrets, capabilities).
-- [`../minimal-agent/agent.toml`](../minimal-agent/agent.toml) and
+- [`../full-agent/agent.toml`](../full-agent/agent.toml) and
   [`../sdk-agent/agent.ts`](../sdk-agent/agent.ts) — the consumers
   of this provider.

@@ -88,7 +88,10 @@ describe("provider package loader", () => {
 
   it("locates plain, scoped, and rejects non-provider or missing packages", async () => {
     const root = tmp();
-    await buildExtensionFixture({ rootDir: root, packageName: "fixture-loom-ext" });
+    await buildExtensionFixture({
+      rootDir: root,
+      packageName: "fixture-loom-ext",
+    });
     await buildExtensionFixture({
       rootDir: root,
       packageName: "fixture",
@@ -109,7 +112,9 @@ describe("provider package loader", () => {
     expect(scoped.name).toBe("@my-org/fixture");
 
     await expect(
-      locateProviderPackage("does-not-exist-loom-ext", { agentManifestDir: root }),
+      locateProviderPackage("does-not-exist-loom-ext", {
+        agentManifestDir: root,
+      }),
     ).rejects.toThrow(/Cannot find Loom provider/);
     await expect(
       locateProviderPackage("boring-pkg", { agentManifestDir: root }),
@@ -165,7 +170,10 @@ describe("provider package loader", () => {
         loom: { provider: "./index.js" },
       }),
     );
-    await fs.writeFile(path.join(pkgDir, "index.js"), `export const noop = true;`);
+    await fs.writeFile(
+      path.join(pkgDir, "index.js"),
+      `export const noop = true;`,
+    );
     await expect(
       loadProviderByName("no-register", {
         agentManifestDir: root,
@@ -183,7 +191,10 @@ describe("agent.toml v5 source resolution end-to-end", () => {
   it("a tool with a path source loads the package and resolves through its Tools instance", async () => {
     const agentDir = path.join(tmp(), "agent");
     await fs.mkdir(agentDir, { recursive: true });
-    await buildExtensionFixture({ rootDir: agentDir, packageName: "ext-pkg-e2e" });
+    await buildExtensionFixture({
+      rootDir: agentDir,
+      packageName: "ext-pkg-e2e",
+    });
 
     await fs.writeFile(
       path.join(agentDir, "agent.toml"),
@@ -196,11 +207,12 @@ provider = "test"
 
 [tools."fixture.echo"]
 provider = { path = "./node_modules/ext-pkg-e2e" }
-greeting = "yo"
 `,
     );
 
-    const manifest = await parseAgentManifest(path.join(agentDir, "agent.toml"));
+    const manifest = await parseAgentManifest(
+      path.join(agentDir, "agent.toml"),
+    );
     if ("provider" in manifest.harness) {
       manifest.harness.script = [
         [
@@ -222,7 +234,7 @@ greeting = "yo"
         tu.content[0].content.type === "text"
           ? tu.content[0].content.text
           : "";
-      expect(text).toBe("yo: world");
+      expect(text).toBe("hi: world");
     } finally {
       await agent.close();
     }

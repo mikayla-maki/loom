@@ -35,7 +35,7 @@ runtime's normal resolution. With the TOML form, every layer is owned
 by the runtime — there's no handle to reach into.
 
 This example shares the [`../notes-provider/`](../notes-provider/)
-package with [`../minimal-agent/`](../minimal-agent/); the two agents
+package with [`../full-agent/`](../full-agent/); the two agents
 present the same notes-taking surface to the user. The difference is
 purely about *who owns the compactor instance*.
 
@@ -98,14 +98,14 @@ exactly (`[[session.layers]]` blocks or `layers = ["a", "b"]` inline).
 What the SDK adds is the ability to drop a pre-built instance in at
 any position.
 
-## How this differs from `minimal-agent/`
+## How this differs from `full-agent/`
 
 Functionally these two agents are equivalent — same harness, same
 three-layer session, same tool set, same notes-provider. The
 difference is purely about which side of the line the compactor
 sits on:
 
-- **`minimal-agent/`** declares `[[session.layers]] provider =
+- **`full-agent/`** declares `[[session.layers]] provider =
   "compacting"`. The runtime constructs the instance; nobody else
   has a reference to it. Auto-compaction works, but `/compact` as a
   slash command isn't possible because the CLI's REPL doesn't know
@@ -120,7 +120,7 @@ and easier to audit.
 
 ## See also
 
-- [`../minimal-agent/agent.toml`](../minimal-agent/agent.toml) —
+- [`../full-agent/agent.toml`](../full-agent/agent.toml) —
   the declarative agent, for comparison.
 - [`../notes-provider/`](../notes-provider/) — the provider this
   example depends on.

@@ -166,19 +166,19 @@ describe("manifest walk via runAgent", () => {
     });
   });
 
-  it("keeps provider-level and per-tool config separate, deduping to one instance", () => {
+  it("tool entries share one `{}`-config provider instance and carry grant metadata", () => {
     const r = resolveManifest(
       spec({
         providers: {
-          fs_mcp: {
-            provider: "test-meta",
-            npm: "@example/mcp-fs",
-            shared: "from-provider",
-          },
+          loaded: { path: "./loaded-provider" },
         },
         tools: {
-          plain: { provider: "fs_mcp", flavour: "vanilla" },
-          override: { provider: "fs_mcp", shared: "from-tool" },
+          plain: { provider: "loaded" },
+          scoped: {
+            provider: "loaded",
+            tool: "underlying_search",
+            capabilities: { paths: ["./"] },
+          },
         },
       }),
     );
@@ -190,16 +190,42 @@ describe("manifest walk via runAgent", () => {
       r.providers.find((p) => p.id === t0.providerInstanceId),
       "provider instance not found",
     );
-    expect(instance.config).toEqual({
-      npm: "@example/mcp-fs",
-      shared: "from-provider",
-    });
+    expect(instance.config).toEqual({});
 
-    expect(t0.toolConfig).toEqual({ flavour: "vanilla" });
-    expect(t1.toolConfig).toEqual({ shared: "from-tool" });
+    expect(t0.toolName).toBe("plain");
+    expect(t0.underlyingName).toBe("plain");
+    expect(t0.toolConfig).toEqual({});
+    expect(t0.requestedGrant).toBeUndefined();
+
+    expect(t1.toolName).toBe("scoped");
+    expect(t1.underlyingName).toBe("underlying_search");
+    expect(t1.toolConfig).toEqual({ tool: "underlying_search" });
+    expect(t1.requestedGrant).toEqual({ paths: ["./"] });
   });
 
-  it("dedupes tools pointing at the same configured-factory handle, even with different per-tool config", () => {
+  it("resolves builtin renames to the native instance", () => {
+    const r = resolveManifest(
+      spec({
+        tools: {
+          gcalcli: { provider: "builtin", tool: "bash" },
+          shell: "bash",
+        },
+      }),
+      { builtinToolNames: new Set(["bash"]) },
+    );
+
+    const gcalcli = defined(r.tools.find((t) => t.toolName === "gcalcli"));
+    expect(gcalcli.providerInstanceId).toBe("native");
+    expect(gcalcli.underlyingName).toBe("bash");
+    expect(gcalcli.toolConfig).toEqual({ tool: "bash" });
+
+    const shell = defined(r.tools.find((t) => t.toolName === "shell"));
+    expect(shell.providerInstanceId).toBe("native");
+    expect(shell.underlyingName).toBe("bash");
+    expect(shell.toolConfig).toEqual({ tool: "bash" });
+  });
+
+  it("dedupes tools pointing at the same configured-factory handle, regardless of rename or grant", () => {
     const r = resolveManifest(
       spec({
         providers: {
@@ -208,7 +234,7 @@ describe("manifest walk via runAgent", () => {
         tools: {
           a: { provider: "fs_mcp" },
           b: { provider: "fs_mcp", tool: "something_else" },
-          c: { provider: "fs_mcp", note: "per-tool-only" },
+          c: { provider: "fs_mcp", capabilities: { paths: ["./"] } },
         },
       }),
     );

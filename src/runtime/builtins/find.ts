@@ -13,10 +13,9 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
-  collectTrustedPaths,
   describePaths,
-  effectivePaths,
   pathAllowed,
+  pathGrantContains,
   paths,
   resolvedPaths,
 } from "./_path.js";
@@ -65,7 +64,14 @@ export class FindTool implements Tool {
     this.description = `List files matching a glob pattern (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
-  async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
+  containsGrant(
+    superset: CapabilitySet | undefined,
+    subset: CapabilitySet,
+  ): boolean {
+    return pathGrantContains(superset, subset);
+  }
+
+  async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {
     const {
       pattern,
       root: requestedRoot = ".",
@@ -73,9 +79,7 @@ export class FindTool implements Tool {
     } = input as FindInput;
     const root = path.resolve(requestedRoot);
 
-    const trusted = await collectTrustedPaths(ctx);
-    const effective = effectivePaths(this.granted, trusted, "read");
-    if (!pathAllowed(root, effective)) {
+    if (!pathAllowed(root, this.granted)) {
       return {
         content: `find: root '${requestedRoot}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,

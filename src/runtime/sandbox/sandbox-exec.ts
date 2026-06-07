@@ -3,7 +3,10 @@ import * as os from "node:os";
 import * as nodePath from "node:path";
 
 import { expandHome } from "../../internal/util.js";
-import type { CapabilitySet } from "../../types/manifest.js";
+import type { CapabilityGrant } from "../../types/manifest.js";
+
+// Bash resolves exactly one grant row before any sandbox is constructed.
+type SingleRowGrant = "*" | CapabilityGrant;
 
 const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
@@ -28,11 +31,11 @@ export function _resetSandboxExecCache(): void {
   sandboxExecAvailable = null;
 }
 
-export function sandboxEngaged(grant: CapabilitySet): boolean {
+export function sandboxEngaged(grant: SingleRowGrant): boolean {
   return grant !== "*";
 }
 
-export function validateBashGrant(grant: CapabilitySet): void {
+export function validateBashGrant(grant: SingleRowGrant): void {
   if (grant === "*") return;
 
   const c = grant.commands;
@@ -81,7 +84,7 @@ export function validateBashGrant(grant: CapabilitySet): void {
   }
 }
 
-export async function buildBashProfile(grant: CapabilitySet): Promise<string> {
+export async function buildBashProfile(grant: SingleRowGrant): Promise<string> {
   if (grant === "*") {
     throw new Error(
       'buildBashProfile: "*" grant means no sandbox; check sandboxEngaged() first',
@@ -140,6 +143,9 @@ export async function buildBashProfile(grant: CapabilitySet): Promise<string> {
 
   if (grant.network === "*") {
     lines.push("(allow network*)");
+    // /etc/resolv.conf symlinks to ../var/run/resolv.conf; without this,
+    // DNS config is unreadable and every networked lookup times out.
+    lines.push('(allow file-read* (subpath "/private/var/run"))');
   }
 
   return lines.join("\n") + "\n";
@@ -163,7 +169,7 @@ async function canonicalPath(p: string): Promise<string> {
 }
 
 export async function maybeSandboxExecPrefix(
-  grant: CapabilitySet,
+  grant: SingleRowGrant,
 ): Promise<{ binary: string; prefixArgs: string[] } | null> {
   if (!sandboxEngaged(grant)) return null;
   if (!(await hasSandboxExec())) return null;

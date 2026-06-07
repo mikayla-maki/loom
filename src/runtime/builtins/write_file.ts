@@ -1,22 +1,3 @@
-/**
- * `write_file` — write a UTF-8 file, restricted to the granted paths.
- *
- * This tool writes the FULL file contents. Use it to create new
- * files or wholesale-replace existing ones. For targeted changes to
- * an existing file, use `edit_file` instead — it's far more
- * efficient (no need to repeat the unchanged bulk of the file) and
- * surfaces a diff in IDE clients.
- *
- * Capability kinds:
- *   optional: ["paths"]
- *
- * Star/list/absent semantics:
- *   paths absent  → smart default `["./"]` (project root)
- *   paths = "*"   → unrestricted
- *   paths = []    → explicit no-access (every call fails)
- *   paths = [...] → allowlist of absolute path roots
- */
-
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -34,10 +15,9 @@ import type { JSONSchema } from "../../types/schema.js";
 import {
   canonicalizeForGrant,
   canonicalizeRoots,
-  collectTrustedPaths,
   describePaths,
-  effectivePaths,
   pathAllowed,
+  pathGrantContains,
   paths,
   resolvedPaths,
 } from "./_path.js";
@@ -91,25 +71,25 @@ export class WriteFileTool implements Tool {
       `it's more efficient and produces a diff for review.`;
   }
 
+  containsGrant(
+    superset: CapabilitySet | undefined,
+    subset: CapabilitySet,
+  ): boolean {
+    return pathGrantContains(superset, subset);
+  }
+
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
     const i = input as WriteFileInput;
     const target = await canonicalizeForGrant(path.resolve(i.path), "write");
-    // Effective path set = manifest grant ∪ session trusted paths
-    // with write access (`"write"` or `"read-write"`).
-    const trusted = await collectTrustedPaths(ctx);
-    const effective = await canonicalizeRoots(
-      effectivePaths(this.granted, trusted, "write"),
-    );
-    if (!pathAllowed(target, effective)) {
+    const allowed = await canonicalizeRoots(this.granted);
+    if (!pathAllowed(target, allowed)) {
       return {
         content: `write_file: '${i.path}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,
       };
     }
 
-    // Try to capture the pre-write content so we can render a Diff
-    // block. Best-effort: a missing-file ENOENT is the common case
-    // for new-file writes, and we want a `null` oldText in that case.
+    // Best-effort pre-write read for the diff; null oldText for new files.
     let priorContent: string | null = null;
     try {
       if (ctx.client?.readTextFile) {
@@ -121,9 +101,8 @@ export class WriteFileTool implements Tool {
       priorContent = null;
     }
 
-    // ACP `fs/writeTextFile` is full-file replacement; we can't satisfy
-    // append-mode or create_dirs via the bridge, so fall through to
-    // local fs in those cases.
+    // ACP `fs/writeTextFile` is full-file replacement; append/create_dirs
+    // must go through local fs.
     const useClient = ctx.client?.writeTextFile && !i.append && !i.create_dirs;
 
     try {
@@ -150,9 +129,6 @@ export class WriteFileTool implements Tool {
       };
     }
 
-    // What did the file end up containing? In overwrite mode, that's
-    // `i.content`. In append mode, it's `priorContent + i.content`
-    // (or just `i.content` when the file didn't exist before).
     const finalContent = i.append
       ? (priorContent ?? "") + i.content
       : i.content;

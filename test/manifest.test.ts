@@ -73,23 +73,98 @@ provider = "test"
 
 [tools.fs_read]
 provider = { npm = "@my-org/mcp" }
-server = "stdio"
 
 [tools.local_grep]
 provider = { path = "../my-fast-grep" }
-flags = ["-i"]
+`);
+    const m = await parseAgentManifest(p);
+    expect(m.tools).toEqual({
+      fs_read: { provider: { npm: "@my-org/mcp" } },
+      local_grep: { provider: { path: "../my-fast-grep" } },
+    });
+  });
+
+  it("rejects tool entries with keys outside the closed grammar", async () => {
+    const p = await writeManifest(`[agent]
+name = "smuggled-config"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[tools.fs_read]
+provider = { npm = "@my-org/mcp" }
+server = "stdio"
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /\[tools\]\.fs_read has unsupported key 'server'.*Construction config belongs on a \[providers\] entry/,
+    );
+  });
+
+  it("parses tool-entry 'capabilities' as \"*\", a single grant, or a row array", async () => {
+    const p = await writeManifest(`[agent]
+name = "tool-caps"
+system_prompt = "x"
+[harness]
+provider = "test"
+
+[tools.fs_read]
+provider = { npm = "@my-org/mcp" }
+capabilities = { paths = ["./"] }
+
+[tools.fetch]
+provider = { npm = "@my-org/fetch" }
+capabilities = [
+  { network = "*" },
+  { paths = ["./cache"] },
+]
+
+[tools.anything]
+provider = { npm = "@my-org/anything" }
+capabilities = "*"
 `);
     const m = await parseAgentManifest(p);
     expect(m.tools).toEqual({
       fs_read: {
         provider: { npm: "@my-org/mcp" },
-        server: "stdio",
+        capabilities: { paths: ["./"] },
       },
-      local_grep: {
-        provider: { path: "../my-fast-grep" },
-        flags: ["-i"],
+      fetch: {
+        provider: { npm: "@my-org/fetch" },
+        capabilities: [{ network: "*" }, { paths: ["./cache"] }],
+      },
+      anything: {
+        provider: { npm: "@my-org/anything" },
+        capabilities: "*",
       },
     });
+  });
+
+  it("parses the 'tool' rename key and rejects an empty string", async () => {
+    const renamed = await parseAgentManifest(
+      await writeManifest(`[agent]
+name = "rename"
+system_prompt = "x"
+[harness]
+provider = "test"
+[tools]
+gcalcli = { provider = "builtin", tool = "bash" }
+`),
+    );
+    expect(renamed.tools).toEqual({
+      gcalcli: { provider: "builtin", tool: "bash" },
+    });
+
+    const p = await writeManifest(`[agent]
+name = "bad-rename"
+system_prompt = "x"
+[harness]
+provider = "test"
+[tools]
+gcalcli = { provider = "builtin", tool = "" }
+`);
+    await expect(parseAgentManifest(p)).rejects.toThrow(
+      /\[tools\]\.gcalcli\.tool must be a non-empty string/,
+    );
   });
 
   it("rejects [tools.X] entries with an empty table", async () => {
@@ -180,13 +255,17 @@ provider = "in-memory"
       expect(Array.isArray(m.session)).toBe(true);
       const layers = m.session as Layers;
       expect(layers).toHaveLength(2);
-      expect(layers[0]).toMatchObject({ provider: "compacting", threshold: 60 });
+      expect(layers[0]).toMatchObject({
+        provider: "compacting",
+        threshold: 60,
+      });
       expect(layers[1]).toMatchObject({ provider: "in-memory" });
     });
 
     it("parses inline layers in string, table, and mixed forms", async () => {
-      const strings = (await parseAgentManifest(
-        await writeManifest(`[agent]
+      const strings = (
+        await parseAgentManifest(
+          await writeManifest(`[agent]
 name = "inline-strings"
 system_prompt = "x"
 [harness]
@@ -195,15 +274,17 @@ provider = "test"
 [session]
 layers = ["skills", "compacting", "in-memory"]
 `),
-      )).session as Layers;
+        )
+      ).session as Layers;
       expect(strings).toEqual([
         { provider: "skills" },
         { provider: "compacting" },
         { provider: "in-memory" },
       ]);
 
-      const tables = (await parseAgentManifest(
-        await writeManifest(`[agent]
+      const tables = (
+        await parseAgentManifest(
+          await writeManifest(`[agent]
 name = "inline-tables"
 system_prompt = "x"
 [harness]
@@ -215,14 +296,16 @@ layers = [
   { provider = "file", path = "./s.jsonl" },
 ]
 `),
-      )).session as Layers;
+        )
+      ).session as Layers;
       expect(tables).toEqual([
         { provider: "compacting", threshold: 60 },
         { provider: "file", path: "./s.jsonl" },
       ]);
 
-      const mixed = (await parseAgentManifest(
-        await writeManifest(`[agent]
+      const mixed = (
+        await parseAgentManifest(
+          await writeManifest(`[agent]
 name = "mixed"
 system_prompt = "x"
 [harness]
@@ -235,7 +318,8 @@ layers = [
   "dms",
 ]
 `),
-      )).session as Layers;
+        )
+      ).session as Layers;
       expect(mixed).toEqual([
         { provider: "compacting" },
         { provider: "identity", vault_path: "/vault" },
@@ -437,7 +521,11 @@ npm_thing = "@scope/pkg"
       const m = await parseAgentManifest(p);
       expect(m.providers).toEqual({
         fs_mcp: { provider: "test-meta", npm: "@example/mcp-fs" },
-        linear: { provider: "test-meta", command: "npx", args: ["@linear/mcp"] },
+        linear: {
+          provider: "test-meta",
+          command: "npx",
+          args: ["@linear/mcp"],
+        },
         local: { path: "./my-tools" },
         npm_thing: "@scope/pkg",
       });
@@ -552,7 +640,10 @@ provider = "test"
 
     it("substitutes ${VAR} in string values, arrays, and nested tables", async () => {
       await withEnv(
-        { LOOM_TEST_VAULT_PATH: "/tmp/glass-vault", LOOM_TEST_PATH: "/tmp/loom-test" },
+        {
+          LOOM_TEST_VAULT_PATH: "/tmp/glass-vault",
+          LOOM_TEST_PATH: "/tmp/loom-test",
+        },
         async () => {
           const m = await parseAgentManifest(
             await writeManifest(`[agent]

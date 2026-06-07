@@ -31,7 +31,11 @@ const modelInfoResponse = () =>
     { status: 200, headers: { "content-type": "application/json" } },
   );
 
-const usage = (input: number, output: number, serverToolUse: unknown = null) => ({
+const usage = (
+  input: number,
+  output: number,
+  serverToolUse: unknown = null,
+) => ({
   input_tokens: input,
   output_tokens: output,
   cache_creation_input_tokens: null,
@@ -48,18 +52,25 @@ const jsonResponse = (body: unknown) =>
     headers: { "content-type": "application/json" },
   });
 
-function resolveByName(body: unknown, name: string): Record<string, unknown> | undefined {
+function resolveByName(
+  body: unknown,
+  name: string,
+): Record<string, unknown> | undefined {
   const tools = (body as { tools?: unknown[] } | null)?.tools ?? [];
   return tools.find(
     (t): t is Record<string, unknown> =>
-      typeof t === "object" && t !== null && (t as { name?: string }).name === name,
+      typeof t === "object" &&
+      t !== null &&
+      (t as { name?: string }).name === name,
   );
 }
 
 type ToolCall = SessionUpdate & { sessionUpdate: "tool_call" };
 type ToolCallUpdate = SessionUpdate & { sessionUpdate: "tool_call_update" };
 
-function pull(agent: { session: { pull?: (below: SessionUpdate[]) => Promise<SessionUpdate[]> } }) {
+function pull(agent: {
+  session: { pull?: (below: SessionUpdate[]) => Promise<SessionUpdate[]> };
+}) {
   return agent.session.pull?.([]) ?? Promise.resolve<SessionUpdate[]>([]);
 }
 
@@ -67,11 +78,15 @@ const toolCalls = (events: SessionUpdate[]): ToolCall[] =>
   events.filter((e): e is ToolCall => e.sessionUpdate === "tool_call");
 
 const toolCallUpdates = (events: SessionUpdate[]): ToolCallUpdate[] =>
-  events.filter((e): e is ToolCallUpdate => e.sessionUpdate === "tool_call_update");
+  events.filter(
+    (e): e is ToolCallUpdate => e.sessionUpdate === "tool_call_update",
+  );
 
 function updateText(update: ToolCallUpdate | undefined): string {
   const first = update?.content?.[0];
-  return first?.type === "content" && first.content.type === "text" ? first.content.text : "";
+  return first?.type === "content" && first.content.type === "text"
+    ? first.content.text
+    : "";
 }
 
 const anthropicHarness = (overrides?: Record<string, unknown>) => ({
@@ -126,7 +141,12 @@ describe("AnthropicHarness server-tool catalog", () => {
       h.resolveTool?.(
         name,
         { max_uses: 3 },
-        { manifest: {} as never, harness: h, session: {}, systemPromptCore: "" },
+        {
+          manifest: {} as never,
+          harness: h,
+          session: {},
+          systemPromptCore: "",
+        },
         undefined,
       ),
     );
@@ -150,35 +170,42 @@ describe("AnthropicHarness server-tool catalog", () => {
 
 describe('resolver: provider = "anthropic" routing', () => {
   const resolve = (manifest: AgentManifest) =>
-    resolveManifest(manifest, { builtinToolNames: new Set(nativeBuiltinNames()) });
+    resolveManifest(manifest, {
+      builtinToolNames: new Set(nativeBuiltinNames()),
+    });
 
-  it("routes opted-in web_search to the (harness) binding with its config", () => {
+  it("routes opted-in web_search to the (harness) binding", () => {
     const resolved = resolve({
       name: "r",
       harness: { provider: "anthropic" },
-      tools: { web_search: { provider: "anthropic", max_uses: 5 } },
+      tools: { web_search: { provider: "anthropic" } },
     });
     const binding = resolved.tools.find((b) => b.toolName === "web_search");
     expect(binding?.providerInstanceId).toBe("(harness)");
-    expect(binding?.toolConfig).toEqual({ max_uses: 5 });
+    expect(binding?.underlyingName).toBe("web_search");
+    expect(binding?.toolConfig).toEqual({});
   });
 
-  it("routes opted-in web_fetch to (harness) preserving config", () => {
+  it("routes opted-in web_fetch to (harness) carrying its requested grant", () => {
     const resolved = resolve({
       name: "r",
       harness: { provider: "anthropic" },
       tools: {
         web_fetch: {
           provider: "anthropic",
-          max_uses: 2,
-          max_content_tokens: 8000,
-          allowed_domains: ["example.com"],
+          capabilities: {
+            max_uses: 2,
+            max_content_tokens: 8000,
+            allowed_domains: ["example.com"],
+          },
         },
       },
     });
     const binding = resolved.tools.find((b) => b.toolName === "web_fetch");
     expect(binding?.providerInstanceId).toBe("(harness)");
-    expect(binding?.toolConfig).toEqual({
+    expect(binding?.underlyingName).toBe("web_fetch");
+    expect(binding?.toolConfig).toEqual({});
+    expect(binding?.requestedGrant).toEqual({
       max_uses: 2,
       max_content_tokens: 8000,
       allowed_domains: ["example.com"],
@@ -239,7 +266,11 @@ describe("anthropic web_search end-to-end", () => {
               },
             ],
           },
-          { type: "text", text: "I found a README about Loom.", citations: null },
+          {
+            type: "text",
+            text: "I found a README about Loom.",
+            citations: null,
+          },
         ],
         stop_reason: "end_turn",
         stop_sequence: null,
@@ -249,11 +280,13 @@ describe("anthropic web_search end-to-end", () => {
     return captured;
   }
 
-  it("translates [tools] config + [capabilities] grants into web_search_20250305 on the wire", async () => {
+  it("translates [capabilities] grants into web_search_20250305 on the wire", async () => {
     const captured = stubServerToolResponse();
     const agent = await startAgent("ws-e2e", {
-      tools: { web_search: { provider: "anthropic", max_uses: 3 } },
-      capabilities: { web_search: { allowed_domains: ["docs.python.org"] } },
+      tools: { web_search: "anthropic" },
+      capabilities: {
+        web_search: { max_uses: 3, allowed_domains: ["docs.python.org"] },
+      },
     });
     try {
       await agent.prompt("search please");
@@ -275,10 +308,14 @@ describe("anthropic web_search end-to-end", () => {
   // capability must omit the field entirely rather than send [].
   it("omits allowed_domains on the wire when the capability isn't granted", async () => {
     const captured = stubServerToolResponse();
-    const agent = await startAgent("ws-no-cap", { tools: { web_search: "anthropic" } });
+    const agent = await startAgent("ws-no-cap", {
+      tools: { web_search: "anthropic" },
+    });
     try {
       await agent.prompt("search");
-      expect(resolveByName(captured.body, "web_search")?.allowed_domains).toBeUndefined();
+      expect(
+        resolveByName(captured.body, "web_search")?.allowed_domains,
+      ).toBeUndefined();
     } finally {
       await agent.close();
     }
@@ -361,13 +398,17 @@ describe("anthropic web_fetch end-to-end", () => {
     return captured;
   }
 
-  it("emits web_fetch_20250910 with config (max_uses, max_content_tokens) + capability (allowed_domains)", async () => {
+  it("emits web_fetch_20250910 with capability knobs (max_uses, max_content_tokens, allowed_domains)", async () => {
     const captured = stubFetchResponse();
     const agent = await startAgent("wf-e2e", {
-      tools: {
-        web_fetch: { provider: "anthropic", max_uses: 2, max_content_tokens: 8000 },
+      tools: { web_fetch: "anthropic" },
+      capabilities: {
+        web_fetch: {
+          max_uses: 2,
+          max_content_tokens: 8000,
+          allowed_domains: ["example.com"],
+        },
       },
-      capabilities: { web_fetch: { allowed_domains: ["example.com"] } },
     });
     try {
       await agent.prompt("fetch please");
@@ -389,12 +430,17 @@ describe("anthropic web_fetch end-to-end", () => {
     const captured = stubFetchResponse();
     const agent = await startAgent("wf-misplaced", {
       tools: {
-        web_fetch: { provider: "anthropic", allowed_domains: ["misplaced.example.com"] },
+        web_fetch: {
+          provider: "anthropic",
+          allowed_domains: ["misplaced.example.com"],
+        },
       },
     });
     try {
       await agent.prompt("fetch");
-      expect(resolveByName(captured.body, "web_fetch")?.allowed_domains).toBeUndefined();
+      expect(
+        resolveByName(captured.body, "web_fetch")?.allowed_domains,
+      ).toBeUndefined();
     } finally {
       await agent.close();
     }
@@ -443,7 +489,11 @@ describe("anthropic server-tool event order during streaming", () => {
           usage: usage(10, 0),
         },
       },
-      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      },
       {
         type: "content_block_delta",
         index: 0,
@@ -485,7 +535,11 @@ describe("anthropic server-tool event order during streaming", () => {
         },
       },
       { type: "content_block_stop", index: 2 },
-      { type: "content_block_start", index: 3, content_block: { type: "text", text: "" } },
+      {
+        type: "content_block_start",
+        index: 3,
+        content_block: { type: "text", text: "" },
+      },
       {
         type: "content_block_delta",
         index: 3,
@@ -525,7 +579,9 @@ describe("anthropic server-tool event order during streaming", () => {
         .map((e) => e.sessionUpdate)
         .filter(
           (k) =>
-            k === "agent_message_chunk" || k === "tool_call" || k === "tool_call_update",
+            k === "agent_message_chunk" ||
+            k === "tool_call" ||
+            k === "tool_call_update",
         );
       expect(sequenceKinds).toEqual([
         "agent_message_chunk",
@@ -576,7 +632,11 @@ describe("anthropic server-tool replay within a session", () => {
                     },
                   ],
                 },
-                { type: "text", text: "I found a README about Loom.", citations: null },
+                {
+                  type: "text",
+                  text: "I found a README about Loom.",
+                  citations: null,
+                },
               ],
               stop_reason: "end_turn",
               stop_sequence: null,
@@ -588,7 +648,11 @@ describe("anthropic server-tool replay within a session", () => {
               role: "assistant",
               model: "claude-sonnet-4-5-latest",
               content: [
-                { type: "text", text: "Building on the search above…", citations: null },
+                {
+                  type: "text",
+                  text: "Building on the search above…",
+                  citations: null,
+                },
               ],
               stop_reason: "end_turn",
               stop_sequence: null,
@@ -607,7 +671,9 @@ describe("anthropic server-tool replay within a session", () => {
       const second = captured.bodies[1] as { messages?: unknown[] };
       const assistant = (second.messages ?? []).find(
         (m): m is { role: string; content: unknown[] } =>
-          typeof m === "object" && m !== null && (m as { role?: string }).role === "assistant",
+          typeof m === "object" &&
+          m !== null &&
+          (m as { role?: string }).role === "assistant",
       );
       const content = (assistant?.content ?? []) as Array<{
         type: string;
@@ -621,12 +687,16 @@ describe("anthropic server-tool replay within a session", () => {
         id: "srvr_1",
         name: "web_search",
       });
-      const serverResult = content.find((c) => c.type === "web_search_tool_result");
+      const serverResult = content.find(
+        (c) => c.type === "web_search_tool_result",
+      );
       expect(serverResult).toMatchObject({
         type: "web_search_tool_result",
         tool_use_id: "srvr_1",
       });
-      const results = (serverResult?.content ?? []) as Array<{ encrypted_content?: string }>;
+      const results = (serverResult?.content ?? []) as Array<{
+        encrypted_content?: string;
+      }>;
       expect(results[0]?.encrypted_content).toBe("ENC-XYZ-123");
     } finally {
       await agent.close();
@@ -713,13 +783,17 @@ describe("anthropic server-tool replay within a session", () => {
       const second = captured.bodies[1] as { messages?: unknown[] };
       const assistant = (second.messages ?? []).find(
         (m): m is { role: string; content: unknown[] } =>
-          typeof m === "object" && m !== null && (m as { role?: string }).role === "assistant",
+          typeof m === "object" &&
+          m !== null &&
+          (m as { role?: string }).role === "assistant",
       );
       const content = (assistant?.content ?? []) as Array<{
         type: string;
         content?: { type?: string; error_code?: string };
       }>;
-      expect(content.find((c) => c.type === "web_search_tool_result")?.content).toMatchObject({
+      expect(
+        content.find((c) => c.type === "web_search_tool_result")?.content,
+      ).toMatchObject({
         type: "web_search_tool_result_error",
         error_code: "unavailable",
       });

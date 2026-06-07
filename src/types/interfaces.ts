@@ -1,6 +1,12 @@
 import type { SessionUpdate, StopReason, TurnUsage } from "./acp.js";
 import type { JSONSchema } from "./schema.js";
-import type { AgentManifest, CapabilitySet } from "./manifest.js";
+import type {
+  AgentManifest,
+  Capabilities,
+  CapabilitySet,
+  ToolGroup,
+  ToolGroupVerdict,
+} from "./manifest.js";
 import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
@@ -19,11 +25,17 @@ export interface Session {
 
   systemPromptSection?(agent: Agent): string | Promise<string>;
 
-  tools?(): Promise<ToolRef[]> | ToolRef[];
+  /**
+   * Labeled `[tools]` tables this session contributes; collected once at
+   * boot and judged against the agent's capability ceiling. Self-implemented
+   * entries use `provider = "session"` and resolve through {@link resolveTool}.
+   */
+  tools?(): Promise<ToolGroup[]> | ToolGroup[];
 
   /**
-   * Resolves session-contributed tool names. Resolution order: this method,
-   * then native built-ins, then SDK-supplied Tools. `null` falls through.
+   * Resolves `provider = "session"` tool names. Resolution order: this
+   * method, then native built-ins, then SDK-supplied Tools. `null` falls
+   * through.
    */
   resolveTool?(
     name: string,
@@ -33,8 +45,6 @@ export interface Session {
   ): Promise<Tool | null> | Tool | null;
 
   dependencies?: { subagents?: AgentManifest[] };
-
-  trustedPaths?(): Promise<TrustedPath[]> | TrustedPath[];
 
   list?(): Promise<SessionDescriptor[]>;
 
@@ -71,8 +81,7 @@ export interface Harness {
   /**
    * Resolves harness-exposed names. Returns a stub `Tool` whose `execute()`
    * is generally never called — the harness intercepts dispatch in `run()`,
-   * but the stub's name/description/inputSchema still feed system prompts and
-   * `loom audit`. `config` is the `[tools.<name>]` block minus `provider`.
+   * but the stub's descriptor still feeds system prompts and `loom audit`.
    */
   resolveTool?(
     name: string,
@@ -99,6 +108,23 @@ export interface Tool extends ToolDescriptor {
   /** The granted set; `"*"` = unrestricted, `{}` = none. Tools self-police on it. */
   capabilities?: CapabilitySet;
 
+  /**
+   * Tool-defined containment: is `subset` authorized by `superset`?
+   * Strict semantics: a kind absent from `superset` is NOT granted.
+   * Falls back to `defaultContains` when absent. Must be pure.
+   */
+  containsGrant?(
+    superset: CapabilitySet | undefined,
+    subset: CapabilitySet,
+  ): boolean;
+
+  /**
+   * Tool-defined join of two grants. The result must contain both inputs
+   * under `containsGrant` (the runtime asserts this law). Falls back to
+   * `defaultMerge` when absent. Must be pure.
+   */
+  mergeGrants?(a: CapabilitySet, b: CapabilitySet): CapabilitySet;
+
   secrets?: SecretNeeds;
 
   /** Read-only environment audit for `loom audit`. Must be side-effect-free. */
@@ -116,13 +142,6 @@ export interface SessionDescriptor {
   agentName?: string;
 }
 
-/** Self-declared filesystem grant surfaced by `loom audit`, not enforced. */
-export interface TrustedPath {
-  path: string;
-  access: "read" | "write" | "read-write";
-  reason?: string;
-}
-
 export interface ToolRef {
   name: string;
   config: ToolConfig;
@@ -136,6 +155,17 @@ export interface Agent {
   session: Session;
   /** Resolved `[agent].system_prompt` text; empty when omitted. */
   systemPromptCore: string;
+  /**
+   * The effective capability ceiling — `[capabilities]` unioned with the
+   * manifest's inline tool declarations — set by the runtime at boot.
+   * Sessions may use it with `containsDeclaration` to trim contributions.
+   */
+  capabilities?: Capabilities;
+  /**
+   * Boot-time verdicts for contributed tool groups, set by the runtime.
+   * Producers can match their own labels to learn whether they were accepted.
+   */
+  toolVerdicts?: ToolGroupVerdict[];
   /**
    * String form looks up by name in the caller's `dependencies.subagents`;
    * manifest form runs the supplied manifest inline. Either auto-fills
@@ -217,8 +247,7 @@ export interface Runtime {
   /**
    * Emits two `tool_call_update` events that differ only in `content`: the
    * session always gets `modelContent` as text (replayable); the client gets
-   * `display.content` when set. `display.rawOutput` lands in both, letting
-   * harnesses round-trip structured payloads on replay.
+   * `display.content` when set. `display.rawOutput` lands in both.
    */
   emitToolResult(args: {
     toolCallId: import("./acp.js").ToolCallId;
@@ -298,9 +327,9 @@ export interface SessionFactory {
   /** Needs a parent agent and cannot be used at the top level (e.g. `fork-of-parent`). */
   readonly requiresParent?: boolean;
   /**
-   * A pass-through layer transforms events but does not persist them. The
-   * runtime fails boot if a chain has no non-pass-through layer, so sessions
-   * that don't store must opt in explicitly. Default `false` = stores events.
+   * A pass-through layer transforms events but does not persist them; the
+   * runtime fails boot if a chain has no non-pass-through layer. Default
+   * `false` = stores events.
    */
   readonly passThrough?: boolean;
   /** Called at `initialize` without instantiating a session. Must be pure. */
@@ -333,6 +362,8 @@ export interface FactoryContext {
   agentName: string;
   loomVersion: string;
   clientCapabilities: ClientAcpCapabilities;
+  /** Whether this construction serves a live agent or `loom audit`. Defaults to `"run"`. */
+  purpose?: "run" | "audit";
   /**
    * Per-agent directory Loom guarantees exists, one root per `[agent].storage_id`.
    * Namespace by factory name to avoid stomping siblings.

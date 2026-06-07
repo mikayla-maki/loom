@@ -3,10 +3,16 @@ import type { Tool } from "../types/interfaces.js";
 import type { JSONSchema } from "../types/schema.js";
 import type {
   Capabilities,
+  CapabilityGrant,
   CapabilitySet,
   CapabilityValue,
   SecretAllowlist,
 } from "../types/manifest.js";
+
+export function grantRows(set: CapabilitySet): "*" | CapabilityGrant[] {
+  if (set === "*") return "*";
+  return Array.isArray(set) ? set : [set];
+}
 
 export function grantFor(
   capabilities: Capabilities | undefined,
@@ -25,7 +31,8 @@ export function kindGranted(
 ): boolean {
   if (grant === undefined) return false;
   if (grant === "*") return true;
-  return Object.prototype.hasOwnProperty.call(grant, kind);
+  const rows = grantRows(grant) as CapabilityGrant[];
+  return rows.some((row) => Object.prototype.hasOwnProperty.call(row, kind));
 }
 
 export function valueFor(
@@ -34,6 +41,12 @@ export function valueFor(
 ): CapabilityValue | undefined {
   if (grant === undefined) return undefined;
   if (grant === "*") return "*";
+  if (Array.isArray(grant)) {
+    for (const row of grant) {
+      if (Object.prototype.hasOwnProperty.call(row, kind)) return row[kind];
+    }
+    return undefined;
+  }
   return grant[kind];
 }
 
@@ -49,13 +62,16 @@ export function assertKnownKinds(
   }> = [];
   for (const [name, grant] of Object.entries(capabilities)) {
     if (grant === "*") continue;
-    if (typeof grant !== "object" || grant === null || Array.isArray(grant)) {
-      continue;
-    }
+    if (typeof grant !== "object" || grant === null) continue;
     const tool = tools.get(name);
     if (!tool) continue;
     const known = new Set([...(tool.requires ?? []), ...(tool.optional ?? [])]);
-    const unknownKinds = Object.keys(grant).filter((k) => !known.has(k));
+    const rows = grantRows(grant) as CapabilityGrant[];
+    const unknownKinds = [
+      ...new Set(
+        rows.flatMap((row) => Object.keys(row).filter((k) => !known.has(k))),
+      ),
+    ];
     if (unknownKinds.length > 0) {
       violations.push({
         tool: name,
@@ -242,29 +258,118 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
+// Strict containment: a kind absent from the superset is NOT granted, and
+// every subset row must fit within a single superset row — rows never combine.
 export function defaultContains(superset: unknown, subset: unknown): boolean {
   if (subset === undefined) return true;
-  if (superset === undefined) return true;
   if (superset === "*") return true;
   if (subset === "*") return false;
+  if (superset === undefined) return isEmptyRequest(subset);
+  if (isRowable(superset) && isRowable(subset)) {
+    const supRows = toRows(superset);
+    const subRows = toRows(subset);
+    return subRows.every((subRow) =>
+      supRows.some((supRow) => rowContains(supRow, subRow)),
+    );
+  }
+  return valueContains(superset, subset);
+}
+
+function isRowable(v: unknown): boolean {
+  if (isObject(v)) return true;
+  return Array.isArray(v) && v.every((x) => isObject(x));
+}
+
+function toRows(v: unknown): Record<string, unknown>[] {
+  return Array.isArray(v)
+    ? (v as Record<string, unknown>[])
+    : [v as Record<string, unknown>];
+}
+
+function rowContains(
+  sup: Record<string, unknown>,
+  sub: Record<string, unknown>,
+): boolean {
+  for (const k of Object.keys(sub)) {
+    if (sub[k] === undefined) continue;
+    if (!(k in sup)) return false;
+    if (!valueContains(sup[k], sub[k])) return false;
+  }
+  return true;
+}
+
+function valueContains(superset: unknown, subset: unknown): boolean {
+  if (subset === undefined) return true;
+  if (superset === "*") return true;
+  if (subset === "*") return false;
+  if (superset === undefined) return false;
   if (Array.isArray(superset) && Array.isArray(subset)) {
     const sup = new Set(superset.map((x) => JSON.stringify(x)));
     return subset.every((x) => sup.has(JSON.stringify(x)));
   }
-  if (
-    typeof superset === "object" &&
-    superset !== null &&
-    typeof subset === "object" &&
-    subset !== null &&
-    !Array.isArray(superset) &&
-    !Array.isArray(subset)
-  ) {
-    const sup = superset as Record<string, unknown>;
-    const sub = subset as Record<string, unknown>;
-    for (const k of Object.keys(sub)) {
-      if (!defaultContains(sup[k], sub[k])) return false;
-    }
-    return true;
+  if (isObject(superset) && isObject(subset)) {
+    return rowContains(superset, subset);
   }
   return JSON.stringify(superset) === JSON.stringify(subset);
+}
+
+function isEmptyRequest(subset: unknown): boolean {
+  if (subset === undefined) return true;
+  if (isObject(subset)) return Object.keys(subset).length === 0;
+  if (Array.isArray(subset)) {
+    return subset.every((row) => isEmptyRequest(row));
+  }
+  return false;
+}
+
+// "*" absorbs; otherwise the deduplicated union of row sets — lossless,
+// never the kind-wise bounding box.
+export function defaultMerge(
+  a: CapabilitySet,
+  b: CapabilitySet,
+): CapabilitySet {
+  if (a === "*" || b === "*") return "*";
+  const rows = [...(grantRows(a) as CapabilityGrant[])];
+  const seen = new Set(rows.map((r) => JSON.stringify(r)));
+  for (const row of grantRows(b) as CapabilityGrant[]) {
+    const key = JSON.stringify(row);
+    if (!seen.has(key)) {
+      seen.add(key);
+      rows.push(row);
+    }
+  }
+  if (rows.length === 1) return rows[0] as CapabilityGrant;
+  return rows;
+}
+
+export function containsWithTool(
+  tool: Tool | undefined,
+  superset: CapabilitySet | undefined,
+  subset: CapabilitySet,
+): boolean {
+  if (tool?.containsGrant) return tool.containsGrant(superset, subset);
+  return defaultContains(superset, subset);
+}
+
+export function mergeWithTool(
+  tool: Tool | undefined,
+  a: CapabilitySet,
+  b: CapabilitySet,
+): CapabilitySet {
+  const merged = tool?.mergeGrants
+    ? tool.mergeGrants(a, b)
+    : defaultMerge(a, b);
+  if (
+    !containsWithTool(tool, merged, a) ||
+    !containsWithTool(tool, merged, b)
+  ) {
+    throw new CapabilityError(
+      `Capability merge law violated${tool ? ` by tool '${tool.name}'` : ""}: ` +
+        `merge(a, b) must contain both a and b under containsGrant. ` +
+        `This is a bug in the tool's capability algebra.`,
+      { a, b } as Record<string, unknown>,
+      { merged } as Record<string, unknown>,
+    );
+  }
+  return merged;
 }

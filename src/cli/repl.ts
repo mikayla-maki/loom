@@ -238,6 +238,7 @@ interface Printer {
 interface PendingCall {
   title: string;
   input: unknown;
+  printed?: boolean;
 }
 
 function startPrinter(agent: RunningAgent, plain: boolean): Printer {
@@ -248,14 +249,32 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
   const stopFlag = { current: false };
 
   const pendingCalls = new Map<string, PendingCall>();
+  // The id of the call whose ⏺ line was printed without a trailing newline,
+  // so its ✓/✗ can land on completion. Any other output closes it first.
+  let openCallId: string | null = null;
+
+  const closeOpenLine = (): void => {
+    if (openCallId !== null) {
+      stdout.write("\n");
+      openCallId = null;
+    }
+  };
 
   const finishMessage = (): void => {
+    closeOpenLine();
     if (inAgentMessage) {
       stdout.write(md.flush());
       stdout.write("\n");
       inAgentMessage = false;
       md = new StreamingMarkdownRenderer({ plain });
     }
+  };
+
+  const callLineFor = (title: string, input: unknown): string => {
+    const argsStr = renderArgs(input);
+    return `${s.cyan}⏺${s.reset} ${s.bold}${title}${s.reset}${
+      argsStr ? `${s.dim}(${s.reset}${argsStr}${s.dim})${s.reset}` : ""
+    }`;
   };
 
   void (async () => {
@@ -278,6 +297,7 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
       }
       case "agent_thought_chunk": {
         if (u.content.type !== "text") return;
+        closeOpenLine();
         stdout.write(`${s.gray}thought: ${u.content.text}${s.reset}\n`);
         break;
       }
@@ -286,7 +306,10 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
         pendingCalls.set(u.toolCallId, {
           title: u.title,
           input: u.rawInput,
+          printed: true,
         });
+        stdout.write(callLineFor(u.title, u.rawInput));
+        openCallId = u.toolCallId;
         break;
       }
       case "tool_call_update": {
@@ -298,11 +321,18 @@ function startPrinter(agent: RunningAgent, plain: boolean): Printer {
         pendingCalls.delete(u.toolCallId);
 
         const title = call?.title ?? u.title ?? "tool";
-        const argsStr = call ? renderArgs(call.input) : "";
-        const callLine = `${s.cyan}⏺${s.reset} ${s.bold}${title}${s.reset}${
-          argsStr ? `${s.dim}(${s.reset}${argsStr}${s.dim})${s.reset}` : ""
-        }`;
-        stdout.write(callLine + "\n");
+        if (u.toolCallId === openCallId) {
+          stdout.write("\n");
+          openCallId = null;
+        } else if (!call?.printed) {
+          closeOpenLine();
+          stdout.write(callLineFor(title, call?.input) + "\n");
+        } else {
+          // Printed at start but other output intervened (parallel calls);
+          // re-identify the result by title.
+          closeOpenLine();
+          stdout.write(`  ${s.dim}${title}:${s.reset}\n`);
+        }
 
         const text = (u.content ?? [])
           .map((c) =>

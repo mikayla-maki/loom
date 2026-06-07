@@ -111,7 +111,6 @@ describe("loom install", () => {
     await writeManifest(manifest, "path-source", [
       "[tools.fixture_tool]",
       'provider = { path = "../pkg-a" }',
-      'greeting = "hello"',
     ]);
 
     const result = await installManifest(manifest, NO_LOG);
@@ -166,7 +165,6 @@ describe("loom install", () => {
       'script = [[{ stop = "end_turn" }]]',
       "[tools.fixture_tool]",
       'provider = { path = "../pkg-a" }',
-      'greeting = "yo"',
       "[capabilities]",
       'fixture_tool = "*"',
     ]);

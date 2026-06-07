@@ -6,6 +6,7 @@ import { expandHome } from "../internal/util.js";
 import type { Session } from "../types/interfaces.js";
 import type {
   AgentManifest,
+  CapabilitySet,
   HarnessSpec,
   ProviderEntry,
   ProviderEntryTable,
@@ -140,8 +141,13 @@ export interface ProviderInstance {
 
 export interface ToolBinding {
   toolName: string;
+  /** The name the implementation dispatches on; equals `toolName` unless renamed via `tool =`. */
+  underlyingName: string;
   providerInstanceId: string;
+  /** Reserved keys only (currently just `tool`); arbitrary per-tool config no longer exists. */
   toolConfig: Record<string, unknown>;
+  /** The entry's requested grant; undefined = request the full ceiling entry. */
+  requestedGrant?: CapabilitySet;
   origin: string;
 }
 
@@ -275,6 +281,7 @@ export function resolveManifest(
       );
       tools.push({
         toolName: name,
+        underlyingName: name,
         providerInstanceId: instanceId,
         toolConfig: {},
         origin: "(default builtin)",
@@ -324,7 +331,12 @@ export function resolveManifest(
   };
 }
 
-const DEFAULT_BUILTIN_TOOLS = ["bash", "read_file", "write_file", "edit_file"];
+export const DEFAULT_BUILTIN_TOOLS = [
+  "bash",
+  "read_file",
+  "write_file",
+  "edit_file",
+];
 
 interface ProviderIndex {
   sources: Map<string, SourceSpec>;
@@ -347,17 +359,10 @@ function resolveProvidersTable(
   if (!providersTable) return out;
   for (const [handle, entry] of Object.entries(providersTable)) {
     if (isProviderEntryTable(entry)) {
-      const { provider: factoryRef, ...config } = entry;
-      const factoryName = referenceToHandle(factoryRef);
-      if (!factoryName) {
-        throw new ResolutionError(
-          `[providers].${handle}.provider must be a bare factory name ` +
-            `(e.g. "mcp-server"). Source-loaded factories aren't yet ` +
-            `supported in the configured-factory form; got ` +
-            `${JSON.stringify(factoryRef)}.`,
-        );
-      }
-      out.factories.set(handle, { factoryName, config });
+      out.factories.set(
+        handle,
+        resolveConfiguredFactory(entry, `[providers].${handle}`),
+      );
       continue;
     }
     const spec = referenceToSourceSpec(entry);
@@ -373,10 +378,28 @@ function resolveProvidersTable(
   return out;
 }
 
-function isProviderEntryTable(e: ProviderEntry): e is ProviderEntryTable {
+function isProviderEntryTable(e: unknown): e is ProviderEntryTable {
   return (
     typeof e === "object" && e !== null && !Array.isArray(e) && "provider" in e
   );
+}
+
+// Single resolution path for configured provider entries wherever they appear.
+function resolveConfiguredFactory(
+  entry: ProviderEntryTable,
+  label: string,
+): ConfiguredFactoryRef {
+  const { provider: factoryRef, ...config } = entry;
+  const factoryName = referenceToHandle(factoryRef);
+  if (!factoryName) {
+    throw new ResolutionError(
+      `${label}.provider must be a bare factory name ` +
+        `(e.g. "mcp-server"). Source-loaded factories aren't yet ` +
+        `supported in the configured-factory form; got ` +
+        `${JSON.stringify(factoryRef)}.`,
+    );
+  }
+  return { factoryName, config };
 }
 
 function resolveToolEntry(
@@ -395,36 +418,68 @@ function resolveToolEntry(
     providerHandle?: string,
   ) => string,
 ): ToolBinding {
-  let providerRef: Reference;
-  let toolConfig: Record<string, unknown>;
+  let providerRef: Reference | ProviderEntryTable;
+  let underlyingName = name;
+  let requestedGrant: CapabilitySet | undefined;
   const originLabel = `[tools.${name}]`;
   if (typeof entry === "string") {
     providerRef = entry;
-    toolConfig = {};
   } else {
-    const { provider, ...rest } = entry as ToolEntryTable;
-    if (provider === undefined) {
+    const table = entry as ToolEntryTable;
+    if (table.provider === undefined) {
       throw new ManifestError(
         `${originLabel} is missing required 'provider' field. Use the string ` +
           `shorthand (e.g. "builtin") or table form with a 'provider' key.`,
       );
     }
-    providerRef = provider;
-    toolConfig = rest;
+    providerRef = table.provider;
+    if (table.tool !== undefined) underlyingName = table.tool;
+    if (table.capabilities !== undefined) requestedGrant = table.capabilities;
+  }
+  const toolConfig: Record<string, unknown> =
+    underlyingName === name ? {} : { tool: underlyingName };
+  const common = {
+    toolName: name,
+    underlyingName,
+    toolConfig,
+    ...(requestedGrant !== undefined ? { requestedGrant } : {}),
+    origin: originLabel,
+  };
+
+  // Instances dedup by (factory, config) value, so an inline table equal in
+  // value to a [providers] entry collapses to the same instance.
+  if (isProviderEntryTable(providerRef)) {
+    const { factoryName, config } = resolveConfiguredFactory(
+      providerRef,
+      originLabel,
+    );
+    return {
+      ...common,
+      providerInstanceId: getOrCreateInstance(
+        { kind: "factory", factoryName },
+        config,
+        { kind: "inline-anonymous", toolName: name },
+      ),
+    };
   }
 
   const handle = referenceToHandle(providerRef);
   if (handle) {
     if (handle === "builtin") {
       return {
-        toolName: name,
+        ...common,
         providerInstanceId: getOrCreateInstance(
           { kind: "native" },
           {},
           { kind: "native" },
         ),
-        toolConfig,
-        origin: originLabel,
+      };
+    }
+    // Reserved like "builtin": implemented by the session chain's resolveTool.
+    if (handle === "session") {
+      return {
+        ...common,
+        providerInstanceId: "(session)",
       };
     }
     const providerSpec = providerIndex.sources.get(handle);
@@ -445,7 +500,7 @@ function resolveToolEntry(
     }
     if (factoryRef) {
       return {
-        toolName: name,
+        ...common,
         providerInstanceId: getOrCreateInstance(
           { kind: "factory", factoryName: factoryRef.factoryName },
           factoryRef.config,
@@ -456,49 +511,49 @@ function resolveToolEntry(
           },
           handle,
         ),
-        toolConfig,
-        origin: originLabel,
       };
     }
     if (providerSpec) {
       return {
-        toolName: name,
+        ...common,
         providerInstanceId: getOrCreateInstance(
           { kind: "source", source: providerSpec },
-          toolConfig,
+          {},
           { kind: "handle-anonymous", providerHandle: handle },
           handle,
         ),
-        toolConfig,
-        origin: originLabel,
       };
     }
     if (isBuiltin) {
-      if (name !== handle) {
-        throw new ResolutionError(
-          `${originLabel}.provider = "${handle}": built-in tool names ` +
-            `can only appear as a 'provider' value when the tool key ` +
-            `matches the built-in name. Either rename the tool key, ` +
-            `or use a [providers] entry / inline SourceSpec.`,
-        );
+      // `provider = "bash"` as a bare builtin name: the underlying builtin is
+      // the handle itself, so a differing key is a rename (`tool =` implied).
+      if (name !== handle && underlyingName !== handle) {
+        return {
+          ...common,
+          underlyingName: handle,
+          toolConfig: { tool: handle },
+          providerInstanceId: getOrCreateInstance(
+            { kind: "native" },
+            {},
+            { kind: "native" },
+          ),
+        };
       }
       return {
-        toolName: name,
+        ...common,
+        underlyingName: handle,
+        toolConfig: name === handle ? {} : { tool: handle },
         providerInstanceId: getOrCreateInstance(
           { kind: "native" },
           {},
           { kind: "native" },
         ),
-        toolConfig,
-        origin: originLabel,
       };
     }
     if (isHarnessName) {
       return {
-        toolName: name,
+        ...common,
         providerInstanceId: "(harness)",
-        toolConfig,
-        origin: originLabel,
       };
     }
     throw new ResolutionError(
@@ -518,17 +573,15 @@ function resolveToolEntry(
     );
   }
   return {
-    toolName: name,
+    ...common,
     providerInstanceId: getOrCreateInstance(
       { kind: "source", source: spec },
-      toolConfig,
+      {},
       {
         kind: "inline-anonymous",
         toolName: name,
       },
     ),
-    toolConfig,
-    origin: originLabel,
   };
 }
 

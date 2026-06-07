@@ -15,10 +15,9 @@ import type { JSONSchema } from "../../types/schema.js";
 import {
   canonicalizeForGrant,
   canonicalizeRoots,
-  collectTrustedPaths,
   describePaths,
-  effectivePaths,
   pathAllowed,
+  pathGrantContains,
   paths,
   resolvedPaths,
 } from "./_path.js";
@@ -88,15 +87,19 @@ export class EditFileTool implements Tool {
       `the original file. To create a new file, use \`write_file\` instead.`;
   }
 
+  containsGrant(
+    superset: CapabilitySet | undefined,
+    subset: CapabilitySet,
+  ): boolean {
+    return pathGrantContains(superset, subset);
+  }
+
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
     const i = input as EditFileInput;
     const target = await canonicalizeForGrant(path.resolve(i.path), "write");
 
-    const trusted = await collectTrustedPaths(ctx);
-    const effective = await canonicalizeRoots(
-      effectivePaths(this.granted, trusted, "write"),
-    );
-    if (!pathAllowed(target, effective)) {
+    const allowed = await canonicalizeRoots(this.granted);
+    if (!pathAllowed(target, allowed)) {
       return {
         content: `edit_file: '${i.path}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,

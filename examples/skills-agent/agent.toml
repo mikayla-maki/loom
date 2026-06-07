@@ -1,0 +1,94 @@
+# ───────────────────────────────────────────────────────────────────────────
+# Loom skills example — a tour of Agent Skills as contributed tool groups.
+# Companion: the sibling `skills/` directory ships four skills, each
+# demonstrating one tier of the model:
+#
+#   release-notes/   no declarations → derived read-only group over its dir
+#   dns-lookup/      frontmatter `loom.tools` → adds a bash ROW (dig gets
+#                    network; everything else stays network-dark)
+#   json-wrangler/   loom.toml sidecar → declares a NEW renamed instance
+#                    (`jq`, backed by the bash builtin, argv-only)
+#   echo-notes/      SHIPS ITS OWN MCP SERVER via `loom.providers` — a
+#                    skill bundling software, accepted by the
+#                    instance-name `echo_note` entry below
+#   web-downloader/  wants curl + network — DELIBERATELY not accepted
+#                    below, so `loom audit` shows the fail-soft rejection
+#                    with its paste-ready remediation line
+#
+# Audit:  ANTHROPIC_API_KEY=dummy loom audit examples/skills-agent/agent.toml
+#         (exits non-zero on purpose: one rejected tool group is the demo)
+# Run:    ANTHROPIC_API_KEY=... loom run examples/skills-agent/agent.toml
+# ───────────────────────────────────────────────────────────────────────────
+
+[agent]
+name = "skills-tour"
+system_prompt = """
+You're a demo assistant with Agent Skills installed. Consult your skills
+catalog when a task matches a skill's description; activate a skill by
+reading its SKILL.md before using it.
+"""
+
+[harness]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+maxTokens = 4096
+maxTurnRequests = 8
+stream = true
+
+# The skills layer scans `./skills` (relative to this manifest) every turn.
+# Skills it finds are compiled into contributed tool groups and judged
+# against [capabilities] below — accepted atomically or rejected with a
+# remediation. Rejected skills are trimmed from the model's catalog at
+# runtime and annotated INACTIVE under `loom audit`.
+[session]
+layers = [{ provider = "skills", root = "./skills" }, "compacting", "in-memory"]
+
+# Tool entries select, name, and authorize — never configure. Bare entries
+# request their full ceiling entry from [capabilities].
+[tools]
+bash      = "builtin"
+read_file = "builtin"
+edit_file = "builtin"
+
+# ── Capabilities: the ceiling ────────────────────────────────────────────
+# The agent's total authority surface: everything here is something this
+# agent may touch in some kind of way, directly or via contributions.
+# (The effective ceiling also unions in any inline `capabilities` on the
+# [tools] entries above — root declarations are self-authorizing.)
+#
+# Absent this section entirely, the conservative default ceiling applies
+# (the four FS/bash tools over cwd, no network, read access to skills
+# roots). Loom never fails open — wildcards are always spelled.
+[capabilities]
+# Row sets are unions of boxes, not bounding boxes: bash picks exactly ONE
+# row per invocation. Row 2 is the acceptance line for the dns-lookup
+# skill — a plain `dig ...` command promotes to argv-exec (no shell) under
+# it, with network; `curl` and friends stay on row 1, network-dark. A row
+# only applies to invocations attributable to its command verbatim at the
+# top level — `dig example.com | head` or `python -c "...dig..."` runs
+# under row 1 and the query fails. Try both!
+bash = [
+  { commands = "*", paths = ["./"] },
+  { commands = ["dig"], network = "*" },
+]
+
+# `./skills` makes the catalog readable (SKILL.md activation is just a
+# read). The dns-lookup and json-wrangler skills' own read declarations
+# are contained by this entry — no per-skill lines needed for reads.
+read_file = { paths = ["./", "./skills"] }
+edit_file = { paths = ["./"] }
+
+# Instance-name acceptance for the json-wrangler skill's renamed instance:
+# it declares `jq = { provider = "builtin", tool = "bash", ... }` and the
+# request below must contain it. The instance is constructed with the
+# skill's (narrow) declaration, not with this entry.
+jq = { commands = ["jq"], paths = ["./"] }
+
+# echo-notes ships its own MCP server, so a grant contained in some entry
+# isn't enough — running contributed code requires naming the instance
+# here. This line IS the consent to spawn that skill's server.
+echo_note = "*"
+
+# web-downloader's `curl` + network request has no acceptance entry — on
+# boot it's rejected fail-soft, and `loom audit` prints the exact line to
+# paste here if you decide to trust it.

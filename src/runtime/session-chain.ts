@@ -1,13 +1,10 @@
-import type {
-  Agent,
-  Session,
-  Tool,
-  ToolConfig,
-  ToolRef,
-  TrustedPath,
-} from "../types/interfaces.js";
+import type { Agent, Session, Tool, ToolConfig } from "../types/interfaces.js";
 import type { SessionUpdate } from "../types/acp.js";
-import type { AgentManifest, CapabilitySet } from "../types/manifest.js";
+import type {
+  AgentManifest,
+  CapabilitySet,
+  ToolGroup,
+} from "../types/manifest.js";
 
 export class ChainedSession implements Session {
   constructor(private readonly children: readonly Session[]) {}
@@ -47,8 +44,8 @@ export class ChainedSession implements Session {
     return parts.join("\n\n");
   }
 
-  async tools(): Promise<ToolRef[]> {
-    const all: ToolRef[] = [];
+  async tools(): Promise<ToolGroup[]> {
+    const all: ToolGroup[] = [];
     for (const c of this.children) {
       const ts = (await c.tools?.()) ?? [];
       all.push(...ts);
@@ -70,15 +67,6 @@ export class ChainedSession implements Session {
       if (t) return t;
     }
     return null;
-  }
-
-  async trustedPaths(): Promise<TrustedPath[]> {
-    const all: TrustedPath[] = [];
-    for (const c of this.children) {
-      const ps = (await c.trustedPaths?.()) ?? [];
-      all.push(...ps);
-    }
-    return all;
   }
 
   get dependencies(): { subagents?: AgentManifest[] } {

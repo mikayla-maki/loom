@@ -16,8 +16,10 @@ import type {
   SecretAllowlist,
   SessionSpec,
   SourceSpec,
+  ProviderEntryTable,
   SystemPromptSpec,
   ToolEntry,
+  ToolEntryTable,
 } from "../types/manifest.js";
 
 export async function parseAgentManifest(
@@ -147,7 +149,7 @@ function parseSecretAllowlist(
   );
 }
 
-function parseProviders(v: unknown, where: string): Providers {
+export function parseProviders(v: unknown, where: string): Providers {
   const obj = ensureObject(v, "[providers]", where);
   const out: Providers = {};
   for (const [handle, val] of Object.entries(obj)) {
@@ -184,16 +186,42 @@ function parseProviderEntry(
   return ref;
 }
 
-function parseToolTable(v: unknown, where: string): Record<string, ToolEntry> {
+// Anything a [providers] entry accepts, plus bare handles ("builtin",
+// "session", [providers] keys), which are legal at this layer.
+function parseToolProviderRef(
+  v: unknown,
+  label: string,
+  where: string,
+): Reference | ProviderEntryTable {
+  if (typeof v === "string") return parseReference(v, label, where);
+  return parseProviderEntry(v, label, where);
+}
+
+export function parseToolTable(
+  v: unknown,
+  where: string,
+  options: ParseToolEntryOptions = {},
+): Record<string, ToolEntry> {
   const obj = ensureObject(v, "[tools]", where);
   const out: Record<string, ToolEntry> = {};
   for (const [k, val] of Object.entries(obj)) {
-    out[k] = parseToolEntry(val, `[tools].${k}`, where);
+    out[k] = parseToolEntry(val, `[tools].${k}`, where, options);
   }
   return out;
 }
 
-function parseToolEntry(v: unknown, label: string, where: string): ToolEntry {
+export interface ParseToolEntryOptions {
+  /** Manifests require a provider; contributed groups may omit it to match an existing instance. */
+  requireProvider?: boolean;
+}
+
+export function parseToolEntry(
+  v: unknown,
+  label: string,
+  where: string,
+  options: ParseToolEntryOptions = {},
+): ToolEntry {
+  const requireProvider = options.requireProvider ?? true;
   if (typeof v === "string") {
     if (v.length === 0) {
       throw new ManifestError(
@@ -205,18 +233,52 @@ function parseToolEntry(v: unknown, label: string, where: string): ToolEntry {
   }
   if (v && typeof v === "object" && !Array.isArray(v)) {
     const obj = v as Record<string, unknown>;
-    if (obj.provider === undefined) {
+    if (obj.provider === undefined && requireProvider) {
       throw new ManifestError(
         `agent.toml at ${where}: ${label} is missing required 'provider' field. ` +
           `Every [tools.X] entry must name a provider (e.g. ${label} = "builtin" ` +
-          `for native tools, or ${label} = { provider = "<handle>", ...config } ` +
-          `for a provider-backed tool). Empty \`{}\` is not accepted.`,
+          `for native tools, or ${label} = { provider = "<handle>" } for a ` +
+          `provider-backed tool). Empty \`{}\` is not accepted.`,
       );
     }
-    const provider = parseReference(obj.provider, `${label}.provider`, where);
-    const { provider: _p, ...config } = obj;
-    void _p;
-    return { provider, ...config };
+    const unknownKeys = Object.keys(obj).filter(
+      (k) => k !== "provider" && k !== "tool" && k !== "capabilities",
+    );
+    if (unknownKeys.length > 0) {
+      throw new ManifestError(
+        `agent.toml at ${where}: ${label} has unsupported ${
+          unknownKeys.length === 1 ? "key" : "keys"
+        } ${unknownKeys.map((k) => `'${k}'`).join(", ")}. Tool entries only ` +
+          `select, name, and authorize: 'provider' (implementation), 'tool' ` +
+          `(underlying name when renaming), and 'capabilities' (requested ` +
+          `grant). Construction config belongs on a [providers] entry; ` +
+          `per-instance parameters are capability kinds.`,
+      );
+    }
+    const out: ToolEntryTable = {};
+    if (obj.provider !== undefined) {
+      out.provider = parseToolProviderRef(
+        obj.provider,
+        `${label}.provider`,
+        where,
+      );
+    }
+    if (obj.tool !== undefined) {
+      if (typeof obj.tool !== "string" || obj.tool.length === 0) {
+        throw new ManifestError(
+          `agent.toml at ${where}: ${label}.tool must be a non-empty string`,
+        );
+      }
+      out.tool = obj.tool;
+    }
+    if (obj.capabilities !== undefined) {
+      out.capabilities = parseCapabilitySet(
+        obj.capabilities,
+        where,
+        `${label}.capabilities`,
+      );
+    }
+    return out;
   }
   throw new ManifestError(
     `agent.toml at ${where}: ${label} must be a string or a table, got ${typeof v}`,
@@ -615,17 +677,38 @@ function parseCapabilitySet(
 ): CapabilitySet {
   if (v === "*") return "*";
   if (v === null) return {};
-  if (typeof v === "object" && !Array.isArray(v)) {
-    const obj = v as Record<string, unknown>;
-    const out: Record<string, CapabilityValue> = {};
-    for (const [k, val] of Object.entries(obj)) {
-      out[k] = parseCapabilityValue(val, where, `${label}.${k}`);
-    }
-    return out;
+  if (Array.isArray(v)) {
+    return v.map((row, i) => {
+      if (typeof row !== "object" || row === null || Array.isArray(row)) {
+        throw new ManifestError(
+          `agent.toml at ${where}: ${label}[${i}] must be a table (a grant row), got ${typeof row}`,
+        );
+      }
+      return parseGrantRow(
+        row as Record<string, unknown>,
+        where,
+        `${label}[${i}]`,
+      );
+    });
+  }
+  if (typeof v === "object") {
+    return parseGrantRow(v as Record<string, unknown>, where, label);
   }
   throw new ManifestError(
-    `agent.toml at ${where}: ${label} must be "*" or a table of kind grants, got ${typeof v}`,
+    `agent.toml at ${where}: ${label} must be "*", a table of kind grants, or an array of grant rows; got ${typeof v}`,
   );
+}
+
+function parseGrantRow(
+  obj: Record<string, unknown>,
+  where: string,
+  label: string,
+): Record<string, CapabilityValue> {
+  const out: Record<string, CapabilityValue> = {};
+  for (const [k, val] of Object.entries(obj)) {
+    out[k] = parseCapabilityValue(val, where, `${label}.${k}`);
+  }
+  return out;
 }
 
 function parseCapabilityValue(

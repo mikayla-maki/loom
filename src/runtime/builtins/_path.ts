@@ -2,20 +2,30 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { expandHome } from "../../internal/util.js";
-import type { CapabilitySet } from "../../types/manifest.js";
-import type { ToolContext, TrustedPath } from "../../types/interfaces.js";
+import { defaultContains, grantRows } from "../../manifest/capabilities.js";
+import type { CapabilityGrant, CapabilitySet } from "../../types/manifest.js";
 
 export function paths(grant: CapabilitySet | undefined): "*" | string[] | null {
   if (grant === undefined) return null;
   if (grant === "*") return "*";
-  const v = grant.paths;
-  if (v === undefined) return null;
-  if (v === "*") return "*";
-  if (Array.isArray(v) && v.every((x) => typeof x === "string")) {
-    // Expand `~/` before resolve; resolve treats `~` as a literal segment.
-    return (v as string[]).map((p) => path.resolve(expandHome(p)));
+  const rows = grantRows(grant) as CapabilityGrant[];
+  let anyRowDeclaresPaths = false;
+  const collected: string[] = [];
+  for (const row of rows) {
+    const value = row.paths;
+    if (value === undefined) continue;
+    if (value === "*") return "*";
+    if (!Array.isArray(value) || !value.every((x) => typeof x === "string")) {
+      throw new Error('capability `paths` must be "*" or an array of strings');
+    }
+    anyRowDeclaresPaths = true;
+    for (const p of value as string[]) {
+      // Expand `~/` before resolve; resolve treats `~` as a literal segment.
+      collected.push(path.resolve(expandHome(p)));
+    }
   }
-  throw new Error('capability `paths` must be "*" or an array of strings');
+  if (!anyRowDeclaresPaths) return null;
+  return [...new Set(collected)];
 }
 
 export function defaultPaths(): string[] {
@@ -29,16 +39,11 @@ export function resolvedPaths(
   return explicit ?? defaultPaths();
 }
 
-// Resolve symlinks to a real path BEFORE the lexical `pathAllowed` check.
-// Without this, a symlink inside a granted dir points outside the allowlist
-// and fs.readFile/writeFile follow it out — these tools have no OS sandbox.
-// (The sandbox modules realpath their binds for the same reason.)
-//
-// For `read`, canonicalize the target itself. For `write`, the file (or its
-// parent dirs, with create_dirs) may not exist yet, so canonicalize the nearest
-// existing ancestor (catching a symlinked parent) and re-join the remaining
-// not-yet-created segments. A path with no resolvable ancestor falls through to
-// its lexical form, preserving the existing not-found/error behavior.
+// Resolve symlinks BEFORE the lexical `pathAllowed` check — these tools have
+// no OS sandbox, so a symlink inside a granted dir would otherwise escape the
+// allowlist. (The sandbox modules realpath their binds for the same reason.)
+// For writes the target may not exist yet, so canonicalize the nearest
+// existing ancestor and re-join the tail.
 export async function canonicalizeForGrant(
   target: string,
   mode: "read" | "write",
@@ -48,7 +53,6 @@ export async function canonicalizeForGrant(
   } catch {
     if (mode === "read") return target;
   }
-  // Walk up to the nearest ancestor that exists, then re-attach the tail.
   const tail: string[] = [];
   let dir = target;
   for (;;) {
@@ -63,10 +67,9 @@ export async function canonicalizeForGrant(
   }
 }
 
-// Canonicalize the granted roots to match `canonicalizeForGrant`'s target, so
-// the prefix check compares realpath-vs-realpath (e.g. on macOS `/tmp` and
-// `/var` are symlinks into `/private`). Non-existent or unresolvable roots keep
-// their lexical form.
+// Granted roots get the same realpath treatment so the prefix check compares
+// realpath-vs-realpath (on macOS `/tmp` and `/var` are symlinks into
+// `/private`). Unresolvable roots keep their lexical form.
 export async function canonicalizeRoots(
   granted: "*" | string[],
 ): Promise<"*" | string[]> {
@@ -97,7 +100,7 @@ export function isUnderAny(target: string, roots: string[]): boolean {
   return false;
 }
 
-function isUnderOrEqual(target: string, root: string): boolean {
+export function isUnderOrEqual(target: string, root: string): boolean {
   if (target === root) return true;
   return target.startsWith(root + path.sep);
 }
@@ -112,44 +115,66 @@ export function describePaths(
   return `restricted to: ${granted.join(", ")}${tag}`;
 }
 
-export function filterTrustedPaths(
-  trusted: readonly TrustedPath[],
-  needs: "read" | "write",
-): TrustedPath[] {
-  if (needs === "read") return [...trusted];
-  return trusted.filter(
-    (t) => t.access === "write" || t.access === "read-write",
+// `Tool.containsGrant` for the path-based builtins. Strict containment: a kind
+// absent from a superset row authorizes nothing, and `paths` compare lexically
+// (equal-to or under a superset root) rather than by set membership.
+export function pathGrantContains(
+  superset: CapabilitySet | undefined,
+  subset: CapabilitySet | undefined,
+): boolean {
+  if (subset === undefined) return true;
+  if (superset === "*") return true;
+  if (subset === "*") return false;
+  if (superset === undefined) return isEmptyGrant(subset);
+  const supersetRows = grantRows(superset) as CapabilityGrant[];
+  const subsetRows = grantRows(subset) as CapabilityGrant[];
+  return subsetRows.every((subsetRow) =>
+    supersetRows.some((supersetRow) => rowContains(supersetRow, subsetRow)),
   );
 }
 
-export function effectivePaths(
-  granted: "*" | string[],
-  trusted: readonly TrustedPath[],
-  needs: "read" | "write",
-): "*" | string[] {
-  if (granted === "*") return "*";
-  const accepted = filterTrustedPaths(trusted, needs);
-  if (accepted.length === 0) return granted;
-  const extras = accepted.map((t) => path.resolve(expandHome(t.path)));
-  const seen = new Set(granted);
-  const out = [...granted];
-  for (const p of extras) {
-    if (!seen.has(p)) {
-      seen.add(p);
-      out.push(p);
-    }
-  }
-  return out;
+function isEmptyGrant(grant: CapabilitySet): boolean {
+  if (grant === "*") return false;
+  const rows = grantRows(grant) as CapabilityGrant[];
+  return rows.every((row) =>
+    Object.keys(row).every((kind) => row[kind] === undefined),
+  );
 }
 
-export async function collectTrustedPaths(
-  ctx: ToolContext,
-): Promise<TrustedPath[]> {
-  const session = ctx.agent?.session;
-  if (!session || typeof session.trustedPaths !== "function") return [];
-  try {
-    return (await Promise.resolve(session.trustedPaths())) ?? [];
-  } catch {
-    return [];
+function rowContains(
+  supersetRow: CapabilityGrant,
+  subsetRow: CapabilityGrant,
+): boolean {
+  for (const kind of Object.keys(subsetRow)) {
+    const subsetValue = subsetRow[kind];
+    if (subsetValue === undefined) continue;
+    if (!Object.prototype.hasOwnProperty.call(supersetRow, kind)) return false;
+    const supersetValue = supersetRow[kind];
+    if (kind === "paths") {
+      if (!pathValueContains(supersetValue, subsetValue)) return false;
+    } else if (!defaultContains(supersetValue, subsetValue)) {
+      return false;
+    }
   }
+  return true;
+}
+
+function pathValueContains(
+  supersetValue: unknown,
+  subsetValue: unknown,
+): boolean {
+  if (subsetValue === undefined) return true;
+  if (supersetValue === "*") return true;
+  if (subsetValue === "*") return false;
+  if (!isStringArray(supersetValue) || !isStringArray(subsetValue)) {
+    return defaultContains(supersetValue, subsetValue);
+  }
+  const supersetRoots = supersetValue.map((p) => path.resolve(expandHome(p)));
+  return subsetValue
+    .map((p) => path.resolve(expandHome(p)))
+    .every((target) => isUnderAny(target, supersetRoots));
+}
+
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((x) => typeof x === "string");
 }

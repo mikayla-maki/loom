@@ -1,0 +1,9 @@
+# Sidecar tool declarations: this file wins over any `loom.tools`
+# frontmatter in SKILL.md — useful for adding loom support to a skill you
+# don't author. `jq` is a NEW renamed instance: backed by the bash builtin
+# (so it inherits the sandbox + argv dispatch), constructed with exactly
+# this narrow grant, and accepted only because the host manifest has an
+# instance-name `jq` entry in [capabilities] that contains this request.
+[tools]
+jq        = { provider = "builtin", tool = "bash", capabilities = { commands = ["jq"], paths = ["./"] } }
+read_file = { capabilities = { paths = ["${SKILL_DIR}"] } }

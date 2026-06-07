@@ -1,0 +1,32 @@
+# The smallest useful Loom agent: a coding-ish assistant with the built-in
+# file and shell tools, scoped to the current directory. No providers, no
+# build step — runs with just an API key:
+#
+#   ANTHROPIC_API_KEY=... loom run examples/minimal-agent/agent.toml
+
+[agent]
+name = "minimal-agent"
+system_prompt = "You are a helpful assistant."
+
+[harness]
+provider = "anthropic"
+model    = "claude-sonnet-4-5"
+
+# A two-layer session: `compacting` summarises old turns once history grows;
+# `in-memory` is the storage underneath it. Drop both and Loom applies its
+# default chain instead.
+[session]
+layers = ["compacting", "in-memory"]
+
+[tools]
+bash       = "builtin"
+read_file  = "builtin"
+write_file = "builtin"
+edit_file  = "builtin"
+
+# Every tool is confined to the current directory; `bash` is sandboxed (no network).
+[capabilities]
+bash       = { commands = "*", paths = ["./"] }
+read_file  = { paths = ["./"] }
+write_file = { paths = ["./"] }
+edit_file  = { paths = ["./"] }

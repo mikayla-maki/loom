@@ -42,42 +42,46 @@ function isAgentManifest(v: unknown): v is AgentManifest {
   );
 }
 
+function grantedManifest(
+  capabilities: CapabilitySet | undefined,
+): AgentManifest | undefined {
+  if (capabilities === undefined || capabilities === "*") return undefined;
+  const rows = Array.isArray(capabilities) ? capabilities : [capabilities];
+  for (const row of rows) {
+    if (isAgentManifest(row.manifest)) return row.manifest;
+  }
+  return undefined;
+}
+
 export class SpawnSubagentTool implements Tool {
   public readonly name = "spawn_subagent";
   public readonly description: string;
   public readonly inputSchema = SCHEMA;
+  public readonly optional = ["manifest"];
   public readonly dependencies: { subagents: AgentManifest[] };
   public readonly isSelfCopy: boolean;
 
+  // The sub-manifest IS the capability declaration, so it lives in the grant
+  // (`manifest` kind), not in config; absent a grant we self-copy the parent.
   constructor(
-    config: ToolConfig,
-    _capabilities: CapabilitySet | undefined,
+    _config: ToolConfig,
+    capabilities: CapabilitySet | undefined,
     agent?: Agent,
   ) {
-    void _capabilities;
-    if (typeof config === "string" || config === null) {
-      throw new Error(
-        "spawn_subagent requires an object config carrying the sub-manifest (either as the config itself or under `config.manifest`), or no config at all to default to cloning the owning agent.",
-      );
-    }
-    const c = (config ?? {}) as Record<string, unknown> & {
-      manifest?: unknown;
-    };
-
+    void _config;
     let manifest: AgentManifest | undefined;
     let selfCopy = false;
-    if (isAgentManifest(c.manifest)) {
-      manifest = c.manifest;
-    } else if (isAgentManifest(c)) {
-      manifest = c as unknown as AgentManifest;
+    const granted = grantedManifest(capabilities);
+    if (granted) {
+      manifest = granted;
     } else if (agent?.manifest) {
       manifest = cloneManifestWithoutSpawnSubagent(agent.manifest);
       selfCopy = true;
     }
     if (!manifest) {
       throw new Error(
-        "spawn_subagent: no sub-manifest available. Pass an `AgentManifest` " +
-          "directly as the config, place one under `config.manifest`, or run " +
+        "spawn_subagent: no sub-manifest available. Grant one in " +
+          "[capabilities] (spawn_subagent = { manifest = {...} }), or run " +
           "the tool through `runAgent` (which provides the owning agent's " +
           "manifest as the self-copy default).",
       );

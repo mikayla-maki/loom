@@ -24,6 +24,42 @@ const BUILTINS: Record<string, Builder> = {
   web_search: (c, caps) => new WebSearchTool(c, caps),
 };
 
+function underlyingNameOf(name: string, config: ToolConfig): string {
+  if (config && typeof config === "object" && !Array.isArray(config)) {
+    const v = (config as Record<string, unknown>)["tool"];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return name;
+}
+
+function renameTool(tool: Tool, instanceName: string): Tool {
+  const renamed: Tool = {
+    name: instanceName,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    ...(tool.requires !== undefined ? { requires: tool.requires } : {}),
+    ...(tool.optional !== undefined ? { optional: tool.optional } : {}),
+    ...(tool.capabilities !== undefined
+      ? { capabilities: tool.capabilities }
+      : {}),
+    ...(tool.secrets !== undefined ? { secrets: tool.secrets } : {}),
+    ...(tool.dependencies !== undefined
+      ? { dependencies: tool.dependencies }
+      : {}),
+    execute: (input, ctx) => tool.execute(input, ctx),
+  };
+  if (tool.containsGrant) {
+    renamed.containsGrant = tool.containsGrant.bind(tool);
+  }
+  if (tool.mergeGrants) {
+    renamed.mergeGrants = tool.mergeGrants.bind(tool);
+  }
+  if (tool.audit) {
+    renamed.audit = tool.audit.bind(tool);
+  }
+  return renamed;
+}
+
 class NativeTools implements Tools {
   resolveTool(
     name: string,
@@ -31,8 +67,11 @@ class NativeTools implements Tools {
     agent: Agent,
     capabilities: CapabilitySet | undefined,
   ): Tool | null {
-    const builder = BUILTINS[name];
-    return builder ? builder(config, capabilities, agent) : null;
+    const underlying = underlyingNameOf(name, config);
+    const builder = BUILTINS[underlying];
+    if (!builder) return null;
+    const tool = builder(config, capabilities, agent);
+    return underlying === name ? tool : renameTool(tool, name);
   }
   close(): void {}
 }

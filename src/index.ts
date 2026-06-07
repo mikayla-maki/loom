@@ -14,12 +14,28 @@ export {
   assertKnownKinds,
   assertRequires,
   assertSecretAllowlist,
+  containsWithTool,
   defaultContains,
+  defaultMerge,
   grantFor,
+  grantRows,
   isStarSet,
   kindGranted,
+  mergeWithTool,
   valueFor,
 } from "./manifest/capabilities.js";
+
+export {
+  applyToolGroups,
+  ceilingEntryFor,
+  collectToolGroups,
+  containsDeclaration,
+  toolGroupQualifies,
+  underlyingNameOfEntry,
+  type AppliedToolGroups,
+} from "./manifest/tool-groups.js";
+
+export { ceilingFor } from "./manifest/ceiling.js";
 
 export {
   registerHarness,

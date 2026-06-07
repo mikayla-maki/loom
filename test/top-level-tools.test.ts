@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { runAgent } from "../src/sdk/run-agent.js";
@@ -90,17 +91,23 @@ describe("top-level [tools]", () => {
     }
   });
 
-  it("explicit [tools] without [capabilities] relies on smart defaults", async () => {
+  it("explicit [tools] without [capabilities] grants from the default ceiling", async () => {
     const agent = await runAgent(
       buildAgent({ tools: { read_file: "builtin", echo: "builtin" } }),
       { providers: [echoTestProvider] },
     );
     try {
       expect(toolNames(agent)).toEqual(["echo", "read_file"]);
+      const skillsRoot = path.join(os.homedir(), ".skills");
+      expect(agent.capabilities.read_file).toEqual({
+        paths: ["./", skillsRoot],
+      });
       const rf = agent.agentState.toolTable
         .list()
         .find((t) => t.name === "read_file");
-      expect(rf?.description).toMatch(/smart default/);
+      expect(rf?.description).toBe(
+        `Read a UTF-8 file from disk (restricted to: ${path.resolve(".")}, ${skillsRoot}).`,
+      );
     } finally {
       await agent.close();
     }

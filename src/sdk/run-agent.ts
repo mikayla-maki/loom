@@ -17,6 +17,7 @@ import {
   nativeBuiltinNames,
 } from "../builtins/tools/native.js";
 import {
+  DEFAULT_BUILTIN_TOOLS,
   isPreBuiltSessionLayer,
   resolveManifest,
   resolveSystemPrompt,
@@ -28,6 +29,8 @@ import {
   type SessionBinding,
   type ToolBinding,
 } from "../manifest/resolver.js";
+import { ceilingEntryFor, collectToolGroups } from "../manifest/tool-groups.js";
+import { planToolGroups } from "../manifest/ceiling.js";
 import {
   instantiateFromBinding,
   loadManifestProviders,
@@ -78,6 +81,7 @@ import type {
   Capabilities,
   CapabilitySet,
   SessionSpec,
+  ToolEntry,
 } from "../types/manifest.js";
 
 import { ChainedSession } from "../runtime/session-chain.js";
@@ -106,13 +110,6 @@ const DEFAULT_SESSION_CHAIN: SessionSpec[] = [
   { provider: "compacting" },
   { provider: "in-memory" },
 ];
-
-const DEFAULT_TOP_LEVEL_CAPABILITIES = {
-  bash: { commands: "*", paths: ["./"] },
-  read_file: { paths: ["./"] },
-  write_file: { paths: ["./"] },
-  edit_file: { paths: ["./"] },
-} as const satisfies Record<string, CapabilitySet>;
 
 export interface RunAgentOptions {
   /**
@@ -173,6 +170,7 @@ export async function runAgent(
     loomVersion: LOOM_VERSION,
     clientCapabilities:
       options.clientAcpCapabilities ?? DEFAULT_CLIENT_ACP_CAPABILITIES,
+    purpose: "run",
     storage: storage.path,
     metadata: manifest.metadata ?? {},
   };
@@ -195,9 +193,10 @@ export async function runAgent(
   }
 
   const store = buildSecretStore(manifest, options);
+  const phase1Needs = collectPhase1SecretNeeds(resolved, toolsIndex);
   const phase1Secrets = await loadSecretsBundle(
     store,
-    collectPhase1SecretNeeds(resolved, toolsIndex),
+    phase1Needs,
     options.allowMissingSecrets ?? false,
     options.onMissingSecret,
   );
@@ -234,31 +233,76 @@ export async function runAgent(
     clientBridgeHolder,
   );
 
+  // Must run after session construction and before binding; grants are fixed
+  // from this point on.
+  const groups = await collectToolGroups(session);
+  const applied = planToolGroups({
+    manifest,
+    manifestDir: baseDir,
+    sessionLayers: resolved.session,
+    groups,
+    agent: ownAgent,
+  });
+  const ceiling = applied.ceiling;
+  if (!options.parent) {
+    for (const verdict of applied.verdicts) {
+      if (verdict.accepted) continue;
+      for (const d of verdict.declarations.filter((d) => !d.ok)) {
+        console.warn(
+          `loom tools: ${verdict.label} inactive — '${d.instance}': ${d.reason}` +
+            (d.remediation
+              ? `\n  to accept, add to [capabilities]:\n    ${d.remediation}`
+              : ""),
+        );
+      }
+    }
+  }
+
+  const augmented = applied.augmented;
+  const resolvedFull = resolveManifest(augmented, { builtinToolNames });
+  const { toolsIndex: toolsIndexFull, loadErrors: loadErrorsFull } =
+    await loadManifestProviders(resolvedFull, factoryCtx, {
+      ...(options.providerLoadOptions
+        ? { loadOptions: options.providerLoadOptions }
+        : {}),
+    });
+  if (loadErrorsFull.size > 0) {
+    const [first] = loadErrorsFull.values();
+    if (first) throw first;
+  }
+
+  // Load only names the first pass didn't request, so each miss (and
+  // `onMissingSecret`) fires exactly once.
+  const phase1Names = new Set(phase1Needs.map((n) => n.name));
+  const contributedNeeds = collectPhase1SecretNeeds(
+    resolvedFull,
+    toolsIndexFull,
+  ).filter((n) => !phase1Names.has(n.name));
+  const fullPhase1Secrets = {
+    ...phase1Secrets,
+    ...(await loadSecretsBundle(
+      store,
+      contributedNeeds,
+      options.allowMissingSecrets ?? false,
+      options.onMissingSecret,
+    )),
+  };
+
   const instances = await materialiseTools_all({
-    resolved,
-    toolsIndex,
+    resolved: resolvedFull,
+    toolsIndex: toolsIndexFull,
     sdkTools: options.providers ?? [],
     session,
     harness,
-    manifest,
+    manifest: augmented,
     factoryCtx,
-    phase1Secrets,
+    phase1Secrets: fullPhase1Secrets,
     runtime: runtimeServices,
     parent: options.parent,
   });
 
-  const effectiveCapabilities = effectiveCapabilitiesFor(manifest);
-  const sessionToolBindings = await collectSessionToolBindings(session);
-  const allBindings: ToolBinding[] = [
-    ...resolved.tools,
-    ...sessionToolBindings,
-  ];
-  const resolvedTools = await bindTools(
-    allBindings,
-    effectiveCapabilities,
-    ownAgent,
-    instances,
-  );
+  const { tools: resolvedTools, grants: effectiveCapabilities } =
+    await bindTools(resolvedFull.tools, ceiling, ownAgent, instances);
 
   const phase2Secrets = await loadSecretsBundle(
     store,
@@ -266,7 +310,7 @@ export async function runAgent(
     options.allowMissingSecrets ?? false,
     options.onMissingSecret,
   );
-  const allSecrets = { ...phase1Secrets, ...phase2Secrets };
+  const allSecrets = { ...fullPhase1Secrets, ...phase2Secrets };
 
   assertKnownKinds(resolvedTools, effectiveCapabilities);
   assertRequires(resolvedTools, effectiveCapabilities);
@@ -288,7 +332,8 @@ export async function runAgent(
   return new RunningAgentImpl({
     manifest,
     systemPrompt,
-    capabilities: effectiveCapabilities,
+    capabilities: ceiling,
+    toolVerdicts: applied.verdicts,
     session,
     harness,
     state,
@@ -478,19 +523,12 @@ function peekToolsContribution(
   return undefined;
 }
 
-function effectiveCapabilitiesFor(manifest: AgentManifest): Capabilities {
-  if (manifest.tools === undefined && manifest.capabilities === undefined) {
-    return DEFAULT_TOP_LEVEL_CAPABILITIES;
-  }
-  return manifest.capabilities ?? {};
-}
-
 async function bindTools(
   bindings: ToolBinding[],
-  capabilities: Capabilities,
+  ceiling: Capabilities,
   ownAgent: Agent,
   instances: MaterialisedTools[],
-): Promise<Map<string, Tool>> {
+): Promise<{ tools: Map<string, Tool>; grants: Capabilities }> {
   const byId = new Map<string, MaterialisedTools>(
     instances.map((m) => [m.id, m]),
   );
@@ -498,6 +536,7 @@ async function bindTools(
   const nativeInstance = instances.find((m) => m.id === "native");
 
   const resolved = new Map<string, Tool>();
+  const grants: Capabilities = {};
   for (const binding of bindings) {
     const inst = byId.get(binding.providerInstanceId);
     if (!inst) {
@@ -507,7 +546,13 @@ async function bindTools(
           `This is a resolver/runtime mismatch.`,
       );
     }
-    const grant = capabilities[binding.toolName];
+    const grant =
+      binding.requestedGrant ??
+      ceilingEntryFor(
+        ceiling,
+        binding.toolName,
+        binding.underlyingName ?? binding.toolName,
+      )?.grant;
     let tool = await Promise.resolve(
       inst.tools.resolveTool(
         binding.toolName,
@@ -547,20 +592,9 @@ async function bindTools(
       );
     }
     resolved.set(binding.toolName, tool);
+    if (grant !== undefined) grants[binding.toolName] = grant;
   }
-  return resolved;
-}
-
-async function collectSessionToolBindings(
-  session: Session,
-): Promise<ToolBinding[]> {
-  const tools = (await session.tools?.()) ?? [];
-  return tools.map((ref) => ({
-    toolName: ref.name,
-    providerInstanceId: "(session)",
-    toolConfig: typeof ref.config === "string" ? {} : ref.config,
-    origin: "(session)",
-  }));
+  return { tools: resolved, grants };
 }
 
 async function instantiateHarness(
@@ -671,22 +705,9 @@ export interface LabeledSecretStore {
 }
 
 /**
- * The ordered secret-store tiers, highest priority first. Resolution is
- * dotenv-style: the most *local*, explicit secret wins and we work outward
- * to progressively more global sources. A `.loom-secrets` checked into the
- * agent's own directory is the most intentional, agent-scoped secret, so it
- * overrides an ambient env var (which is often exported globally for an
- * unrelated tool) rather than the other way around.
- *
- *   1. SDK-supplied store (an explicit programmatic override)
- *   2. `.loom-secrets` next to the manifest (most local to THIS agent)
- *   3. `.loom-secrets` in the cwd (the invocation's working dir)
- *   4. environment variables
- *   5. macOS keychain
- *   6. `~/.config/loom/secrets.toml` (the global fallback)
- *
- * The single source of truth for both {@link buildSecretStore} (runtime) and
- * `loom audit` (which labels where each secret resolved from).
+ * The ordered secret-store tiers, highest priority first. Dotenv-style: the
+ * most local, explicit source wins (manifest-dir `.loom-secrets` over ambient
+ * env vars). Single source of truth for {@link buildSecretStore} and `loom audit`.
  */
 export function describeSecretStores(
   manifest: AgentManifest,

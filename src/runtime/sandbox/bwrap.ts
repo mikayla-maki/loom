@@ -2,7 +2,10 @@ import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
 import { expandHome } from "../../internal/util.js";
-import type { CapabilitySet } from "../../types/manifest.js";
+import type { CapabilityGrant } from "../../types/manifest.js";
+
+// Bash resolves exactly one grant row before any sandbox is constructed.
+type SingleRowGrant = "*" | CapabilityGrant;
 
 const BWRAP_CANDIDATES = [
   "/usr/bin/bwrap",
@@ -39,7 +42,7 @@ export function _resetBwrapCache(): void {
   bwrapPath = undefined;
 }
 
-export function validateBashGrantLinux(grant: CapabilitySet): void {
+export function validateBashGrantLinux(grant: SingleRowGrant): void {
   if (grant === "*") return;
 
   const c = grant.commands;
@@ -88,7 +91,7 @@ export function validateBashGrantLinux(grant: CapabilitySet): void {
   }
 }
 
-export async function buildBwrapArgs(grant: CapabilitySet): Promise<string[]> {
+export async function buildBwrapArgs(grant: SingleRowGrant): Promise<string[]> {
   if (grant === "*") {
     throw new Error(
       'buildBwrapArgs: "*" grant means no sandbox; check sandboxEngaged() first',
@@ -135,6 +138,11 @@ export async function buildBwrapArgs(grant: CapabilitySet): Promise<string[]> {
 
   if (grant.network !== "*") {
     args.push("--unshare-net");
+  } else {
+    // systemd-resolved keeps the real resolv.conf under /run; without it,
+    // DNS config is unreadable inside the sandbox.
+    args.push("--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve");
+    args.push("--ro-bind-try", "/run/resolvconf", "/run/resolvconf");
   }
 
   // --unshare-pid breaks bash builtins like `wait`, so it is omitted.
@@ -147,13 +155,12 @@ export async function buildBwrapArgs(grant: CapabilitySet): Promise<string[]> {
 }
 
 export async function maybeBwrapPrefix(
-  grant: CapabilitySet,
+  grant: SingleRowGrant,
 ): Promise<{ binary: string; prefixArgs: string[] } | null> {
   if (grant === "*") return null;
   const bwrap = await findBwrap();
   if (!bwrap) return null;
   const prefixArgs = await buildBwrapArgs(grant);
-  // bwrap separates its own args from the target command with `--`.
   prefixArgs.push("--");
   return { binary: bwrap, prefixArgs };
 }

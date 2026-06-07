@@ -1,19 +1,29 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as TOML from "toml";
 
 import { expandHome } from "../../internal/util.js";
 
 import YAML from "yaml";
 
 import type {
+  Agent,
   FactoryContext,
   Session,
   SessionFactory,
-  ToolRef,
-  TrustedPath,
 } from "../../types/interfaces.js";
+import type {
+  CapabilitySet,
+  ToolEntry,
+  ToolEntryTable,
+  ToolGroup,
+  ToolGroupVerdict,
+} from "../../types/manifest.js";
 import { ManifestError } from "../../errors.js";
+import { probeTool, toolGroupQualifies } from "../../manifest/tool-groups.js";
+import { parseProviders, parseToolTable } from "../../manifest/parser.js";
+import { buildNativeTools } from "../tools/native.js";
 
 export interface SkillFrontmatter {
   name: string;
@@ -22,65 +32,92 @@ export interface SkillFrontmatter {
   compatibility?: string;
   metadata?: Record<string, string>;
   allowedTools?: string;
-  /** Undefined = use session `default_tools`; empty array = suppress the default. */
-  requiredTools?: string[];
 }
 
 export interface Skill {
   skillMdPath: string;
   rootDir: string;
   frontmatter: SkillFrontmatter;
+  group: ToolGroup;
 }
 
 export interface SkillsSessionOptions {
   roots: readonly string[];
-  defaultTools?: readonly string[];
+  purpose: "run" | "audit";
 }
+
+const SKILL_DIR_PLACEHOLDER = /\$\{SKILL_DIR\}/g;
+const LOOM_TOOLS_KEY = "loom.tools";
+const LOOM_PROVIDERS_KEY = "loom.providers";
+const SIDECAR_FILENAME = "loom.toml";
 
 export class SkillsSession implements Session {
   private cache: Skill[] | null = null;
-  private readonly defaultTools: readonly string[];
 
-  constructor(private readonly options: SkillsSessionOptions) {
-    this.defaultTools = options.defaultTools ?? ["bash"];
-  }
+  constructor(private readonly options: SkillsSessionOptions) {}
 
   async prepareTurn(): Promise<void> {
     this.cache = await scanRoots(this.options.roots);
   }
 
-  async systemPromptSection(): Promise<string> {
+  async systemPromptSection(agent: Agent): Promise<string> {
     const skills = await this.ensureCache();
     if (skills.length === 0) return "";
-    return renderCatalog(skills);
+    const verdicts = agent.toolVerdicts ?? [];
+    const usable: Skill[] = [];
+    const trimmed: Array<{ skill: Skill; reason: string }> = [];
+    for (const skill of skills) {
+      const reason = this.disqualification(skill, agent, verdicts);
+      if (reason === null) usable.push(skill);
+      else trimmed.push({ skill, reason });
+    }
+    if (this.options.purpose === "audit") {
+      return renderCatalog(usable, trimmed);
+    }
+    return usable.length === 0 ? "" : renderCatalog(usable, []);
   }
 
-  async tools(): Promise<ToolRef[]> {
+  async tools(): Promise<ToolGroup[]> {
     const skills = await this.ensureCache();
-    return aggregateRequiredTools(skills, this.defaultTools);
+    return skills.map((s) => s.group);
   }
 
-  trustedPaths(): TrustedPath[] {
-    return this.options.roots.map((root) => ({
-      path: root,
-      access: "read",
-      reason: `Agent Skills root (${this.shortenForReason(root)})`,
-    }));
+  // Subtractive only: skills that appeared after boot can never gain grants
+  // mid-session; at most they reference already-granted authority.
+  private disqualification(
+    skill: Skill,
+    agent: Agent,
+    verdicts: ToolGroupVerdict[],
+  ): string | null {
+    const verdict = verdicts.find((v) => v.label === skill.group.label);
+    if (verdict) {
+      if (verdict.accepted) return null;
+      const failed = verdict.declarations.filter((d) => !d.ok);
+      return failed.map((d) => `'${d.instance}': ${d.reason}`).join("; ");
+    }
+    if (agent.capabilities === undefined) return null;
+    if (declaresNewInstances(skill.group)) {
+      return "appeared after boot and declares tools; restart to bind them";
+    }
+    const registry = buildNativeTools();
+    const probe = (instance: string, underlying: string) =>
+      probeTool(registry, instance, underlying, agent);
+    if (!toolGroupQualifies(skill.group, agent.capabilities, probe)) {
+      return "declarations exceed the capability ceiling";
+    }
+    return null;
   }
 
   private async ensureCache(): Promise<Skill[]> {
     if (!this.cache) this.cache = await scanRoots(this.options.roots);
     return this.cache;
   }
+}
 
-  private shortenForReason(p: string): string {
-    const home = os.homedir();
-    if (home && p === home) return "~";
-    if (home && p.startsWith(home + path.sep)) {
-      return "~" + p.slice(home.length);
-    }
-    return p;
-  }
+function declaresNewInstances(group: ToolGroup): boolean {
+  return Object.values(group.tools).some(
+    (entry) => typeof entry === "string" || entry.provider !== undefined,
+  );
 }
 
 async function scanRoots(roots: readonly string[]): Promise<Skill[]> {
@@ -101,10 +138,8 @@ async function walk(dir: string, acc: Skill[]): Promise<void> {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const hasSkillMd = entries.some((e) => e.isFile() && e.name === "SKILL.md");
   if (hasSkillMd) {
-    const skillMdPath = path.join(dir, "SKILL.md");
     try {
-      const fm = await readFrontmatter(skillMdPath);
-      acc.push({ skillMdPath, rootDir: dir, frontmatter: fm });
+      acc.push(await loadSkill(dir));
     } catch {
       // Malformed skill: skip so boot stays resilient.
     }
@@ -117,16 +152,103 @@ async function walk(dir: string, acc: Skill[]): Promise<void> {
   }
 }
 
-async function readFrontmatter(skillMdPath: string): Promise<SkillFrontmatter> {
+async function loadSkill(dir: string): Promise<Skill> {
+  const skillMdPath = path.join(dir, "SKILL.md");
   const text = await fs.readFile(skillMdPath, "utf8");
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   if (!match) {
     throw new Error(`SKILL.md has no YAML frontmatter: ${skillMdPath}`);
   }
-  return parseFrontmatter(match[1] ?? "");
+  const frontmatter = parseFrontmatter(match[1] ?? "");
+  const group = await compileToolGroup(dir, frontmatter);
+  return { skillMdPath, rootDir: dir, frontmatter, group };
 }
 
-const REQUIRED_TOOLS_KEY = "loom.required-tools";
+// Precedence: `loom.toml` sidecar (enhances a skill you didn't author), then
+// `loom.tools` frontmatter, then a derived read-only grant over the skill dir.
+// `${SKILL_DIR}` substitutes textually before parsing.
+async function compileToolGroup(
+  dir: string,
+  frontmatter: SkillFrontmatter,
+): Promise<ToolGroup> {
+  const label = `skill '${frontmatter.name}'`;
+
+  const sidecarPath = path.join(dir, SIDECAR_FILENAME);
+  let sidecarText: string | null = null;
+  try {
+    sidecarText = await fs.readFile(sidecarPath, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  if (sidecarText !== null) {
+    const parsed = parseTomlSource(sidecarText, dir, `${label} loom.toml`);
+    const rawTools = (parsed as { tools?: unknown }).tools;
+    if (rawTools === undefined) {
+      throw new Error(`${label}: loom.toml has no [tools] table`);
+    }
+    return buildGroup(
+      label,
+      rawTools,
+      (parsed as { providers?: unknown }).providers,
+    );
+  }
+
+  const inlineTools = frontmatter.metadata?.[LOOM_TOOLS_KEY];
+  if (inlineTools !== undefined && inlineTools.trim().length > 0) {
+    const rawTools = parseTomlSource(
+      inlineTools,
+      dir,
+      `${label} ${LOOM_TOOLS_KEY}`,
+    );
+    const inlineProviders = frontmatter.metadata?.[LOOM_PROVIDERS_KEY];
+    const rawProviders =
+      inlineProviders !== undefined && inlineProviders.trim().length > 0
+        ? parseTomlSource(
+            inlineProviders,
+            dir,
+            `${label} ${LOOM_PROVIDERS_KEY}`,
+          )
+        : undefined;
+    return buildGroup(label, rawTools, rawProviders);
+  }
+
+  return {
+    label,
+    tools: {
+      read_file: { capabilities: { paths: [dir] } },
+    },
+  };
+}
+
+// Same parser as the manifest so skill declarations obey the [tools] /
+// [providers] grammar; provider-less entries grant onto existing instances.
+function buildGroup(
+  label: string,
+  rawTools: unknown,
+  rawProviders: unknown,
+): ToolGroup {
+  const group: ToolGroup = {
+    label,
+    tools: parseToolTable(rawTools, label, { requireProvider: false }),
+  };
+  if (rawProviders !== undefined) {
+    group.providers = parseProviders(rawProviders, label);
+  }
+  return group;
+}
+
+function parseTomlSource(
+  source: string,
+  dir: string,
+  where: string,
+): Record<string, unknown> {
+  const substituted = source.replace(SKILL_DIR_PLACEHOLDER, dir);
+  try {
+    return TOML.parse(substituted) as Record<string, unknown>;
+  } catch (e) {
+    throw new Error(`${where} is not valid TOML: ${(e as Error).message}`);
+  }
+}
 
 export function parseFrontmatter(yaml: string): SkillFrontmatter {
   let raw: unknown;
@@ -157,21 +279,16 @@ export function parseFrontmatter(yaml: string): SkillFrontmatter {
   const allowedTools = stringOf(obj["allowed-tools"]);
   if (allowedTools) fm.allowedTools = allowedTools;
 
-  let metadata: Record<string, string> | undefined;
   if (
     obj.metadata &&
     typeof obj.metadata === "object" &&
     !Array.isArray(obj.metadata)
   ) {
-    metadata = {};
+    const metadata: Record<string, string> = {};
     for (const [k, v] of Object.entries(obj.metadata)) {
       metadata[k] = stringify(v);
     }
     fm.metadata = metadata;
-  }
-
-  if (metadata && Object.hasOwn(metadata, REQUIRED_TOOLS_KEY)) {
-    fm.requiredTools = toStringList(metadata[REQUIRED_TOOLS_KEY]);
   }
 
   return fm;
@@ -189,56 +306,29 @@ function stringify(v: unknown): string {
   return String(v);
 }
 
-function toStringList(v: unknown): string[] {
-  if (v === undefined || v === null) return [];
-  if (Array.isArray(v)) {
-    return v.map((x) => stringify(x)).filter((s) => s.length > 0);
-  }
-  if (typeof v === "string") {
-    return v.split(/[,\s]+/g).filter((s) => s.length > 0);
-  }
-  return [];
-}
-
-function aggregateRequiredTools(
+function renderCatalog(
   skills: readonly Skill[],
-  defaultTools: readonly string[],
-): ToolRef[] {
-  const seen = new Set<string>();
-  const out: ToolRef[] = [];
-  const add = (name: string) => {
-    if (seen.has(name)) return;
-    seen.add(name);
-    out.push({ name, config: {} });
-  };
-  for (const skill of skills) {
-    const list = skill.frontmatter.requiredTools ?? defaultTools;
-    for (const name of list) add(name);
-  }
-  return out;
-}
-
-function renderCatalog(skills: readonly Skill[]): string {
+  trimmed: ReadonlyArray<{ skill: Skill; reason: string }>,
+): string {
   const home = os.homedir();
   const lines: string[] = [];
   lines.push(
     "Agent Skills are available. Each is a folder containing SKILL.md " +
       "(metadata + instructions) plus optional scripts/, references/, " +
       "and assets/. To activate a skill, read its SKILL.md with the " +
-      "file tool; load referenced files only as needed.",
+      "file tool; load referenced files only as needed. Tools a skill " +
+      "provides are already in your tool list.",
   );
   lines.push("");
   for (const skill of skills) {
     const fm = skill.frontmatter;
     const display = displayPath(skill.skillMdPath, home);
     lines.push(`- **${fm.name}** (\`${display}\`) — ${fm.description}`);
-    const extras: string[] = [];
-    if (fm.compatibility) extras.push(`compatibility: ${fm.compatibility}`);
-    if (fm.allowedTools) extras.push(`pre-approved tools: ${fm.allowedTools}`);
-    if (fm.requiredTools && fm.requiredTools.length > 0) {
-      extras.push(`requires tools: ${fm.requiredTools.join(", ")}`);
-    }
-    for (const e of extras) lines.push(`  - ${e}`);
+    if (fm.compatibility) lines.push(`  - compatibility: ${fm.compatibility}`);
+  }
+  for (const { skill, reason } of trimmed) {
+    const fm = skill.frontmatter;
+    lines.push(`- **${fm.name}** — INACTIVE: ${reason}`);
   }
   return lines.join("\n");
 }
@@ -256,31 +346,32 @@ function resolveRoot(raw: string, manifestDir: string): string {
   return path.resolve(manifestDir, expanded);
 }
 
+/**
+ * Skills roots from a `[session.skills]`-shaped config, resolved against the
+ * manifest directory. Also used to extend the default capability ceiling.
+ */
+export function resolveConfiguredSkillRoots(
+  config: Record<string, unknown>,
+  manifestDir: string,
+): string[] {
+  return collectRoots(config).map((r) => resolveRoot(r, manifestDir));
+}
+
 export const skillsSessionFactory: SessionFactory = {
   name: "skills",
   passThrough: true,
   create(config: Record<string, unknown>, ctx: FactoryContext): Session {
-    const rawRoots = collectRoots(config);
-    const roots = rawRoots.map((r) => resolveRoot(r, ctx.manifestDir));
-    const defaultTools = collectDefaultTools(config);
-    return new SkillsSession({ roots, defaultTools });
+    if (config.default_tools !== undefined) {
+      throw new ManifestError(
+        `[session.skills] 'default_tools' no longer exists — skills declare ` +
+          `the tools they need themselves (frontmatter 'loom.tools' or a ` +
+          `loom.toml sidecar), checked against your [capabilities] ceiling.`,
+      );
+    }
+    const roots = resolveConfiguredSkillRoots(config, ctx.manifestDir);
+    return new SkillsSession({ roots, purpose: ctx.purpose ?? "run" });
   },
 };
-
-function collectDefaultTools(
-  config: Record<string, unknown>,
-): readonly string[] | undefined {
-  if (config.default_tools === undefined) return undefined;
-  if (
-    !Array.isArray(config.default_tools) ||
-    !config.default_tools.every((s) => typeof s === "string")
-  ) {
-    throw new ManifestError(
-      `[session] provider 'skills' config 'default_tools' must be an array of strings`,
-    );
-  }
-  return config.default_tools as string[];
-}
 
 function collectRoots(config: Record<string, unknown>): string[] {
   if (config.roots !== undefined) {

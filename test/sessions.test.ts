@@ -8,12 +8,8 @@ import { ChainedSession } from "../src/runtime/session-chain.js";
 import { InMemorySession } from "../src/builtins/session/memory.js";
 import { runAgent } from "../src/sdk/run-agent.js";
 import type { TurnStep } from "../src/builtins/harness/test.js";
-import type {
-  Agent,
-  Runtime,
-  Session,
-  ToolRef,
-} from "../src/types/interfaces.js";
+import type { Agent, Runtime, Session } from "../src/types/interfaces.js";
+import type { ToolGroup } from "../src/types/manifest.js";
 import type { SessionUpdate } from "../src/types/acp.js";
 import { echoTestProvider } from "./fixtures/echo-tool.js";
 
@@ -134,7 +130,7 @@ describe("Session push/pull semantics", () => {
         calls.push("a:prepare");
       },
       systemPromptSection: () => "section A",
-      tools: () => [{ name: "tool_a", config: {} }],
+      tools: () => [{ label: "a's tools", tools: { tool_a: "session" } }],
       dependencies: {
         subagents: [{ name: "sub-a", harness: { provider: "test" } }],
       },
@@ -144,7 +140,7 @@ describe("Session push/pull semantics", () => {
         calls.push("b:prepare");
       },
       systemPromptSection: () => "section B",
-      tools: () => [{ name: "tool_b", config: {} }],
+      tools: () => [{ label: "b's tools", tools: { tool_b: "session" } }],
       dependencies: {
         subagents: [{ name: "sub-b", harness: { provider: "test" } }],
       },
@@ -164,8 +160,12 @@ describe("Session push/pull semantics", () => {
     const section = await chained.systemPromptSection?.(fakeAgent);
     expect(section).toBe("section A\n\nsection B");
 
-    const tools = (await chained.tools?.()) as ToolRef[];
-    expect(tools.map((t) => t.name)).toEqual(["tool_a", "tool_b"]);
+    const groups = (await chained.tools?.()) as ToolGroup[];
+    expect(groups.map((g) => g.label)).toEqual(["a's tools", "b's tools"]);
+    expect(groups.flatMap((g) => Object.keys(g.tools))).toEqual([
+      "tool_a",
+      "tool_b",
+    ]);
 
     const subs = chained.dependencies?.subagents ?? [];
     expect(subs.map((m) => m.name)).toEqual(["sub-a", "sub-b"]);
@@ -322,7 +322,7 @@ describe("End-to-end: ChainedSession through runAgent", () => {
 
   it("registers tools contributed by a session via tools() at boot", async () => {
     const sessionWithTool: Session = {
-      tools: () => [{ name: "echo", config: {} }],
+      tools: () => [{ label: "echo group", tools: { echo: "session" } }],
     };
     const agent = await runAgent(
       {
@@ -346,7 +346,7 @@ describe("End-to-end: ChainedSession through runAgent", () => {
   it("lets a session own its contributed tools' implementations via resolveTool", async () => {
     let executed = 0;
     const selfImplementingSession: Session = {
-      tools: () => [{ name: "ping", config: {} }],
+      tools: () => [{ label: "ping group", tools: { ping: "session" } }],
       resolveTool(name, _config, _agent, _capabilities) {
         if (name !== "ping") return null;
         return {
@@ -385,7 +385,7 @@ describe("End-to-end: ChainedSession through runAgent", () => {
 
   it("falls back to native impls for session-contributed names without resolveTool", async () => {
     const skillsStyle: Session = {
-      tools: () => [{ name: "read_file", config: {} }],
+      tools: () => [{ label: "skills style", tools: { read_file: "session" } }],
     };
     const agent = await runAgent({
       name: "skills-style",

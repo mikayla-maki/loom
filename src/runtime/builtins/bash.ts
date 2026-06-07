@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
+import * as path from "node:path";
 
+import { expandHome } from "../../internal/util.js";
+import { defaultContains, defaultMerge } from "../../manifest/capabilities.js";
 import type {
   EnvVariable,
   TerminalHandle,
@@ -13,7 +16,11 @@ import type {
   ToolDisplay,
   ToolResult,
 } from "../../types/interfaces.js";
-import type { CapabilitySet, CapabilityValue } from "../../types/manifest.js";
+import type {
+  CapabilityGrant,
+  CapabilitySet,
+  CapabilityValue,
+} from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import type { ClientBridge } from "../client-bridge.js";
@@ -147,26 +154,47 @@ export class BashTool implements Tool {
 
   private readonly mode: DispatchMode;
   private readonly allowedCommands: readonly string[] | null;
+  private readonly rows: readonly CapabilityGrant[] | null;
+  private readonly generalRow: CapabilityGrant | null;
+  private readonly singleGrant: "*" | CapabilityGrant;
 
   constructor(_config: ToolConfig, capabilities: CapabilitySet | undefined) {
     this.capabilities = capabilities ?? {};
 
-    const cmds = readCommandsGrant(this.capabilities);
-    if (Array.isArray(cmds)) {
-      this.mode = "argv";
-      this.allowedCommands = cmds;
-      this.inputSchema = argvSchema(cmds);
-    } else {
+    const rowSet =
+      this.capabilities === "*"
+        ? "*"
+        : Array.isArray(this.capabilities)
+          ? this.capabilities
+          : [this.capabilities];
+
+    if (rowSet !== "*" && rowSet.length > 1) {
+      this.rows = rowSet;
+      this.generalRow = rowSet.find((row) => row.commands === "*") ?? null;
+      this.singleGrant = this.generalRow ?? {};
       this.mode = "shell";
       this.allowedCommands = null;
       this.inputSchema = SHELL_SCHEMA;
+      for (const row of rowSet) validateGrantRow(row);
+    } else {
+      const single: "*" | CapabilityGrant =
+        rowSet === "*" ? "*" : (rowSet[0] ?? {});
+      this.rows = null;
+      this.generalRow = null;
+      this.singleGrant = single;
+      const cmds = readCommandsGrant(single);
+      if (Array.isArray(cmds)) {
+        this.mode = "argv";
+        this.allowedCommands = cmds;
+        this.inputSchema = argvSchema(cmds);
+      } else {
+        this.mode = "shell";
+        this.allowedCommands = null;
+        this.inputSchema = SHELL_SCHEMA;
+      }
+      validateGrantRow(single);
     }
 
-    if (process.platform === "darwin") {
-      validateBashGrant(this.capabilities);
-    } else if (process.platform === "linux") {
-      validateBashGrantLinux(this.capabilities);
-    }
     this.description = describeBash(
       this.capabilities,
       this.mode,
@@ -174,9 +202,31 @@ export class BashTool implements Tool {
     );
   }
 
+  containsGrant(
+    superset: CapabilitySet | undefined,
+    subset: CapabilitySet,
+  ): boolean {
+    if (superset === "*") return true;
+    if (subset === "*") return false;
+    const subsetRows = Array.isArray(subset) ? subset : [subset];
+    if (superset === undefined) {
+      return subsetRows.every((row) => Object.keys(row).length === 0);
+    }
+    const supersetRows = Array.isArray(superset) ? superset : [superset];
+    return subsetRows.every((subsetRow) =>
+      supersetRows.some((supersetRow) =>
+        bashRowContains(supersetRow, subsetRow),
+      ),
+    );
+  }
+
+  mergeGrants(a: CapabilitySet, b: CapabilitySet): CapabilitySet {
+    return defaultMerge(a, b);
+  }
+
   async audit(): Promise<AuditFinding[]> {
     const findings: AuditFinding[] = [];
-    if (!sandboxEngaged(this.capabilities)) {
+    if (this.capabilities === "*") {
       findings.push({
         severity: "warning",
         message:
@@ -186,18 +236,20 @@ export class BashTool implements Tool {
       });
       return findings;
     }
-    // env = "*" hands bash the ENTIRE environment, including provider API keys
-    // and LOOM_-promoted secrets. That's an explicit grant we honor literally,
-    // but it's worth surfacing loudly — and naming the secrets it exposes — in
-    // `loom audit`, mirroring the unsandboxed warning above.
-    if (this.capabilities !== "*" && this.capabilities.env === "*") {
-      const exposed = Object.keys(process.env).filter(isSensitiveEnvName).sort();
+    // env = "*" is honored literally (full environment, secrets included), so
+    // audit names the exposed secrets rather than silently stripping them.
+    const grantRows = Array.isArray(this.capabilities)
+      ? this.capabilities
+      : [this.capabilities];
+    if (grantRows.some((row) => row.env === "*")) {
+      const exposed = Object.keys(process.env)
+        .filter(isSensitiveEnvName)
+        .sort();
       const secretList =
         exposed.length > 0 ? exposed.join(", ") : "none currently set";
       findings.push({
         severity: "warning",
-        message:
-          `env = "*" — bash inherits the full environment, exposing secrets to the agent's shell (e.g. via \`env\`): ${secretList}.`,
+        message: `env = "*" — bash inherits the full environment, exposing secrets to the agent's shell (e.g. via \`env\`): ${secretList}.`,
         remediation:
           'If that is not intended, grant only the variables bash needs, e.g. { env = ["PATH", "FOO"] }.',
       });
@@ -246,19 +298,67 @@ export class BashTool implements Tool {
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
+    if (this.rows) {
+      return this.executeRowSet(input as ShellInput, ctx);
+    }
     const dispatch =
       this.mode === "argv" && this.allowedCommands
         ? buildArgvDispatch(input as ArgvInput, this.allowedCommands)
         : buildShellDispatch(input as ShellInput);
+    return this.run(dispatch, this.singleGrant, ctx);
+  }
+
+  private async executeRowSet(
+    input: ShellInput,
+    ctx: ToolContext,
+  ): Promise<ToolResult> {
+    const rows = this.rows ?? [];
+    const argv = tokenizeSimpleCommand(input.command ?? "");
+    const program = argv === null ? undefined : argv[0];
+    if (argv !== null && program !== undefined) {
+      const promotedRow = rows.find(
+        (row) => Array.isArray(row.commands) && row.commands.includes(program),
+      );
+      if (promotedRow) {
+        return this.run(
+          {
+            childProgram: program,
+            childArgs: argv.slice(1),
+            cwd: input.cwd ?? process.cwd(),
+            timeout: input.timeout_ms ?? 30_000,
+            displayLabel: describeCommand(input.command),
+          },
+          promotedRow,
+          ctx,
+        );
+      }
+    }
+    if (this.generalRow) {
+      return this.run(buildShellDispatch(input), this.generalRow, ctx);
+    }
+    const direct = directCommandNames(rows);
+    return {
+      content:
+        `bash: this grant only allows direct invocation of: ${direct.join(", ")}. ` +
+        `Call it as a plain command (no pipes, substitutions, or interpreters) to use its grant.`,
+      isError: true,
+    };
+  }
+
+  private async run(
+    dispatch: DispatchPlan,
+    grant: "*" | CapabilityGrant,
+    ctx: ToolContext,
+  ): Promise<ToolResult> {
     const { childProgram, childArgs, cwd, timeout, displayLabel } = dispatch;
 
-    const env = buildEnv(this.capabilities);
+    const env = buildEnv(grant);
 
     let sandboxPrefix: { binary: string; prefixArgs: string[] } | null = null;
     if (process.platform === "darwin") {
-      sandboxPrefix = await maybeSandboxExecPrefix(this.capabilities);
+      sandboxPrefix = await maybeSandboxExecPrefix(grant);
     } else if (process.platform === "linux") {
-      sandboxPrefix = await maybeBwrapPrefix(this.capabilities);
+      sandboxPrefix = await maybeBwrapPrefix(grant);
     }
 
     let binary: string;
@@ -269,7 +369,7 @@ export class BashTool implements Tool {
     } else {
       binary = childProgram;
       args = childArgs;
-      if (sandboxEngaged(this.capabilities)) {
+      if (sandboxEngaged(grant)) {
         if (process.platform === "darwin") {
           return {
             content:
@@ -411,8 +511,7 @@ async function runViaClientTerminal(
   }, timeout);
 
   // Deliberately no handle.release(): releasing before the client receives the
-  // tool_call_update referencing this terminalId makes it render nothing. The
-  // client caps output and releases session terminals on close.
+  // tool_call_update referencing this terminalId makes it render nothing.
   try {
     const exit = await raceAbort(handle.waitForExit(), abortSignal, () => {
       void handle.kill().catch(() => undefined);
@@ -455,24 +554,20 @@ async function runViaClientTerminal(
   }
 }
 
-// Secret-like env names: provider/harness API keys (e.g. ANTHROPIC_API_KEY,
-// OPENAI_API_KEY) and everything promoted via the `LOOM_` convention used by
-// EnvSecretsStore. `env = "*"` is an EXPLICIT grant and deliberately DOES expose
-// these to bash — we don't silently strip them — but `audit()` lists them by
-// name so the operator sees exactly which secrets a wildcard env grant hands to
-// the agent's shell.
+// Provider/harness API keys plus everything promoted via EnvSecretsStore's
+// `LOOM_` convention — the names audit() lists when env = "*" exposes them.
 function isSensitiveEnvName(name: string): boolean {
   return name.startsWith("LOOM_") || name.endsWith("_API_KEY");
 }
 
 export function buildEnv(grant: CapabilitySet): NodeJS.ProcessEnv {
-  // `*` / `env = "*"` is an explicit request for the whole environment, secrets
-  // included — honor it literally. Return a shallow copy rather than the live
-  // process.env so callers can't mutate the orchestrator's environment; the
-  // values (including secrets) are still all present. `audit()` warns and names
-  // the exposed secrets so this is never a silent leak.
+  // Wildcard grants are honored literally, secrets included; copy so callers
+  // can't mutate the orchestrator's process.env. audit() names what's exposed.
   if (grant === "*") return { ...process.env };
-  const e = grant.env;
+  // execute() dispatches row sets one row at a time; a whole set falls back to
+  // its first row.
+  const row = Array.isArray(grant) ? (grant[0] ?? {}) : grant;
+  const e = row.env;
   if (e === "*") return { ...process.env };
   if (e === undefined) {
     return pickEnv([...ALWAYS_INHERITED_ENV, ...DEFAULT_INHERITED_ENV]);
@@ -516,8 +611,124 @@ function describeCommand(cmd: string): string {
   return `bash: ${truncated}`;
 }
 
+function validateGrantRow(row: "*" | CapabilityGrant): void {
+  if (process.platform === "darwin") {
+    validateBashGrant(row);
+  } else if (process.platform === "linux") {
+    validateBashGrantLinux(row);
+  }
+}
+
+function directCommandNames(rows: readonly CapabilityGrant[]): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (!Array.isArray(row.commands)) continue;
+    for (const command of row.commands) {
+      if (typeof command !== "string" || seen.has(command)) continue;
+      seen.add(command);
+      names.push(command);
+    }
+  }
+  return names;
+}
+
+function bashRowContains(
+  supersetRow: CapabilityGrant,
+  subsetRow: CapabilityGrant,
+): boolean {
+  for (const [kind, subsetValue] of Object.entries(subsetRow)) {
+    if (subsetValue === undefined) continue;
+    if (!Object.hasOwn(supersetRow, kind)) return false;
+    const supersetValue = supersetRow[kind];
+    if (kind === "paths") {
+      if (!pathGrantContains(supersetValue, subsetValue)) return false;
+    } else if (!defaultContains(supersetValue, subsetValue)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function pathGrantContains(superset: unknown, subset: unknown): boolean {
+  if (superset === "*") return true;
+  if (subset === "*") return false;
+  if (!Array.isArray(superset) || !Array.isArray(subset)) return false;
+  const supersetRoots = superset
+    .filter((p): p is string => typeof p === "string")
+    .map(resolveGrantPath);
+  return subset.every(
+    (p) =>
+      typeof p === "string" &&
+      supersetRoots.some((root) =>
+        isPathUnderOrEqual(resolveGrantPath(p), root),
+      ),
+  );
+}
+
+function resolveGrantPath(p: string): string {
+  return path.resolve(expandHome(p));
+}
+
+function isPathUnderOrEqual(target: string, root: string): boolean {
+  return target === root || target.startsWith(root + path.sep);
+}
+
+const BARE_WORD_CHAR = /[A-Za-z0-9_\-./:=@+,%]/;
+const ENV_ASSIGNMENT_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+// Conservative splitter deciding row promotion: accepts only commands a POSIX
+// shell would parse into a plain argv with zero evaluation (safe-charset bare
+// words, single quotes, double quotes free of $/`/\). Anything else — incl.
+// env assignment prefixes — returns null and falls back to the general row.
+export function tokenizeSimpleCommand(command: string): string[] | null {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < command.length) {
+    if (command.charAt(i) === " " || command.charAt(i) === "\t") {
+      i++;
+      continue;
+    }
+    let word = "";
+    while (i < command.length) {
+      const c = command.charAt(i);
+      if (c === " " || c === "\t") break;
+      if (c === "'") {
+        const close = command.indexOf("'", i + 1);
+        if (close === -1) return null;
+        word += command.slice(i + 1, close);
+        i = close + 1;
+        continue;
+      }
+      if (c === '"') {
+        let j = i + 1;
+        while (j < command.length && command.charAt(j) !== '"') {
+          const inner = command.charAt(j);
+          if (inner === "$" || inner === "`" || inner === "\\") return null;
+          j++;
+        }
+        if (j >= command.length) return null;
+        word += command.slice(i + 1, j);
+        i = j + 1;
+        continue;
+      }
+      if (BARE_WORD_CHAR.test(c)) {
+        word += c;
+        i++;
+        continue;
+      }
+      return null;
+    }
+    tokens.push(word);
+  }
+  const first = tokens[0];
+  if (first === undefined) return null;
+  if (ENV_ASSIGNMENT_PREFIX.test(first)) return null;
+  return tokens;
+}
+
 function readCommandsGrant(
-  grant: CapabilitySet,
+  grant: "*" | CapabilityGrant,
 ): "*" | readonly string[] | undefined {
   if (grant === "*") return "*";
   const c: CapabilityValue | undefined = grant.commands;
@@ -589,6 +800,51 @@ function describeBash(
   if (grant === "*") {
     return "Run a bash command. Unrestricted environment (no sandbox engaged).";
   }
+  const rows = Array.isArray(grant) ? grant : [grant];
+  if (rows.length <= 1) {
+    return describeSingleGrant(rows[0] ?? {}, mode, allowedCommands);
+  }
+  const generalRow = rows.find((row) => row.commands === "*");
+  const directRows = rows.filter((row) => Array.isArray(row.commands));
+  const directSummary = directRows.map(describeDirectRow).join("; ");
+  if (generalRow === undefined) {
+    return (
+      `Run one of these commands directly (plain \`cmd args...\` form only; ` +
+      `no pipes, substitutions, or interpreters), each with its own grant: ${directSummary}.`
+    );
+  }
+  const base = describeSingleGrant(generalRow, "shell", null);
+  if (directRows.length === 0) return base;
+  return (
+    `${base} Additionally, these commands may be invoked directly ` +
+    `(plain \`cmd args...\` form only) with their own grants: ${directSummary}.`
+  );
+}
+
+function describeDirectRow(row: CapabilityGrant): string {
+  const names = (Array.isArray(row.commands) ? row.commands : [])
+    .filter((c): c is string => typeof c === "string")
+    .map((c) => `\`${c}\``)
+    .join(", ");
+  const parts: string[] = [];
+  const network = row.network;
+  if (network === "*") parts.push("network access");
+  else if (Array.isArray(network) && network.length > 0) {
+    parts.push(`network: ${network.join(", ")}`);
+  }
+  const grantedPaths = row.paths;
+  if (grantedPaths === "*") parts.push("unrestricted filesystem");
+  else if (Array.isArray(grantedPaths) && grantedPaths.length > 0) {
+    parts.push(`filesystem: ${grantedPaths.join(", ")}`);
+  }
+  return parts.length === 0 ? names : `${names} (${parts.join("; ")})`;
+}
+
+function describeSingleGrant(
+  grant: CapabilityGrant,
+  mode: DispatchMode,
+  allowedCommands: readonly string[] | null,
+): string {
   const lede =
     mode === "argv" && allowedCommands
       ? allowedCommands.length === 1

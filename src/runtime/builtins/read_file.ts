@@ -14,10 +14,9 @@ import type { JSONSchema } from "../../types/schema.js";
 import {
   canonicalizeForGrant,
   canonicalizeRoots,
-  collectTrustedPaths,
   describePaths,
-  effectivePaths,
   pathAllowed,
+  pathGrantContains,
   paths,
   resolvedPaths,
 } from "./_path.js";
@@ -55,14 +54,18 @@ export class ReadFileTool implements Tool {
     this.description = `Read a UTF-8 file from disk (${describePaths(this.granted, this.fromDefault)}).`;
   }
 
+  containsGrant(
+    superset: CapabilitySet | undefined,
+    subset: CapabilitySet,
+  ): boolean {
+    return pathGrantContains(superset, subset);
+  }
+
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
     const { path: requested } = input as ReadFileInput;
     const target = await canonicalizeForGrant(path.resolve(requested), "read");
-    const trusted = await collectTrustedPaths(ctx);
-    const effective = await canonicalizeRoots(
-      effectivePaths(this.granted, trusted, "read"),
-    );
-    if (!pathAllowed(target, effective)) {
+    const allowed = await canonicalizeRoots(this.granted);
+    if (!pathAllowed(target, allowed)) {
       return {
         content: `read_file: '${requested}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,
