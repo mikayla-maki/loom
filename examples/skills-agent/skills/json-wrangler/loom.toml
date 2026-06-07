@@ -5,5 +5,4 @@
 # this narrow grant, and accepted only because the host manifest has an
 # instance-name `jq` entry in [capabilities] that contains this request.
 [tools]
-jq        = { provider = "builtin", tool = "bash", capabilities = { commands = ["jq"], paths = ["./"] } }
-read_file = { capabilities = { paths = ["${SKILL_DIR}"] } }
+jq = { provider = "builtin", tool = "bash", capabilities = { commands = ["jq"], paths = ["./"] } }

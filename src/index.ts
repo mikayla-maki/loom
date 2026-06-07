@@ -22,6 +22,7 @@ export {
   isStarSet,
   kindGranted,
   mergeWithTool,
+  singleRowGrant,
   valueFor,
 } from "./manifest/capabilities.js";
 

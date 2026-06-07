@@ -114,7 +114,12 @@ export class SpawnSubagentTool implements Tool {
         : `spawn_subagent: ${subName}`,
       kind: "think",
     };
-    const sub = await ctx.agent.spawnSubagent(subName);
+    let sub;
+    try {
+      sub = await ctx.agent.spawnSubagent(subName);
+    } catch (e) {
+      return { content: (e as Error).message, isError: true, display };
+    }
     try {
       await sub.prompt(prompt);
       const text = await lastAgentMessage(sub.session);

@@ -39,7 +39,7 @@ import { resolveAgentStorage } from "../runtime/storage.js";
 import { ChainedSession } from "../runtime/session-chain.js";
 import { LoomError } from "../errors.js";
 import { parseAgentManifest } from "../manifest/parser.js";
-import { defaultContains } from "../manifest/capabilities.js";
+import { defaultContains, kindGranted } from "../manifest/capabilities.js";
 import type {
   AgentManifest,
   Capabilities,
@@ -511,8 +511,6 @@ async function auditAgentInner(
   const groups = perLinkContributions.flatMap((slot) => slot.toolGroups);
   const applied = planToolGroups({
     manifest,
-    manifestDir: baseDir,
-    sessionLayers: resolved.session,
     groups,
     agent: auditAgentRef,
   });
@@ -1123,13 +1121,7 @@ function computeMissing(
   requires: string[],
   grant: CapabilitySet | undefined,
 ): string[] {
-  if (grant === "*") return [];
-  if (grant === undefined) return [...requires];
-  const missing: string[] = [];
-  for (const k of requires) {
-    if (!Object.hasOwn(grant, k)) missing.push(k);
-  }
-  return missing;
+  return requires.filter((k) => !kindGranted(grant, k));
 }
 
 // Static version of the runtime spawn-time check (§1.6 of the manifest spec):

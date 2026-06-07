@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { singleRowGrant } from "../src/manifest/capabilities.js";
 import {
   assertKnownKinds,
   assertRequires,
@@ -344,5 +345,22 @@ describe("assertSecretAllowlist", () => {
       makeTool({ name: "fetch", secrets: { optional: ["BEARER_TOKEN"] } }),
     );
     expect(() => assertSecretAllowlist(tools, [])).toThrow(SecretError);
+  });
+});
+
+describe("singleRowGrant", () => {
+  it("passes through star, undefined, single tables, and one-row arrays", () => {
+    expect(singleRowGrant(undefined, "t")).toBeUndefined();
+    expect(singleRowGrant("*", "t")).toBe("*");
+    expect(singleRowGrant({ paths: ["./"] }, "t")).toEqual({ paths: ["./"] });
+    expect(singleRowGrant([{ paths: ["./"] }], "t")).toEqual({
+      paths: ["./"],
+    });
+  });
+
+  it("throws a teaching error on multi-row grants", () => {
+    expect(() =>
+      singleRowGrant([{ a: "*" }, { b: "*" }], "calendar_add"),
+    ).toThrow(/'calendar_add' does not support row-set grants/);
   });
 });

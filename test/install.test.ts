@@ -158,6 +158,145 @@ describe("loom install", () => {
     ).rejects.toThrow(/manifest has changed/);
   });
 
+  it("installs and locks a path source contributed by a skill", async () => {
+    const agentDir = path.join(tmp(), "agent");
+    const skillDir = path.join(agentDir, "skills", "noteskill");
+    await fs.mkdir(skillDir, { recursive: true });
+    // The skill bundles its own provider package and declares it as a path
+    // source via loom.providers (${SKILL_DIR} resolves to the skill dir).
+    await buildFixturePackage(skillDir, "note-pkg", "fixture-note-pkg");
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      [
+        "---",
+        "name: noteskill",
+        "description: A test skill that ships its own path-sourced provider.",
+        "metadata:",
+        "  loom.providers: |",
+        '    note_server = { path = "${SKILL_DIR}/note-pkg" }',
+        "  loom.tools: |",
+        '    fixture_tool = { provider = "note_server", capabilities = "*" }',
+        "---",
+        "",
+        "Body.",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const manifest = path.join(agentDir, "agent.toml");
+    await writeManifest(manifest, "skill-source", [
+      "[session]",
+      'layers = [{ provider = "skills", root = "./skills" }]',
+      "[tools]",
+      'read_file = "builtin"',
+      // Naming the contributed instance is the consent that lets the skill's
+      // own provider be accepted — and thus installed and locked.
+      "[capabilities]",
+      'fixture_tool = "*"',
+      'read_file = { paths = ["./"] }',
+    ]);
+
+    const result = await installManifest(manifest, NO_LOG);
+    const noteSource = result.sources.find((s) => s.spec.includes("note-pkg"));
+    expect(noteSource).toBeDefined();
+    expect(noteSource?.spec.startsWith("path:")).toBe(true);
+
+    const lock = await fs.readFile(
+      path.join(agentDir, ".loom", "lock.toml"),
+      "utf8",
+    );
+    expect(lock).toContain("note-pkg");
+  });
+
+  it("does not install a skill's provider that the ceiling doesn't accept", async () => {
+    const agentDir = path.join(tmp(), "agent");
+    const skillDir = path.join(agentDir, "skills", "noteskill");
+    await fs.mkdir(skillDir, { recursive: true });
+    await buildFixturePackage(skillDir, "note-pkg", "fixture-note-pkg");
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      [
+        "---",
+        "name: noteskill",
+        "description: A skill shipping a provider the host never accepts.",
+        "metadata:",
+        "  loom.providers: |",
+        '    note_server = { path = "${SKILL_DIR}/note-pkg" }',
+        "  loom.tools: |",
+        '    fixture_tool = { provider = "note_server", capabilities = "*" }',
+        "---",
+        "",
+        "Body.",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const manifest = path.join(agentDir, "agent.toml");
+    // No [capabilities] entry names `fixture_tool`, so the contributed group
+    // is rejected and its source must not be installed.
+    await writeManifest(manifest, "skill-unaccepted", [
+      "[session]",
+      'layers = [{ provider = "skills", root = "./skills" }]',
+      "[tools]",
+      'read_file = "builtin"',
+      "[capabilities]",
+      'read_file = { paths = ["./"] }',
+    ]);
+
+    const result = await installManifest(manifest, NO_LOG);
+    expect(
+      result.sources.find((s) => s.spec.includes("note-pkg")),
+    ).toBeUndefined();
+  });
+
+  it("--frozen catches a skill changing its bundled provider source", async () => {
+    const agentDir = path.join(tmp(), "agent");
+    const skillDir = path.join(agentDir, "skills", "noteskill");
+    await fs.mkdir(skillDir, { recursive: true });
+    await buildFixturePackage(skillDir, "note-pkg", "fixture-note-pkg");
+    await buildFixturePackage(skillDir, "note-pkg2", "fixture-note-pkg2");
+    const writeSkill = (pkg: string) =>
+      fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        [
+          "---",
+          "name: noteskill",
+          "description: A skill whose bundled provider source can drift.",
+          "metadata:",
+          "  loom.providers: |",
+          `    note_server = { path = "\${SKILL_DIR}/${pkg}" }`,
+          "  loom.tools: |",
+          '    fixture_tool = { provider = "note_server", capabilities = "*" }',
+          "---",
+          "",
+          "Body.",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+    await writeSkill("note-pkg");
+
+    const manifest = path.join(agentDir, "agent.toml");
+    await writeManifest(manifest, "skill-drift", [
+      "[session]",
+      'layers = [{ provider = "skills", root = "./skills" }]',
+      "[tools]",
+      'read_file = "builtin"',
+      "[capabilities]",
+      'fixture_tool = "*"',
+      'read_file = { paths = ["./"] }',
+    ]);
+
+    await installManifest(manifest, NO_LOG);
+    // Manifest is untouched; the skill now ships a different provider source.
+    await writeSkill("note-pkg2");
+    await expect(
+      installManifest(manifest, { ...NO_LOG, frozen: true }),
+    ).rejects.toThrow(/set of sources changed/);
+  });
+
   it("end-to-end: install a path source, then runAgent resolves the tool", async () => {
     await buildFixturePackage(tmp());
     const manifest = path.join(tmp(), "agent", "agent.toml");

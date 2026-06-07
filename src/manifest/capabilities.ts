@@ -14,6 +14,28 @@ export function grantRows(set: CapabilitySet): "*" | CapabilityGrant[] {
   return Array.isArray(set) ? set : [set];
 }
 
+/**
+ * For tools that don't support row-set grants: unwraps `"*"`, a single
+ * table, or a one-row array; throws a teaching error on multi-row grants.
+ * Call at construction so misconfiguration fails boot, not execution.
+ */
+export function singleRowGrant(
+  grant: CapabilitySet | undefined,
+  toolName: string,
+): "*" | CapabilityGrant | undefined {
+  if (grant === undefined || grant === "*") return grant;
+  if (!Array.isArray(grant)) return grant;
+  if (grant.length === 1) return grant[0];
+  throw new CapabilityError(
+    `'${toolName}' does not support row-set grants; it was given ` +
+      `${grant.length} rows. Collapse the [capabilities] entry to a single ` +
+      `table, or — if per-row behavior is wanted — the tool must implement ` +
+      `containsGrant/mergeGrants and row dispatch.`,
+    { [toolName]: grant },
+    {},
+  );
+}
+
 export function grantFor(
   capabilities: Capabilities | undefined,
   toolName: string,

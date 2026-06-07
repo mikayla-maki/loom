@@ -9,8 +9,20 @@ import TOMLWriter from "@iarna/toml";
 
 import { LoomError } from "../errors.js";
 import { parseAgentManifest } from "../manifest/parser.js";
-import { resolveManifest, sourceSpecKey } from "../manifest/resolver.js";
+import {
+  resolveManifest,
+  sourceSpecKey,
+  isPreBuiltSessionLayer,
+} from "../manifest/resolver.js";
+import { collectToolGroups } from "../manifest/tool-groups.js";
+import { planToolGroups } from "../manifest/ceiling.js";
 import { nativeBuiltinNames } from "../builtins/tools/native.js";
+import { getSessionFactory } from "../builtins/index.js";
+import { instantiateFromBinding } from "../runtime/boot.js";
+import { ChainedSession } from "../runtime/session-chain.js";
+import { resolveAgentStorage } from "../runtime/storage.js";
+import { DEFAULT_CLIENT_ACP_CAPABILITIES } from "../runtime/acp-capabilities.js";
+import type { Agent, FactoryContext, Session } from "../types/interfaces.js";
 import type { AgentManifest, SourceSpec } from "../types/manifest.js";
 
 const exec = promisify(execFile);
@@ -44,7 +56,7 @@ export async function installManifest(
   const manifestDir = path.dirname(absManifest);
   const loomDir = path.join(manifestDir, ".loom");
 
-  const sources = harvestSources(manifest);
+  const sources = await harvestSources(manifest);
   if (sources.size === 0) {
     log("loom install: no non-builtin sources in the manifest; nothing to do");
     await fs.mkdir(loomDir, { recursive: true });
@@ -71,6 +83,22 @@ export async function installManifest(
       throw new LoomError(
         `loom install --frozen: manifest has changed since the last install. ` +
           `Run \`loom install\` (without --frozen) to refresh the lockfile.`,
+      );
+    }
+    // The manifest hash misses drift in contributed sources: a skill can
+    // change the npm/path provider it ships without touching the manifest.
+    // Compare the full resolved source set against the lockfile so --frozen
+    // catches it.
+    const lockedSpecs = new Set((existing.source ?? []).map((s) => s.spec));
+    const currentSpecs = new Set(
+      [...sources.values()].map((s) => sourceSpecToKey(s)),
+    );
+    if (!sameSet(lockedSpecs, currentSpecs)) {
+      throw new LoomError(
+        `loom install --frozen: the set of sources changed since the last ` +
+          `install (a dependency or a skill's bundled provider may have ` +
+          `drifted). Run \`loom install\` (without --frozen) to refresh the ` +
+          `lockfile.`,
       );
     }
   }
@@ -182,9 +210,20 @@ export async function installManifest(
   };
 }
 
-function harvestSources(manifest: AgentManifest): Map<string, SourceSpec> {
+async function harvestSources(
+  manifest: AgentManifest,
+): Promise<Map<string, SourceSpec>> {
   const builtinToolNames = new Set(nativeBuiltinNames());
-  const resolved = resolveManifest(manifest, { builtinToolNames });
+  // Fold in tool groups the session chain contributes (e.g. a skill that
+  // ships its own npm- or path-sourced provider via loom.providers) before
+  // harvesting, so those sources install and lock alongside the manifest's
+  // own. resolveManifest sees the contributed source because the group's
+  // provider is inlined onto the tool entry.
+  const augmented = await augmentWithContributedGroups(
+    manifest,
+    builtinToolNames,
+  );
+  const resolved = resolveManifest(augmented, { builtinToolNames });
   const out = new Map<string, SourceSpec>();
   for (const [key, rs] of resolved.sources) {
     out.set(key, rs.spec);
@@ -192,8 +231,100 @@ function harvestSources(manifest: AgentManifest): Map<string, SourceSpec> {
   return out;
 }
 
+// Build the session chain just far enough to collect contributed tool
+// groups, then fold the accepted ones into the manifest. Best-effort: the
+// skills session is a builtin that only reads SKILL.md, so this needs
+// nothing installed first; a session layer sourced from an as-yet
+// uninstalled provider simply can't contribute here and is skipped.
+async function augmentWithContributedGroups(
+  manifest: AgentManifest,
+  builtinToolNames: Set<string>,
+): Promise<AgentManifest> {
+  const resolved = resolveManifest(manifest, { builtinToolNames });
+  const sessionBindings = resolved.session ?? [];
+  if (sessionBindings.length === 0) return manifest;
+
+  let storagePath: string;
+  try {
+    storagePath = (await resolveAgentStorage(manifest)).path;
+  } catch {
+    return manifest;
+  }
+  const factoryCtx: FactoryContext = {
+    manifestDir: manifest.manifestPath
+      ? path.dirname(manifest.manifestPath)
+      : process.cwd(),
+    agentName: manifest.name,
+    loomVersion: "install",
+    clientCapabilities: DEFAULT_CLIENT_ACP_CAPABILITIES,
+    purpose: "audit",
+    storage: storagePath,
+    metadata: manifest.metadata ?? {},
+  };
+
+  const links: Session[] = [];
+  for (const layer of sessionBindings) {
+    try {
+      if (isPreBuiltSessionLayer(layer)) {
+        links.push(layer.instance);
+        continue;
+      }
+      const { instance } = await instantiateFromBinding<Session>(
+        layer,
+        getSessionFactory,
+        factoryCtx,
+        {},
+        undefined,
+        "session",
+      );
+      links.push(instance);
+    } catch {
+      // A layer we can't construct yet just doesn't contribute sources.
+    }
+  }
+  if (links.length === 0) return manifest;
+  const session =
+    links.length === 1 ? (links[0] as Session) : new ChainedSession(links);
+
+  let groups;
+  try {
+    groups = await collectToolGroups(session);
+  } catch {
+    return manifest;
+  }
+  if (groups.length === 0) return manifest;
+
+  try {
+    const plan = planToolGroups({
+      manifest,
+      groups,
+      agent: stubInstallAgent(manifest),
+    });
+    return plan.augmented;
+  } catch {
+    return manifest;
+  }
+}
+
+// planToolGroups needs an Agent only to probe the tool-owned grant algebra
+// of native tools; a throwaway stub suffices here.
+function stubInstallAgent(manifest: AgentManifest): Agent {
+  return {
+    manifest,
+    harness: { run: async () => ({ stopReason: "end_turn" }) },
+    session: { push: async () => [], pull: async () => [] },
+    systemPromptCore: "",
+  };
+}
+
 function sourceSpecToKey(s: SourceSpec): string {
   return sourceSpecKey(s);
+}
+
+function sameSet(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
 }
 
 function generateLoomPackageJson(

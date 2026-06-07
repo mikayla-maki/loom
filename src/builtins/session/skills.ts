@@ -12,6 +12,10 @@ import type {
   FactoryContext,
   Session,
   SessionFactory,
+  Tool,
+  ToolConfig,
+  ToolContext,
+  ToolResult,
 } from "../../types/interfaces.js";
 import type {
   CapabilitySet,
@@ -20,6 +24,7 @@ import type {
   ToolGroup,
   ToolGroupVerdict,
 } from "../../types/manifest.js";
+import type { JSONSchema } from "../../types/schema.js";
 import { ManifestError } from "../../errors.js";
 import { probeTool, toolGroupQualifies } from "../../manifest/tool-groups.js";
 import { parseProviders, parseToolTable } from "../../manifest/parser.js";
@@ -38,6 +43,7 @@ export interface Skill {
   skillMdPath: string;
   rootDir: string;
   frontmatter: SkillFrontmatter;
+  body: string;
   group: ToolGroup;
 }
 
@@ -50,6 +56,8 @@ const SKILL_DIR_PLACEHOLDER = /\$\{SKILL_DIR\}/g;
 const LOOM_TOOLS_KEY = "loom.tools";
 const LOOM_PROVIDERS_KEY = "loom.providers";
 const SIDECAR_FILENAME = "loom.toml";
+const READ_SKILL = "read_skill";
+const RESOURCE_LISTING_CAP = 50;
 
 export class SkillsSession implements Session {
   private cache: Skill[] | null = null;
@@ -63,11 +71,10 @@ export class SkillsSession implements Session {
   async systemPromptSection(agent: Agent): Promise<string> {
     const skills = await this.ensureCache();
     if (skills.length === 0) return "";
-    const verdicts = agent.toolVerdicts ?? [];
     const usable: Skill[] = [];
     const trimmed: Array<{ skill: Skill; reason: string }> = [];
     for (const skill of skills) {
-      const reason = this.disqualification(skill, agent, verdicts);
+      const reason = disqualificationFor(skill, agent);
       if (reason === null) usable.push(skill);
       else trimmed.push({ skill, reason });
     }
@@ -79,38 +86,209 @@ export class SkillsSession implements Session {
 
   async tools(): Promise<ToolGroup[]> {
     const skills = await this.ensureCache();
-    return skills.map((s) => s.group);
+    if (skills.length === 0) return [];
+    return [
+      {
+        label: "skills session",
+        tools: { [READ_SKILL]: { provider: "session" } },
+      },
+      ...skills.map((s) => s.group),
+    ];
   }
 
-  // Subtractive only: skills that appeared after boot can never gain grants
-  // mid-session; at most they reference already-granted authority.
-  private disqualification(
-    skill: Skill,
-    agent: Agent,
-    verdicts: ToolGroupVerdict[],
-  ): string | null {
-    const verdict = verdicts.find((v) => v.label === skill.group.label);
-    if (verdict) {
-      if (verdict.accepted) return null;
-      const failed = verdict.declarations.filter((d) => !d.ok);
-      return failed.map((d) => `'${d.instance}': ${d.reason}`).join("; ");
-    }
-    if (agent.capabilities === undefined) return null;
-    if (declaresNewInstances(skill.group)) {
-      return "appeared after boot and declares tools; restart to bind them";
-    }
-    const registry = buildNativeTools();
-    const probe = (instance: string, underlying: string) =>
-      probeTool(registry, instance, underlying, agent);
-    if (!toolGroupQualifies(skill.group, agent.capabilities, probe)) {
-      return "declarations exceed the capability ceiling";
-    }
-    return null;
+  resolveTool(name: string, _config: ToolConfig): Tool | null {
+    if (name !== READ_SKILL) return null;
+    return new ReadSkillTool(() => this.ensureCache());
   }
 
   private async ensureCache(): Promise<Skill[]> {
     if (!this.cache) this.cache = await scanRoots(this.options.roots);
     return this.cache;
+  }
+}
+
+// Subtractive only: skills that appeared after boot can never gain grants
+// mid-session; at most they reference already-granted authority.
+function disqualificationFor(skill: Skill, agent: Agent): string | null {
+  const verdicts = agent.toolVerdicts ?? [];
+  const verdict = verdicts.find((v) => v.label === skill.group.label);
+  if (verdict) {
+    if (verdict.accepted) return null;
+    const failed = verdict.declarations.filter((d) => !d.ok);
+    return failed.map((d) => `'${d.instance}': ${d.reason}`).join("; ");
+  }
+  if (agent.capabilities === undefined) return null;
+  if (declaresNewInstances(skill.group)) {
+    return "appeared after boot and declares tools; restart to bind them";
+  }
+  const registry = buildNativeTools();
+  const probe = (instance: string, underlying: string) =>
+    probeTool(registry, instance, underlying, agent);
+  if (!toolGroupQualifies(skill.group, agent.capabilities, probe)) {
+    return "declarations exceed the capability ceiling";
+  }
+  return null;
+}
+
+const READ_SKILL_SCHEMA: JSONSchema = {
+  type: "object",
+  required: ["skill"],
+  additionalProperties: false,
+  properties: {
+    skill: {
+      type: "string",
+      minLength: 1,
+      description: "Skill name from the catalog.",
+    },
+    path: {
+      type: "string",
+      minLength: 1,
+      description:
+        "Relative path to a bundled file inside the skill folder. Omit to " +
+        "activate the skill (returns its instructions and resource listing).",
+    },
+  },
+};
+
+class ReadSkillTool implements Tool {
+  readonly name = READ_SKILL;
+  readonly description =
+    "Activate an Agent Skill or read its bundled files. Call with just " +
+    "`skill` to load a skill's full instructions plus a listing of its " +
+    "bundled resources; pass `path` to read one of those files. Skill " +
+    "names are in the skills catalog.";
+  readonly inputSchema = READ_SKILL_SCHEMA;
+
+  constructor(private readonly skills: () => Promise<Skill[]>) {}
+
+  async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {
+    const { skill: name, path: relPath } = input as {
+      skill?: string;
+      path?: string;
+    };
+    if (!name) {
+      return { content: "read_skill: 'skill' is required", isError: true };
+    }
+    const skills = await this.skills();
+    const usable = skills.filter(
+      (s) => disqualificationFor(s, ctx.agent) === null,
+    );
+    const skill = usable.find((s) => s.frontmatter.name === name);
+    if (!skill) {
+      const known = usable.map((s) => s.frontmatter.name).join(", ");
+      return {
+        content: `read_skill: unknown skill '${name}'. Available: ${known || "(none)"}`,
+        isError: true,
+      };
+    }
+    if (relPath === undefined) {
+      return { content: await renderActivation(skill) };
+    }
+    return await readBundledFile(skill, relPath);
+  }
+}
+
+// Structured wrapping per the Agent Skills client guide: instructions
+// tagged with the skill identity, the directory for resolving relative
+// references, and a resource listing that is never eagerly loaded.
+async function renderActivation(skill: Skill): Promise<string> {
+  const lines: string[] = [];
+  lines.push(
+    `<skill name="${skill.frontmatter.name}" directory="${skill.rootDir}">`,
+  );
+  lines.push(skill.body.trim());
+  lines.push("</skill>");
+  lines.push("");
+  lines.push(
+    "Relative paths in these instructions resolve against the skill " +
+      "directory. Read bundled files with read_skill " +
+      `{ "skill": "${skill.frontmatter.name}", "path": "<relative path>" }.`,
+  );
+  const resources = await listResources(skill.rootDir);
+  if (resources.length > 0) {
+    lines.push("");
+    lines.push("Bundled resources:");
+    lines.push(...resources);
+  }
+  return lines.join("\n");
+}
+
+async function listResources(rootDir: string): Promise<string[]> {
+  const out: string[] = [];
+  let truncated = false;
+  const walkDir = async (dir: string, rel: string): Promise<void> => {
+    if (out.length > RESOURCE_LISTING_CAP) {
+      truncated = true;
+      return;
+    }
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        await walkDir(path.join(dir, entry.name), relPath);
+      } else if (entry.isFile()) {
+        if (relPath === "SKILL.md") continue;
+        out.push(relPath);
+        if (out.length > RESOURCE_LISTING_CAP) {
+          truncated = true;
+          return;
+        }
+      }
+    }
+  };
+  await walkDir(rootDir, "");
+  const listing = out.slice(0, RESOURCE_LISTING_CAP);
+  if (truncated || out.length > RESOURCE_LISTING_CAP) {
+    listing.push("(listing truncated)");
+  }
+  return listing;
+}
+
+// This tool runs as session code: no grant check, no OS sandbox. It must
+// self-police containment — realpath both sides so symlinks can't escape
+// the skill directory.
+async function readBundledFile(
+  skill: Skill,
+  relPath: string,
+): Promise<ToolResult> {
+  if (path.isAbsolute(relPath)) {
+    return {
+      content: `read_skill: 'path' must be relative to the skill directory`,
+      isError: true,
+    };
+  }
+  const target = path.resolve(skill.rootDir, relPath);
+  let realRoot: string;
+  let realTarget: string;
+  try {
+    realRoot = await fs.realpath(skill.rootDir);
+    realTarget = await fs.realpath(target);
+  } catch {
+    return {
+      content: `read_skill: '${relPath}' not found in skill '${skill.frontmatter.name}'`,
+      isError: true,
+    };
+  }
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+    return {
+      content: `read_skill: '${relPath}' is outside the skill directory`,
+      isError: true,
+    };
+  }
+  try {
+    return { content: await fs.readFile(realTarget, "utf8") };
+  } catch (e) {
+    return {
+      content: `read_skill: ${(e as Error).message}`,
+      isError: true,
+    };
   }
 }
 
@@ -160,8 +338,9 @@ async function loadSkill(dir: string): Promise<Skill> {
     throw new Error(`SKILL.md has no YAML frontmatter: ${skillMdPath}`);
   }
   const frontmatter = parseFrontmatter(match[1] ?? "");
+  const body = text.slice(match[0].length);
   const group = await compileToolGroup(dir, frontmatter);
-  return { skillMdPath, rootDir: dir, frontmatter, group };
+  return { skillMdPath, rootDir: dir, frontmatter, body, group };
 }
 
 // Precedence: `loom.toml` sidecar (enhances a skill you didn't author), then
@@ -212,11 +391,11 @@ async function compileToolGroup(
     return buildGroup(label, rawTools, rawProviders);
   }
 
+  // No declarations: activation and bundled reads go through read_skill,
+  // so the skill requests no authority at all.
   return {
     label,
-    tools: {
-      read_file: { capabilities: { paths: [dir] } },
-    },
+    tools: { [READ_SKILL]: {} },
   };
 }
 
@@ -313,11 +492,11 @@ function renderCatalog(
   const home = os.homedir();
   const lines: string[] = [];
   lines.push(
-    "Agent Skills are available. Each is a folder containing SKILL.md " +
-      "(metadata + instructions) plus optional scripts/, references/, " +
-      "and assets/. To activate a skill, read its SKILL.md with the " +
-      "file tool; load referenced files only as needed. Tools a skill " +
-      "provides are already in your tool list.",
+    "Agent Skills are available. Activate one with the read_skill tool " +
+      "(pass the skill name) when a task matches its description; it " +
+      "returns the skill's instructions and a listing of bundled files, " +
+      "which you read with read_skill's `path` argument — load them only " +
+      "as needed. Tools a skill provides are already in your tool list.",
   );
   lines.push("");
   for (const skill of skills) {

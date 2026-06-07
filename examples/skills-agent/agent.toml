@@ -3,7 +3,8 @@
 # Companion: the sibling `skills/` directory ships four skills, each
 # demonstrating one tier of the model:
 #
-#   release-notes/   no declarations → derived read-only group over its dir
+#   release-notes/   no declarations → authority-free; activation and
+#                    bundled reads go through the read_skill tool
 #   dns-lookup/      frontmatter `loom.tools` → adds a bash ROW (dig gets
 #                    network; everything else stays network-dark)
 #   json-wrangler/   loom.toml sidecar → declares a NEW renamed instance
@@ -57,8 +58,9 @@ edit_file = "builtin"
 # [tools] entries above — root declarations are self-authorizing.)
 #
 # Absent this section entirely, the conservative default ceiling applies
-# (the four FS/bash tools over cwd, no network, read access to skills
-# roots). Loom never fails open — wildcards are always spelled.
+# (the four FS/bash tools over cwd, no network). Skill activation needs no
+# read grants at all — that's read_skill's job. Loom never fails open;
+# wildcards are always spelled.
 [capabilities]
 # Row sets are unions of boxes, not bounding boxes: bash picks exactly ONE
 # row per invocation. Row 2 is the acceptance line for the dns-lookup
@@ -72,10 +74,10 @@ bash = [
   { commands = ["dig"], network = "*" },
 ]
 
-# `./skills` makes the catalog readable (SKILL.md activation is just a
-# read). The dns-lookup and json-wrangler skills' own read declarations
-# are contained by this entry — no per-skill lines needed for reads.
-read_file = { paths = ["./", "./skills"] }
+# Skill activation and bundled-file reads go through the read_skill tool
+# the skills layer contributes — no skills paths needed here. read_file is
+# purely for the agent's working directory.
+read_file = { paths = ["./"] }
 edit_file = { paths = ["./"] }
 
 # Instance-name acceptance for the json-wrangler skill's renamed instance:

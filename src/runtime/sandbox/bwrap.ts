@@ -91,7 +91,15 @@ export function validateBashGrantLinux(grant: SingleRowGrant): void {
   }
 }
 
-export async function buildBwrapArgs(grant: SingleRowGrant): Promise<string[]> {
+export interface BrokerAccess {
+  socketPath: string;
+  readDirs: string[];
+}
+
+export async function buildBwrapArgs(
+  grant: SingleRowGrant,
+  broker?: BrokerAccess,
+): Promise<string[]> {
   if (grant === "*") {
     throw new Error(
       'buildBwrapArgs: "*" grant means no sandbox; check sandboxEngaged() first',
@@ -145,6 +153,15 @@ export async function buildBwrapArgs(grant: SingleRowGrant): Promise<string[]> {
     args.push("--ro-bind-try", "/run/resolvconf", "/run/resolvconf");
   }
 
+  if (broker) {
+    for (const dir of broker.readDirs) {
+      args.push("--ro-bind-try", dir, dir);
+    }
+    // Unix sockets ignore the network namespace, so a bind suffices even
+    // when this row is network-dark.
+    args.push("--bind-try", broker.socketPath, broker.socketPath);
+  }
+
   // --unshare-pid breaks bash builtins like `wait`, so it is omitted.
   args.push("--unshare-uts");
   args.push("--unshare-ipc");
@@ -156,11 +173,12 @@ export async function buildBwrapArgs(grant: SingleRowGrant): Promise<string[]> {
 
 export async function maybeBwrapPrefix(
   grant: SingleRowGrant,
+  broker?: BrokerAccess,
 ): Promise<{ binary: string; prefixArgs: string[] } | null> {
   if (grant === "*") return null;
   const bwrap = await findBwrap();
   if (!bwrap) return null;
-  const prefixArgs = await buildBwrapArgs(grant);
+  const prefixArgs = await buildBwrapArgs(grant, broker);
   prefixArgs.push("--");
   return { binary: bwrap, prefixArgs };
 }

@@ -95,16 +95,18 @@ describe("parseFrontmatter", () => {
 });
 
 describe("tool group compilation", () => {
-  it("derives a read-only declaration over the skill dir when nothing is declared", async () => {
-    const dir = await writeSkill("plain", "name: plain\ndescription: Docs.");
+  it("contributes read_skill first, then an authority-free group per plain skill", async () => {
+    await writeSkill("plain", "name: plain\ndescription: Docs.");
     const session = new SkillsSession({ roots: [tmp()], purpose: "run" });
     const groups = await session.tools();
     expect(groups).toEqual([
       {
+        label: "skills session",
+        tools: { read_skill: { provider: "session" } },
+      },
+      {
         label: "skill 'plain'",
-        tools: {
-          read_file: { capabilities: { paths: [dir] } },
-        },
+        tools: { read_skill: {} },
       },
     ]);
   });
@@ -123,7 +125,7 @@ describe("tool group compilation", () => {
     );
     const session = new SkillsSession({ roots: [tmp()], purpose: "run" });
     const groups = await session.tools();
-    expect(groups).toEqual([
+    expect(groups.slice(1)).toEqual([
       {
         label: "skill 'calendar'",
         tools: {
@@ -154,7 +156,7 @@ describe("tool group compilation", () => {
     );
     const session = new SkillsSession({ roots: [tmp()], purpose: "run" });
     const groups = await session.tools();
-    expect(groups).toEqual([
+    expect(groups.slice(1)).toEqual([
       {
         label: "skill 'enhanced'",
         tools: {
@@ -190,7 +192,10 @@ describe("tool group compilation", () => {
     await writeSkill("good", "name: good\ndescription: Works.");
     const session = new SkillsSession({ roots: [tmp()], purpose: "run" });
     const groups = await session.tools();
-    expect(groups.map((f) => f.label)).toEqual(["skill 'good'"]);
+    expect(groups.map((f) => f.label)).toEqual([
+      "skills session",
+      "skill 'good'",
+    ]);
   });
 });
 
@@ -415,6 +420,13 @@ describe("skills via runAgent", () => {
       const verdicts = agent.toolVerdicts ?? [];
       expect(verdicts).toEqual([
         {
+          label: "skills session",
+          accepted: true,
+          declarations: [
+            { instance: "read_skill", underlying: "read_skill", ok: true },
+          ],
+        },
+        {
           label: "skill 'calendar'",
           accepted: true,
           declarations: [
@@ -509,10 +521,9 @@ describe("skills via runAgent", () => {
     };
     const agent = await runAgent(manifest);
     try {
-      const verdicts = agent.toolVerdicts ?? [];
-      expect(verdicts).toHaveLength(1);
-      const verdict = verdicts[0]!;
-      expect(verdict.label).toBe("skill 'greedy'");
+      const verdict = (agent.toolVerdicts ?? []).find(
+        (v) => v.label === "skill 'greedy'",
+      )!;
       expect(verdict.accepted).toBe(false);
       const declaration = verdict.declarations[0]!;
       expect(declaration.ok).toBe(false);
@@ -591,10 +602,202 @@ describe("skills via runAgent", () => {
       );
       expect(byLabel.get("skill 'reader'")?.accepted).toBe(true);
       expect(byLabel.get("skill 'networker'")?.accepted).toBe(false);
+      // Skill reads go through read_skill; the default ceiling no longer
+      // widens read_file with the skills roots.
       const readFile = agent.agentState.toolTable
         .list()
         .find((t) => t.name === "read_file");
-      expect(readFile?.description).toContain(tmp());
+      expect(readFile?.description).not.toContain(tmp());
+      const names = agent.agentState.toolTable.list().map((t) => t.name);
+      expect(names).toContain("read_skill");
+    } finally {
+      await agent.close();
+    }
+  });
+});
+
+describe("read_skill", () => {
+  async function bootAgent(): Promise<Awaited<ReturnType<typeof runAgent>>> {
+    const manifest: AgentManifest = {
+      name: "read-skill-e2e",
+      systemPrompt: "x",
+      session: [{ provider: "skills", root: tmp() }, { provider: "in-memory" }],
+      harness: stopHarness,
+    };
+    return runAgent(manifest);
+  }
+
+  it("activation returns wrapped instructions plus a resource listing", async () => {
+    const dir = await writeSkill(
+      "notes",
+      "name: notes\ndescription: Note style.",
+      "# Notes\n\nKeep them short.\n",
+    );
+    await fs.mkdir(path.join(dir, "references"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "references", "style.md"),
+      "terse\n",
+      "utf8",
+    );
+    const agent = await bootAgent();
+    try {
+      const result = await agent.agentState.toolTable.execute({
+        id: "t1",
+        name: "read_skill",
+        input: { skill: "notes" },
+      });
+      expect(result.isError).toBeUndefined();
+      expect(result.content).toContain(
+        `<skill name="notes" directory="${dir}">`,
+      );
+      expect(result.content).toContain("Keep them short.");
+      expect(result.content).toContain("</skill>");
+      expect(result.content).toContain("Bundled resources:");
+      expect(result.content).toContain("references/style.md");
+      expect(result.content).not.toContain("terse");
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("reads bundled files by relative path and refuses traversal", async () => {
+    const dir = await writeSkill("notes", "name: notes\ndescription: Docs.");
+    await fs.mkdir(path.join(dir, "references"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "references", "style.md"),
+      "terse\n",
+      "utf8",
+    );
+    await fs.symlink("/etc/hosts", path.join(dir, "escape"));
+    const agent = await bootAgent();
+    try {
+      const ok = await agent.agentState.toolTable.execute({
+        id: "t1",
+        name: "read_skill",
+        input: { skill: "notes", path: "references/style.md" },
+      });
+      expect(ok.isError).toBeUndefined();
+      expect(ok.content).toBe("terse\n");
+
+      const dotdot = await agent.agentState.toolTable.execute({
+        id: "t2",
+        name: "read_skill",
+        input: { skill: "notes", path: "../other/SKILL.md" },
+      });
+      expect(dotdot.isError).toBe(true);
+
+      const absolute = await agent.agentState.toolTable.execute({
+        id: "t3",
+        name: "read_skill",
+        input: { skill: "notes", path: "/etc/hosts" },
+      });
+      expect(absolute.isError).toBe(true);
+      expect(absolute.content).toContain("must be relative");
+
+      const symlinked = await agent.agentState.toolTable.execute({
+        id: "t4",
+        name: "read_skill",
+        input: { skill: "notes", path: "escape" },
+      });
+      expect(symlinked.isError).toBe(true);
+      expect(symlinked.content).toContain("outside the skill directory");
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("trimmed skills are not readable through read_skill", async () => {
+    await writeSkill("plain", "name: plain\ndescription: Docs.");
+    await writeSkill(
+      "greedy",
+      [
+        "name: greedy",
+        "description: Wants the network.",
+        "metadata:",
+        "  loom.tools: |",
+        '    bash = { capabilities = { commands = "*", network = "*" } }',
+      ].join("\n"),
+    );
+    const agent = await bootAgent();
+    try {
+      const result = await agent.agentState.toolTable.execute({
+        id: "t1",
+        name: "read_skill",
+        input: { skill: "greedy" },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("unknown skill 'greedy'");
+      expect(result.content).toContain("plain");
+    } finally {
+      await agent.close();
+    }
+  });
+});
+
+describe("spawn-time subagent ceiling", () => {
+  it("refuses to spawn a child whose effective ceiling exceeds the parent's", async () => {
+    const child: AgentManifest = {
+      name: "greedy-child",
+      systemPrompt: "x",
+      tools: { bash: "builtin" },
+      capabilities: { bash: { commands: "*", network: "*" } },
+      harness: stopHarness,
+      session: { provider: "in-memory" },
+    };
+    const manifest: AgentManifest = {
+      name: "strict-parent",
+      systemPrompt: "x",
+      tools: { spawn_subagent: "builtin" },
+      capabilities: {
+        spawn_subagent: { manifest: child as unknown as Record<string, unknown> },
+        bash: { commands: "*", paths: ["./"] },
+      },
+      session: { provider: "in-memory" },
+      harness: stopHarness,
+    };
+    const agent = await runAgent(manifest);
+    try {
+      const result = await agent.agentState.toolTable.execute({
+        id: "t1",
+        name: "spawn_subagent",
+        input: { prompt: "hi" },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("exceeds the parent's");
+      expect(result.content).toContain("'bash'");
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("spawns a child whose ceiling fits", async () => {
+    const child: AgentManifest = {
+      name: "modest-child",
+      systemPrompt: "x",
+      tools: { bash: "builtin" },
+      capabilities: { bash: { commands: "*", paths: ["./"] } },
+      harness: stopHarness,
+      session: { provider: "in-memory" },
+    };
+    const manifest: AgentManifest = {
+      name: "permissive-parent",
+      systemPrompt: "x",
+      tools: { spawn_subagent: "builtin" },
+      capabilities: {
+        spawn_subagent: { manifest: child as unknown as Record<string, unknown> },
+        bash: { commands: "*", paths: ["./"] },
+      },
+      session: { provider: "in-memory" },
+      harness: stopHarness,
+    };
+    const agent = await runAgent(manifest);
+    try {
+      const result = await agent.agentState.toolTable.execute({
+        id: "t1",
+        name: "spawn_subagent",
+        input: { prompt: "hi" },
+      });
+      expect(result.isError).toBeUndefined();
     } finally {
       await agent.close();
     }
@@ -718,15 +921,17 @@ describe("auditAgent + skills session", () => {
     const tree = await auditAgent(manifest);
     expect(tree.toolGroups).toEqual([
       {
+        label: "skills session",
+        accepted: true,
+        declarations: [
+          { instance: "read_skill", underlying: "read_skill", ok: true },
+        ],
+      },
+      {
         label: "skill 'ops'",
         accepted: true,
         declarations: [
-          {
-            instance: "read_file",
-            underlying: "read_file",
-            ok: true,
-            against: "read_file",
-          },
+          { instance: "read_skill", underlying: "read_skill", ok: true },
         ],
       },
     ]);

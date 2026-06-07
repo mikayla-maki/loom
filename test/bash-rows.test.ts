@@ -2,7 +2,10 @@ import { describe, expect, it, beforeAll, beforeEach, afterEach } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { BashTool, tokenizeSimpleCommand } from "../src/runtime/builtins/bash.js";
+import {
+  BashTool,
+  tokenizeSimpleCommand,
+} from "../src/runtime/builtins/bash.js";
 import { hasSandboxExec } from "../src/runtime/sandbox/sandbox-exec.js";
 import { hasBwrap } from "../src/runtime/sandbox/bwrap.js";
 import type { CapabilityGrant, CapabilitySet } from "../src/types/manifest.js";
@@ -171,10 +174,7 @@ describe("bash rows: dispatch", () => {
       { commands: ["echo"], paths: "*", env: "*" },
       { commands: ["true"], paths: "*", env: "*" },
     ]);
-    const r = await tool.execute(
-      { command: `echo 'a b' "c d" e` },
-      makeCtx(),
-    );
+    const r = await tool.execute({ command: `echo 'a b' "c d" e` }, makeCtx());
     expect(r.isError).toBeFalsy();
     expect((r.content as string).trim()).toBe("a b c d e");
   });
@@ -222,7 +222,9 @@ describe("bash rows: dispatch", () => {
     ]);
     const r = await tool.execute({ command: "rm -rf ./x" }, makeCtx());
     expect(r.isError).toBe(true);
-    expect(r.content).toContain("only allows direct invocation of: true, gcalcli");
+    expect(r.content).toContain(
+      "only allows direct invocation of: true, gcalcli",
+    );
   });
 });
 
@@ -418,8 +420,8 @@ describe("bash rows: description and schema", () => {
       "Run a bash command in a sandboxed environment.",
     );
     expect(tool.description).toContain(
-      "Additionally, these commands may be invoked directly " +
-        "(plain `cmd args...` form only) with their own grants: " +
+      "These commands carry their own grants wherever they run — " +
+        "on their own, in a pipeline, or invoked from a script: " +
         "`gcalcli` (network access; filesystem: ~/.gcalcli).",
     );
   });
@@ -466,15 +468,18 @@ describe("bash rows: single-grant back-compat", () => {
     expect(wrapped.inputSchema).toEqual(bare.inputSchema);
   });
 
-  dit("shell mode still evaluates shell syntax under a single grant", async () => {
-    const tool = new BashTool(
-      {},
-      { commands: "*", paths: "*", network: "*", env: "*" },
-    );
-    const r = await tool.execute({ command: "echo $((1+1))" }, makeCtx());
-    expect(r.isError).toBeFalsy();
-    expect((r.content as string).trim()).toBe("2");
-  });
+  dit(
+    "shell mode still evaluates shell syntax under a single grant",
+    async () => {
+      const tool = new BashTool(
+        {},
+        { commands: "*", paths: "*", network: "*", env: "*" },
+      );
+      const r = await tool.execute({ command: "echo $((1+1))" }, makeCtx());
+      expect(r.isError).toBeFalsy();
+      expect((r.content as string).trim()).toBe("2");
+    },
+  );
 });
 
 describe("bash rows: audit", () => {
@@ -484,9 +489,9 @@ describe("bash rows: audit", () => {
       { commands: ["gcalcli"], network: "*", paths: ["~/.gcalcli"] },
     ]);
     const findings = await tool.audit();
-    expect(
-      findings.some((f) => f.message.includes('capabilities = "*"')),
-    ).toBe(false);
+    expect(findings.some((f) => f.message.includes('capabilities = "*"'))).toBe(
+      false,
+    );
   });
 
   it("env = '*' in any row triggers the env warning", async () => {

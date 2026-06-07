@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { expandHome } from "../../internal/util.js";
@@ -36,6 +37,7 @@ import {
   sandboxEngaged,
   validateBashGrant,
 } from "../sandbox/sandbox-exec.js";
+import { setupCommandBroker, type CommandBroker } from "../sandbox/broker.js";
 import { describePaths, paths, resolvedPaths } from "./_path.js";
 
 export const ALWAYS_INHERITED_ENV = [
@@ -313,6 +315,12 @@ export class BashTool implements Tool {
     ctx: ToolContext,
   ): Promise<ToolResult> {
     const rows = this.rows ?? [];
+    // Fast path: a plain `cmd args` invocation of a per-command row's command
+    // runs directly under that row — no shell. When a general row exists the
+    // broker (below) would reach the same command with the same grant, so
+    // this is purely an optimization that skips standing up the broker. When
+    // there is NO general row it is also the only way to run the command at
+    // all: with no shell, there is nothing for the broker to live inside.
     const argv = tokenizeSimpleCommand(input.command ?? "");
     const program = argv === null ? undefined : argv[0];
     if (argv !== null && program !== undefined) {
@@ -334,7 +342,25 @@ export class BashTool implements Tool {
       }
     }
     if (this.generalRow) {
-      return this.run(buildShellDispatch(input), this.generalRow, ctx);
+      // Per-command rows reachable from inside the general shell: a brokered
+      // shim runs each in its own row sandbox, so `dig … | jq` and
+      // interpreter-laundered calls get their grant too — not just plain
+      // top-level invocations.
+      const specificRows = rows.filter((r) => Array.isArray(r.commands));
+      const broker =
+        specificRows.length > 0 && sandboxEngaged(this.generalRow)
+          ? await setupCommandBroker(specificRows)
+          : null;
+      try {
+        return await this.run(
+          buildShellDispatch(input),
+          this.generalRow,
+          ctx,
+          broker,
+        );
+      } finally {
+        await broker?.close();
+      }
     }
     const direct = directCommandNames(rows);
     return {
@@ -349,16 +375,26 @@ export class BashTool implements Tool {
     dispatch: DispatchPlan,
     grant: "*" | CapabilityGrant,
     ctx: ToolContext,
+    broker?: CommandBroker | null,
   ): Promise<ToolResult> {
     const { childProgram, childArgs, cwd, timeout, displayLabel } = dispatch;
 
     const env = buildEnv(grant);
+    // Seed PWD with the canonical working directory. bash recomputes PWD via
+    // getcwd at startup when it can, but the sandbox can deny getcwd (the
+    // "shell-init" warning); without this the shell — and any broker shim it
+    // spawns — would fall back to the orchestrator's PWD and run in the wrong
+    // place. Canonical so `pwd` and the granted subpaths agree.
+    env.PWD = await canonicalizeCwd(cwd);
+    if (broker) {
+      env.PATH = broker.shimDir + path.delimiter + (env.PATH ?? "");
+    }
 
     let sandboxPrefix: { binary: string; prefixArgs: string[] } | null = null;
     if (process.platform === "darwin") {
-      sandboxPrefix = await maybeSandboxExecPrefix(grant);
+      sandboxPrefix = await maybeSandboxExecPrefix(grant, broker?.access);
     } else if (process.platform === "linux") {
-      sandboxPrefix = await maybeBwrapPrefix(grant);
+      sandboxPrefix = await maybeBwrapPrefix(grant, broker?.access);
     }
 
     let binary: string;
@@ -560,26 +596,37 @@ function isSensitiveEnvName(name: string): boolean {
   return name.startsWith("LOOM_") || name.endsWith("_API_KEY");
 }
 
-export function buildEnv(grant: CapabilitySet): NodeJS.ProcessEnv {
+// `base` is the environment the row's tier filters. It defaults to the host
+// process env (normal invocations); the broker passes the host env overlaid
+// with the shim's in-sandbox env, so both orchestrator-held and agent-set
+// variables a row grants reach the brokered command. The tier is the same
+// allowlist either way.
+export function buildEnv(
+  grant: CapabilitySet,
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
   // Wildcard grants are honored literally, secrets included; copy so callers
   // can't mutate the orchestrator's process.env. audit() names what's exposed.
-  if (grant === "*") return { ...process.env };
+  if (grant === "*") return { ...base };
   // execute() dispatches row sets one row at a time; a whole set falls back to
   // its first row.
   const row = Array.isArray(grant) ? (grant[0] ?? {}) : grant;
   const e = row.env;
-  if (e === "*") return { ...process.env };
+  if (e === "*") return { ...base };
   if (e === undefined) {
-    return pickEnv([...ALWAYS_INHERITED_ENV, ...DEFAULT_INHERITED_ENV]);
+    return pickEnv([...ALWAYS_INHERITED_ENV, ...DEFAULT_INHERITED_ENV], base);
   }
   if (Array.isArray(e)) {
     const requested = e.filter((n): n is string => typeof n === "string");
-    return pickEnv([...ALWAYS_INHERITED_ENV, ...requested]);
+    return pickEnv([...ALWAYS_INHERITED_ENV, ...requested], base);
   }
-  return pickEnv(ALWAYS_INHERITED_ENV);
+  return pickEnv(ALWAYS_INHERITED_ENV, base);
 }
 
-function pickEnv(names: readonly string[]): NodeJS.ProcessEnv {
+function pickEnv(
+  names: readonly string[],
+  base: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
   const exact: string[] = [];
   const prefixes: string[] = [];
   for (const n of names) {
@@ -591,11 +638,11 @@ function pickEnv(names: readonly string[]): NodeJS.ProcessEnv {
   }
   const out: NodeJS.ProcessEnv = {};
   for (const name of exact) {
-    const v = process.env[name];
+    const v = base[name];
     if (v !== undefined) out[name] = v;
   }
   if (prefixes.length > 0) {
-    for (const [name, v] of Object.entries(process.env)) {
+    for (const [name, v] of Object.entries(base)) {
       if (v === undefined) continue;
       if (prefixes.some((p) => name.startsWith(p))) out[name] = v;
     }
@@ -748,6 +795,15 @@ interface DispatchPlan {
   displayLabel: string;
 }
 
+async function canonicalizeCwd(cwd: string): Promise<string> {
+  const abs = path.resolve(cwd);
+  try {
+    return await fs.realpath(abs);
+  } catch {
+    return abs;
+  }
+}
+
 function buildShellDispatch(input: ShellInput): DispatchPlan {
   const cwd = input.cwd ?? process.cwd();
   const timeout = input.timeout_ms ?? 30_000;
@@ -816,8 +872,8 @@ function describeBash(
   const base = describeSingleGrant(generalRow, "shell", null);
   if (directRows.length === 0) return base;
   return (
-    `${base} Additionally, these commands may be invoked directly ` +
-    `(plain \`cmd args...\` form only) with their own grants: ${directSummary}.`
+    `${base} These commands carry their own grants wherever they run — ` +
+    `on their own, in a pipeline, or invoked from a script: ${directSummary}.`
   );
 }
 

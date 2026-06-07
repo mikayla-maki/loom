@@ -133,23 +133,12 @@ export function applyToolGroups(args: {
   const { manifestTools, capabilities, groups, toolFor } = args;
 
   const instances = new Map<string, InstanceState>();
-  const ceiling: Capabilities = { ...capabilities };
   for (const [name, entry] of Object.entries(manifestTools)) {
     const table: ToolEntryTable =
       typeof entry === "string" ? { provider: entry } : { ...entry };
     instances.set(name, { entry: table, origin: `[tools.${name}]` });
-    if (table.capabilities === undefined) continue;
-    const underlying = underlyingNameOfEntry(name, entry);
-    const existing = ceiling[name];
-    ceiling[name] =
-      existing === undefined
-        ? table.capabilities
-        : mergeWithTool(
-            toolFor?.(name, underlying),
-            existing,
-            table.capabilities,
-          );
   }
+  const ceiling = effectiveCeiling(capabilities, manifestTools, toolFor);
 
   const verdicts: ToolGroupVerdict[] = [];
   for (const group of groups) {
@@ -282,6 +271,32 @@ function entriesMatch(
 
 function referencesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+// The effective ceiling: `capabilities` unioned with the manifest's own
+// inline tool declarations (root declarations are self-authorizing).
+export function effectiveCeiling(
+  capabilities: Capabilities,
+  manifestTools: Record<string, ToolEntry>,
+  toolFor?: (instance: string, underlying: string) => Tool | undefined,
+): Capabilities {
+  const ceiling: Capabilities = { ...capabilities };
+  for (const [name, entry] of Object.entries(manifestTools)) {
+    if (typeof entry === "string" || entry.capabilities === undefined) {
+      continue;
+    }
+    const underlying = underlyingNameOfEntry(name, entry);
+    const existing = ceiling[name];
+    ceiling[name] =
+      existing === undefined
+        ? entry.capabilities
+        : mergeWithTool(
+            toolFor?.(name, underlying),
+            existing,
+            entry.capabilities,
+          );
+  }
+  return ceiling;
 }
 
 // Groups go through the same parser as the manifest; groups that fail to

@@ -4,19 +4,16 @@ description: Look up DNS records with dig. Use when the user asks what a
   domain resolves to, or wants to inspect A, AAAA, MX, TXT, or NS records.
 metadata:
   loom.tools: |
-    bash      = { capabilities = { commands = ["dig"], network = "*" } }
-    read_file = { capabilities = { paths = ["${SKILL_DIR}"] } }
+    bash = { capabilities = { commands = ["dig"], network = "*" } }
 ---
 
 # DNS lookup
 
-Use the `bash` tool to invoke `dig` as a plain command — no pipes,
-substitutions, or interpreters, or it loses its network grant and the
-query fails. Common invocations:
+Use the `bash` tool to invoke `dig`. Its network grant is bound to the
+`dig` command itself, so it holds even inside a pipeline — `dig +short
+example.com | sort` works. Common invocations:
 
 - Resolve a name: `dig +short example.com`
 - Specific record type: `dig +short example.com MX`
 - Trace delegation: `dig +trace example.com`
-
-Filter or reshape the output yourself after reading it; don't pipe dig
-into other commands.
+- Pipe into other commands: `dig +short example.com | tail -1`

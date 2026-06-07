@@ -84,7 +84,17 @@ export function validateBashGrant(grant: SingleRowGrant): void {
   }
 }
 
-export async function buildBashProfile(grant: SingleRowGrant): Promise<string> {
+// When the outer command may escalate into per-command rows, it needs to
+// reach the broker: read the shim dir and connect the (canonicalized) socket.
+export interface BrokerAccess {
+  socketPath: string;
+  readDirs: string[];
+}
+
+export async function buildBashProfile(
+  grant: SingleRowGrant,
+  broker?: BrokerAccess,
+): Promise<string> {
   if (grant === "*") {
     throw new Error(
       'buildBashProfile: "*" grant means no sandbox; check sandboxEngaged() first',
@@ -97,6 +107,10 @@ export async function buildBashProfile(grant: SingleRowGrant): Promise<string> {
     "(allow signal (target self))",
     "(allow sysctl-read)",
     "(allow mach-lookup)",
+    // Load-bearing for getcwd: a process must be able to stat its working
+    // directory (and the broker shim must read its own cwd to forward it).
+    // Without this, process.cwd()/`pwd` fail with EPERM in any granted dir
+    // whose parents aren't otherwise readable. Do not remove.
     "(allow file-read-metadata)",
     '(allow file-read* (literal "/"))',
     '(allow file-read* (subpath "/usr"))',
@@ -148,6 +162,17 @@ export async function buildBashProfile(grant: SingleRowGrant): Promise<string> {
     lines.push('(allow file-read* (subpath "/private/var/run"))');
   }
 
+  if (broker) {
+    for (const dir of broker.readDirs) {
+      const abs = await canonicalPath(dir);
+      lines.push(`(allow file-read* (subpath "${escapeSbpl(abs)}"))`);
+    }
+    // Unix-socket connect needs the network-outbound rule on the canonical
+    // path (the /tmp→/private/tmp symlink defeats a literal otherwise).
+    const sock = await canonicalPath(broker.socketPath);
+    lines.push(`(allow network-outbound (literal "${escapeSbpl(sock)}"))`);
+  }
+
   return lines.join("\n") + "\n";
 }
 
@@ -170,10 +195,11 @@ async function canonicalPath(p: string): Promise<string> {
 
 export async function maybeSandboxExecPrefix(
   grant: SingleRowGrant,
+  broker?: BrokerAccess,
 ): Promise<{ binary: string; prefixArgs: string[] } | null> {
   if (!sandboxEngaged(grant)) return null;
   if (!(await hasSandboxExec())) return null;
-  const profile = await buildBashProfile(grant);
+  const profile = await buildBashProfile(grant, broker);
   return {
     binary: SANDBOX_EXEC_PATH,
     prefixArgs: ["-p", profile, "--"],

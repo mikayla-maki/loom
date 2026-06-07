@@ -30,7 +30,7 @@ import {
   type ToolBinding,
 } from "../manifest/resolver.js";
 import { ceilingEntryFor, collectToolGroups } from "../manifest/tool-groups.js";
-import { planToolGroups } from "../manifest/ceiling.js";
+import { assertSubagentCeiling, planToolGroups } from "../manifest/ceiling.js";
 import {
   instantiateFromBinding,
   loadManifestProviders,
@@ -238,8 +238,6 @@ export async function runAgent(
   const groups = await collectToolGroups(session);
   const applied = planToolGroups({
     manifest,
-    manifestDir: baseDir,
-    sessionLayers: resolved.session,
     groups,
     agent: ownAgent,
   });
@@ -1124,6 +1122,7 @@ async function spawnSubagentInScope(
   } else {
     submanifest = nameOrManifest;
   }
+  assertSubagentCeiling(parent, submanifest, who);
   return runAgent(submanifest, { parent });
 }
 

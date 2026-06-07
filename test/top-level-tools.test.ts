@@ -98,15 +98,14 @@ describe("top-level [tools]", () => {
     );
     try {
       expect(toolNames(agent)).toEqual(["echo", "read_file"]);
-      const skillsRoot = path.join(os.homedir(), ".skills");
-      expect(agent.capabilities.read_file).toEqual({
-        paths: ["./", skillsRoot],
-      });
+      // Skill reads go through read_skill, so the default ceiling is just
+      // cwd — no ambient skills-root widening.
+      expect(agent.capabilities.read_file).toEqual({ paths: ["./"] });
       const rf = agent.agentState.toolTable
         .list()
         .find((t) => t.name === "read_file");
       expect(rf?.description).toBe(
-        `Read a UTF-8 file from disk (restricted to: ${path.resolve(".")}, ${skillsRoot}).`,
+        `Read a UTF-8 file from disk (restricted to: ${path.resolve(".")}).`,
       );
     } finally {
       await agent.close();
