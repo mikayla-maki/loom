@@ -178,6 +178,7 @@ export class BashTool implements Tool {
       this.allowedCommands = null;
       this.inputSchema = SHELL_SCHEMA;
       for (const row of rowSet) validateGrantRow(row);
+      validateDisjointCommands(rowSet);
     } else {
       const single: "*" | CapabilityGrant =
         rowSet === "*" ? "*" : (rowSet[0] ?? {});
@@ -224,6 +225,48 @@ export class BashTool implements Tool {
 
   mergeGrants(a: CapabilitySet, b: CapabilitySet): CapabilitySet {
     return defaultMerge(a, b);
+  }
+
+  // Valid-grant generator for the capability-algebra conformance checker
+  // (audit/tests only). Spans bash's full, complex value space so the laws
+  // are exercised across every corner:
+  //   commands : "*" (all) | a non-empty command enum
+  //   network  : "*" (on)  | [] (off) | absent (off)
+  //   paths    : "*"       | dirs incl. nested prefixes (./ ⊃ ./src ⊃ …)
+  //   env      : "*"       | a var allowlist | absent
+  //   shape    : "*" | {} | a single row | a row set (1–4 rows)
+  sampleGrant(random: () => number): CapabilitySet {
+    const pick = <T>(xs: readonly T[]): T =>
+      xs[Math.floor(random() * xs.length)] as T;
+    const subset = <T>(xs: readonly T[]): T[] => {
+      const out = xs.filter(() => random() < 0.5);
+      return out.length > 0 ? out : [pick(xs)]; // keep allowlists non-empty
+    };
+    const commands = (): CapabilityValue =>
+      random() < 0.4
+        ? "*"
+        : subset(["cat", "gcalcli", "git", "dig", "jq", "curl"]);
+    const network = (): CapabilityValue => (random() < 0.5 ? "*" : []);
+    const paths = (): CapabilityValue =>
+      random() < 0.35
+        ? "*"
+        : subset(["./", "./src", "./src/deep", "~/.config", "/tmp"]);
+    const env = (): CapabilityValue =>
+      random() < 0.35 ? "*" : subset(["PATH", "HOME", "FOO", "BAR"]);
+    const row = (): CapabilityGrant => {
+      const r: CapabilityGrant = {};
+      if (random() < 0.85) r.commands = commands();
+      if (random() < 0.6) r.paths = paths();
+      if (random() < 0.55) r.network = network();
+      if (random() < 0.4) r.env = env();
+      return r;
+    };
+    const shape = random();
+    if (shape < 0.1) return "*";
+    if (shape < 0.18) return {};
+    if (shape < 0.55) return row();
+    const n = 1 + Math.floor(random() * 4);
+    return Array.from({ length: n }, row);
   }
 
   async audit(): Promise<AuditFinding[]> {
@@ -664,6 +707,33 @@ function validateGrantRow(row: "*" | CapabilityGrant): void {
   } else if (process.platform === "linux") {
     validateBashGrantLinux(row);
   }
+}
+
+// Dispatch is a piecewise function: a command runs under its specific
+// (array `commands`) row, or the general `commands = "*"` row as a fallback.
+// The `"*"` row never competes for a named command, but two specific rows
+// that share a command have no well-defined winner — "most specific" is
+// undefined for overlapping non-nested allowlists. Rather than silently pick
+// by list order, require the specific rows to be disjoint so every command
+// has exactly one home.
+function validateDisjointCommands(rows: readonly CapabilityGrant[]): void {
+  const claimedBy = new Map<string, number>();
+  rows.forEach((row, index) => {
+    if (!Array.isArray(row.commands)) return;
+    for (const command of row.commands) {
+      if (typeof command !== "string") continue;
+      const prior = claimedBy.get(command);
+      if (prior !== undefined && prior !== index) {
+        throw new Error(
+          `bash: command '${command}' is claimed by more than one capability ` +
+            `row (rows ${prior} and ${index}). A command may belong to at most ` +
+            `one row so its sandbox is unambiguous — split overlapping ` +
+            `allowlists into disjoint rows.`,
+        );
+      }
+      claimedBy.set(command, index);
+    }
+  });
 }
 
 function directCommandNames(rows: readonly CapabilityGrant[]): string[] {

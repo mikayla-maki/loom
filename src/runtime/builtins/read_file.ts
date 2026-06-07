@@ -19,6 +19,7 @@ import {
   pathGrantContains,
   paths,
   resolvedPaths,
+  samplePathGrant,
 } from "./_path.js";
 
 const SCHEMA: JSONSchema = {
@@ -59,6 +60,10 @@ export class ReadFileTool implements Tool {
     subset: CapabilitySet,
   ): boolean {
     return pathGrantContains(superset, subset);
+  }
+
+  sampleGrant(random: () => number): CapabilitySet {
+    return samplePathGrant(random);
   }
 
   async execute(input: unknown, ctx: ToolContext): Promise<ToolResult> {

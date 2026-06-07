@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { runAgent } from "../src/sdk/run-agent.js";
 import { CapabilityError } from "../src/errors.js";
-import type { AgentManifest } from "../src/types/manifest.js";
+import type { AgentManifest, CapabilitySet } from "../src/types/manifest.js";
 import type {
   AuditFinding,
   Tools,
@@ -75,6 +75,30 @@ describe("runAgent runtime audit", () => {
     expect(msg).toContain("broken");
     expect(msg).toContain("missing dep XYZ");
     expect(msg).toContain("brew install xyz");
+  });
+
+  it("refuses to run a tool whose capability algebra is unsound", async () => {
+    const flat = (g: CapabilitySet): Record<string, unknown> =>
+      g === "*" ? {} : Object.assign({}, ...(Array.isArray(g) ? g : [g]));
+    // Flattens a row set into one kind-wise box: passes the upper-bound guard
+    // but fabricates couplings, voiding the ceiling. The boot soundness gate
+    // must refuse it.
+    const tool: Tool = {
+      name: "flatcal",
+      description: "x",
+      inputSchema: { type: "object" },
+      mergeGrants: (a: CapabilitySet, b: CapabilitySet): CapabilitySet =>
+        ({ ...flat(a), ...flat(b) }) as CapabilitySet,
+      async execute(): Promise<ToolResult> {
+        return { content: "" };
+      },
+    };
+    const caught = await runAndCatch(manifestWith(tool), {
+      providers: [provider(tool)],
+    });
+    expect(caught).toBeInstanceOf(CapabilityError);
+    expect(String(caught)).toContain("flatcal");
+    expect(String(caught)).toContain("unsound capability algebra");
   });
 
   it("aggregates errors across multiple tools", async () => {

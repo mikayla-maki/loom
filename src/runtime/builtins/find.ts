@@ -18,6 +18,7 @@ import {
   pathGrantContains,
   paths,
   resolvedPaths,
+  samplePathGrant,
 } from "./_path.js";
 
 const SCHEMA: JSONSchema = {
@@ -69,6 +70,10 @@ export class FindTool implements Tool {
     subset: CapabilitySet,
   ): boolean {
     return pathGrantContains(superset, subset);
+  }
+
+  sampleGrant(random: () => number): CapabilitySet {
+    return samplePathGrant(random);
   }
 
   async execute(input: unknown, _ctx: ToolContext): Promise<ToolResult> {

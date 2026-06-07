@@ -54,6 +54,9 @@ function renameTool(tool: Tool, instanceName: string): Tool {
   if (tool.mergeGrants) {
     renamed.mergeGrants = tool.mergeGrants.bind(tool);
   }
+  if (tool.sampleGrant) {
+    renamed.sampleGrant = tool.sampleGrant.bind(tool);
+  }
   if (tool.audit) {
     renamed.audit = tool.audit.bind(tool);
   }

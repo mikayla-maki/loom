@@ -226,6 +226,31 @@ describe("bash rows: dispatch", () => {
       "only allows direct invocation of: true, gcalcli",
     );
   });
+
+  // A command in two specific rows has no well-defined sandbox, so the
+  // overlap is rejected at construction rather than silently resolved by
+  // list order.
+  it("rejects a command claimed by two specific rows", () => {
+    expect(
+      () =>
+        new BashTool({}, [
+          { commands: "*", paths: ["./"] },
+          { commands: ["gcalcli", "git"], network: "*" },
+          { commands: ["git", "curl"], paths: ["./x"] },
+        ]),
+    ).toThrow(/'git' is claimed by more than one/);
+  });
+
+  it("accepts disjoint specific rows alongside the general row", () => {
+    expect(
+      () =>
+        new BashTool({}, [
+          { commands: "*", paths: ["./"] },
+          { commands: ["gcalcli"], network: "*" },
+          { commands: ["git"], paths: ["./repo"] },
+        ]),
+    ).not.toThrow();
+  });
 });
 
 describe("bash rows: containsGrant", () => {
@@ -363,6 +388,32 @@ describe("bash rows: containsGrant", () => {
       contains(supersetRows, { commands: ["x"], network: "*", paths: ["/a"] }),
     ).toBe(false);
     expect(contains(supersetRows, supersetRows)).toBe(true);
+  });
+
+  // SECURITY: skill admission. A skill is a *request* checked against the
+  // manifest's ceiling — it must never grant itself authority the human
+  // didn't write. The load-bearing case is the REFUSAL: the happy path
+  // (gcalcli wants the network it was granted) passes under both a correct
+  // per-command check AND a broken flattened one, so it proves nothing. Only
+  // the cross-command refusal distinguishes them: if a skill can ask for
+  // network on a *different* command and be admitted, the check has flattened
+  // the ceiling into "has network somewhere" and lost the command↔grant
+  // coupling that made it safe.
+  it("refuses a skill asking network for a command the manifest didn't grant it to", () => {
+    // Manifest: any command in ./ with no network, EXCEPT gcalcli gets network.
+    const ceiling: CapabilitySet = [
+      { commands: "*", paths: ["./"] },
+      { commands: ["gcalcli"], network: "*" },
+    ];
+    // The grant the human actually wrote — admitted.
+    expect(contains(ceiling, { commands: ["gcalcli"], network: "*" })).toBe(
+      true,
+    );
+    // A skill smuggling network onto a different command — refused, because
+    // no single ceiling row grants both `curl` and the network.
+    expect(contains(ceiling, { commands: ["curl"], network: "*" })).toBe(false);
+    // Even the catch-all command form can't borrow gcalcli's network.
+    expect(contains(ceiling, { commands: "*", network: "*" })).toBe(false);
   });
 });
 

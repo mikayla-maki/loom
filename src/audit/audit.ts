@@ -12,6 +12,10 @@ import {
 import { ceilingEntryFor, collectToolGroups } from "../manifest/tool-groups.js";
 import { planToolGroups } from "../manifest/ceiling.js";
 import {
+  checkGrantAlgebra,
+  customAlgebraWithoutSampler,
+} from "../manifest/algebra-conformance.js";
+import {
   findToolsFactory,
   getHarnessFactory,
   getSessionFactory,
@@ -772,6 +776,30 @@ async function auditAgentInner(
           message: `tool.audit() threw: ${(e as Error).message}`,
         });
       }
+    }
+    // Conformance-check the tool's capability algebra: an unsound
+    // containsGrant/mergeGrants voids the `[capabilities]` ceiling guarantee.
+    // Cheap (a few hundred trials) and silent unless a law is broken.
+    for (const v of checkGrantAlgebra(t, { maxViolations: 4 })) {
+      findings.push({
+        severity: "error",
+        message: `capability algebra unsound (${v.law}): ${v.message}`,
+        remediation:
+          "Fix the tool's containsGrant/mergeGrants so the grant lattice is " +
+          "well-formed; an unsound algebra voids the [capabilities] ceiling.",
+      });
+    }
+    if (customAlgebraWithoutSampler(t)) {
+      findings.push({
+        severity: "warning",
+        message:
+          "custom capability algebra (containsGrant/mergeGrants) is checked " +
+          "only with generic structural grants; domain-specific shapes go " +
+          "unexercised.",
+        remediation:
+          "Add a sampleGrant(random) that emits valid grants over this tool's " +
+          "real value domain so the conformance check can stress the algebra.",
+      });
     }
     let providerKey: string | undefined;
     let providerHandle: string | undefined;

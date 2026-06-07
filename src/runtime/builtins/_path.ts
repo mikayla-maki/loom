@@ -133,6 +133,30 @@ export function pathGrantContains(
   );
 }
 
+// Valid-grant generator shared by the path-based builtins for the capability
+// algebra conformance checker (audit/tests only). The generic structural
+// generator emits unrelated tokens that never share a prefix, so it can't
+// exercise the lexical containment in `pathValueContains` (e.g. `./` ⊃
+// `./src`). Drawing from a pool of nested prefixes makes those relationships
+// occur, stressing the real path algebra.
+export function samplePathGrant(random: () => number): CapabilitySet {
+  const dirs = ["./", "./src", "./src/deep", "~/.config", "/tmp", "/tmp/sub"];
+  const pick = (xs: readonly string[]): string =>
+    xs[Math.floor(random() * xs.length)] as string;
+  const subset = (xs: readonly string[]): string[] => {
+    const out = xs.filter(() => random() < 0.5);
+    return out.length > 0 ? out : [pick(xs)];
+  };
+  const row = (): CapabilityGrant =>
+    random() < 0.2 ? {} : { paths: random() < 0.3 ? "*" : subset(dirs) };
+  const shape = random();
+  if (shape < 0.12) return "*";
+  if (shape < 0.2) return {};
+  if (shape < 0.6) return row();
+  const n = 1 + Math.floor(random() * 3);
+  return Array.from({ length: n }, row);
+}
+
 function isEmptyGrant(grant: CapabilitySet): boolean {
   if (grant === "*") return false;
   const rows = grantRows(grant) as CapabilityGrant[];

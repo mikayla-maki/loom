@@ -133,7 +133,10 @@ Taken together, Loom's capability security model gives you leverage over the com
 
 Providers do everything interesting in Loom. Beyond implementing their own features, providers are responsible for accurately and honestly reporting what their dependencies are. If a harness or tool needs an API key, use your component's `secret` field to get it.
 
+IMPORTANT: A tool's `containsGrant` and `mergeGrants` methods define its _capability algebra_. Loom provides a simple default, but many tools will want to provide a custom implementation for their domain.  The soundness of these two methods rests on them forming a _lattice_, `containsGrant` a partial order and  `mergeGrants` its least upper bound. Loom cannot provide it's capability checks if these methods are incorrect. As such, Loom property-checks these two methods on every agent boot, and uses the `sampleGrant` method to generate random values that conform to your tool's grant schema. `loom audit` will highlight if this sample method isn't implemented. Loom will refuse to run if the property check does not pass.
+
 Tools and sessions can also define functional dependencies that are automatically included when those tools and sessions are used. For example, building an [RLM](https://arxiv.org/abs/2512.24601) agent on Loom requires your session to provide tools for the agent to configure the context window of its sub-agents. Similarly, a spawn-subagent tool might require its own configuration, such as its own system prompt and a subset of tools. Harnesses also provide their own tools, e.g. a `web_search` tool, but these tools are not automatically included in the agent's manifest.
+
 
 Subagents are a special case of functional dependencies. Generally, if your component wants to use an LLM for its features, it can use the harness directly. But if you want to spawn a small research subagent, for example, use the subagents field in your component's type. Loom will ensure that all of its dependencies (secrets, packages, etc.) are resolved and available to your tool. Simply use Loom's spawnSubagent method to create your subagent by name.
 

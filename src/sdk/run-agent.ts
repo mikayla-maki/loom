@@ -31,6 +31,7 @@ import {
 } from "../manifest/resolver.js";
 import { ceilingEntryFor, collectToolGroups } from "../manifest/tool-groups.js";
 import { assertSubagentCeiling, planToolGroups } from "../manifest/ceiling.js";
+import { checkGrantAlgebra } from "../manifest/algebra-conformance.js";
 import {
   instantiateFromBinding,
   loadManifestProviders,
@@ -316,6 +317,7 @@ export async function runAgent(
   assertKnownKinds(resolvedTools, effectiveCapabilities);
   assertRequires(resolvedTools, effectiveCapabilities);
   assertSecretAllowlist(resolvedTools, manifest.secrets);
+  assertGrantAlgebra(resolvedTools);
   if (!options.skipRuntimeAudit) {
     await runRuntimeAudit(resolvedTools, options.onAuditFinding);
   }
@@ -995,6 +997,30 @@ function buildToolTable(
       },
     },
   });
+}
+
+// A soundness gate, not an advisory audit: an unsound capability algebra
+// (containsGrant/mergeGrants not a well-formed lattice) voids the
+// `[capabilities]` ceiling guarantee, so we refuse to run. Deterministic and
+// cheap (a fixed-seed conformance pass per tool); builtins pass trivially.
+function assertGrantAlgebra(tools: Map<string, Tool>): void {
+  for (const [name, tool] of tools) {
+    const violations = checkGrantAlgebra(tool, {
+      samples: 40,
+      trials: 300,
+      maxViolations: 1,
+    });
+    const v = violations[0];
+    if (v) {
+      throw new CapabilityError(
+        `Tool '${name}' has an unsound capability algebra (${v.law}): ` +
+          `${v.message}. This voids the [capabilities] ceiling guarantee; ` +
+          `refusing to run.`,
+        {},
+        {},
+      );
+    }
+  }
 }
 
 async function runRuntimeAudit(

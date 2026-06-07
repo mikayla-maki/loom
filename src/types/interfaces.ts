@@ -125,6 +125,18 @@ export interface Tool extends ToolDescriptor {
    */
   mergeGrants?(a: CapabilitySet, b: CapabilitySet): CapabilitySet;
 
+  /**
+   * Optional: produce a random VALID grant for this tool, given a
+   * `random()` that returns a float in [0, 1). Used ONLY by the capability
+   * algebra conformance checker (`checkGrantAlgebra`) in audit/tests — never
+   * on a hot path. It lets the law checks run over the tool's real value
+   * domain (e.g. bash's `commands`/`network` shapes) instead of generic
+   * structural grants. Correctness here only affects test coverage, not
+   * runtime security, so it's safe to trust. Omit to use the generic
+   * generator.
+   */
+  sampleGrant?(random: () => number): CapabilitySet;
+
   secrets?: SecretNeeds;
 
   /** Read-only environment audit for `loom audit`. Must be side-effect-free. */

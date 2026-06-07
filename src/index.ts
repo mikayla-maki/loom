@@ -39,6 +39,13 @@ export {
 export { ceilingFor } from "./manifest/ceiling.js";
 
 export {
+  checkGrantAlgebra,
+  customAlgebraWithoutSampler,
+  type AlgebraViolation,
+  type AlgebraCheckOptions,
+} from "./manifest/algebra-conformance.js";
+
+export {
   registerHarness,
   registerSession,
   getHarnessFactory,
