@@ -111,7 +111,7 @@ Loom ships with a simple, no-frills CLI for debugging or interacting with an age
 - `$ loom run <agent.toml>` to run a simple client for interacting with the agent instantiated by the manifest
 - `$ loom audit <agent.toml>` to see the full list of every component that will be used to run a given agent.
 
-Loom is intended to be embedded in a larger agent system, called a "client", that orchestrates the loom invocations. This could be a discord bot, a multi agent system, or anything else that needs to safely build and invoke an agent turn.
+Loom is intended to be embedded in a larger agent system, called a "client", that orchestrates the loom invocations. This could be a discord bot, a multi agent system, a coding CLI, or anything else that needs to safely build and invoke an agent turn.
 
 ## Security Model
 
