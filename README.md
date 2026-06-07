@@ -114,7 +114,9 @@ Loom cannot, and does not attempt to, protect you from supply chain attacks. Thi
 
 Loom is intended to allow you to safely run agents without monitoring the output for misbehavior. Loom does this by using capability security to control which resources each tool has access to _before_ it's been instantiated. Each tool uses a contextually appropriate capability scheme, defined and enforced by the tool itself. For example, a `bash` tool needs to be sandboxed to run safely. However, for a `read_discord_messages` tool, a sandbox is a distraction. The tool implicitly needs access to a network, and its capabilities are better described in terms of user or channel IDs. By defining capabilities at the tool level, both of these tools can coexist in the same agent harness without contradiction.
 
-The capabilities declaration in the manifest specifies the highest capabilities possible to grant. In general, Loom goes for explicit and declarative configuration over implicit behavior. If you don't include _any_ value, Loom will attempt to use a smart and safe default. For example, if your manifest doesn't include a `[tools]` block, Loom will automatically add the same tools as [Pi](https://pi.dev): read_file, write_file, edit_file, and bash, each scoped to the current working directory. However, as soon as you do include a `[tools]` block, Loom will only add the tools you specify, and any tools added by a provider.
+Capabilities are always tied to the tools that define them. When adding tools to your Agent.toml, you specify the capabilities you want for each tool, as part of the tool's configuration. However, the tools you define aren't the whole picture. To be useful, agents must compose tools from multiple different sources together, such as memory tools tied to your session storage, or tools implied by a specific skill. As such, the Agent.toml contains an additional `[capabilities]` section, that lets you control the overall capabilities that your agent is allowed to access, in terms of the tools added to your manifest by all of your dependencies. This is a strict _ceiling_. As long as you trust your tool implementations, loom will never let you run an agent with capabilities not covered by your `[capabilities]` section.
+
+If you don't include any `[tools]` or `[capabilities]` section, Loom will provide the same tools as [Pi](https://pi.dev): read_file, write_file, edit_file, and bash, each scoped to the current working directory.
 
 To see the full list of providers, harnesses, sessions, tools, capabilities, and secrets that an agent manifest will use, run `loom audit <agent.toml>`
 
@@ -129,6 +131,8 @@ Subagents are a special case of functional dependencies. Generally, if your comp
 ## Learning Loom
 
 Claude has written a lot of documentation, but the main place to learn the entry points and common usage is the `examples/` directory. I'd recommend starting there, before diving into the rest of the codebase. Loom has a lot of basic application features that provider authors might want to use, secret resolution, automatic storage directory, etc. But at the end of the day, Loom is only as useful as the providers that are built into it. 
+
+# Docs
 
 >[!NOTE]
 > Everything below this message is written by an LLM, intended for agents
@@ -259,52 +263,53 @@ for a full working SDK setup including a tiny update renderer.
 ## Layered sessions
 
 A session in Loom is either a single layer or a stack of layers.
-The `Session` interface defines the composition protocol:
+The `Session` interface defines the composition protocol: **`push`**
+flows top-to-bottom (each layer may transform, drop, or fan-out the
+event; the bottom layer is typically storage), **`pull`** flows
+bottom-to-top (each layer may rewrite what the layers below
+produced; the top is the prompt the harness sees), and every other
+hook (`tools()`, `systemPromptSection()`, `prepareTurn()`,
+`close()`) aggregates across layers.
 
-- **`push`** flows top-to-bottom. Each layer may transform, drop,
-  or fan-out the event before the next layer sees it. The bottom
-  layer is typically storage.
-- **`pull`** flows bottom-to-top. Each layer receives what the
-  layers below it produced and may rewrite it. The top is what the
-  harness sees as the prompt.
-- Every other hook (`tools()`, `systemPromptSection()`,
-  `prepareTurn()`, `close()`) aggregates across layers.
+Declare layers with `[[session.layers]]` (array-of-tables),
+`[session] layers = [...]` (inline; all-strings or all-tables,
+a TOML parser quirk), or a `SessionSpec[]` on
+`AgentManifest.session` (SDK). A singleton `[session]` with just
+`provider = "..."` is the one-layer case; when absent entirely, the
+default chain `skills → compacting → in-memory` applies — bounded
+growth and skill auto-loading out of the box.
 
-Declare layers with `[[session.layers]]` (TOML array-of-tables) or
-`[session] layers = [...]` (inline form, all-strings or all-tables
-thanks to a TOML parser quirk). From the SDK, pass a `SessionSpec[]`
-on `AgentManifest.session`. A singleton `[session]` with just
-`provider = "..."` is the trivial one-layer case. The
-default-when-absent is the chain `skills → compacting → in-memory`,
-producing bounded growth and skill auto-loading out of the box.
-
-**Pass-through vs storage**. Some sessions are *pass-through*
-layers — they transform / adorn events flowing through the chain
-but don't themselves persist them (e.g. `compacting`, `skills`).
-Others actually retain events (`in-memory`, `file`). Boot fails
-with a clear error if every factory-based layer in the chain is
-pass-through (no storage anywhere) — otherwise pushes would
-propagate without anything to retain them and every turn would see
-an empty history. Add a storage layer to the end of your chain.
-Session authors flag their factories with `passThrough: true` when
-they don't store events; default is storage-class, the safe default
-for third-party sessions.
+**Pass-through vs storage**. *Pass-through* layers transform
+events flowing through the chain without persisting them
+(`compacting`, `skills`); storage layers retain them (`in-memory`,
+`file`). Boot fails with a clear error if every factory-based layer
+is pass-through — every turn would see an empty history — so end
+your chain with a storage layer. Session authors flag pass-through
+factories with `passThrough: true`; the default is storage-class,
+the safe default for third-party sessions.
 
 A layer can also contribute tools. `Session.tools()` is **the**
 single channel by which tools enter an agent beyond the manifest
 itself: it returns labeled **tool groups** — `{ label, tools }`,
 where `tools` is a `[tools]`-shaped table using the same closed
-entry grammar (`provider` / `tool` / `capabilities`). Each group's
-declarations are judged against the effective capability ceiling at
-boot, fail-soft and atomically per group (see the Capabilities
-reference). Entries the session implements itself use the reserved
+entry grammar, parsed by the manifest parser itself, and judged
+against the effective ceiling at boot (see the
+[Capabilities reference](#capabilities-reference) for the judging
+rules). Entries the session implements itself use the reserved
 provider `"session"`; the runtime resolves those names through the
 session chain's `resolveTool(name, config, agent, capabilities)` —
-no separate `[tools.X]` entry needed in the manifest. The notes
-example uses this to bundle its `remember` verb with the session
-that stores it.
+no separate `[tools.X]` entry needed (this is how the notes example
+bundles its `remember` verb with the session that stores it).
 
-A group may also carry its
+A group may also carry its own `providers` table — same shape as
+the manifest's `[providers]`, but with **group-local** handles:
+lexically scoped to that group's entries (`"builtin"` and
+`"session"` reserved), substituted with their values before
+resolution, and deduped globally by value so identical specs
+shipped by several groups share one instance. Entries that resolve
+to a group-shipped implementation need instance-name acceptance in
+`[capabilities]` — see
+[the consent rule](#tool-entries-select-name-and-authorize).
 
 ### Mixing pre-built instances into the chain (SDK only)
 
@@ -314,12 +319,7 @@ The runtime resolves the named entries and threads everything
 through `ChainedSession`:
 
 ```ts
-import {
-  CompactingSession,
-  modelCompactor,
-  runAgent,
-  type AgentManifest,
-} from "loom";
+import { CompactingSession, modelCompactor, runAgent, type AgentManifest } from "loom";
 
 const compactor = new CompactingSession({
   threshold: 60,
@@ -347,12 +347,9 @@ const used = compactor.tokensInContext;       // peek at usage
 
 Reach for this when you need a **handle** to a specific layer —
 wiring `compactor.compactNow()` to a `/compact` slash command, or
-reading `tokensInContext` to show context-usage in your UI. With the
-TOML form, the runtime owns every instance and nobody else can call
-those methods.
-
-For the singleton case (no chain, one hand-built session), pass the
-instance directly: `session: someSession`. See
+reading `tokensInContext` for a context-usage UI; with the TOML
+form, the runtime owns every instance. For the singleton case, pass
+the instance directly: `session: someSession`. See
 [`examples/sdk-agent/agent.ts`](./examples/sdk-agent/agent.ts) for
 a complete working example.
 
@@ -364,38 +361,28 @@ a complete working example.
 
 The agent's **total authority surface** — the *effective ceiling* —
 is `[capabilities]` unioned with the inline `capabilities`
-declarations on the manifest's own `[tools]` entries. Root
-declarations are **self-authorizing**: same author, same file, so an
-inline request never "exceeds" anything — it widens the ceiling.
-Anything in the effective ceiling is something your agent may touch
-in some kind of way; anything absent is unreachable.
-
-`[capabilities]` is therefore best read as the **pre-authorization
-surface** — the place to write authority not attached to a tool
-entry:
-
-- **grants** for bare entries (`bash = "builtin"` with no inline
-  request picks up its `[capabilities]` row),
-- **acceptance rows** for contributions that haven't arrived yet
-  (a skill's declaration is granted only if the union already
-  covers it),
-- **ceilings** for delegation (sub-agents are checked against it).
-
-Contributed declarations — tool groups from skills and session
-layers — are judged against the union and can never widen it.
-`loom audit` prints the computed effective ceiling at the top of
-the tree (`grants` in `--json`); that's the one place to look.
+declarations on the manifest's own `[tools]` entries; root
+declarations are **self-authorizing** (same author, same file), so
+an inline request widens the ceiling rather than exceeding it.
+Anything absent from the ceiling is unreachable; contributed
+declarations (tool groups from skills and session layers) are
+judged against the union and can never widen it. `loom audit`
+prints the computed ceiling at the top of the tree (`grants` in
+`--json`). Read `[capabilities]` as the **pre-authorization
+surface** — authority not attached to a tool entry: **grants** for
+bare entries (`bash = "builtin"` picks up its row), **acceptance
+rows** for contributions that haven't arrived yet, and **ceilings**
+for delegation.
 
 **No `[capabilities]` section ≠ fail open.** Absent the section,
 the conservative default ceiling applies: the four FS/shell tools
 over the working directory — no network — plus `read_file`/`find`
 read access to any configured skills roots so the default chain's
-catalog stays readable out of the box. Wildcards are always
-explicit; loom never widens a grant on its own.
+catalog stays readable. Wildcards are always explicit; loom never
+widens a grant on its own.
 
 Every tool declares the capability *kinds* it needs (`requires`)
-and those it may use if granted (`optional`). The manifest's
-`[capabilities]` table grants them per-tool:
+and those it may use if granted (`optional`); grants are per-tool:
 
 ```toml
 [capabilities]
@@ -404,6 +391,48 @@ read_file = { paths = ["./"] }
 edit_file = "*"                # whole-tool unrestricted
 fetch_url = "*"
 ```
+
+### Tool entries select, name, and authorize
+
+A `[tools.X]` entry never configures. It has exactly three keys:
+
+| Key | Meaning |
+|---|---|
+| `provider` | Implementation reference: `"builtin"`, `"session"`, a `[providers]` handle, a source spec, or the **inline form of a configured `[providers]` entry** (`{ provider = "mcp-server", npm = "…" }`). |
+| `tool` | Underlying tool name when the instance key is a rename. |
+| `capabilities` | The **requested grant** for this instance. |
+
+Construction config lives on the thing being constructed — a
+`[providers]` entry, `[session.X]`, or `[harness]`; per-instance
+parameters are capability kinds. The inline provider form is just
+an anonymous `[providers]` entry — same parser, same resolution
+path, **deduplicated by value**, so one spec means one process. An
+entry omitting `capabilities` requests the full ceiling entry for
+its name (`ceiling[instance] ?? ceiling[underlying]`); one carrying
+it is self-authorizing — both the requested grant and a widening
+of the ceiling.
+
+Contributed entries (from session tool groups) are instead judged
+against the effective ceiling, fail-soft — each group accepted
+atomically or rejected with per-declaration verdicts. A contributed
+entry with no `capabilities` field requests nothing and is always
+granted; if its tool needs grants nothing pre-authorized, boot
+fails at the ordinary `requires` check.
+
+**Shipping an implementation needs by-name consent.** A contributed
+entry that references a root-trusted implementation — `"builtin"`,
+the reserved `"session"`, or a handle into the manifest's own
+`[providers]` — only needs its request to fit the ceiling. An
+entry that ships its **own** implementation (an inline
+configured table or npm/path spec, possibly via a group-local
+handle) is an authority claim the grant vocabulary can't see:
+materializing a provider loads code or spawns a process before any
+verdict-gated tool runs. Such an entry is accepted only when the
+instance is **named** in `[capabilities]` — judged against that
+instance-name entry alone, the underlying-name fallback never
+widens acceptance, and a bare request is never silently granted.
+Rejections print the provider spec and a paste-ready acceptance
+line.
 
 ### Grant shapes
 
@@ -424,32 +453,30 @@ bash = [
 ]
 ```
 
-A row set is a **union of boxes, not a bounding box**. Rows never
-combine to authorize a request that no single row authorizes: the
-grant above does *not* give "bash" the network — it gives arbitrary
-shell commands a network-less sandbox over `./`, and gives `gcalcli`
-(and only `gcalcli`) the network plus its config directory.
+A row set is a **union of boxes, not a bounding box** — rows never
+combine to authorize a request that no single row authorizes. The
+grant above does *not* give "bash" the network: arbitrary shell
+commands get a network-less sandbox over `./`; only `gcalcli` gets
+the network plus its config directory.
 
-`bash` dispatches on rows at runtime, picking exactly one row per
-invocation. A plain `cmd args…` invocation of a per-command row's
-command — bare words and simple quotes only; no `$`, backticks,
-pipes, redirects, or `FOO=bar` prefixes — is **promoted to direct
-argv exec** (no shell) under that row's sandbox. Every other input
-runs under the general (`commands = "*"`) row; when no general row
-exists, bash refuses with an error teaching the model the
-plain-command form. The rule: a row applies only to invocations loom
-can attribute to that row's command, verbatim, at the top level —
-anything laundered through an interpreter gets the interpreter's
-privileges. `bash -c "gcalcli …"`, `gcalcli … | curl …`, or a Python
-one-liner that shells out all run under the general row, not the
-`gcalcli` row.
+`bash` picks exactly one row per invocation: a plain `cmd args…`
+invocation of a per-command row's command — bare words and simple
+quotes only; no `$`, backticks, pipes, redirects, or `FOO=bar`
+prefixes — is **promoted to direct argv exec** (no shell) under
+that row's sandbox; everything else runs under the general
+(`commands = "*"`) row, or is refused with a teaching error when
+none exists. The rule: a row applies only to invocations loom can
+attribute to that row's command, verbatim, at the top level —
+anything laundered through an interpreter (`bash -c "gcalcli …"`,
+`gcalcli … | curl …`, a Python one-liner that shells out) gets the
+interpreter's privileges: the general row, not the `gcalcli` row.
 
 **What per-command network rows buy you — honestly.** They shrink
-and itemize the exfiltration surface: `loom audit` can enumerate
+and itemize the exfiltration surface — `loom audit` can enumerate
 exactly which binaries may touch the network and with what
-filesystem view. They do **not** eliminate it — nothing does while
-one model holds both secret-reads and any network path. Treat a row
-set as a reviewable, enumerable risk list, not a proof of
+filesystem view — but they do **not** eliminate it; nothing does
+while one model holds both secret-reads and any network path. Treat
+a row set as a reviewable, enumerable risk list, not a proof of
 impossibility.
 
 ### The algebra is tool-owned
@@ -471,9 +498,8 @@ default semantics are **strict**:
 The path-based builtins override containment so `paths` values
 compare lexically (`["./src"]` is contained by `["./"]`); `bash`
 does the same per row. Whatever a tool implements, the runtime
-asserts the merge law on every merge — `merge(a, b)` must contain
-both `a` and `b` under `containsGrant` — and fails loudly naming
-the offending tool when it doesn't hold.
+asserts the merge law — `merge(a, b)` must contain both under
+`containsGrant` — and fails loudly naming the offending tool.
 
 ### Kinds shipped by the built-in tools
 
@@ -491,15 +517,12 @@ The Anthropic harness's server tools add their own kinds
 
 ### Bash env inheritance
 
-Bash inherits environment variables in two tiers:
-
-- **Tier 1 — always inherited.** `HOME`, `USER`, `LOGNAME`, `SHELL`,
-  `TERM`, `COLORTERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`. Locale
-  and terminal plumbing; never overridable. A hermetic shell with
-  broken locale and no `$HOME` isn't hermetic, it's broken.
-- **Tier 2 — default-on, replaceable.** `PATH`, `PWD`, `TMPDIR`,
-  `EDITOR`, `VISUAL`, `PAGER`. Included when `env` is absent;
-  dropped when `env` is an explicit list.
+Bash inherits environment variables in two tiers. **Tier 1 —
+always inherited, never overridable** (locale and terminal
+plumbing): `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `COLORTERM`,
+`LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`. **Tier 2 — default-on,
+replaceable** (dropped when `env` is an explicit list): `PATH`,
+`PWD`, `TMPDIR`, `EDITOR`, `VISUAL`, `PAGER`.
 
 | Grant | Result |
 |---|---|
@@ -513,10 +536,91 @@ Bash inherits environment variables in two tiers:
 
 `[capabilities]` is a transitive ceiling across the sub-agent tree:
 every sub-agent's grant must be contained by the parent's grant for
-the same key, under the strict algebra above — a kind the parent
-doesn't grant is denied, and `"*"` is only contained by `"*"`.
-`loom audit` walks the whole tree statically and reports violations
-before they hit at runtime.
+the same key, under the strict algebra above. `loom audit` walks
+the whole tree statically and reports violations before they hit
+at runtime.
+
+---
+
+## Writing skills
+
+A loom skill is a standard [Agent Skills](https://agentskills.io)
+folder — a directory with a `SKILL.md` whose frontmatter has `name`
+and `description`, instructions in the body, and optional
+`scripts/`, `references/`, and `assets/`. Any spec-compliant skill
+works in loom with no loom-specific metadata at all: it compiles to
+a read-only declaration over its own directory, so the model can
+activate it and read its bundled files, and nothing more.
+
+Loom-specific metadata starts when a skill needs *authority* — a
+command, network access, a tool of its own. Declare it in the
+frontmatter `metadata` table as TOML carried in YAML block scalars:
+
+```markdown
+---
+name: dns-lookup
+description: Look up DNS records with dig. Use when the user asks
+  what a domain resolves to.
+metadata:
+  loom.tools: |
+    bash      = { capabilities = { commands = ["dig"], network = "*" } }
+    read_file = { capabilities = { paths = ["${SKILL_DIR}"] } }
+---
+
+# DNS lookup
+
+Use the `bash` tool to invoke `dig` as a plain command — no pipes
+or interpreters, or it loses its network grant…
+```
+
+The keys:
+
+| Key | Contents |
+|---|---|
+| `loom.tools` | A `[tools]` table body — the exact grammar of a manifest's `[tools]` section, parsed by the same code. Provider-less entries contribute grant rows to a tool the host already has (`bash` above); entries with `provider`/`tool` declare new instances (e.g. `jq = { provider = "builtin", tool = "bash", capabilities = { commands = ["jq"] } }`). |
+| `loom.providers` | A `[providers]` table body, for skills that ship software (an MCP server in the skill folder, an npm package). Handles are local to the skill; sources dedup globally by value. |
+
+`${SKILL_DIR}` substitutes textually — before TOML parsing — to the
+skill's absolute directory, so declarations can reference bundled
+files (`paths = ["${SKILL_DIR}"]`, `args = ["${SKILL_DIR}/server.mjs"]`)
+without knowing where the skill is installed.
+
+**Declare the minimum.** Your declaration is a *request*, judged
+against the host's `[capabilities]` ceiling — atomically: one
+over-broad entry rejects the whole skill, fail-soft, and the skill
+vanishes from the model's catalog. The remediation line users see
+is generated *from your declaration*, so a precise request
+(`commands = ["dig"]`, not `commands = "*"`) is both your best
+chance of fitting an existing ceiling and the consent prompt your
+users will be asked to paste. Skills that ship their own
+implementation (`loom.providers`, or a `provider` source in an
+entry) additionally require the host to **name the instance** in
+`[capabilities]` — fitting the ceiling is never enough to run
+contributed code. See
+[the consent rule](#tool-entries-select-name-and-authorize).
+
+**Write instructions for the sandbox you asked for.** If you
+declared a per-command row, say so in the body ("invoke `dig` as a
+plain command — no pipes, or it loses its network grant"): plain
+invocations promote to your row; anything laundered through a shell
+pipeline or interpreter runs under the host's general grant. The
+model self-corrects fastest when the SKILL.md predicts the failure
+mode.
+
+**Enhancing a skill you don't author:** drop a `loom.toml` sidecar
+(`[tools]` + optional `[providers]`) next to someone else's
+`SKILL.md` — it wins over frontmatter entirely.
+
+**Portability:** `loom.*` metadata keys are spec-legal string
+values; other Agent Skills clients ignore them. Use the spec's
+`compatibility` field for human-facing requirements ("requires dig
+on PATH"), and keep the body client-agnostic.
+
+Validate with `loom audit <agent.toml>` against a manifest that
+mounts your skill: ACTIVE/INACTIVE per declaration, with reasons.
+`examples/skills-agent/` has one skill per authoring tier — from
+zero-metadata to MCP-server-shipping — and the
+[`skills` session docs](#skills) cover the host-side mechanics.
 
 ---
 
@@ -614,9 +718,8 @@ entries, `{ provider: "<name>", ...config }`, bare strings in the
 `session: [...]` array, or `new XxxSession(...)` (SDK).
 
 When `manifest.session` is absent entirely, the runtime applies the
-default chain `skills → compacting → in-memory` — bounded growth
-and `~/.skills` auto-loading out of the box, with `skills` silently
-no-opping when the directory is missing.
+default chain `skills → compacting → in-memory`; `skills` silently
+no-ops when `~/.skills` is missing.
 
 #### `in-memory`
 
@@ -679,8 +782,7 @@ with a `SKILL.md` YAML-frontmatter file) and contributes two things:
   by reading its `SKILL.md` with the file tool.
 - **Tool groups** — each skill compiles to a labeled
   `[tools]`-shaped table declaring the tools and grants it needs,
-  contributed through `Session.tools()` and judged against the
-  effective capability ceiling before anything is bound.
+  contributed through `Session.tools()`.
 
 | Config key | Default | Notes |
 |---|---|---|
@@ -691,34 +793,43 @@ need themselves, and boot fails with a pointer if you set it.)
 
 **The skill→tools compiler.** Precedence, per skill directory:
 
-1. A `loom.toml` sidecar next to `SKILL.md` wins entirely — the
-   "enhance a skill you didn't author" path: drop a file beside
-   someone else's `SKILL.md`. Its `[tools]` table is the group.
-2. Else the frontmatter `metadata` key `loom.tools`: a TOML snippet
-   of tool entries, carried as a YAML block scalar.
+1. A `loom.toml` sidecar next to `SKILL.md` wins entirely — its
+   `[tools]` table (plus an optional `[providers]` table) is the
+   group. This is the "enhance a skill you didn't author" path.
+2. Else the frontmatter `metadata` keys `loom.tools` /
+   `loom.providers`: TOML snippets carried as YAML block scalars.
 3. Else a derived default: a read-only `read_file` declaration over
    the skill's own directory.
 
 `${SKILL_DIR}` substitutes textually (before the TOML is parsed) to
-the skill's absolute directory. Group entries follow the same closed
-grammar as `[tools.X]` — only `provider`, `tool`, `capabilities` —
-and a provider-less entry can only contribute grant rows to an
-instance that already exists; it can't conjure new implementations.
-An entry without `capabilities` requests nothing and is always
-granted.
+the skill's absolute directory. Declarations are parsed by the
+manifest parser itself, so authoring errors and capability
+semantics are identical across manifests, the SDK, and skills —
+see the [Capabilities reference](#capabilities-reference) for how
+contributed entries are judged.
 
-**Verdicts.** Declarations are judged against the effective ceiling
-at boot. Groups are fail-soft: each is accepted atomically (every
-declaration granted) or rejected with per-declaration verdicts, each
-carrying paste-ready `[capabilities]` TOML remediation. Under run,
-rejected skills are **trimmed from the catalog** — the model never
-sees them; under audit, they're listed as INACTIVE with the reason.
+**Skills can ship software.** A skill's `[providers]` declarations
+(frontmatter `loom.providers` or the sidecar table) are the
+group-local handles described under
+[Layered sessions](#layered-sessions). Because the skill carries
+its own implementation, fitting the ceiling isn't enough: the host
+manifest must **name the instance** in `[capabilities]`, and that
+line is the consent to run the skill's code (see
+[the consent rule](#tool-entries-select-name-and-authorize)).
+`examples/skills-agent/skills/echo-notes/` bundles an MCP server
+this way, accepted by the manifest's `echo_note = "*"` entry.
+
+**Verdicts.** Groups are judged at boot — fail-soft, atomic per
+group, with paste-ready `[capabilities]` TOML remediation per
+rejected declaration. Under run, rejected skills are **trimmed
+from the catalog** — the model never sees them; under audit,
+they're listed as INACTIVE with the reason.
 
 **Post-boot is subtractive only.** Roots rescan each turn, but a
 skill that appears mid-session can at most reference already-granted
 authority: if its declarations exceed the ceiling it's trimmed, and
 if it declares new tool instances it stays inactive until a restart
-binds them. New skills can never gain grants mid-session.
+binds them.
 
 **Worked example.** A calendar skill that needs `gcalcli`:
 
@@ -748,13 +859,14 @@ bash = [
 
 At boot the declarations pass containment (the `gcalcli` row covers
 the bash request row-for-row; `${SKILL_DIR}` resolves under
-`~/.skills`), the group's rows merge into the bound tools, and the
-skill shows in the catalog. Drop the second `bash` row and the
-skill is trimmed instead — `loom audit` prints the verdict with the
-exact `[capabilities]` line to paste back.
+`~/.skills`) and the skill shows in the catalog. Drop the second
+`bash` row and the skill is trimmed instead.
 
-Skills with malformed frontmatter are skipped quietly so boot stays
-resilient.
+For a runnable tour of all five tiers — derived read-only group,
+frontmatter bash row, sidecar-renamed instance, skill-shipped MCP
+server, deliberate rejection — see
+[`examples/skills-agent/`](./examples/skills-agent/). Skills with
+malformed frontmatter are skipped quietly so boot stays resilient.
 
 - **SDK class:** `SkillsSession`.
 
@@ -820,12 +932,9 @@ and the OS-level confinement.
     the allowed commands and exposes an `args` array; dispatch is direct
     `spawn(cmd, args, …)` with no shell. Useful for scoped sub-agents that
     should only run a handful of programs.
-  - A **row set** mixes both: plain `cmd args…` invocations of a
-    per-command row's command are promoted to argv exec under that
-    row; everything else runs under the general (`commands = "*"`)
-    row, or is refused with a teaching error when none exists. The
-    tool description enumerates the rows for the model. See
-    [Row sets](#row-sets).
+  - A **row set** mixes both — see [Row sets](#row-sets) for the
+    dispatch and attribution rules. The tool description enumerates
+    the rows for the model.
 - **Sandbox profile** is derived from the picked row's grant — a structured
   grant engages the sandbox; `"*"` opts out (no confinement).
 
@@ -938,10 +1047,9 @@ message. Two modes:
 Either way, the resolved sub-manifest is recorded in
 `tool.dependencies.subagents` so `loom audit` walks it (audit cycle
 detection handles trivial loops; self-copy avoids them by stripping
-`spawn_subagent` from the clone). The capability ceiling is checked
-strictly — every grant in the sub-agent's `[capabilities]` must be
-contained by the parent's grant for the same key (trivially
-satisfied for self-copies).
+`spawn_subagent` from the clone), and the
+[subagent ceiling](#subagent-ceiling) check applies — trivially
+satisfied for self-copies.
 
 | Input field | Type | Notes |
 |---|---|---|
@@ -950,8 +1058,8 @@ satisfied for self-copies).
 - **Capability kinds:** optional `manifest`. Omit it (e.g.
   `spawn_subagent = "*"`) for the self-copy default; grant
   `{ manifest = {...} }` for an explicit sub-manifest. There is no
-  `[tools.spawn_subagent]` config — tool entries only select, name,
-  and authorize.
+  `[tools.spawn_subagent]` config
+  ([tool entries never configure](#tool-entries-select-name-and-authorize)).
 - The ceiling check bounds what the sub-agent's tools can do,
   regardless of what else `spawn_subagent` is granted.
 
@@ -1039,7 +1147,7 @@ plus dedicated POI/Places sections when local recall is on).
   construct the instance yourself (`new WebSearchTool({...})`) and
   supply it via a Tools provider.
 
-| Config key | Maps to Brave param | Range |
+| Constructor option | Maps to Brave param | Range |
 |---|---|---|
 | `count` | `count` | 1-50 |
 | `freshness` | `freshness` | `pd` / `pw` / `pm` / `py` / `YYYY-MM-DDtoYYYY-MM-DD` |
@@ -1182,13 +1290,14 @@ read_text_file = { path = "*" }
 list_directory = { path = "*" }
 ```
 
-One `[providers]` handle = **one** MCP server process. Every
+One `[providers]` handle = **one** MCP server process: every
 `[tools.X]` entry pointing at the handle dispatches against the
-same `Tools` instance — the underlying MCP server is contacted
-once, and `resolveTool` routes each tool call. A `[tools.X]` entry
-only selects (`provider`), names (`tool` rename), and authorizes
-(`capabilities`); it never affects which server gets spawned — all
-server construction config lives on the `[providers]` entry.
+same `Tools` instance, with `resolveTool` routing each call. As
+everywhere, a tool entry only
+[selects, names, and authorizes](#tool-entries-select-name-and-authorize)
+— all server construction config lives on the `[providers]` entry,
+and an inline `provider = { provider = "mcp-server", npm = "…" }`
+table dedups by value to the same server process.
 
 **Capability-based partial application.** The big win: each
 `[capabilities]` per-arg grant doubles as a pre-binding. A literal
@@ -1304,18 +1413,15 @@ Discovery walks `<manifest-dir>/node_modules` → `npm root -g` →
 `~/.loom/providers`. `loom providers list` enumerates everything
 visible.
 
-A session can also bundle the tools it implements. Its `tools()`
-hook contributes labeled tool groups (`{ label, tools }`); entries
-the session implements itself use the reserved provider
-`"session"` — e.g. `remember = { provider = "session" }` — and the
-runtime resolves those names through the session chain's
-`resolveTool(name, config, agent, capabilities)` (this method,
-then native built-ins, then SDK-supplied Tools). Each group's
-declarations are judged against the effective capability ceiling
-at boot, like any other contribution. This is how the notes
+A session can also bundle the tools it implements via its
+`tools()` hook — labeled tool groups with the reserved provider
+`"session"` (e.g. `remember = { provider = "session" }`), resolved
+through the session chain's `resolveTool` (this method, then
+native built-ins, then SDK-supplied Tools) and judged against the
+effective ceiling like any other contribution — see
+[Layered sessions](#layered-sessions). This is how the notes
 example bundles its `remember` verb with the session that owns the
-state — no separate `[tools.X]` entry in the manifest, no
-duplicate config.
+state.
 
 ---
 
