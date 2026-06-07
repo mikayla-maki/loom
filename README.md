@@ -12,60 +12,47 @@
 
 Loom is a package manager and runtime for agent harnesses. Define
 your agent's features and capabilities in an `agent.toml` manifest,
-install any skills as you need, check what it can do via `loom audit`, 
+install any skills as you need, check what it can do via `loom audit`,
 then prompt it via `loom prompt`:
 
 ```toml
 [agent]
 name = "example-agent"
-system_prompt = "You are a helpful assistant." # Customize for your needs
+system_prompt = "You are a helpful assistant."
 
 [harness]
 provider = "anthropic" # This harness will inform Loom it needs an ANTHROPIC_API_KEY
 model    = "claude-sonnet-4-5"
 
-# Define what context management features you need
+# Context management as composable layers.
 [session]
 layers = ["skills", "compacting", "in-memory"]
 
- # The four FS / shell tools auto-load when `[tools]` is absent;
- # `find` is built-in but opt-in.
+# Tools carry their own capabilities.
+# Each builtin is sandboxed to exactly what you grant.
 [tools]
-bash       = "builtin"
-read_file  = "builtin"
-write_file = "builtin"
-edit_file  = "builtin"
-find       = "builtin"
-
-# Use capabilities to define a flexible security model that fits your needs
-[capabilities]
-# Read files in this directory and another
-read_file  = { paths = ["./", "../other-files"] }
-find       = { paths = ["./", "../other-files"] }
-# Writing + editing files is restricted to the current directory
-bash       = [
-  # Commands are sandboxed by default
-  { commands = "*", paths = ["./"] } 
-  # But individual programs can have their own permissions
-  { commands = [ "gcalcli" ], network = "*" },
-]
-write_file = { paths = ["./"] }
-edit_file  = { paths = ["./"] }
+read_file  = { capabilities = { paths = ["./"] } }
+write_file = { capabilities = { paths = ["./"] } }
+edit_file  = { capabilities = { paths = ["./"] } }
+bash = { capabilities = [
+  { commands = "*", paths = ["./"] },        # any command: this dir, no network
+  { commands = ["gcalcli"], network = "*" }, # gcalcli alone may reach the network
+] }
 ```
 
-And skills can participate too, by defining their own tools and capabilities, that is enforced by your agent.toml above:
+Skills plug into the capability system. A skill is a folder with a `SKILL.md`
+that can declare the tools and grants it needs — Loom activates it only
+if its request fits what your `agent.toml` allows:
 
-```calendar_skill.md
+```md
 ---
-name: gcalcli
-description: Instructions to use gcalcli...
+name: calendar
+description: Read and add Google Calendar events with gcalcli.
 metadata:
   loom.tools: |
     bash = { capabilities = { commands = ["gcalcli"], network = "*" } }
 ---
-
-# DNS lookup
-
+Use `gcalcli agenda`...
 ```
 
 ## Install
@@ -128,15 +115,19 @@ Loom is intended to be embedded in a larger agent system, called a "client", tha
 
 ## Security Model
 
-Loom cannot, and does not attempt to, protect you from supply chain attacks. Think of using loom as similar to installing a library or a CLI tool. Loom providers have full access to your system, and are trusted to be responsible and honest in their interactions. Loom can only protect you from misbehaving agents, not misbehaving humans.
+Loom uses a capability-based security model, where its features and its security properties are one and the same. In loom, all agent security flows from the tools. These are the only mechanism the agent has for interacting with the world and so are the best location from which to define security boundaries. Loom cannot, and does not attempt to, protect you from supply chain attacks. Think of using loom as similar to installing a library or a CLI tool. Tool implementations have full access to your system, and are trusted to be responsible and honest in their interactions. Loom can only protect you from misbehaving agents, not misbehaving humans.
 
-Loom is intended to allow you to safely run agents without monitoring the output for misbehavior. Loom does this by using capability security to control which resources each tool has access to _before_ it's been instantiated. Each tool uses a contextually appropriate capability scheme, defined and enforced by the tool itself. For example, a `bash` tool needs to be sandboxed to run safely. However, for a `read_discord_messages` tool, a sandbox is a distraction. The tool implicitly needs access to a network, and its capabilities are better described in terms of user or channel IDs. By defining capabilities at the tool level, both of these tools can coexist in the same agent harness without contradiction.
+Loom uses this by using capability security to both define and control which resources each tool has access to _before_ it's been instantiated. Each tool uses a contextually appropriate capability scheme, defined and enforced by the tool itself. For example, Loom's `bash` tool wraps each invocation in it's own sandbox. However, for a `read_discord_messages` tool, a sandbox is a distraction. The tool implicitly needs access to a network, and its capabilities are better described in terms of user or channel IDs. By defining capabilities at the tool level, both of these tools can coexist in the same agent harness without contradiction. 
+
+Capabilites are a positive declaration of access. If it's not granted in the capability definition, the tool will not have access to the resource. While simple, this approach is powerful for defining fine-grained access control without needing to write complex permission logic. We use this feature extensively to manage the complexity of the tools provided by the MCP spec. We can filter the tools exposed to a useful subset, partially apply tool arguments so agents can only provide the arguments they need to, and render all of these policies visible by the capability grant section. However, per-tool capabilities on their own are not sufficient for complex permission logic. 
+
+So far we've been talking about composition _across_ tools, but for composition _within_ tools we have another feature: _capability sets_. These allow you to apply _multiple_ capabilities to a single tool, as long as the tool is able to support them. Our bash tool uses this extensively to provide a flexible and fine-grained sandboxes via the `commands` capability. A simple `{ commands = "*" }` grant gives you full access to the shell without any network access, but if you pair that with a `{ commands = [ "gcalcli" ], network = "*" }` grant, the bash tool will _only_ allow gcalcli to access the network. It does this by shadowing the `gcalcli` binary with a shim that connects to a socket, leading to a broker process _outside_ of the sandbox. That broker process has a whitelist of allowed commands (driven by the `commands` capability set), and it spawns a _second_ sandbox, just for the capabilities granted to the `gcalcli` command. The broker then hands whatever results it gets back to the shim, letting the in-sandbox process continue as if the command had completed locally. Because the bash tool supports capability sets, we can define powerful primitives for running commands, letting you safely compose agent features without worrying about what they can get up to. We use this to support the agent skills spec in a safe and flexible way. Check out the skills agent example for more.
 
 Capabilities are always tied to the tools that define them. When adding tools to your Agent.toml, you specify the capabilities you want for each tool, as part of the tool's configuration. However, the tools you define aren't the whole picture. To be useful, agents must compose tools from multiple different sources together, such as memory tools tied to your session storage, or tools implied by a specific skill. As such, the Agent.toml contains an additional `[capabilities]` section, that lets you control the overall capabilities that your agent is allowed to access, in terms of the tools added to your manifest by all of your dependencies. This is a strict _ceiling_. As long as you trust your tool implementations, loom will never let you run an agent with capabilities not covered by your `[capabilities]` section.
 
-If you don't include any `[tools]` or `[capabilities]` section, Loom will provide the same tools as [Pi](https://pi.dev): read_file, write_file, edit_file, and bash, each scoped to the current working directory.
+If you don't include any `[tools]` or `[capabilities]` section, Loom will provide the same tools as [Pi](https://pi.dev): read_file, write_file, edit_file, and bash, each scoped to the current working directory. To see the full list of providers, harnesses, sessions, tools, capabilities, and secrets that an agent manifest will use, run `loom audit <agent.toml>`.
 
-To see the full list of providers, harnesses, sessions, tools, capabilities, and secrets that an agent manifest will use, run `loom audit <agent.toml>`
+Taken together, Loom's capability security model gives you leverage over the complexity of the AI ecosystem. You can safely install skills from anywhere on the internet, use MCP tools without blowing up context windows, and audit the whole security surface with a single command. All within a pluggable, modular architecture that lets you swap in new features as you see fit. The security model _is_ the feature set.
 
 ## Building a provider
 
@@ -460,14 +451,14 @@ line.
 
 ### Grant shapes
 
-| Shape              | Meaning                                                                                                               |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `"*"`              | Whole-tool unrestricted. Sandbox engagement opts out.                                                                 |
-| `{ kind = value }` | One grant row, where `value` is `"*"`, an allowlist array (`["./src", "./test"]`), or a kind-defined object.          |
-| `[ { … }, { … } ]` | A **row set**: each row is an independent grant; a request is authorized iff it fits entirely within some single row. |
-| `{}`               | Nothing granted. Tools with non-empty `requires` fail boot.                                                           |
+| Shape              | Meaning                                                                                                                      |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `"*"`              | Whole-tool unrestricted. Sandbox engagement opts out.                                                                        |
+| `{ kind = value }` | One grant row, where `value` is `"*"`, an allowlist array (`["./src", "./test"]`), or a kind-defined object.                 |
+| `[ { … }, { … } ]` | A **capability set**: each row is an independent grant; a request is authorized iff it fits entirely within some single row. |
+| `{}`               | Nothing granted. Tools with non-empty `requires` fail boot.                                                                  |
 
-### Row sets
+### Capability sets
 
 ```toml
 [capabilities]
@@ -477,7 +468,7 @@ bash = [
 ]
 ```
 
-A row set is a **union of boxes, not a bounding box** — rows never
+A capability set is a **union of boxes, not a bounding box** — rows never
 combine to authorize a request that no single row authorizes. The
 grant above does _not_ give "bash" the network: arbitrary shell
 commands get a network-less sandbox over `./`; only `gcalcli` gets
@@ -510,13 +501,13 @@ and itemize the exfiltration surface — `loom audit` can enumerate
 exactly which binaries may touch the network and with what
 filesystem view — but they do **not** eliminate it; nothing does
 while one model holds both secret-reads and any network path. Treat
-a row set as a reviewable, enumerable risk list, not a proof of
+a capability set as a reviewable, enumerable risk list, not a proof of
 impossibility.
 
 ### How a row reaches a pipeline: the command broker
 
 This is the machinery behind "carry their own grants wherever they
-run." When a row set has a general row that engages the sandbox,
+run." When a capability set has a general row that engages the sandbox,
 loom stands up a **broker** for the per-command rows before
 launching the shell:
 
@@ -594,9 +585,9 @@ default semantics are **strict**:
 - A kind absent from a grant is **not** granted — there is no
   implicit `"*"`.
 - `"*"` contains everything; nothing but `"*"` contains `"*"`.
-- Row sets compare row-wise: every subset row must fit entirely
+- Capability sets compare row-wise: every subset row must fit entirely
   within some single superset row.
-- The default merge is the deduplicated union of the two row sets —
+- The default merge is the deduplicated union of the two capability sets —
   lossless, never the kind-wise bounding box.
 
 The path-based builtins override containment so `paths` values
@@ -626,13 +617,13 @@ exactly what `mergeGrants` overrides.
 
 ### Kinds shipped by the built-in tools
 
-| Kind       | Used by                                                | Semantics                                                                                                                                                                                     |
-| ---------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `paths`    | `read_file`, `write_file`, `edit_file`, `find`, `bash` | `"*"` any FS; `["./"]` allowlist roots (lexical containment); absent → the tool defaults to the working directory                                                                             |
-| `commands` | `bash`                                                 | `"*"` shell mode (any command via `bash -c`); `["cat", …]` argv mode (model picks from list, direct spawn, no shell); rows of both kinds compose in a row set; absent → boot fails (required) |
-| `network`  | `bash`                                                 | `"*"` allow; `[]` or absent → deny. Per-host filtering isn't supported by the OS sandboxes.                                                                                                   |
-| `env`      | `bash`                                                 | Two-tier inheritance — see below                                                                                                                                                              |
-| `manifest` | `spawn_subagent`                                       | An inline sub-agent manifest — the delegated authority itself. See the tool's section.                                                                                                        |
+| Kind       | Used by                                                | Semantics                                                                                                                                                                                            |
+| ---------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `paths`    | `read_file`, `write_file`, `edit_file`, `find`, `bash` | `"*"` any FS; `["./"]` allowlist roots (lexical containment); absent → the tool defaults to the working directory                                                                                    |
+| `commands` | `bash`                                                 | `"*"` shell mode (any command via `bash -c`); `["cat", …]` argv mode (model picks from list, direct spawn, no shell); rows of both kinds compose in a capability set; absent → boot fails (required) |
+| `network`  | `bash`                                                 | `"*"` allow; `[]` or absent → deny. Per-host filtering isn't supported by the OS sandboxes.                                                                                                          |
+| `env`      | `bash`                                                 | Two-tier inheritance — see below                                                                                                                                                                     |
+| `manifest` | `spawn_subagent`                                       | An inline sub-agent manifest — the delegated authority itself. See the tool's section.                                                                                                               |
 
 The Anthropic harness's server tools add their own kinds
 (`max_uses`, `allowed_domains`, `blocked_domains`, `user_location`,
@@ -1091,7 +1082,7 @@ and the OS-level confinement.
     the allowed commands and exposes an `args` array; dispatch is direct
     `spawn(cmd, args, …)` with no shell. Useful for scoped sub-agents that
     should only run a handful of programs.
-  - A **row set** mixes both — see [Row sets](#row-sets) for the
+  - A **capability set** mixes both — see [Capability sets](#capability-sets) for the
     dispatch and attribution rules, and
     [the command broker](#how-a-row-reaches-a-pipeline-the-command-broker)
     for how a per-command grant follows its command into pipelines
@@ -1604,7 +1595,7 @@ state.
 | `loom prompt <agent.toml> [text] [--format <text\|trace\|jsonl>] [--emit-preamble]` | One-shot prompt (`text` or stdin). Exits after the turn with a Unix-style code (`0` clean, `130` cancelled, `1` otherwise). `--format`: `text` (default) prints only the final agent message to stdout, pipe-friendly; `trace` prints a coalesced labelled view with tool calls + stop reason; `jsonl` emits one raw `SessionUpdate` per line. `--emit-preamble` (jsonl only) prepends one `{ "preamble": { systemPrompt, events, tools } }` line capturing exactly what the model is about to see — useful for per-turn audit logging.                                                                                                                                                                                                                            |
 | `loom audit <agent.toml> [--json]`                                                  | Static capability tree: the computed effective ceiling (`grants` in `--json` — the one place to see the agent's total authority) plus a `contributed tools:` section with per-group verdicts (which skill/session declarations were accepted or rejected against the ceiling, with paste-ready remediation; `toolGroups` in `--json`; the failure-path `health` report counts them as `rejectedToolGroups`). No model calls. Exits non-zero (with the partial tree printed) when the manifest isn't fully resolvable — unresolved sources, provider init failures, unresolved `[tools]` entries, missing required capabilities, sub-agent capability-ceiling violations (checked with strict containment), rejected tool groups, or `tool.audit()` error findings. |
 | `loom acp serve <agent.toml>`                                                       | Speak [ACP][acp] over stdio. Pairs with any ACP-aware client.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `loom install [agent.toml]`                                                         | Materialise the manifest's npm/path sources into `.loom/node_modules/`, plus those a skill contributes via `loom.providers` (accepted groups only). `lock.toml` records the full set; `--frozen` (CI) fails if the manifest or any contributed source has drifted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `loom install [agent.toml]`                                                         | Materialise the manifest's npm/path sources into `.loom/node_modules/`, plus those a skill contributes via `loom.providers` (accepted groups only). `lock.toml` records the full set; `--frozen` (CI) fails if the manifest or any contributed source has drifted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `loom mcp inspect <provider-spec> [--manifest <agent.toml>] [--json]`               | Spawn an MCP server, dump its tools as paste-and-prune TOML (or JSON). Provider spec is an npm name, a path, or a `[providers]` handle from `--manifest`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `loom providers list`                                                               | List Loom provider packages discoverable from cwd.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `loom providers info <name>`                                                        | Show resolved metadata for a provider package.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
