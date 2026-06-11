@@ -1,5 +1,7 @@
 import type { SessionUpdate } from "../types/acp.js";
 
+export type SubscribeCapacity = number | "unbounded";
+
 interface Subscription {
   queue: SessionUpdate[];
   resolveNext: ((value: IteratorResult<SessionUpdate>) => void) | null;
@@ -38,12 +40,20 @@ export class UpdateSink {
     this.subs.clear();
   }
 
-  subscribe(opts: { capacity?: number } = {}): AsyncIterableIterator<SessionUpdate> {
+  subscribe(
+    opts: { capacity?: SubscribeCapacity } = {},
+  ): AsyncIterableIterator<SessionUpdate> {
+    // "unbounded" is for embedders that drive state machines off the stream:
+    // a silently dropped update (e.g. a message_end frame) corrupts host
+    // state, which is worse than unbounded memory growth under a slow reader.
     const sub: Subscription = {
       queue: [],
       resolveNext: null,
       closed: false,
-      cap: opts.capacity ?? 1024,
+      cap:
+        opts.capacity === "unbounded"
+          ? Number.POSITIVE_INFINITY
+          : (opts.capacity ?? 1024),
     };
     this.subs.add(sub);
     const subs = this.subs;

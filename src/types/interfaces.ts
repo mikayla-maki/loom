@@ -1,4 +1,9 @@
-import type { SessionUpdate, StopReason, TurnUsage } from "./acp.js";
+import type {
+  ContentBlock,
+  SessionUpdate,
+  StopReason,
+  TurnUsage,
+} from "./acp.js";
 import type { JSONSchema } from "./schema.js";
 import type {
   AgentManifest,
@@ -57,6 +62,18 @@ export interface Session {
 export interface Harness {
   /** Should honour `runtime.abortSignal`. */
   run(runtime: Runtime, params?: RunParameters): Promise<TurnResult>;
+
+  /**
+   * Queue user content to inject into the running turn without cancelling
+   * it. Contract for implementers: drain the queue between provider
+   * requests — after the current tool batch completes — and route drained
+   * blocks into history via `runtime.update` as `user_message_chunk`s (with
+   * framing) so sessions and subscribers observe them in order. When no turn
+   * is in flight, queued blocks are drained at the start of the next turn.
+   * Harnesses that do not implement this surface only cancel-and-restart
+   * steering via a second `prompt()`.
+   */
+  steer?(blocks: ContentBlock[]): void;
 
   /** One-shot, tool-free summarisation; does not write to any session. */
   summarise?(args: SummariseArgs): Promise<string>;
@@ -207,6 +224,14 @@ export interface ToolResult {
   display?: ToolDisplay;
 }
 
+/** Interim progress published via `ToolContext.progress`. */
+export interface ToolProgress {
+  /** Plain text is wrapped in a single text content block. */
+  content?: string | import("./acp.js").ToolCallContent[];
+  title?: string;
+  rawOutput?: unknown;
+}
+
 /** Optional ACP rendering metadata folded into the emitted `tool_call_update`. */
 export interface ToolDisplay {
   /** Per-invocation title override, e.g. `"bash: \`ls -la\`"`. */
@@ -230,7 +255,18 @@ export interface AuditFinding {
 export interface ToolContext {
   /** Secret slice filtered to this tool's allowlist. */
   secrets: Record<string, string>;
+  /** The dispatching call's id; ties progress and results to the call. */
+  toolCallId?: string;
   abortSignal: AbortSignal;
+  /**
+   * Publish interim progress for this call. Emits a `tool_call_update` with
+   * `status: "in_progress"` to update subscribers only — progress is
+   * ephemeral and never persisted to the session. Fire-and-forget; safe to
+   * call from long-running tools (e.g. streaming command output). Optional
+   * so hand-built contexts (tests, embedders) need not supply it; tools
+   * call `ctx.progress?.(...)`.
+   */
+  progress?(update: ToolProgress): void;
   /** `sessionId` is filled in by the runtime. */
   requestPermission(
     req: Omit<RequestPermissionRequest, "sessionId">,

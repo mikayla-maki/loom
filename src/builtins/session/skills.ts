@@ -330,7 +330,7 @@ async function walk(dir: string, acc: Skill[]): Promise<void> {
   }
 }
 
-async function loadSkill(dir: string): Promise<Skill> {
+export async function loadSkill(dir: string): Promise<Skill> {
   const skillMdPath = path.join(dir, "SKILL.md");
   const text = await fs.readFile(skillMdPath, "utf8");
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
@@ -346,7 +346,7 @@ async function loadSkill(dir: string): Promise<Skill> {
 // Precedence: `loom.toml` sidecar (enhances a skill you didn't author), then
 // `loom.tools` frontmatter, then a derived read-only grant over the skill dir.
 // `${SKILL_DIR}` substitutes textually before parsing.
-async function compileToolGroup(
+export async function compileToolGroup(
   dir: string,
   frontmatter: SkillFrontmatter,
 ): Promise<ToolGroup> {

@@ -1,4 +1,6 @@
-import type { ContentBlock, SessionUpdate } from "../types/acp.js";
+import { randomUUID } from "node:crypto";
+
+import type { ContentBlock, FrameUpdate, SessionUpdate } from "../types/acp.js";
 import type {
   Agent,
   AgentPreamble,
@@ -20,7 +22,7 @@ import type { Ref } from "../internal/util.js";
 
 import { RuntimeImpl } from "../runtime/runtime.js";
 import type { AgentState } from "../runtime/agent-state.js";
-import type { UpdateSink } from "../runtime/update-sink.js";
+import type { SubscribeCapacity, UpdateSink } from "../runtime/update-sink.js";
 import { agentForSession, type RuntimeServicesImpl } from "./run-agent.js";
 
 export interface RunningAgent {
@@ -28,8 +30,18 @@ export interface RunningAgent {
     prompt: string | ContentBlock[],
     params?: RunParameters,
   ): Promise<TurnResult>;
+  /**
+   * Inject user content into the running turn without cancelling it.
+   * Delegates to `Harness.steer`; throws when the harness does not implement
+   * it. See the `Harness.steer` contract for drain points and history
+   * routing. With no turn in flight, the content is drained at the start of
+   * the next turn.
+   */
+  steer(prompt: string | ContentBlock[]): void;
   cancel(): Promise<void>;
-  updates(opts?: { capacity?: number }): AsyncIterableIterator<SessionUpdate>;
+  updates(opts?: {
+    capacity?: SubscribeCapacity;
+  }): AsyncIterableIterator<SessionUpdate>;
   readonly session: Session;
   readonly harness: Harness;
   readonly manifest: AgentManifest;
@@ -118,6 +130,14 @@ export class RunningAgentImpl implements RunningAgent {
     }
     const blocks: ContentBlock[] =
       typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt;
+    await this.emitFrame({ sessionUpdate: "frame", frame: "turn_start" });
+    const userMessageId = randomUUID();
+    await this.emitFrame({
+      sessionUpdate: "frame",
+      frame: "message_start",
+      role: "user",
+      messageId: userMessageId,
+    });
     for (const block of blocks) {
       const userUpdate: SessionUpdate = {
         sessionUpdate: "user_message_chunk",
@@ -126,6 +146,12 @@ export class RunningAgentImpl implements RunningAgent {
       await Promise.resolve(this.session.push?.(userUpdate) ?? [userUpdate]);
       this.updateSink.emit(userUpdate);
     }
+    await this.emitFrame({
+      sessionUpdate: "frame",
+      frame: "message_end",
+      role: "user",
+      messageId: userMessageId,
+    });
 
     const ctl = new AbortController();
     this.currentAbortCtl = ctl;
@@ -192,11 +218,33 @@ export class RunningAgentImpl implements RunningAgent {
         }
         return await this.harness.run(runtime, params);
       } finally {
+        // turn_end follows the harness's stop, even when run() threw.
+        await this.emitFrame({
+          sessionUpdate: "frame",
+          frame: "turn_end",
+        }).catch(() => undefined);
         this.currentAbortCtl = null;
         this.inflight = null;
       }
     })();
     return this.inflight;
+  }
+
+  steer(prompt: string | ContentBlock[]): void {
+    if (this.closed) throw new Error("Agent has been closed");
+    if (!this.harness.steer) {
+      throw new Error(
+        "This harness does not support steering; cancel and re-prompt instead",
+      );
+    }
+    const blocks: ContentBlock[] =
+      typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt;
+    this.harness.steer(blocks);
+  }
+
+  private async emitFrame(frame: FrameUpdate): Promise<void> {
+    await Promise.resolve(this.session.push?.(frame) ?? [frame]);
+    this.updateSink.emit(frame);
   }
 
   async cancel(): Promise<void> {
@@ -207,7 +255,7 @@ export class RunningAgentImpl implements RunningAgent {
   }
 
   updates(
-    opts: { capacity?: number } = {},
+    opts: { capacity?: SubscribeCapacity } = {},
   ): AsyncIterableIterator<SessionUpdate> {
     return this.updateSink.subscribe(opts);
   }

@@ -4,7 +4,12 @@ export * as errors from "./errors.js";
 
 export { resolveSystemPrompt } from "./manifest/resolver.js";
 
-export { parseAgentManifest } from "./manifest/parser.js";
+export {
+  parseAgentManifest,
+  parseManifestFragments,
+  parseToolTable,
+  type ManifestFragments,
+} from "./manifest/parser.js";
 export {
   substituteEnv,
   type EnvSubstitutionOptions,
@@ -73,7 +78,12 @@ export {
 } from "./builtins/session/compacting.js";
 export { InMemorySession } from "./builtins/session/memory.js";
 export { FileSession } from "./builtins/session/file.js";
-export { SkillsSession } from "./builtins/session/skills.js";
+export {
+  SkillsSession,
+  loadSkill,
+  compileToolGroup,
+  parseFrontmatter,
+} from "./builtins/session/skills.js";
 export { ChainedSession } from "./runtime/session-chain.js";
 export type {
   ClientBridge,
@@ -92,6 +102,8 @@ export type {
 } from "./builtins/session/skills.js";
 
 export { summarise, summariseViaRun } from "./sdk/session-utils.js";
+
+export type { SubscribeCapacity } from "./runtime/update-sink.js";
 
 export type {
   TestHarnessConfig,
@@ -120,6 +132,20 @@ export type {
 } from "./providers/loader.js";
 
 export { buildNativeTools } from "./builtins/tools/native.js";
+
+export {
+  bashSandboxPlan,
+  type SandboxPlan,
+  type SandboxPrefix,
+  type SingleRowGrant,
+} from "./runtime/sandbox/prefix.js";
+export { sandboxEngaged } from "./runtime/sandbox/sandbox-exec.js";
+
+export {
+  OutputBuffer,
+  type OutputBufferOptions,
+  type OutputSnapshot,
+} from "./runtime/output-buffer.js";
 
 export { auditAgent, formatCapabilityTree } from "./audit/audit.js";
 export type { CapabilityTree } from "./audit/audit.js";

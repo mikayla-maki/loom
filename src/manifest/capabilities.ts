@@ -189,6 +189,11 @@ export interface AppliedArgGrant {
   schema: JSONSchema;
   bound: Record<string, unknown>;
   modelArgs: Set<string>;
+  // True only when a per-arg map grant actually narrowed the schema. When
+  // false (whole-tool `*`/undefined or a non-object grant) the model may pass
+  // any argument the underlying tool accepts, so callers must NOT treat
+  // `modelArgs` as a closed whitelist.
+  narrowed: boolean;
 }
 
 export function applyArgGrant(
@@ -211,10 +216,11 @@ export function applyArgGrant(
       schema,
       bound: {},
       modelArgs: allProperties,
+      narrowed: false,
     };
   }
   if (typeof grant !== "object" || Array.isArray(grant)) {
-    return { schema, bound: {}, modelArgs: allProperties };
+    return { schema, bound: {}, modelArgs: allProperties, narrowed: false };
   }
 
   const bound: Record<string, unknown> = {};
@@ -266,6 +272,7 @@ export function applyArgGrant(
     schema: narrowedSchema as JSONSchema,
     bound,
     modelArgs,
+    narrowed: true,
   };
 }
 

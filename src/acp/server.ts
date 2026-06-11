@@ -337,9 +337,9 @@ class LoomAcpAgent implements ACPAgent {
       const sub = agent.updates();
       for await (const u of sub) {
         if (signal.aborted) break;
-        // "stop" is a Loom-internal extension; the wire signals turn end
-        // via PromptResponse.stopReason, so never forward it.
-        if (u.sessionUpdate === "stop") continue;
+        // "stop" and "frame" are Loom-internal extensions; the wire signals
+        // turn end via PromptResponse.stopReason, so never forward them.
+        if (u.sessionUpdate === "stop" || u.sessionUpdate === "frame") continue;
         try {
           await this.connection.sessionUpdate({
             sessionId,

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
 import type {
   ContentBlock as AnthropicContentBlock,
@@ -340,6 +342,37 @@ export class AnthropicHarness implements Harness {
       .join("");
   }
 
+  private steerQueue: ACPContentBlock[] = [];
+
+  steer(blocks: ACPContentBlock[]): void {
+    this.steerQueue.push(...blocks);
+  }
+
+  private async drainSteering(runtime: Runtime): Promise<void> {
+    if (this.steerQueue.length === 0) return;
+    const blocks = this.steerQueue;
+    this.steerQueue = [];
+    const messageId = randomUUID();
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_start",
+      role: "user",
+      messageId,
+    });
+    for (const block of blocks) {
+      await runtime.update({
+        sessionUpdate: "user_message_chunk",
+        content: block,
+      });
+    }
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_end",
+      role: "user",
+      messageId,
+    });
+  }
+
   async run(runtime: Runtime, params?: RunParameters): Promise<TurnResult> {
     let requests = 0;
     this.turnUsage = null;
@@ -350,6 +383,7 @@ export class AnthropicHarness implements Harness {
     const turnThinking = params?.thinking;
 
     while (true) {
+      await this.drainSteering(runtime);
       if (runtime.abortSignal.aborted) {
         await runtime.update({
           sessionUpdate: "stop",
@@ -399,6 +433,13 @@ export class AnthropicHarness implements Harness {
         body.output_config = { effort: turnEffort };
       }
 
+      const messageId = randomUUID();
+      await runtime.update({
+        sessionUpdate: "frame",
+        frame: "message_start",
+        role: "assistant",
+        messageId,
+      });
       let response: AnthropicMessage;
       try {
         response = turnStream
@@ -417,6 +458,14 @@ export class AnthropicHarness implements Harness {
           message: `[anthropic] ${(e as Error).message}`,
         });
       }
+      // The message_end barrier: the assistant message is complete before any
+      // tool from it executes; hosts may rely on this ordering.
+      await runtime.update({
+        sessionUpdate: "frame",
+        frame: "message_end",
+        role: "assistant",
+        messageId,
+      });
 
       if (response.usage) {
         this.accumulateUsage(response.usage);
@@ -815,6 +864,7 @@ export class AnthropicHarness implements Harness {
         case "stop":
         case "plan":
         case "usage_update":
+        case "frame":
           break;
       }
     }

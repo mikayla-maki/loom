@@ -269,6 +269,90 @@ to the layers.
 See [`examples/sdk-agent/agent.ts`](./examples/sdk-agent/agent.ts)
 for a full working SDK setup including a tiny update renderer.
 
+### Embedding Loom: framing, progress, steering
+
+Hosts that drive their own UI or event model off `agent.updates()` get four
+affordances beyond the ACP wire updates:
+
+**Lifecycle frames.** The stream interleaves non-wire
+`{ sessionUpdate: "frame", frame, role?, messageId? }` events:
+`turn_start`/`turn_end` around each `prompt()`, and
+`message_start`/`message_end` around the user message and each assistant
+message (emitted by the harness). `messageId` correlates chunks to their
+message. An assistant `message_end` always precedes execution of any tool
+that message called — hosts can rely on it as a barrier. Frames flow through
+`session.push` so layers can observe them, but storage layers do not persist
+them, and the ACP server strips them from the wire.
+
+**Tool progress.** Tools may call `ctx.progress?.({ content, title?,
+rawOutput? })` to publish interim output; subscribers see a
+`tool_call_update` with `status: "in_progress"`. Progress is ephemeral — it
+never reaches the session, so replay never depends on it.
+
+**Lossless subscriptions.** `agent.updates({ capacity: "unbounded" })`
+disables the default drop-oldest bound (1024). Use it when a dropped update
+would corrupt host state; the default bound remains right for debugging
+renderers.
+
+**Steering.** `agent.steer(prompt)` injects user content into the running
+turn without cancelling it. It delegates to `Harness.steer` (implemented by
+the `anthropic`, `openai`, and `test` harnesses, optional for custom ones):
+queued blocks are drained after the current tool batch completes — or at the
+start of the next turn when idle — and enter history as ordinary framed
+`user_message_chunk`s. Overlapping `prompt()` calls remain the
+cancel-and-restart path.
+
+### Building terminal-style tools
+
+A tool's `execute(input, ctx)` has everything a rich, long-running terminal
+tool needs:
+
+- **Live streaming.** Call `ctx.progress?.({ content, title?, rawOutput? })`
+  as output arrives. Each call emits a `tool_call_update` with
+  `status: "in_progress"` to subscribers only — progress is ephemeral and
+  never persisted, so replay never depends on it. Throttle it (the built-in
+  `bash` flushes at most every 100ms) and send the cumulative tail, not
+  deltas.
+- **Cancellation.** `ctx.abortSignal` fires on `agent.cancel()`; kill the
+  process (and its tree) from the abort handler.
+- **Output discipline.** `OutputBuffer` (exported from the package root)
+  accumulates bytes in arrival order, keeps memory bounded by retaining only
+  the tail, counts the full totals, and — with `spillToFile: true` — streams
+  the complete output to a temp file. `snapshot()` returns the truncated,
+  tail-biased view for `ctx.progress` and the final `ToolResult`;
+  `finalize()` closes the spill file (removing it when nothing was dropped)
+  and yields a `fullOutputPath` to surface when the in-context view is
+  truncated.
+- **Rich results.** Return `{ content, isError?, display? }`, where `display`
+  carries ACP rendering metadata: `title`, `kind`, `locations`,
+  `content` (rich `ToolCallContent[]`, including `{ type: "terminal",
+  terminalId }` when driving an ACP client terminal), and `rawOutput`
+  (e.g. `{ exitCode, signal, durationMs, fullOutputPath }`).
+
+The built-in `bash` tool is the worked example: it streams cumulative output
+via `ctx.progress`, bounds it with `OutputBuffer` (spilling to a temp file on
+overflow), drives the ACP client terminal when one is bridged
+(`ctx.client.createTerminal`), and otherwise spawns directly under the
+capability sandbox.
+
+```ts
+import { OutputBuffer } from "@mcmaki/loom";
+
+async execute(input, ctx) {
+  const out = new OutputBuffer({ spillToFile: true });
+  const child = spawn(cmd, args, { signal: ctx.abortSignal });
+  child.stdout.on("data", (b) => { out.append(b); throttledProgress(ctx, out); });
+  child.stderr.on("data", (b) => { out.append(b); throttledProgress(ctx, out); });
+  const code = await once(child, "close");
+  const snap = await out.finalize();
+  return {
+    content: snap.text,
+    isError: code !== 0,
+    display: { kind: "execute", rawOutput: { exitCode: code, fullOutputPath: snap.fullOutputPath } },
+  };
+}
+```
+
 ---
 
 ## Layered sessions

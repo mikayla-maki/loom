@@ -38,6 +38,7 @@ import {
   validateBashGrant,
 } from "../sandbox/sandbox-exec.js";
 import { setupCommandBroker, type CommandBroker } from "../sandbox/broker.js";
+import { OutputBuffer, type OutputSnapshot } from "../output-buffer.js";
 import { describePaths, paths, resolvedPaths } from "./_path.js";
 
 export const ALWAYS_INHERITED_ENV = [
@@ -482,19 +483,59 @@ export class BashTool implements Tool {
       title: displayLabel,
       kind: "execute",
     };
+    const startedAt = Date.now();
     return await new Promise<ToolResult>((resolve) => {
       const child = spawn(binary, args, {
         cwd,
         env,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let stdout = "";
-      let stderr = "";
+      // One buffer in arrival order gives true terminal-like interleaving of
+      // stdout and stderr, with bounded memory and a spill file for the full
+      // output when the in-context view is truncated.
+      const out = new OutputBuffer({
+        spillToFile: true,
+        tempFilePrefix: "loom-bash",
+      });
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
         child.kill("SIGKILL");
       }, timeout);
+
+      // Throttled live streaming via ctx.progress: subscribers see the
+      // cumulative tail as it grows; the update is ephemeral (never persisted).
+      let progressDirty = false;
+      let lastProgressAt = 0;
+      let progressTimer: NodeJS.Timeout | undefined;
+      const flushProgress = (): void => {
+        if (!ctx.progress || !progressDirty) return;
+        progressDirty = false;
+        lastProgressAt = Date.now();
+        const snap = out.snapshot();
+        ctx.progress({
+          content: snap.text,
+          title: displayLabel,
+          rawOutput: { running: true, bytes: snap.totalBytes },
+        });
+      };
+      const scheduleProgress = (): void => {
+        if (!ctx.progress) return;
+        progressDirty = true;
+        const wait = PROGRESS_THROTTLE_MS - (Date.now() - lastProgressAt);
+        if (wait <= 0) {
+          if (progressTimer) {
+            clearTimeout(progressTimer);
+            progressTimer = undefined;
+          }
+          flushProgress();
+          return;
+        }
+        progressTimer ??= setTimeout(() => {
+          progressTimer = undefined;
+          flushProgress();
+        }, wait);
+      };
 
       const onAbort = (): void => {
         try {
@@ -506,44 +547,75 @@ export class BashTool implements Tool {
       if (ctx.abortSignal.aborted) onAbort();
       else ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
 
-      child.stdout.on("data", (b: Buffer) => (stdout += b.toString("utf8")));
-      child.stderr.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
+      child.stdout.on("data", (b: Buffer) => {
+        out.append(b);
+        scheduleProgress();
+      });
+      child.stderr.on("data", (b: Buffer) => {
+        out.append(b);
+        scheduleProgress();
+      });
       child.on("close", (code, signal) => {
         clearTimeout(timer);
+        if (progressTimer) clearTimeout(progressTimer);
         ctx.abortSignal.removeEventListener("abort", onAbort);
-        const display: ToolDisplay = {
-          ...baseDisplay,
-          rawOutput: { exitCode: code, signal },
-        };
-        if (timedOut) {
-          resolve({
-            content: `bash: timed out after ${timeout}ms\n${stderr}`,
-            isError: true,
-            display,
-          });
-          return;
-        }
-        if (code === 0) {
-          resolve({ content: stdout, display });
-        } else {
-          resolve({
-            content: `exit ${code ?? signal}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
-            isError: true,
-            display,
-          });
-        }
+        void out.finalize().then((snap) => {
+          const body = snap.text + truncationFooter(snap);
+          const display: ToolDisplay = {
+            ...baseDisplay,
+            rawOutput: {
+              exitCode: code,
+              signal,
+              durationMs: Date.now() - startedAt,
+              truncated: snap.truncated,
+              ...(snap.fullOutputPath
+                ? { fullOutputPath: snap.fullOutputPath }
+                : {}),
+            },
+          };
+          if (timedOut) {
+            resolve({
+              content: `bash: timed out after ${timeout}ms\n${body}`,
+              isError: true,
+              display,
+            });
+            return;
+          }
+          if (code === 0) {
+            resolve({ content: body, display });
+          } else {
+            resolve({
+              content: `exit ${code ?? signal}\n${body}`,
+              isError: true,
+              display,
+            });
+          }
+        });
       });
       child.on("error", (err) => {
         clearTimeout(timer);
+        if (progressTimer) clearTimeout(progressTimer);
         ctx.abortSignal.removeEventListener("abort", onAbort);
-        resolve({
-          content: `bash: ${err.message}`,
-          isError: true,
-          display: baseDisplay,
+        void out.finalize().then(() => {
+          resolve({
+            content: `bash: ${err.message}`,
+            isError: true,
+            display: baseDisplay,
+          });
         });
       });
     });
   }
+}
+
+const PROGRESS_THROTTLE_MS = 100;
+
+function truncationFooter(snap: OutputSnapshot): string {
+  if (!snap.truncated) return "";
+  const where = snap.fullOutputPath
+    ? `. Full output: ${snap.fullOutputPath}`
+    : "";
+  return `\n\n[Output truncated: showing last ${snap.shownBytes} of ${snap.totalBytes} bytes${where}]`;
 }
 
 async function runViaClientTerminal(

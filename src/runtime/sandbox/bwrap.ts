@@ -162,7 +162,14 @@ export async function buildBwrapArgs(
     args.push("--bind-try", broker.socketPath, broker.socketPath);
   }
 
-  // --unshare-pid breaks bash builtins like `wait`, so it is omitted.
+  // Isolate the PID namespace. Without it, the fresh `--proc /proc` mount above
+  // reflects the host PID namespace, and because the sandboxed command runs as
+  // the same UID as the orchestrator, the agent could read
+  // /proc/<orchestrator-pid>/environ — exfiltrating the provider API keys that
+  // buildEnv() deliberately strips from the sandbox env. bwrap becomes pid 1 of
+  // the new namespace and reaps children, so bash's `wait` on its own jobs still
+  // works.
+  args.push("--unshare-pid");
   args.push("--unshare-uts");
   args.push("--unshare-ipc");
   args.push("--new-session");

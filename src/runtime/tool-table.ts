@@ -17,7 +17,11 @@ export interface ToolEntry {
 }
 
 export interface ToolContextFactory {
-  build(args: { allowedSecrets: Set<string>; tool: Tool }): ToolContext;
+  build(args: {
+    allowedSecrets: Set<string>;
+    tool: Tool;
+    call: ToolCall;
+  }): ToolContext;
 }
 
 export class ToolTable {
@@ -90,6 +94,7 @@ export class ToolTable {
     const ctx = this.contextFactory.build({
       allowedSecrets: entry.allowedSecrets,
       tool: entry.tool,
+      call,
     });
     ctx.secrets = filteredSecrets;
     try {

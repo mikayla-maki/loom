@@ -22,9 +22,26 @@ import type {
   ToolEntryTable,
 } from "../types/manifest.js";
 
-export async function parseAgentManifest(
+/**
+ * Whatever a manifest file actually contains — every section optional.
+ * The capability and provider machinery consumes fragments directly
+ * (a `[capabilities]`-only file is a valid fragment set); only
+ * `parseAgentManifest` — and thus a runnable agent — demands
+ * `[agent].name` and `[harness]`.
+ */
+export type ManifestFragments = Omit<
+  AgentManifest,
+  "name" | "harness" | "session" | "manifestPath"
+> & {
+  manifestPath: string;
+  name?: string;
+  harness?: HarnessSpec;
+  session?: SessionSpec | SessionSpec[];
+};
+
+export async function parseManifestFragments(
   manifestPath: string,
-): Promise<AgentManifest> {
+): Promise<ManifestFragments> {
   const abs = path.resolve(manifestPath);
   const rawToml = await readToml(abs, "agent.toml");
   const raw = substituteEnv(rawToml, { context: abs }) as Record<
@@ -33,9 +50,12 @@ export async function parseAgentManifest(
   >;
 
   const agent = ensureObject(raw.agent, "[agent]", abs);
-  if (typeof agent.name !== "string" || !agent.name) {
+  if (
+    agent.name !== undefined &&
+    (typeof agent.name !== "string" || !agent.name)
+  ) {
     throw new ManifestError(
-      `agent.toml at ${abs} is missing required [agent].name`,
+      `agent.toml at ${abs}: [agent].name must be a non-empty string`,
     );
   }
   const systemPrompt = parseSystemPromptSpec(agent.system_prompt, abs);
@@ -48,10 +68,10 @@ export async function parseAgentManifest(
       ? undefined
       : parseProviders(raw.providers, abs);
 
-  const harness = parseHarnessSpec(
-    ensureObject(raw.harness, "[harness]", abs),
-    abs,
-  );
+  const harness =
+    raw.harness === undefined
+      ? undefined
+      : parseHarnessSpec(ensureObject(raw.harness, "[harness]", abs), abs);
 
   let session: SessionSpec | SessionSpec[] | undefined;
   if (raw.session !== undefined) {
@@ -68,7 +88,7 @@ export async function parseAgentManifest(
 
   return {
     manifestPath: abs,
-    name: agent.name,
+    ...(typeof agent.name === "string" ? { name: agent.name } : {}),
     ...(typeof agent.description === "string"
       ? { description: agent.description }
       : {}),
@@ -76,12 +96,30 @@ export async function parseAgentManifest(
     ...(secrets !== undefined ? { secrets } : {}),
     ...(storageId !== undefined ? { storageId } : {}),
     ...(providers ? { providers } : {}),
-    harness,
+    ...(harness ? { harness } : {}),
     ...(session ? { session } : {}),
     ...(tools !== undefined ? { tools } : {}),
     ...(capabilities ? { capabilities } : {}),
     ...(metadata ? { metadata } : {}),
   };
+}
+
+export async function parseAgentManifest(
+  manifestPath: string,
+): Promise<AgentManifest> {
+  const fragments = await parseManifestFragments(manifestPath);
+  const { name, harness } = fragments;
+  if (name === undefined) {
+    throw new ManifestError(
+      `agent.toml at ${fragments.manifestPath} is missing required [agent].name`,
+    );
+  }
+  if (harness === undefined) {
+    throw new ManifestError(
+      `agent.toml at ${fragments.manifestPath} is missing required [harness]`,
+    );
+  }
+  return { ...fragments, name, harness };
 }
 
 function parseMetadata(

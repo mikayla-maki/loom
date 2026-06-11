@@ -8,7 +8,11 @@ import type {
   Runtime,
   TurnResult,
 } from "../../types/interfaces.js";
-import type { SessionUpdate, StopReason } from "../../types/acp.js";
+import type {
+  ContentBlock,
+  SessionUpdate,
+  StopReason,
+} from "../../types/acp.js";
 
 export type TurnStep =
   | { say: string }
@@ -35,18 +39,49 @@ export interface TestHarnessConfig {
 
 export class TestHarness implements Harness {
   private turnIndex = 0;
+  private steerQueue: ContentBlock[] = [];
 
   constructor(private readonly config: TestHarnessConfig) {}
 
   public lastParams: RunParameters | undefined;
 
+  steer(blocks: ContentBlock[]): void {
+    this.steerQueue.push(...blocks);
+  }
+
   async run(runtime: Runtime, params?: RunParameters): Promise<TurnResult> {
     this.lastParams = params;
+    await this.drainSteering(runtime);
     if (this.config.echo) {
       return this.runEcho(runtime);
     }
     const steps = await this.nextSteps(runtime);
     return this.executeSteps(runtime, steps);
+  }
+
+  private async drainSteering(runtime: Runtime): Promise<void> {
+    if (this.steerQueue.length === 0) return;
+    const blocks = this.steerQueue;
+    this.steerQueue = [];
+    const messageId = randomUUID();
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_start",
+      role: "user",
+      messageId,
+    });
+    for (const block of blocks) {
+      await runtime.update({
+        sessionUpdate: "user_message_chunk",
+        content: block,
+      });
+    }
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_end",
+      role: "user",
+      messageId,
+    });
   }
 
   private async nextSteps(runtime: Runtime): Promise<TurnStep[]> {
@@ -81,9 +116,22 @@ export class TestHarness implements Harness {
       lastUser && lastUser.content.type === "text"
         ? lastUser.content.text
         : "(no user message)";
+    const messageId = randomUUID();
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_start",
+      role: "assistant",
+      messageId,
+    });
     await runtime.update({
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: `echo: ${text}` },
+    });
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_end",
+      role: "assistant",
+      messageId,
     });
     await runtime.update({ sessionUpdate: "stop", stopReason: "end_turn" });
     return { stopReason: "end_turn" };
@@ -94,22 +142,50 @@ export class TestHarness implements Harness {
     steps: TurnStep[],
   ): Promise<TurnResult> {
     let stopReason: StopReason = "end_turn";
+    // Mirrors a provider harness: say/think chunks and tool-call
+    // announcements belong to an assistant message; the message closes
+    // before any tool executes (the message_end barrier), and post-result
+    // content opens a fresh message.
+    let messageId: string | null = null;
+    const openMessage = async (): Promise<void> => {
+      if (messageId !== null) return;
+      messageId = randomUUID();
+      await runtime.update({
+        sessionUpdate: "frame",
+        frame: "message_start",
+        role: "assistant",
+        messageId,
+      });
+    };
+    const closeMessage = async (): Promise<void> => {
+      if (messageId === null) return;
+      await runtime.update({
+        sessionUpdate: "frame",
+        frame: "message_end",
+        role: "assistant",
+        messageId,
+      });
+      messageId = null;
+    };
     for (const step of steps) {
       if (runtime.abortSignal.aborted) {
         stopReason = "cancelled";
         break;
       }
       if ("say" in step) {
+        await openMessage();
         await runtime.update({
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: step.say },
         });
       } else if ("think" in step) {
+        await openMessage();
         await runtime.update({
           sessionUpdate: "agent_thought_chunk",
           content: { type: "text", text: step.think },
         });
       } else if ("call" in step) {
+        await openMessage();
         const id = randomUUID();
         await runtime.update({
           sessionUpdate: "tool_call",
@@ -118,6 +194,7 @@ export class TestHarness implements Harness {
           status: "in_progress",
           rawInput: step.call.input,
         });
+        await closeMessage();
         const result = await runtime.executeTool({
           id,
           name: step.call.tool,
@@ -129,7 +206,9 @@ export class TestHarness implements Harness {
           modelContent: result.content,
           ...(result.display ? { display: result.display } : {}),
         });
+        await this.drainSteering(runtime);
         if (step.surface !== false) {
+          await openMessage();
           await runtime.update({
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: result.content },
@@ -139,6 +218,7 @@ export class TestHarness implements Harness {
         stopReason = step.stop;
       }
     }
+    await closeMessage();
     await runtime.update({ sessionUpdate: "stop", stopReason });
     return { stopReason };
   }

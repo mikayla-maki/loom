@@ -300,6 +300,40 @@ describe("mcp-server factory — tool resolution + execution", () => {
     });
   });
 
+  it("a per-arg map grant is a closed whitelist at execute time: dropped args can't be re-supplied", async () => {
+    await withEchoTools(async (tools) => {
+      // Grant names only `a`, deliberately withholding `b` from the model.
+      const narrowed = defined(
+        tools.resolveTool("add", {}, {} as never, { a: "*" }),
+        "resolveTool('add', { a: '*' }) returned null",
+      );
+      // The model-facing schema hides `b`...
+      expect(
+        Object.keys(
+          (narrowed.inputSchema as { properties: Record<string, unknown> })
+            .properties,
+        ),
+      ).toEqual(["a"]);
+      // ...and re-supplying `b` is rejected rather than forwarded to the server.
+      const reSupplied = await narrowed.execute(
+        { a: 5, b: 100 },
+        {} as never,
+      );
+      expect(reSupplied.isError).toBe(true);
+      expect(reSupplied.content).toMatch(/'b' is not permitted/);
+
+      // A whole-tool `*`/undefined grant does NOT narrow, so an open schema
+      // still forwards every argument verbatim (no false positives).
+      const open = defined(
+        tools.resolveTool("add", {}, {} as never, undefined),
+        "resolveTool('add', undefined) returned null",
+      );
+      const summed = await open.execute({ a: 5, b: 100 }, {} as never);
+      expect(summed.isError).toBeUndefined();
+      expect(summed.content).toBe("105");
+    });
+  });
+
   it("rejects a non-string `tool` config value", async () => {
     await withEchoTools(async (tools) => {
       expect(() =>

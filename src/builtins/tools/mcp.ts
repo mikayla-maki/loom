@@ -357,6 +357,19 @@ function buildLoomTool(args: {
             isError: true,
           };
         }
+        // When a per-arg map grant narrowed the schema, the granted args form a
+        // closed whitelist. Enforce it here rather than relying on the schema's
+        // `additionalProperties`: many MCP servers omit it, and Ajv runs with
+        // `strict:false`, so a dropped arg the manifest deliberately withheld
+        // would otherwise pass validation and reach the server verbatim.
+        if (applied.narrowed && !applied.modelArgs.has(k)) {
+          return {
+            content:
+              `MCP tool '${mcpName}': argument '${k}' is not permitted by the ` +
+              `[capabilities] grant for this tool.`,
+            isError: true,
+          };
+        }
       }
       const argumentsObject = { ...applied.bound, ...modelArgs };
       let result: CallToolResult;

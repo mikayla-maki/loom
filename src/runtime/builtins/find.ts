@@ -13,6 +13,8 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
+  canonicalizeForGrant,
+  canonicalizeRoots,
   describePaths,
   pathAllowed,
   pathGrantContains,
@@ -82,9 +84,15 @@ export class FindTool implements Tool {
       root: requestedRoot = ".",
       limit = 200,
     } = input as FindInput;
-    const root = path.resolve(requestedRoot);
+    // Resolve symlinks before the lexical allowlist check — find has no OS
+    // sandbox, so a symlink inside a granted dir whose target lies outside the
+    // grant would otherwise let the walk enumerate arbitrary directories.
+    // Mirror read_file/write_file/edit_file: realpath both the target and the
+    // granted roots so the prefix check compares realpath-vs-realpath.
+    const root = await canonicalizeForGrant(path.resolve(requestedRoot), "read");
+    const allowed = await canonicalizeRoots(this.granted);
 
-    if (!pathAllowed(root, this.granted)) {
+    if (!pathAllowed(root, allowed)) {
       return {
         content: `find: root '${requestedRoot}' is outside the granted paths (${describePaths(this.granted, this.fromDefault)})`,
         isError: true,

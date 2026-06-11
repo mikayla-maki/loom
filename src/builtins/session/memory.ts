@@ -9,6 +9,9 @@ export class InMemorySession implements Session {
   private events: SessionUpdate[] = [];
 
   async push(update: SessionUpdate): Promise<SessionUpdate[]> {
+    // Frames are derivable structure, not content; persisting them would
+    // pollute replay. Forward without storing.
+    if (update.sessionUpdate === "frame") return [update];
     this.events.push(update);
     return [update];
   }

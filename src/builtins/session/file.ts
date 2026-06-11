@@ -26,6 +26,10 @@ export class FileSession implements Session {
   constructor(public readonly filePath: string) {}
 
   async push(update: SessionUpdate): Promise<SessionUpdate[]> {
+    // Frames are derivable structure, not content; persisting them would
+    // pollute replay. Forward without storing.
+    if (update.sessionUpdate === "frame") return [update];
+
     const cache = await this.ensureCache();
 
     if (isCoalescable(update)) {

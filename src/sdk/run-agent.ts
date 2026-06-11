@@ -322,11 +322,13 @@ export async function runAgent(
     await runRuntimeAudit(resolvedTools, options.onAuditFinding);
   }
 
+  const updateSink = new UpdateSink();
   const toolTable = buildToolTable(
     resolvedTools,
     allSecrets,
     runtimeServices,
     ownAgent,
+    updateSink,
   );
   const state = new AgentState({
     grants: effectiveCapabilities,
@@ -340,7 +342,7 @@ export async function runAgent(
     session,
     harness,
     state,
-    updateSink: new UpdateSink(),
+    updateSink,
     secrets: allSecrets,
     providers: instances.map((i) => i.tools),
     permissionHolder,
@@ -974,6 +976,7 @@ function buildToolTable(
   allSecrets: Record<string, string>,
   runtimeServices: RuntimeServicesImpl,
   ownAgent: Agent,
+  updateSink: UpdateSink,
 ): ToolTable {
   return new ToolTable({
     tools: [...resolvedTools.values()].map((tool) => ({
@@ -985,12 +988,39 @@ function buildToolTable(
     })),
     secrets: allSecrets,
     contextFactory: {
-      build: ({ tool }) => {
+      build: ({ tool, call }) => {
         const bridge = runtimeServices.currentClientBridge();
         return {
           secrets: {}, // overridden by ToolTable per-call
+          toolCallId: call.id,
           abortSignal: runtimeServices.currentAbortSignal(),
           requestPermission: (req) => runtimeServices.requestPermission(req),
+          // Progress is ephemeral: subscribers only, never session.push, so
+          // replay never depends on it.
+          progress: (update) => {
+            const content =
+              typeof update.content === "string"
+                ? [
+                    {
+                      type: "content" as const,
+                      content: {
+                        type: "text" as const,
+                        text: update.content,
+                      },
+                    },
+                  ]
+                : update.content;
+            updateSink.emit({
+              sessionUpdate: "tool_call_update",
+              toolCallId: call.id,
+              status: "in_progress",
+              ...(content ? { content } : {}),
+              ...(update.title ? { title: update.title } : {}),
+              ...(update.rawOutput !== undefined
+                ? { rawOutput: update.rawOutput }
+                : {}),
+            });
+          },
           agent: agentForTool(ownAgent, tool),
           ...(bridge ? { client: bridge } : {}),
         };

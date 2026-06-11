@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import OpenAI, { APIUserAbortError } from "openai";
 import type {
   EasyInputMessage,
@@ -122,6 +124,37 @@ export class OpenAIHarness implements Harness {
     return response.output_text ?? extractTextFromOutput(response.output);
   }
 
+  private steerQueue: ACPContentBlock[] = [];
+
+  steer(blocks: ACPContentBlock[]): void {
+    this.steerQueue.push(...blocks);
+  }
+
+  private async drainSteering(runtime: Runtime): Promise<void> {
+    if (this.steerQueue.length === 0) return;
+    const blocks = this.steerQueue;
+    this.steerQueue = [];
+    const messageId = randomUUID();
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_start",
+      role: "user",
+      messageId,
+    });
+    for (const block of blocks) {
+      await runtime.update({
+        sessionUpdate: "user_message_chunk",
+        content: block,
+      });
+    }
+    await runtime.update({
+      sessionUpdate: "frame",
+      frame: "message_end",
+      role: "user",
+      messageId,
+    });
+  }
+
   async run(runtime: Runtime, params?: RunParameters): Promise<TurnResult> {
     let requests = 0;
     this.turnUsage = null;
@@ -131,6 +164,7 @@ export class OpenAIHarness implements Harness {
     const turnReasoning = buildReasoning(params);
 
     while (true) {
+      await this.drainSteering(runtime);
       if (runtime.abortSignal.aborted) {
         await runtime.update({
           sessionUpdate: "stop",
@@ -170,6 +204,13 @@ export class OpenAIHarness implements Harness {
         body.reasoning = turnReasoning;
       }
 
+      const messageId = randomUUID();
+      await runtime.update({
+        sessionUpdate: "frame",
+        frame: "message_start",
+        role: "assistant",
+        messageId,
+      });
       let response: OpenAIResponse;
       try {
         response = turnStream
@@ -213,6 +254,15 @@ export class OpenAIHarness implements Harness {
           });
         }
       }
+
+      // The message_end barrier: the assistant message is complete before any
+      // tool from it executes; hosts may rely on this ordering.
+      await runtime.update({
+        sessionUpdate: "frame",
+        frame: "message_end",
+        role: "assistant",
+        messageId,
+      });
 
       if (
         response.status === "incomplete" &&
@@ -411,12 +461,8 @@ export class OpenAIHarness implements Harness {
   private eventsToInputItems(events: SessionUpdate[]): ResponseInputItem[] {
     const items: ResponseInputItem[] = [];
 
-    const isMessageItem = (
-      item: ResponseInputItem,
-    ): item is EasyInputMessage =>
-      !("type" in item) ||
-      item.type === "message" ||
-      item.type === undefined;
+    const isMessageItem = (item: ResponseInputItem): item is EasyInputMessage =>
+      !("type" in item) || item.type === "message" || item.type === undefined;
 
     const lastMessageContent = (
       role: "user" | "assistant",
@@ -498,6 +544,7 @@ export class OpenAIHarness implements Harness {
         case "stop":
         case "plan":
         case "usage_update":
+        case "frame":
           break;
       }
     }
