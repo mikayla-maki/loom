@@ -132,6 +132,11 @@ export type {
 } from "./providers/loader.js";
 
 export { buildNativeTools } from "./builtins/tools/native.js";
+export {
+  McpServerTools,
+  mcpServerToolsFactory,
+  type McpServerInfo,
+} from "./builtins/tools/mcp.js";
 
 export {
   bashSandboxPlan,
