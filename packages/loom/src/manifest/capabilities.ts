@@ -1,0 +1,17 @@
+export {
+  grantRows,
+  singleRowGrant,
+  grantFor,
+  isStarSet,
+  kindGranted,
+  valueFor,
+  assertKnownKinds,
+  assertRequires,
+  assertSecretAllowlist,
+  applyArgGrant,
+  defaultContains,
+  defaultMerge,
+  containsWithTool,
+  mergeWithTool,
+  type AppliedArgGrant,
+} from "@mcmaki/loom-capabilities";

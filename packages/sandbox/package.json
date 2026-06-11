@@ -1,0 +1,73 @@
+{
+  "name": "@mcmaki/loom-sandbox",
+  "version": "0.2.0",
+  "description": "Loom's sandbox layer: per-invocation OS sandboxes (sandbox-exec/bwrap) scoped to capability grants, the command broker, deny-by-default env inheritance, and OutputBuffer",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./sandbox-exec": {
+      "import": "./dist/sandbox-exec.js",
+      "types": "./dist/sandbox-exec.d.ts"
+    },
+    "./bwrap": {
+      "import": "./dist/bwrap.js",
+      "types": "./dist/bwrap.d.ts"
+    },
+    "./broker": {
+      "import": "./dist/broker.js",
+      "types": "./dist/broker.d.ts"
+    },
+    "./prefix": {
+      "import": "./dist/prefix.js",
+      "types": "./dist/prefix.d.ts"
+    },
+    "./env": {
+      "import": "./dist/env.js",
+      "types": "./dist/env.d.ts"
+    },
+    "./output-buffer": {
+      "import": "./dist/output-buffer.js",
+      "types": "./dist/output-buffer.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "sandbox",
+    "sandbox-exec",
+    "bubblewrap",
+    "capabilities",
+    "loom"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikayla-maki/loom.git",
+    "directory": "packages/sandbox"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mcmaki/loom-capabilities": "^0.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -8,19 +8,19 @@ coverage/
 .env
 .env.*
 !.env.example
-test/fixtures/**/session.jsonl
-test/fixtures/**/.glass-secrets
+**/test/fixtures/**/session.jsonl
+**/test/fixtures/**/.glass-secrets
 
 # Stray TS compile output inside `src/` and `test/`. `npm run build`
 # writes everything to `dist/`; if `.js` / `.d.ts` ever appears beside
 # a `.ts` source it's because something ran `tsc <file.ts>` directly
 # (which bypasses tsconfig and emits next to the source). Belt-and-
 # braces in case that happens again.
-src/**/*.js
-src/**/*.js.map
-src/**/*.d.ts
-src/**/*.d.ts.map
-test/**/*.js
-test/**/*.js.map
-test/**/*.d.ts
-test/**/*.d.ts.map
+**/src/**/*.js
+**/src/**/*.js.map
+**/src/**/*.d.ts
+**/src/**/*.d.ts.map
+**/test/**/*.js
+**/test/**/*.js.map
+**/test/**/*.d.ts
+**/test/**/*.d.ts.map

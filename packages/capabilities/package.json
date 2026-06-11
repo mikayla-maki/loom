@@ -1,0 +1,52 @@
+{
+  "name": "@mcmaki/loom-capabilities",
+  "version": "0.2.0",
+  "description": "Loom's capability format: the grant grammar, the tool-owned lattice algebra, ceiling judging, manifest fragments, and the Agent Skills compiler",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "capabilities",
+    "agent",
+    "security",
+    "agent-skills",
+    "loom"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikayla-maki/loom.git",
+    "directory": "packages/capabilities"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "seedrandom": "^3.0.5",
+    "toml": "^4.1.1",
+    "yaml": "^2.8.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/seedrandom": "^3.0.8",
+    "typescript": "^5.6.0"
+  }
+}

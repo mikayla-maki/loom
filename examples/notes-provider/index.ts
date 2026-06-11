@@ -33,10 +33,10 @@ import type {
   Tool,
   ToolConfig,
   ToolRef,
-} from "../../src/types/interfaces.js";
-import type { LoomProviderApi } from "../../src/providers/loader.js";
-import type { SessionUpdate } from "../../src/types/acp.js";
-import type { CapabilitySet } from "../../src/types/manifest.js";
+} from "../../packages/loom/src/types/interfaces.js";
+import type { LoomProviderApi } from "../../packages/loom/src/providers/loader.js";
+import type { SessionUpdate } from "../../packages/loom/src/types/acp.js";
+import type { CapabilitySet } from "../../packages/loom/src/types/manifest.js";
 
 // By convention this matches the package name (and, for path-based
 // references, the directory name) so a manifest's local handle

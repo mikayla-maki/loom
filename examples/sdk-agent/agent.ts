@@ -60,7 +60,7 @@ import {
   runAgent,
   type AgentManifest,
   type SessionUpdate,
-} from "../../src/index.js";
+} from "../../packages/loom/src/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
