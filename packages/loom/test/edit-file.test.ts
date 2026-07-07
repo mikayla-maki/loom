@@ -97,3 +97,68 @@ describe("edit_file applies exact-text replacements", () => {
     });
   });
 });
+
+// edit_file writes back through the same no-follow fd it read from, so a
+// terminal symlink or a hard-link alias cannot redirect the write-back out of
+// the grant. Mirrors the write_file hardening.
+describe("edit_file refuses symlink and hard-link escapes", () => {
+  const root = useTmpDir("loom-edit-sec-");
+
+  async function grantAndOutside() {
+    const grant = path.join(root(), "grant");
+    const outside = path.join(root(), "outside");
+    await fs.mkdir(grant, { recursive: true });
+    await fs.mkdir(outside, { recursive: true });
+    return { grant, outside };
+  }
+
+  it("refuses to edit through a terminal symlink pointing out of the grant", async () => {
+    const { grant, outside } = await grantAndOutside();
+    const secret = path.join(outside, "secret.txt");
+    await fs.writeFile(secret, "hello world");
+    const link = path.join(grant, "escape.txt");
+    await fs.symlink(secret, link);
+
+    const tool = new EditFileTool({}, { paths: [grant] });
+    const result = await tool.execute(
+      { path: link, edits: [{ old_text: "world", new_text: "PWNED" }] },
+      makeCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(await fs.readFile(secret, "utf8")).toBe("hello world");
+  });
+
+  it("refuses to edit a hard link that aliases a file outside the grant", async () => {
+    const { grant, outside } = await grantAndOutside();
+    const secret = path.join(outside, "secret.txt");
+    await fs.writeFile(secret, "hello world");
+    const alias = path.join(grant, "alias.txt");
+    await fs.link(secret, alias);
+
+    const tool = new EditFileTool({}, { paths: [grant] });
+    const result = await tool.execute(
+      { path: alias, edits: [{ old_text: "world", new_text: "PWNED" }] },
+      makeCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/hard link/i);
+    expect(await fs.readFile(secret, "utf8")).toBe("hello world");
+  });
+
+  it("still edits a normal in-grant file", async () => {
+    const { grant } = await grantAndOutside();
+    const file = path.join(grant, "note.txt");
+    await fs.writeFile(file, "alpha beta");
+
+    const tool = new EditFileTool({}, { paths: [grant] });
+    const result = await tool.execute(
+      { path: file, edits: [{ old_text: "beta", new_text: "gamma" }] },
+      makeCtx(),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(await fs.readFile(file, "utf8")).toBe("alpha gamma");
+  });
+});

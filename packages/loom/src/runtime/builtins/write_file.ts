@@ -13,9 +13,11 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
+  assertSafeWriteTarget,
   canonicalizeForGrant,
   canonicalizeRoots,
   describePaths,
+  openWriteNoFollow,
   pathAllowed,
   pathGrantContains,
   paths,
@@ -94,36 +96,63 @@ export class WriteFileTool implements Tool {
       };
     }
 
-    // Best-effort pre-write read for the diff; null oldText for new files.
-    let priorContent: string | null = null;
-    try {
-      if (ctx.client?.readTextFile) {
-        priorContent = await ctx.client.readTextFile({ path: target });
-      } else {
-        priorContent = await fs.readFile(target, "utf8");
+    // Parent dirs first, so the final-component open below sees a real dir.
+    if (i.create_dirs) {
+      try {
+        await fs.mkdir(path.dirname(target), { recursive: true });
+      } catch (e) {
+        return {
+          content: `write_file: ${(e as Error).message}`,
+          isError: true,
+          display: failureDisplay(target, i),
+        };
       }
-    } catch {
-      priorContent = null;
     }
 
     // ACP `fs/writeTextFile` is full-file replacement; append/create_dirs
     // must go through local fs.
     const useClient = ctx.client?.writeTextFile && !i.append && !i.create_dirs;
 
+    // Prior content is best-effort, for the diff only; null oldText = new file.
+    let priorContent: string | null = null;
+    let existed = false;
     try {
       if (useClient) {
-        await ctx.client!.writeTextFile!({
-          path: target,
-          content: i.content,
-        });
-      } else {
-        if (i.create_dirs) {
-          await fs.mkdir(path.dirname(target), { recursive: true });
+        // The editor writes by path — guard the final component (symlink /
+        // hard-link escape) before delegating.
+        await assertSafeWriteTarget(target);
+        try {
+          priorContent = await ctx.client!.readTextFile!({ path: target });
+          existed = priorContent !== null;
+        } catch {
+          priorContent = null;
         }
-        if (i.append) {
-          await fs.appendFile(target, i.content, "utf8");
-        } else {
-          await fs.writeFile(target, i.content, "utf8");
+        await ctx.client!.writeTextFile!({ path: target, content: i.content });
+      } else {
+        // Open the final component without following a terminal symlink and
+        // write THROUGH the fd, closing the check-then-write race; reject
+        // hard-link aliases. See openWriteNoFollow.
+        const { handle, existed: pre } = await openWriteNoFollow(target, {
+          append: i.append === true,
+          create: true,
+        });
+        existed = pre;
+        try {
+          if (existed) {
+            try {
+              priorContent = await handle.readFile({ encoding: "utf8" });
+            } catch {
+              priorContent = null;
+            }
+          }
+          if (i.append) {
+            await handle.write(i.content, null, "utf8");
+          } else {
+            await handle.truncate(0);
+            await handle.write(i.content, 0, "utf8");
+          }
+        } finally {
+          await handle.close();
         }
       }
     } catch (e) {
@@ -145,7 +174,7 @@ export class WriteFileTool implements Tool {
       newText: finalContent,
     };
     const display: ToolDisplay = {
-      title: describeTitle(target, priorContent !== null, i.append === true),
+      title: describeTitle(target, existed, i.append === true),
       kind: "edit",
       locations: [{ path: target }],
       content: [diff],

@@ -1,3 +1,4 @@
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -83,6 +84,116 @@ export async function canonicalizeRoots(
       }
     }),
   );
+}
+
+// Raised when a write target defeats the lexical allowlist by aliasing a file
+// outside the grant (a terminal symlink or a hard link). Callers surface the
+// message and mark the result as an error.
+export class PathSecurityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PathSecurityError";
+  }
+}
+
+// A write target opened WITHOUT following a terminal symlink and verified not
+// to be a hard-link alias. Callers write THROUGH `handle` (never by path
+// again), so no symlink can be raced into place between the check and the
+// write. `existed` reports whether the file was already present, for the
+// create-vs-overwrite diff label.
+export interface SafeWriteHandle {
+  handle: fs.FileHandle;
+  existed: boolean;
+}
+
+function symlinkRefusal(target: string): PathSecurityError {
+  return new PathSecurityError(
+    `refusing to write through a symlink ('${target}'): the granted path ` +
+      `allowlist is enforced on the link itself, not on the file it points ` +
+      `to, so following it could escape the grant`,
+  );
+}
+
+function hardLinkRefusal(target: string, nlink: number): PathSecurityError {
+  return new PathSecurityError(
+    `refusing to write to '${target}': it is a hard link (link count ` +
+      `${nlink}) and may alias a file outside the granted paths. Write to a ` +
+      `fresh path instead`,
+  );
+}
+
+// `realpath` resolves symlinks, so `canonicalizeForGrant` already rejects a
+// write whose final component is a symlink pointing at an *existing* file
+// outside the grant. Two escapes slip past it, which this closes:
+//
+//   * A DANGLING terminal symlink (or one whose target doesn't exist yet):
+//     `realpath` fails, the fallback re-joins the tail onto the in-grant
+//     ancestor, the lexical check passes, and a path-based write then follows
+//     the link out of the grant. Also covers the check-then-write RACE where a
+//     symlink is swapped in after the allowlist check. `O_NOFOLLOW` makes the
+//     open fail (ELOOP) rather than follow a terminal symlink, and the write
+//     goes through the returned fd, so there is no second path lookup to race.
+//
+//   * A HARD LINK inside the grant aliasing an inode that also lives outside
+//     it. `realpath` sees only an in-grant name; the link count from `fstat`
+//     is the only tell, so regular files with nlink > 1 are refused.
+export async function openWriteNoFollow(
+  target: string,
+  opts: { append: boolean; create: boolean },
+): Promise<SafeWriteHandle> {
+  // Prior existence (for the diff label) plus an early, precise symlink reject.
+  // The authoritative symlink defense is O_NOFOLLOW below.
+  let existed = true;
+  try {
+    const pre = await fs.lstat(target);
+    if (pre.isSymbolicLink()) throw symlinkRefusal(target);
+  } catch (e) {
+    if (e instanceof PathSecurityError) throw e;
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") existed = false;
+    else throw e;
+  }
+
+  // O_RDWR (not O_WRONLY) so prior content can be read back through this same
+  // fd for the diff, race-free, without a second path lookup.
+  let flags = fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW ?? 0);
+  if (opts.append) flags |= fsConstants.O_APPEND;
+  if (opts.create) flags |= fsConstants.O_CREAT;
+
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(target, flags, 0o644);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") throw symlinkRefusal(target);
+    throw e;
+  }
+
+  try {
+    const st = await handle.stat();
+    if (st.isFile() && st.nlink > 1) throw hardLinkRefusal(target, st.nlink);
+  } catch (e) {
+    await handle.close();
+    throw e;
+  }
+
+  return { handle, existed };
+}
+
+// Best-effort guard for the ACP-client write path, which writes by PATH on the
+// editor side, so we cannot hand it a fd. Rejects the same terminal-symlink and
+// hard-link escapes via an lstat. A residual check-then-write race is inherent
+// to delegating by path and is bounded by the editor being a trusted local
+// component; the fd-based `openWriteNoFollow` is used whenever we write
+// ourselves.
+export async function assertSafeWriteTarget(target: string): Promise<void> {
+  let st: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    st = await fs.lstat(target);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  if (st.isSymbolicLink()) throw symlinkRefusal(target);
+  if (st.isFile() && st.nlink > 1) throw hardLinkRefusal(target, st.nlink);
 }
 
 export function pathAllowed(target: string, granted: "*" | string[]): boolean {

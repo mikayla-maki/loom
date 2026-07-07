@@ -1,4 +1,3 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { ToolCallContent } from "../../types/acp.js";
@@ -13,9 +12,12 @@ import type { CapabilitySet } from "../../types/manifest.js";
 import type { JSONSchema } from "../../types/schema.js";
 
 import {
+  assertSafeWriteTarget,
   canonicalizeForGrant,
   canonicalizeRoots,
   describePaths,
+  openWriteNoFollow,
+  PathSecurityError,
   pathAllowed,
   pathGrantContains,
   paths,
@@ -111,62 +113,99 @@ export class EditFileTool implements Tool {
       };
     }
 
-    // Route through the ACP client so the agent sees unsaved editor changes.
-    let oldContent: string;
-    try {
-      if (ctx.client?.readTextFile) {
-        oldContent = await ctx.client.readTextFile({ path: target });
-      } else {
-        oldContent = await fs.readFile(target, "utf8");
+    // When the ACP client can both read and write, route through it so the
+    // agent sees (and the editor keeps) unsaved buffer changes. Otherwise write
+    // through a validated fd that never follows a terminal symlink and rejects
+    // hard-link aliases (see openWriteNoFollow).
+    const useClient = !!(ctx.client?.readTextFile && ctx.client?.writeTextFile);
+
+    if (useClient) {
+      try {
+        await assertSafeWriteTarget(target);
+      } catch (e) {
+        return { content: `edit_file: ${(e as Error).message}`, isError: true };
       }
+      let oldContent: string;
+      try {
+        oldContent = await ctx.client!.readTextFile!({ path: target });
+      } catch (e) {
+        return {
+          content: `edit_file: ${(e as Error).message}. Use write_file to create new files.`,
+          isError: true,
+        };
+      }
+      let newContent: string;
+      try {
+        newContent = applyEdits(oldContent, i.edits);
+      } catch (e) {
+        return { content: `edit_file: ${(e as Error).message}`, isError: true };
+      }
+      try {
+        await ctx.client!.writeTextFile!({ path: target, content: newContent });
+      } catch (e) {
+        return { content: `edit_file: ${(e as Error).message}`, isError: true };
+      }
+      return editResult(target, oldContent, newContent, i.edits.length, i.path);
+    }
+
+    let handle;
+    try {
+      ({ handle } = await openWriteNoFollow(target, {
+        append: false,
+        create: false,
+      }));
     } catch (e) {
+      if (e instanceof PathSecurityError) {
+        return { content: `edit_file: ${e.message}`, isError: true };
+      }
       return {
         content: `edit_file: ${(e as Error).message}. Use write_file to create new files.`,
         isError: true,
       };
     }
 
-    let newContent: string;
     try {
-      newContent = applyEdits(oldContent, i.edits);
-    } catch (e) {
-      return {
-        content: `edit_file: ${(e as Error).message}`,
-        isError: true,
-      };
-    }
-
-    try {
-      if (ctx.client?.writeTextFile) {
-        await ctx.client.writeTextFile({ path: target, content: newContent });
-      } else {
-        await fs.writeFile(target, newContent, "utf8");
+      const oldContent = await handle.readFile({ encoding: "utf8" });
+      let newContent: string;
+      try {
+        newContent = applyEdits(oldContent, i.edits);
+      } catch (e) {
+        return { content: `edit_file: ${(e as Error).message}`, isError: true };
       }
+      await handle.truncate(0);
+      await handle.write(newContent, 0, "utf8");
+      return editResult(target, oldContent, newContent, i.edits.length, i.path);
     } catch (e) {
-      return {
-        content: `edit_file: ${(e as Error).message}`,
-        isError: true,
-      };
+      return { content: `edit_file: ${(e as Error).message}`, isError: true };
+    } finally {
+      await handle.close();
     }
-
-    const diff: ToolCallContent = {
-      type: "diff",
-      path: target,
-      oldText: oldContent,
-      newText: newContent,
-    };
-    const display: ToolDisplay = {
-      title: `Edited ${path.basename(target)} (${i.edits.length} block${i.edits.length === 1 ? "" : "s"})`,
-      kind: "edit",
-      locations: [{ path: target }],
-      content: [diff],
-    };
-
-    return {
-      content: `Replaced ${i.edits.length} block${i.edits.length === 1 ? "" : "s"} in ${i.path}.`,
-      display,
-    };
   }
+}
+
+function editResult(
+  target: string,
+  oldContent: string,
+  newContent: string,
+  editCount: number,
+  requestedPath: string,
+): ToolResult {
+  const diff: ToolCallContent = {
+    type: "diff",
+    path: target,
+    oldText: oldContent,
+    newText: newContent,
+  };
+  const display: ToolDisplay = {
+    title: `Edited ${path.basename(target)} (${editCount} block${editCount === 1 ? "" : "s"})`,
+    kind: "edit",
+    locations: [{ path: target }],
+    content: [diff],
+  };
+  return {
+    content: `Replaced ${editCount} block${editCount === 1 ? "" : "s"} in ${requestedPath}.`,
+    display,
+  };
 }
 
 export function applyEdits(
