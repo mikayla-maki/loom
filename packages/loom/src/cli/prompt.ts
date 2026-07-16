@@ -12,6 +12,38 @@ import type { PermissionHandler } from "../types/permissions.js";
 
 export type PromptFormat = "text" | "trace" | "jsonl";
 
+/**
+ * Parse and validate a JSON string as an ACP `ContentBlock[]`, as accepted by
+ * `loom prompt --blocks-stdin`. Throws an `Error` with a user-facing message on
+ * any failure (malformed JSON, non-array, empty array, or an element lacking a
+ * string `type`). We validate only the `type` discriminant; the harness rejects
+ * blocks whose shape doesn't match their declared type.
+ */
+export function parseContentBlocksJson(raw: string): ContentBlock[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`--blocks-stdin: invalid JSON (${(e as Error).message})`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("--blocks-stdin: expected a JSON array of content blocks");
+  }
+  if (parsed.length === 0) {
+    throw new Error("--blocks-stdin: content block array is empty");
+  }
+  for (let i = 0; i < parsed.length; i++) {
+    const block = parsed[i];
+    if (typeof block !== "object" || block === null || Array.isArray(block)) {
+      throw new Error(`--blocks-stdin: block ${i} is not an object`);
+    }
+    if (typeof (block as { type?: unknown }).type !== "string") {
+      throw new Error(`--blocks-stdin: block ${i} is missing a string "type"`);
+    }
+  }
+  return parsed as ContentBlock[];
+}
+
 export const TEXT_MODE_PROMPT_AUGMENTATION =
   "You are being invoked in text-output mode. Only " +
   "your final message — the text after your last tool call, before " +
@@ -48,6 +80,48 @@ export function applyTextModeAugmentation(
     return { ...manifest, systemPrompt: joined };
   }
   return manifest;
+}
+
+export type ResolvedPromptInput =
+  | { ok: true; input: string | ContentBlock[] }
+  | { ok: false; error: string };
+
+/**
+ * Resolve the `loom prompt` turn input from CLI args. In text mode the input is
+ * the positional `[text]` or, if absent, stdin. With `--blocks-stdin` the input
+ * is a JSON `ContentBlock[]` read from stdin; passing `[text]` as well is an
+ * error. Returns `{ ok: false, error }` (caller prints to stderr and exits 2)
+ * rather than throwing, so both empty-input guards live in one place.
+ */
+export async function resolvePromptInput(args: {
+  positionalText: string;
+  blocksStdin: boolean;
+  readStdin: () => Promise<string>;
+}): Promise<ResolvedPromptInput> {
+  if (args.blocksStdin) {
+    if (args.positionalText) {
+      return {
+        ok: false,
+        error:
+          "--blocks-stdin reads content blocks from stdin; do not also pass [text]",
+      };
+    }
+    const raw = await args.readStdin();
+    try {
+      return { ok: true, input: parseContentBlocksJson(raw) };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+  let text = args.positionalText;
+  if (!text) text = await args.readStdin();
+  if (!text.trim()) {
+    return {
+      ok: false,
+      error: "no prompt text supplied (pipe via stdin or pass as arg)",
+    };
+  }
+  return { ok: true, input: text };
 }
 
 export interface PromptRenderer {
@@ -320,7 +394,12 @@ export function makeRenderer(
 
 export interface RunPromptOptions {
   manifest: string | AgentManifest;
-  text: string;
+  /**
+   * The turn's user content: either plain text or a pre-built ACP
+   * `ContentBlock[]` (e.g. from `--blocks-stdin`). Passed straight through to
+   * `agent.prompt()`, which accepts both shapes.
+   */
+  input: string | ContentBlock[];
   format: PromptFormat;
   /** Emits one `{"preamble": {...}}` JSON line before the turn; requires `format === "jsonl"`. */
   emitPreamble?: boolean;
@@ -368,7 +447,7 @@ export async function runPromptCommand(
   let runErr: unknown = null;
   try {
     const result = await agent.prompt(
-      opts.text,
+      opts.input,
       opts.emitPreamble
         ? {
             onPreamble: (preamble) => {

@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 import { runAgent, LOOM_VERSION } from "../sdk/run-agent.js";
-import { runPromptCommand, type PromptFormat } from "./prompt.js";
+import {
+  runPromptCommand,
+  resolvePromptInput,
+  type PromptFormat,
+} from "./prompt.js";
 import {
   AuditError,
   auditAgent,
@@ -67,7 +71,7 @@ function printHelp(): void {
 
 Usage:
   loom run <agent.toml>                  Interactive REPL with the agent.
-  loom prompt <agent.toml> [text] [--format <text|trace|jsonl>] [--emit-preamble]
+  loom prompt <agent.toml> [text] [--format <text|trace|jsonl>] [--emit-preamble] [--blocks-stdin]
                                          One-shot prompt (stdin if [text] omitted).
                                          text (default): final agent message to stdout.
                                          trace: coalesced labelled debug view.
@@ -76,6 +80,10 @@ Usage:
                                          { preamble: {...} } line first, capturing
                                          the system prompt, history events, and
                                          tool list as the model will see them.
+                                         --blocks-stdin reads a JSON ACP
+                                         ContentBlock[] from stdin as the prompt
+                                         (for image/audio input); mutually
+                                         exclusive with [text].
   loom audit <agent.toml> [--json]       Print the static capability tree.
                                          Exits non-zero (with partial tree)
                                          if the manifest isn't fully resolved.
@@ -133,7 +141,7 @@ async function cmdPrompt(args: string[]): Promise<number> {
   const manifestPath = opts._[0];
   if (!manifestPath) {
     console.error(
-      "usage: loom prompt <agent.toml> [text] [--format <text|trace|jsonl>] [--emit-preamble]",
+      "usage: loom prompt <agent.toml> [text] [--format <text|trace|jsonl>] [--emit-preamble] [--blocks-stdin]",
     );
     return 2;
   }
@@ -153,17 +161,18 @@ async function cmdPrompt(args: string[]): Promise<number> {
     );
     return 2;
   }
-  let text = opts._.slice(1).join(" ");
-  if (!text) text = await readStdin();
-  if (!text.trim()) {
-    console.error(
-      "error: no prompt text supplied (pipe via stdin or pass as arg)",
-    );
+  const resolved = await resolvePromptInput({
+    positionalText: opts._.slice(1).join(" "),
+    blocksStdin: opts.flags["blocks-stdin"] === true,
+    readStdin,
+  });
+  if (!resolved.ok) {
+    console.error(`error: ${resolved.error}`);
     return 2;
   }
   return await runPromptCommand({
     manifest: manifestPath,
-    text,
+    input: resolved.input,
     format,
     emitPreamble,
     permissionHandler: ttyPermissionHandler(),

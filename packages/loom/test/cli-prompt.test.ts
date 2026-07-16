@@ -3,6 +3,8 @@ import { Writable } from "node:stream";
 
 import {
   runPromptCommand,
+  parseContentBlocksJson,
+  resolvePromptInput,
   exitCodeForStopReason,
   applyTextModeAugmentation,
   TEXT_MODE_PROMPT_AUGMENTATION,
@@ -10,6 +12,7 @@ import {
   TracePromptRenderer,
   JsonlPromptRenderer,
 } from "../src/cli/prompt.js";
+import type { ContentBlock } from "../src/types/acp.js";
 import type { AgentManifest } from "../src/types/manifest.js";
 import type { Harness, Runtime } from "../src/types/interfaces.js";
 import type { SessionUpdate } from "../src/types/acp.js";
@@ -293,6 +296,157 @@ describe("applyTextModeAugmentation", () => {
   });
 });
 
+describe("parseContentBlocksJson", () => {
+  it("parses a valid non-empty array of typed blocks", () => {
+    const blocks = parseContentBlocksJson(
+      JSON.stringify([
+        { type: "text", text: "look at this" },
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+      ]),
+    );
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toMatchObject({ type: "text", text: "look at this" });
+    expect(blocks[1]).toMatchObject({ type: "image", mimeType: "image/png" });
+  });
+
+  it("rejects malformed JSON", () => {
+    expect(() => parseContentBlocksJson("{not json")).toThrow(/invalid JSON/);
+  });
+
+  it("rejects a non-array top-level value", () => {
+    expect(() => parseContentBlocksJson('{"type":"text"}')).toThrow(
+      /expected a JSON array/,
+    );
+  });
+
+  it("rejects an empty array", () => {
+    expect(() => parseContentBlocksJson("[]")).toThrow(/empty/);
+  });
+
+  it("rejects a block that is not an object", () => {
+    expect(() => parseContentBlocksJson('["hi"]')).toThrow(
+      /block 0 is not an object/,
+    );
+  });
+
+  it("rejects a block missing a string type", () => {
+    expect(() => parseContentBlocksJson('[{"text":"hi"}]')).toThrow(
+      /block 0 is missing a string "type"/,
+    );
+  });
+});
+
+describe("resolvePromptInput", () => {
+  const noStdin = () => Promise.resolve("");
+
+  it("uses positional text in text mode", async () => {
+    const r = await resolvePromptInput({
+      positionalText: "hello there",
+      blocksStdin: false,
+      readStdin: noStdin,
+    });
+    expect(r).toEqual({ ok: true, input: "hello there" });
+  });
+
+  it("falls back to stdin text when no positional is given", async () => {
+    const r = await resolvePromptInput({
+      positionalText: "",
+      blocksStdin: false,
+      readStdin: () => Promise.resolve("from stdin"),
+    });
+    expect(r).toEqual({ ok: true, input: "from stdin" });
+  });
+
+  it("rejects empty text input", async () => {
+    const r = await resolvePromptInput({
+      positionalText: "",
+      blocksStdin: false,
+      readStdin: () => Promise.resolve("   \n"),
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/no prompt text supplied/);
+  });
+
+  it("parses blocks from stdin under --blocks-stdin", async () => {
+    const r = await resolvePromptInput({
+      positionalText: "",
+      blocksStdin: true,
+      readStdin: () =>
+        Promise.resolve(
+          JSON.stringify([{ type: "image", data: "AAAA", mimeType: "image/png" }]),
+        ),
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.input).toEqual([
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+      ]);
+    }
+  });
+
+  it("rejects passing both [text] and --blocks-stdin", async () => {
+    const r = await resolvePromptInput({
+      positionalText: "some text",
+      blocksStdin: true,
+      readStdin: () => Promise.reject(new Error("stdin should not be read")),
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/do not also pass \[text\]/);
+  });
+
+  it("surfaces block validation errors from stdin", async () => {
+    const r = await resolvePromptInput({
+      positionalText: "",
+      blocksStdin: true,
+      readStdin: () => Promise.resolve("[]"),
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/empty/);
+  });
+});
+
+describe("runPromptCommand (content-block input)", () => {
+  it("passes a ContentBlock[] through to the turn (echoed as user chunks)", async () => {
+    const cap = captureStreams();
+    const harness = makeRecordingHarness(async () => [
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "got it" },
+      },
+      { sessionUpdate: "stop", stopReason: "end_turn" },
+    ]);
+    const manifest: AgentManifest = {
+      name: "blocks",
+      tools: {},
+      harness,
+    };
+    const input: ContentBlock[] = [
+      { type: "text", text: "describe this" },
+      { type: "image", data: "AAAA", mimeType: "image/png" },
+    ];
+    const code = await runPromptCommand({
+      manifest,
+      input,
+      format: "jsonl",
+      streams: cap.streams,
+    });
+    expect(code).toBe(0);
+    const userChunks = cap
+      .stdout()
+      .trimEnd()
+      .split("\n")
+      .map((l) => JSON.parse(l))
+      .filter((u) => u.sessionUpdate === "user_message_chunk")
+      .map((u) => u.content);
+    expect(userChunks).toContainEqual({ type: "text", text: "describe this" });
+    expect(userChunks).toContainEqual({
+      type: "image",
+      data: "AAAA",
+      mimeType: "image/png",
+    });
+  });
+});
+
 describe("runPromptCommand (end-to-end)", () => {
   async function runScenario(opts: {
     updates: SessionUpdate[];
@@ -316,7 +470,7 @@ describe("runPromptCommand (end-to-end)", () => {
     };
     const code = await runPromptCommand({
       manifest,
-      text: opts.text ?? "hi",
+      input: opts.text ?? "hi",
       format: opts.format,
       streams: cap.streams,
     });
