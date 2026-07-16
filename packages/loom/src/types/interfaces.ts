@@ -217,8 +217,11 @@ export interface ToolCall {
 }
 
 export interface ToolResult {
-  /** Stringified content the model will see. */
-  content: string;
+  /**
+   * Content the model will see. A plain string is the common case; tools
+   * that produce rich output (e.g. images) return content blocks instead.
+   */
+  content: string | ContentBlock[];
   isError?: boolean;
   /** Optional ACP-client rendering metadata; ignored by non-ACP consumers. */
   display?: ToolDisplay;
@@ -294,13 +297,14 @@ export interface Runtime {
 
   /**
    * Emits two `tool_call_update` events that differ only in `content`: the
-   * session always gets `modelContent` as text (replayable); the client gets
+   * session always gets `modelContent` (a string becomes one text entry;
+   * blocks map 1:1 to content entries — replayable); the client gets
    * `display.content` when set. `display.rawOutput` lands in both.
    */
   emitToolResult(args: {
     toolCallId: import("./acp.js").ToolCallId;
     status: import("./acp.js").ToolCallStatus;
-    modelContent: string;
+    modelContent: string | ContentBlock[];
     display?: ToolDisplay;
   }): Promise<void>;
 

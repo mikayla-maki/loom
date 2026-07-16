@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
+import { textContent } from "./helpers/assert.js";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -177,7 +178,7 @@ describe("bash broker: per-command rows reach pipelines", () => {
   dit("the sandbox allows getcwd in the granted directory", async () => {
     const r = await run(`/bin/pwd`);
     expect(r.isError).toBeFalsy();
-    expect(r.content.trim()).toBe(await fs.realpath(work));
+    expect(textContent(r.content).trim()).toBe(await fs.realpath(work));
   });
 
   dit("a brokered command can read its own cwd via getcwd", async () => {
@@ -190,7 +191,7 @@ describe("bash broker: per-command rows reach pipelines", () => {
     // runs under the pwd row and must getcwd successfully inside the broker.
     const r = await tool.execute({ command: "env pwd", cwd: work }, makeCtx());
     expect(r.isError).toBeFalsy();
-    expect(r.content.trim()).toBe(await fs.realpath(work));
+    expect(textContent(r.content).trim()).toBe(await fs.realpath(work));
   });
 
   // Exit-status fidelity: a brokered command's exit code must reach the

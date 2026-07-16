@@ -526,11 +526,17 @@ export class OpenAIHarness implements Harness {
           break;
         }
         case "tool_call_update": {
+          // Function outputs are strings here; image entries degrade to a
+          // placeholder rather than crashing or leaking base64 bytes.
           const text =
             (e.content ?? [])
               .map((c) =>
-                c.type === "content" && c.content.type === "text"
-                  ? c.content.text
+                c.type === "content"
+                  ? c.content.type === "text"
+                    ? c.content.text
+                    : c.content.type === "image"
+                      ? `[image: ${c.content.mimeType}]`
+                      : ""
                   : "",
               )
               .join("") || "";

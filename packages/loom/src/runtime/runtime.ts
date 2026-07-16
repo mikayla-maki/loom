@@ -9,6 +9,7 @@ import type {
   ToolResult,
 } from "../types/interfaces.js";
 import type {
+  ContentBlock,
   SessionUpdate,
   ToolCallId,
   ToolCallStatus,
@@ -77,10 +78,10 @@ export class RuntimeImpl implements Runtime {
   async emitToolResult(args: {
     toolCallId: ToolCallId;
     status: ToolCallStatus;
-    modelContent: string;
+    modelContent: string | ContentBlock[];
     display?: ToolDisplay;
   }): Promise<void> {
-    // Session gets model-facing text; client gets display.content when set. Both
+    // Session gets model-facing content; client gets display.content when set. Both
     // share rawOutput so replay can re-cite server-tool payloads (e.g. web_search).
     const display = args.display;
     const sharedMeta = {
@@ -91,12 +92,20 @@ export class RuntimeImpl implements Runtime {
         ? { rawOutput: display.rawOutput }
         : {}),
     };
-    const modelTextContent = [
-      {
-        type: "content" as const,
-        content: { type: "text" as const, text: args.modelContent },
-      },
-    ];
+    // A string stays a single text entry (byte-identical to the historical
+    // shape); block arrays map 1:1 so replay preserves rich content.
+    const modelTextContent =
+      typeof args.modelContent === "string"
+        ? [
+            {
+              type: "content" as const,
+              content: { type: "text" as const, text: args.modelContent },
+            },
+          ]
+        : args.modelContent.map((block) => ({
+            type: "content" as const,
+            content: block,
+          }));
     const sessionUpdate: SessionUpdate = {
       sessionUpdate: "tool_call_update",
       toolCallId: args.toolCallId,

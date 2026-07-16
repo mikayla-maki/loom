@@ -64,9 +64,18 @@ async function runBash(
   caps: CapabilitySet,
   command: string,
   cwd?: string,
-): Promise<ToolResult> {
+): Promise<ToolResult & { content: string }> {
   const tool = new BashTool({}, caps);
-  return await tool.execute({ command, ...(cwd ? { cwd } : {}) }, makeCtx());
+  const result = await tool.execute(
+    { command, ...(cwd ? { cwd } : {}) },
+    makeCtx(),
+  );
+  // Bash output is always a string; narrow so assertions can call
+  // string methods directly.
+  if (typeof result.content !== "string") {
+    throw new Error("bash returned non-string content");
+  }
+  return result as ToolResult & { content: string };
 }
 
 const grantFor = (root: string): CapabilitySet => ({

@@ -105,7 +105,8 @@ describe("top-level [tools]", () => {
         .list()
         .find((t) => t.name === "read_file");
       expect(rf?.description).toBe(
-        `Read a UTF-8 file from disk (restricted to: ${path.resolve(".")}).`,
+        `Read a UTF-8 file from disk (restricted to: ${path.resolve(".")}). ` +
+          `Image files (png/jpeg/gif/webp, up to 5 MiB) are returned as viewable images.`,
       );
     } finally {
       await agent.close();

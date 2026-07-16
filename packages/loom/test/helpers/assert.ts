@@ -42,3 +42,14 @@ export function defined<T>(v: T | undefined | null, msg?: string): T {
   }
   return v;
 }
+
+/**
+ * Narrows a `ToolResult.content` (`string | ContentBlock[]`) to its
+ * string form; fails the test if the tool returned content blocks.
+ */
+export function textContent(v: unknown, msg?: string): string {
+  if (typeof v !== "string") {
+    throw new Error(msg ?? "expected tool content to be a string");
+  }
+  return v;
+}

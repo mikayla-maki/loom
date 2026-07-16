@@ -211,7 +211,7 @@ export class TestHarness implements Harness {
           await openMessage();
           await runtime.update({
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: result.content },
+            content: { type: "text", text: flattenToolContent(result.content) },
           });
         }
       } else if ("stop" in step) {
@@ -222,6 +222,20 @@ export class TestHarness implements Harness {
     await runtime.update({ sessionUpdate: "stop", stopReason });
     return { stopReason };
   }
+}
+
+/** Surfaced tool output is text; image blocks degrade to a placeholder. */
+function flattenToolContent(content: string | ContentBlock[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .map((block) =>
+      block.type === "text"
+        ? block.text
+        : block.type === "image"
+          ? `[image: ${block.mimeType}]`
+          : "",
+    )
+    .join("");
 }
 
 export const testHarnessFactory: HarnessFactory = {

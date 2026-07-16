@@ -4,9 +4,11 @@ import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
 import type {
   ContentBlock as AnthropicContentBlock,
   ContentBlockParam,
+  ImageBlockParam,
   Message as AnthropicMessage,
   MessageCreateParamsBase,
   MessageParam,
+  TextBlockParam,
   Tool as AnthropicTool,
   ToolUnion as AnthropicToolUnion,
   Usage as AnthropicUsage,
@@ -21,6 +23,7 @@ import type {
   ContentBlock as ACPContentBlock,
   SessionUpdate,
   StopReason,
+  ToolCallContent,
   ToolCallStatus,
   TurnUsage,
 } from "../../types/acp.js";
@@ -840,21 +843,13 @@ export class AnthropicHarness implements Harness {
         }
         case "tool_call_update": {
           if (serverPayloads.has(e.toolCallId)) break;
-          const text =
-            (e.content ?? [])
-              .map((c) =>
-                c.type === "content" && c.content.type === "text"
-                  ? c.content.text
-                  : "",
-              )
-              .join("") || "";
           push({
             role: "user",
             content: [
               {
                 type: "tool_result",
                 tool_use_id: e.toolCallId,
-                content: text,
+                content: toolResultApiContent(e.content ?? []),
                 ...(e.status === "failed" ? { is_error: true } : {}),
               },
             ],
@@ -970,6 +965,63 @@ function renderWebFetchResult(block: WebFetchToolResultBlock): {
     lines.push(`[PDF content; ${src.media_type}; see rawOutput for bytes]`);
   }
   return { text: lines.join("\n").trimEnd(), isError: false };
+}
+
+/**
+ * Builds the API `tool_result.content` from ACP tool_call_update entries.
+ *
+ * Text-only results keep the historical plain-string form — byte-identical
+ * request shapes preserve prompt caches for existing conversations. Only
+ * when an image entry is present does the content become a block array
+ * (text entries merged/dropped-if-empty, images as base64 sources).
+ */
+function toolResultApiContent(
+  entries: ToolCallContent[],
+): string | Array<TextBlockParam | ImageBlockParam> {
+  const hasImage = entries.some(
+    (c) => c.type === "content" && c.content.type === "image",
+  );
+  if (!hasImage) {
+    return (
+      entries
+        .map((c) =>
+          c.type === "content" && c.content.type === "text"
+            ? c.content.text
+            : "",
+        )
+        .join("") || ""
+    );
+  }
+  const blocks: Array<TextBlockParam | ImageBlockParam> = [];
+  const pushText = (text: string): void => {
+    if (!text) return;
+    const last = blocks[blocks.length - 1];
+    if (last?.type === "text") {
+      last.text += text;
+    } else {
+      blocks.push({ type: "text", text });
+    }
+  };
+  for (const c of entries) {
+    if (c.type !== "content") continue;
+    if (c.content.type === "text") {
+      pushText(c.content.text);
+    } else if (c.content.type === "image") {
+      if (isAnthropicImageMediaType(c.content.mimeType)) {
+        blocks.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: c.content.mimeType,
+            data: c.content.data,
+          },
+        });
+      } else {
+        pushText(`[unsupported image type: ${c.content.mimeType}]`);
+      }
+    }
+  }
+  return blocks;
 }
 
 function acpToAnthropicContent(

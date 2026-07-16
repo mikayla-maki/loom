@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeAll } from "vitest";
+import { textContent } from "./helpers/assert.js";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -75,7 +76,7 @@ describe("sandbox-exec extras (macOS-only)", () => {
       scratch,
     );
     expect(r.isError).toBeFalsy();
-    expect(r.content.trim()).toMatch(/^hello ruby$|^missing$/);
+    expect(textContent(r.content).trim()).toMatch(/^hello ruby$|^missing$/);
   });
 });
 
@@ -83,6 +84,6 @@ describe("bash unsandboxed (capabilities = '*')", () => {
   it("runs without sandbox-exec engagement", async () => {
     const r = await runBash("*", "pwd");
     expect(r.isError).toBeFalsy();
-    expect(r.content.trim()).toBe(process.cwd());
+    expect(textContent(r.content).trim()).toBe(process.cwd());
   });
 });
